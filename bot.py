@@ -806,27 +806,17 @@ def _message_template(section,key,default,**kwargs):
     try: return text.format(**kwargs)
     except Exception: return text
 
-def _command_help():
-    return ("━━━━━━━━ 📋 أوامر البوت ━━━━━━━━\n"
-            "🎵 .sa اسم الأغنية — تشغيل أغنية\n"
-            "🎁 sa@رقم_الهدية@اسم_المستخدم — إرسال هدية\n"
-            "🏠 دخول اسم الغرفة — دخول غرفة\n"
-            "🚪 خروج اسم الغرفة — خروج من غرفة\n"
-            "🚪 خروج — خروج من جميع الغرف\n"
-            "📨 inv — دعوة مستخدمي الغرفة\n"
-            "📢 انشر — أرسل الصورة التالية للنشر في جميع الغرف\n"
-            "📢 انشر@الرسالة — أرسل الصورة التالية مع هذا الوصف\n"
-            "💰 نقاطي / توب — النقاط والمتصدرين\n"
-            "━━━━━━━━ 👑 أوامر الماستر ━━━━━━━━\n"
-            "sb@اسم المستخدم@عدد النقاط — إضافة/خصم نقاط\n"
-            "mas@اسم المستخدم — إضافة ماستر متحكم بالبوت\n"
-            "umas@اسم المستخدم — إزالة ماستر\n"
-            "s@اسم المستخدم — توثيق لاستخدام البوت\n"
-            "ازالة توثيق@اسم المستخدم — إزالة التوثيق\n"
-            "Vip@اسم المستخدم — إضافة VIP\n"
-            "unVip@اسم المستخدم — إزالة VIP\n"
-            "المسترات — عرض الماسترز\n"
-            "اوامر — عرض هذه القائمة")
+def _command_help(page=1):
+    pages = [
+        "📋 أوامر البوت (1/4)\n1. .sa اسم/رابط الأغنية\n2. sa@رقم_الهدية@اسم\n3. نقاطي\n4. توب\n5. دخول اسم_الغرفة\n6. خروج [الغرفة]\n7. inv\n8. invmsg نص الدعوة\n9. انشر\n10. انشر@الرسالة\n➡️ أرسل ns للقائمة التالية",
+        "📋 أوامر البوت (2/4)\n1. انشر ثم أرسل الصورة\n2. انشر@الرسالة ثم أرسل الصورة\n3. .sa اسم الأغنية\n4. sa@رقم_الهدية@اسم\n5. نقاطي\n6. توب\n7. دخول اسم_الغرفة\n8. خروج\n9. inv\n10. say النص\n➡️ أرسل ns للقائمة التالية",
+        "👑 أوامر الماستر (3/4)\n1. sb@اسم@عدد\n2. mas@اسم\n3. umas@اسم\n4. s@اسم\n5. ازالة توثيق@اسم\n6. Vip@اسم\n7. unVip@اسم\n8. المسترات\n9. دخول اسم_الغرفة\n10. خروج [الغرفة]\n➡️ أرسل ns للقائمة التالية",
+        "👑 أوامر الماستر (4/4)\n1. inv\n2. inv اسم_الغرفة\n3. invmsg نص الدعوة\n4. say النص\n5. k@ اسم للطرد\n6. b@ اسم للحظر\n7. u@ اسم لإلغاء الحظر\n8. a@ اسم مشرف\n9. o@ اسم مالك\n10. اوامر\n✅ انتهت القوائم. أرسل اوامر للبدء من جديد"
+    ]
+    try: page=int(page)
+    except Exception: page=1
+    page=max(1,min(len(pages),page))
+    return pages[page-1]
 
 # ------------------------------ Bot --------------------------------------
 
@@ -937,6 +927,7 @@ class TalkinBot:
         self.music_current = {}
         self.music_lock = threading.Lock()
         self.publish_pending = {}
+        self.help_pages = {}
         self.invite_message_template = _message_template("invite", "default", "{sender} يدعوك للغرفة {room}")
 
     def log(self, *args):
@@ -1067,8 +1058,32 @@ class TalkinBot:
                 self.log("[ROOM] leave failed", room, repr(e))
         return rooms
 
+    def _split_talkin_text(self, text: str, limit: int = 180):
+        """Talkin Chat rejects/tears down oversized text frames; keep every
+        outgoing text safely below the server's 200-character limit.
+        Prefer line boundaries, then hard-split long lines."""
+        text = str(text or "")
+        if not text:
+            return [""]
+        chunks = []
+        for block in text.split("\n"):
+            block = block.strip()
+            if not block:
+                continue
+            while len(block) > limit:
+                cut = block.rfind(" ", 0, limit + 1)
+                if cut < max(20, limit // 2):
+                    cut = limit
+                chunks.append(block[:cut].rstrip())
+                block = block[cut:].lstrip()
+            if block:
+                chunks.append(block)
+        return chunks or [""]
+
     def send_room_text(self, room: str, text: str):
-        self.send_query(encode_query("room_message", type_="text", room=room, body=text))
+        for chunk in self._split_talkin_text(text):
+            self.send_query(encode_query("room_message", type_="text", room=room, body=chunk))
+        return True
 
     def send_admin(self, room: str, target: str, operation: str):
         # Exact command forms observed in the APK.
@@ -1092,11 +1107,12 @@ class TalkinBot:
             self.send_query(encode_query("ack_msg", uid=uid))
 
     def send_private_text(self, username: str, text: str):
-        """Send one normal TalkinChat private text message."""
+        """Send TalkinChat private text safely under the 200-char limit."""
         username = str(username or "").strip()
         if not username or username == BOT_ID:
             return False
-        self.send_query(encode_query("chat_message", type_="text", to=username, body=text))
+        for chunk in self._split_talkin_text(text):
+            self.send_query(encode_query("chat_message", type_="text", to=username, body=chunk))
         return True
 
     def request_occupants(self, room: str = ""):
@@ -1470,20 +1486,22 @@ class TalkinBot:
                 if balance < cost:
                     self.send_room_text(room,f"❌ رصيدك غير كافٍ. الهدية تحتاج {cost} نقطة، ورصيدك {balance}."); return True
                 _add_points(sender_name,-cost); charged=True
-            try:
-                rendered=render_gift_card(gift_id,sender_name,target); base=MEDIA_PUBLIC_BASE_URL
-            except Exception:
-                if charged: _add_points(sender_name,cost)
-                raise
-            if not base: raise RuntimeError("لا يوجد رابط عام للهدايا؛ ضع GIFT_PUBLIC_BASE_URL أو أنشئ Railway Public Domain")
-            self.send_room_media(room,base+"/gifts/"+rendered.name,"image")
-            self.send_room_text(room,f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
+            # Render and send the real gift card image, then send the gift text.
+            # The image is hosted by the bot media server under /gifts/.
+            if not MEDIA_PUBLIC_BASE_URL:
+                if charged:
+                    _add_points(sender_name, cost)
+                raise RuntimeError("لا يوجد رابط عام لصور الهدايا؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
+            gift_path = render_gift_card(gift_id, sender_name, target)
+            gift_url = MEDIA_PUBLIC_BASE_URL + "/gifts/" + gift_path.name
+            self.send_room_media(room, gift_url, "image")
+            self.send_room_text(room, f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
         except Exception as e:
             self.log("[GIFT] failed:",repr(e)); self.send_room_text(room,"❌ تعذر تجهيز الهدية: "+str(e)[:180])
         return True
 
-    def _send_help(self, room=None, private_to=None):
-        text=_command_help()
+    def _send_help(self, room=None, private_to=None, page=1):
+        text=_command_help(page)
         if private_to: self.send_private_text(private_to,text)
         elif room: self.send_room_text(room,text)
 
@@ -1493,7 +1511,16 @@ class TalkinBot:
         low=text.casefold()
         # Help is available to everyone.
         if low in ("اوامر","الاوامر","help","مساعدة"):
-            self._send_help(room=room, private_to=sender if room == BOT_MASTER else None)
+            key=(str(room), _norm_user(sender))
+            self.help_pages[key]=1
+            self._send_help(room=room, private_to=sender if room == BOT_MASTER else None, page=1)
+            return True
+        if low in ("ns","n","التالي","القائمة التالية","next"):
+            key=(str(room), _norm_user(sender))
+            page=int(self.help_pages.get(key,1) or 1)+1
+            if page>4: page=1
+            self.help_pages[key]=page
+            self._send_help(room=room, private_to=sender if room == BOT_MASTER else None, page=page)
             return True
         if low in ("نقاطي","points"):
             pts=_get_points(sender)
@@ -1531,6 +1558,8 @@ class TalkinBot:
             target=text[5:].strip().lstrip("@"); masters=[x for x in _master_list() if _norm_user(x)!=_norm_user(target)]; _save_local_json(MASTERS_FILE,masters)
             self.send_private_text(sender,f"✅ تم إزالة @{target} من الماسترز."); return True
         if low.startswith("sb@"):
+            if not _is_master_name(sender):
+                self.send_private_text(sender,"🚫 أمر النقاط للماستر فقط."); return True
             m=re.match(r"^sb@([^@]+)@(-?\d+)$",text,re.I)
             if not m: self.send_private_text(sender,"❌ الصيغة: sb@اسم المستخدم@عدد النقاط"); return True
             target,amount=m.group(1).strip(),int(m.group(2)); new=_add_points(target,amount)
@@ -1555,27 +1584,49 @@ class TalkinBot:
         # Publishing: master says `انشر` or `انشر@description`, then sends an image.
         if low == "انشر" or low.startswith("انشر@"):
             desc=text[5:].strip() if low.startswith("انشر@") else ""
-            self.publish_pending[(str(room),_norm_user(sender))]={"description":desc,"created_at":time.time()}
-            self.send_private_text(sender,"🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في جميع الغرف." + (f"\n📝 الوصف: {desc}" if desc else ""))
+            # The image may be sent later in a room or in private chat.
+            # Key the pending publish by sender, not by the command room, so
+            # sending the image from another room still completes the publish.
+            self.publish_pending[_norm_user(sender)]={"description":desc,"source_room":str(room or ""),"created_at":time.time()}
+            self.send_private_text(sender,"🖼️ تم استلام أمر النشر. أرسل الصورة الآن خلال دقيقتين في الروم أو الخاص، وسيتم نشرها في جميع الغرف." + (f"\n📝 الوصف: {desc}" if desc else ""))
             return True
         return False
 
     def _handle_publish_media(self, room, sender, media_url, description=""):
         if not media_url: return False
-        key=(str(room),_norm_user(sender)); pending=self.publish_pending.get(key)
+        # Accept the pending image from ANY room (or private chat).
+        key=_norm_user(sender); pending=self.publish_pending.get(key)
         if not pending: return False
         if time.time()-pending.get("created_at",0)>120:
             self.publish_pending.pop(key,None); self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد."); return True
         desc=pending.get("description",description or "")
+        source_room=str(pending.get("source_room") or room or "")
         self.publish_pending.pop(key,None)
         rooms=list(self.known_rooms) or ([self.room] if self.room else [])
-        caption=_message_template("publish","broadcast","🖼️ {publisher}\n📝 {description}\n🏠 {room}",publisher=sender,description=desc or "منشور صورة",source_label=room,code="",like="",love="",dislike="",comment="",report="",room=room)
+        # In rooms, the successful publish message contains ONLY the reaction
+        # controls. The publish status/result is sent privately to the master.
+        caption=_message_template(
+            "publish", "reaction_only",
+            "🆔 {code}\n👍 lk@{code}\n❤️ lv@{code}\n👎 dl@{code}\n💬 cm@{code} msg\n🚨 report@{code} msg",
+            publisher=sender, description=desc or "منشور صورة",
+            source_label=source_room, code=uuid.uuid4().hex[:8],
+            like="", love="", dislike="", comment="", report="", room=source_room
+        )
         ok=0
+        errors=[]
         for target in rooms:
             try:
-                self.send_room_media(target,media_url,"image"); self.send_room_text(target,caption); ok+=1
-            except Exception as e: self.log("[PUBLISH] failed",target,repr(e))
-        self.send_private_text(sender,f"✅ تم نشر الصورة في {ok} غرفة.")
+                self.send_room_media(target,media_url,"image")
+                self.send_room_text(target,caption)
+                ok+=1
+            except Exception as e:
+                errors.append((target,str(e)))
+                self.log("[PUBLISH] failed",target,repr(e))
+        # Never announce a successful publish in the room; tell the master in PM.
+        self.send_private_text(sender,f"✅ تم نشر الصورة في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else ""))
+        # Errors are also visible in the source room so the master can notice them.
+        if errors and source_room:
+            self.send_room_text(source_room, "❌ خطأ في النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors)[:170])
         return True
 
     def handle_room_event(self, result):
@@ -1620,6 +1671,16 @@ class TalkinBot:
                 self.ack(result["uid"])
             except Exception as e:
                 self.log("[ACK] failed:", e)
+
+        # A photo sent in a room arrives as RoomEvent type=image with its
+        # public URL in field 7 (url). If a master previously used `انشر`,
+        # publish that image even when it was sent from a different room.
+        if event_type == "image":
+            media_url = str(event.get(7, "") or "").strip()
+            if frm and frm != BOT_ID and media_url:
+                if self._handle_publish_media(room, frm, media_url):
+                    return
+            return
 
         if event_type != "text" or not body:
             return

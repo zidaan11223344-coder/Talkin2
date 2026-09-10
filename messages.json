@@ -8,7 +8,8 @@
   },
   "publish": {
     "broadcast": "🖼️ IMAGE BROADCAST\n.sa Publish image\n👤 {publisher}\n📝 {description}\n\n⏱️ Source: {source_label}\n🆔 {code}\n💬 Room: {room}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
-    "reaction_hint": "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة"
+    "reaction_hint": "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة",
+    "reaction_only": "🆔 {code}\\n👍 lk@{code}\\n❤️ lv@{code}\\n👎 dl@{code}\\n💬 cm@{code} msg\\n🚨 report@{code} msg"
   },
   "games": {
     "fallback": "{title}\n{details}",
