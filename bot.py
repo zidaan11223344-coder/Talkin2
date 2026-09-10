@@ -922,6 +922,8 @@ class TalkinBot:
         self._join_lock = threading.Lock()
         self._last_join_sent = {}
         self._rejoin_attempts = defaultdict(int)
+        # WebSocket reconnect backoff counter. Keep separate from room rejoin attempts.
+        self._reconnect_attempts = defaultdict(int)
         self._last_reconnect = 0.0
         self.banned_words = set(BANNED_WORDS)
         self.db = DatabaseBridge(self.log)
