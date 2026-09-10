@@ -1,0 +1,5 @@
+Railway: Deploy this folder as a Docker project.
+Required: BOT_ID, BOT_PWD, BOT_MASTER, GROUP_TO_JOIN.
+Generate a Railway public domain, then set PUBLIC_BASE_URL=https://your-domain.up.railway.app
+Gift test: sa@1@اسم_المستلم
+Music test: اغنية اسم_أغنية
