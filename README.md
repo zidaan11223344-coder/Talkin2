@@ -1,23 +1,31 @@
-# TalkinChat V21
+# TalkinChat V22 - Giant assets + points + masters + VIP + publishing
 
-## Railway Variables (minimum)
+Railway variables:
 - BOT_ID
 - BOT_PWD
 - BOT_MASTER
 - GROUP_TO_JOIN
-- YOUTUBE_COOKIES (optional Netscape cookies)
-- GIFT_PUBLIC_BASE_URL (optional backup public Railway URL; Railway RAILWAY_PUBLIC_DOMAIN is preferred automatically)
-- MUSIC_MAX_SECONDS (default 900)
-- MUSIC_COOLDOWN (default 15)
+- YOUTUBE_COOKIES (optional but recommended for YouTube)
+- GIFT_PUBLIC_BASE_URL (optional fallback public URL; RAILWAY_PUBLIC_DOMAIN is used automatically)
+- MUSIC_MAX_SECONDS=900
+- MUSIC_COOLDOWN=15
 
-## Commands
-- `.sa اسم الأغنية`
-- `.sa https://www.youtube.com/...`
-- `sa@رقم_الهدية@اسم_المستخدم`
-- `دخول اسم_الغرفة`
-- `خروج اسم_الغرفة`
-- `خروج`
-- `inv`
-- `invmsg نص الدعوة`
+Commands:
+- .sa SONG NAME
+- sa@GIFT_NUMBER@USERNAME
+- دخول ROOM
+- خروج ROOM
+- خروج
+- انشر
+- انشر@DESCRIPTION (then send image)
+- sb@USERNAME@POINTS (master)
+- mas@USERNAME (owner)
+- umas@USERNAME (owner)
+- s@USERNAME (master)
+- ازالة توثيق@USERNAME (master)
+- Vip@USERNAME (master)
+- unVip@USERNAME (master)
+- اوامر
+- نقاطي / توب
 
-Gift cards use the local Giant Chat assets copied into `assets/`, with the sender and recipient names rendered as provided, including decorative Unicode characters when supported by the installed fonts. Sender and recipient are rendered in different colors.
+The Giant Chat messages.json is included and used for message templates. Giant assets are copied verbatim under assets/.

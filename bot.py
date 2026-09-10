@@ -100,6 +100,19 @@ BOT_MASTER = os.getenv("BOT_MASTER", "").strip()
 INVITE_SENDER_NAME = os.getenv("INVITE_SENDER_NAME", "السفير").strip() or "السفير"
 GROUP_TO_JOIN = os.getenv("GROUP_TO_JOIN", "").strip()
 
+# Persistent Giant-style bot data. The owner/master has unlimited points.
+DATA_DIR = Path(__file__).resolve().parent
+MASTERS_FILE = DATA_DIR / "masters.json"
+VIP_FILE = DATA_DIR / "vip_users.json"
+VERIFIED_FILE = DATA_DIR / "verified_users.json"
+POINTS_FILE = DATA_DIR / "points.json"
+MESSAGES_FILE = DATA_DIR / "messages.json"
+PUBLISHED_FILE = DATA_DIR / "published_posts.json"
+
+# Giant Chat gift costs/labels; images remain the local Giant assets.
+GIFT_COSTS = {"1":10,"2":20,"3":30,"4":50,"5":80,"6":150,"7":200,"8":500,"9":800,"10":1000,"11":1500,"12":3000,"13":5000,"14":8000}
+
+
 API_BASE_URL = os.getenv("API_BASE_URL", "https://chatp.net/api?").rstrip("?") + "?"
 HOST = os.getenv("HOST_HEADER", "chatp.net").strip()
 WS_HOSTS = [x.strip() for x in os.getenv("WS_HOSTS", "chatp.net").split(",") if x.strip()]
@@ -173,41 +186,16 @@ def android_build_info():
     return manufacturer.strip(), model.strip(), sdk.strip()
 
 
-_MANUFACTURER, _MODEL, _ANDROID_SDK = android_build_info()
-_MANUFACTURER = os.getenv("DEVICE_MANUFACTURER", "").strip() or _MANUFACTURER
-_MODEL = os.getenv("DEVICE_PRODUCT_MODEL", "").strip() or _MODEL
-SDK = os.getenv("SDK", "").strip() or _ANDROID_SDK
-
-# Do NOT silently generate a fake device identity. The APK sends the real
-# Android ID. If Pydroid cannot access it, the operator can set DEVICE_ID in
-# .env after obtaining the value from the same Android device.
-DEVICE_ID = os.getenv("DEVICE_ID", "").strip() or android_secure_id()
-# Exact fallback from the APK's M9/c.h(): when ANDROID_ID is unavailable,
-# it uses the literal prefix "null-" followed by a UUID, then replaces @.
-if not DEVICE_ID:
-    # APK behavior: when ANDROID_ID is unavailable it creates a UUID and
-    # stores it in SharedPreferences, so it stays stable across reconnects.
-    _fallback_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".talkin_device_id")
-    try:
-        if os.path.exists(_fallback_file):
-            DEVICE_ID = open(_fallback_file, "r", encoding="utf-8").read().strip()
-    except Exception:
-        pass
-    if not DEVICE_ID:
-        DEVICE_ID = "null-" + str(uuid.uuid4()).lower()
-        try:
-            with open(_fallback_file, "w", encoding="utf-8") as _f:
-                _f.write(DEVICE_ID)
-        except Exception:
-            pass
-    print("[DEVICE] ANDROID_ID unavailable; using persistent APK fallback", DEVICE_ID)
-if not _MANUFACTURER or not _MODEL or not SDK:
-    raise RuntimeError(
-        "Cannot read Android Build information. Set DEVICE_MANUFACTURER, "
-        "DEVICE_PRODUCT_MODEL and SDK in .env to the values of the same Android device."
-    )
+# Railway has no Android runtime and this bot does not need the phone's
+# Android ID or Android system properties for publishing.  Talkin's wire
+# protocol still requires device_id/device_model fields, so keep a stable
+# synthetic profile in the exact APK fingerprint format without probing Android.
+DEVICE_ID = "chatbuz-railway"
+_MANUFACTURER = "samsung"
+_MODEL = "SM-G998B"
+SDK = os.getenv("SDK", "35").strip() or "35"
 DEVICE_MODEL = os.getenv("DEVICE_MODEL", "").strip() or (
-    "444$" + _MANUFACTURER.replace("@", "-") + "-" + _MODEL.replace("@", "-") + "$" + SDK
+    "444$" + _MANUFACTURER + "-" + _MODEL + "$" + SDK
 )
 
 API_VER = "2"
@@ -760,6 +748,86 @@ class DatabaseBridge:
             self.log("[DB] room_members query failed:", repr(e))
             return []
 
+# ----------------------- Giant-style local data -----------------------
+def _load_local_json(path, default):
+    try:
+        if Path(path).is_file():
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+def _save_local_json(path, data):
+    tmp=Path(str(path)+".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+def _norm_user(name):
+    return str(name or "").strip().lstrip("@").casefold()
+
+def _master_list():
+    data=_load_local_json(MASTERS_FILE, [])
+    return data if isinstance(data,list) else []
+
+def _is_master_name(name):
+    n=_norm_user(name)
+    return bool(n and (n == _norm_user(BOT_MASTER) or n in {_norm_user(x) for x in _master_list()}))
+
+def _verified_data():
+    data=_load_local_json(VERIFIED_FILE,{})
+    return data if isinstance(data,dict) else {}
+
+def _vip_data():
+    data=_load_local_json(VIP_FILE,{})
+    return data if isinstance(data,dict) else {}
+
+def _points_data():
+    data=_load_local_json(POINTS_FILE,{})
+    return data if isinstance(data,dict) else {}
+
+def _add_points(username, amount):
+    amount=int(amount)
+    data=_points_data(); key=_norm_user(username)
+    item=data.get(key,{"username":str(username).strip().lstrip("@"),"points":0})
+    item["username"]=str(username).strip().lstrip("@")
+    item["points"]=int(item.get("points",0) or 0)+amount
+    data[key]=item; _save_local_json(POINTS_FILE,data)
+    return item["points"]
+
+def _get_points(username):
+    if _is_master_name(username): return None
+    item=_points_data().get(_norm_user(username),{})
+    return int(item.get("points",0) or 0)
+
+def _message_template(section,key,default,**kwargs):
+    data=_load_local_json(MESSAGES_FILE,{})
+    value=((data.get(section) or {}).get(key)) if isinstance(data,dict) else None
+    text=value if isinstance(value,str) else default
+    try: return text.format(**kwargs)
+    except Exception: return text
+
+def _command_help():
+    return ("━━━━━━━━ 📋 أوامر البوت ━━━━━━━━\n"
+            "🎵 .sa اسم الأغنية — تشغيل أغنية\n"
+            "🎁 sa@رقم_الهدية@اسم_المستخدم — إرسال هدية\n"
+            "🏠 دخول اسم الغرفة — دخول غرفة\n"
+            "🚪 خروج اسم الغرفة — خروج من غرفة\n"
+            "🚪 خروج — خروج من جميع الغرف\n"
+            "📨 inv — دعوة مستخدمي الغرفة\n"
+            "📢 انشر — أرسل الصورة التالية للنشر في جميع الغرف\n"
+            "📢 انشر@الرسالة — أرسل الصورة التالية مع هذا الوصف\n"
+            "💰 نقاطي / توب — النقاط والمتصدرين\n"
+            "━━━━━━━━ 👑 أوامر الماستر ━━━━━━━━\n"
+            "sb@اسم المستخدم@عدد النقاط — إضافة/خصم نقاط\n"
+            "mas@اسم المستخدم — إضافة ماستر متحكم بالبوت\n"
+            "umas@اسم المستخدم — إزالة ماستر\n"
+            "s@اسم المستخدم — توثيق لاستخدام البوت\n"
+            "ازالة توثيق@اسم المستخدم — إزالة التوثيق\n"
+            "Vip@اسم المستخدم — إضافة VIP\n"
+            "unVip@اسم المستخدم — إزالة VIP\n"
+            "المسترات — عرض الماسترز\n"
+            "اوامر — عرض هذه القائمة")
+
 # ------------------------------ Bot --------------------------------------
 
 def _shape_name(text):
@@ -868,6 +936,8 @@ class TalkinBot:
         self.music_last = defaultdict(float)
         self.music_current = {}
         self.music_lock = threading.Lock()
+        self.publish_pending = {}
+        self.invite_message_template = _message_template("invite", "default", "{sender} يدعوك للغرفة {room}")
 
     def log(self, *args):
         if DEBUG:
@@ -1393,12 +1463,119 @@ class TalkinBot:
             self.send_room_text(room,"❌ الصيغة: sa@رقم_الهدية@اسم_المستخدم"); return True
         try:
             sender_name = str(sender_name or BOT_ID).strip()
-            rendered=render_gift_card(gift_id,sender_name,target); base=MEDIA_PUBLIC_BASE_URL
+            # Giant Chat point costs; owner/masters have unlimited points.
+            cost=int(GIFT_COSTS.get(str(gift_id),0)); charged=False
+            if not _is_master_name(sender_name):
+                balance=_get_points(sender_name)
+                if balance < cost:
+                    self.send_room_text(room,f"❌ رصيدك غير كافٍ. الهدية تحتاج {cost} نقطة، ورصيدك {balance}."); return True
+                _add_points(sender_name,-cost); charged=True
+            try:
+                rendered=render_gift_card(gift_id,sender_name,target); base=MEDIA_PUBLIC_BASE_URL
+            except Exception:
+                if charged: _add_points(sender_name,cost)
+                raise
             if not base: raise RuntimeError("لا يوجد رابط عام للهدايا؛ ضع GIFT_PUBLIC_BASE_URL أو أنشئ Railway Public Domain")
             self.send_room_media(room,base+"/gifts/"+rendered.name,"image")
-            self.send_room_text(room,f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target}")
+            self.send_room_text(room,f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
         except Exception as e:
             self.log("[GIFT] failed:",repr(e)); self.send_room_text(room,"❌ تعذر تجهيز الهدية: "+str(e)[:180])
+        return True
+
+    def _send_help(self, room=None, private_to=None):
+        text=_command_help()
+        if private_to: self.send_private_text(private_to,text)
+        elif room: self.send_room_text(room,text)
+
+    def _handle_management_command(self, room, body, sender):
+        """Giant-style persistent management commands. Returns True if consumed."""
+        text=str(body or "").strip()
+        low=text.casefold()
+        # Help is available to everyone.
+        if low in ("اوامر","الاوامر","help","مساعدة"):
+            self._send_help(room=room, private_to=sender if room == BOT_MASTER else None)
+            return True
+        if low in ("نقاطي","points"):
+            pts=_get_points(sender)
+            self.send_private_text(sender, "♾️ نقاطك: لا محدود" if pts is None else f"💰 نقاطك: {pts}")
+            return True
+        if low in ("توب","top"):
+            data=_points_data(); rows=[]
+            for v in data.values():
+                try: rows.append((int(v.get("points",0)),v.get("username", "")))
+                except Exception: pass
+            rows.sort(reverse=True)
+            msg="🏆 المتصدرين:\n"+"\n".join(f"{i}. @{u} — {p}" for i,(p,u) in enumerate(rows[:10],1)) if rows else "🏆 لا توجد نقاط بعد."
+            self.send_room_text(room,msg)
+            return True
+        if low in ("المسترات", "masters"):
+            masters=_master_list()
+            names=[BOT_MASTER] + [x for x in masters if _norm_user(x)!=_norm_user(BOT_MASTER)]
+            msg="👑 الماسترز:\n"+"\n".join(f"{i}. @{u}" for i,u in enumerate(names,1)) if names and any(names) else "👑 لا يوجد ماستر مسجل."
+            self.send_room_text(room,msg)
+            return True
+        if not _is_master_name(sender):
+            return False
+        # Add/remove master. Only the owner from BOT_MASTER may alter master list.
+        if low.startswith("mas@"):
+            if _norm_user(sender) != _norm_user(BOT_MASTER):
+                self.send_private_text(sender,"🚫 إضافة الماسترز متاحة لصاحب البوت فقط."); return True
+            target=text[4:].strip().lstrip("@");
+            if not target: self.send_private_text(sender,"❌ الصيغة: mas@اسم المستخدم"); return True
+            masters=_master_list()
+            if not any(_norm_user(x)==_norm_user(target) for x in masters): masters.append(target); _save_local_json(MASTERS_FILE,masters)
+            self.send_private_text(sender,f"✅ تم إضافة @{target} كماستر متحكم بالبوت."); return True
+        if low.startswith("umas@") or low.startswith("umas "):
+            if _norm_user(sender) != _norm_user(BOT_MASTER):
+                self.send_private_text(sender,"🚫 إزالة الماسترز متاحة لصاحب البوت فقط."); return True
+            target=text[5:].strip().lstrip("@"); masters=[x for x in _master_list() if _norm_user(x)!=_norm_user(target)]; _save_local_json(MASTERS_FILE,masters)
+            self.send_private_text(sender,f"✅ تم إزالة @{target} من الماسترز."); return True
+        if low.startswith("sb@"):
+            m=re.match(r"^sb@([^@]+)@(-?\d+)$",text,re.I)
+            if not m: self.send_private_text(sender,"❌ الصيغة: sb@اسم المستخدم@عدد النقاط"); return True
+            target,amount=m.group(1).strip(),int(m.group(2)); new=_add_points(target,amount)
+            self.send_private_text(sender,f"✅ تم تعديل نقاط @{target} بمقدار {amount}. الرصيد: {new}"); return True
+        if low.startswith("s@"):
+            target=text[2:].strip().lstrip("@");
+            if not target: self.send_private_text(sender,"❌ الصيغة: s@اسم المستخدم"); return True
+            data=_verified_data(); data[_norm_user(target)]={"username":target,"verified_by":sender,"created_at":int(time.time())}; _save_local_json(VERIFIED_FILE,data)
+            self.send_private_text(sender,f"✅ تم توثيق @{target} لاستخدام البوت."); return True
+        if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("uns@"): 
+            prefix="uns@" if low.startswith("uns@") else text.split("@",1)[0]+"@"
+            target=text[len(prefix):].strip().lstrip("@"); data=_verified_data(); data.pop(_norm_user(target),None); _save_local_json(VERIFIED_FILE,data)
+            self.send_private_text(sender,f"✅ تم إزالة توثيق @{target}."); return True
+        if low.startswith("vip@"):
+            target=text[4:].strip().lstrip("@");
+            if not target: self.send_private_text(sender,"❌ الصيغة: Vip@اسم المستخدم"); return True
+            data=_vip_data(); data[_norm_user(target)]={"username":target,"granted_by":sender,"created_at":int(time.time())}; _save_local_json(VIP_FILE,data)
+            self.send_private_text(sender,f"✅ تم توثيق VIP @{target}."); return True
+        if low.startswith("unvip@") or low.startswith("un vip@"):
+            target=text[text.casefold().find("vip@")+4:].strip().lstrip("@"); data=_vip_data(); data.pop(_norm_user(target),None); _save_local_json(VIP_FILE,data)
+            self.send_private_text(sender,f"✅ تم إزالة VIP @{target}."); return True
+        # Publishing: master says `انشر` or `انشر@description`, then sends an image.
+        if low == "انشر" or low.startswith("انشر@"):
+            desc=text[5:].strip() if low.startswith("انشر@") else ""
+            self.publish_pending[(str(room),_norm_user(sender))]={"description":desc,"created_at":time.time()}
+            self.send_private_text(sender,"🖼️ أرسل الصورة الآن خلال دقيقتين، وسيتم نشرها في جميع الغرف." + (f"\n📝 الوصف: {desc}" if desc else ""))
+            return True
+        return False
+
+    def _handle_publish_media(self, room, sender, media_url, description=""):
+        if not media_url: return False
+        key=(str(room),_norm_user(sender)); pending=self.publish_pending.get(key)
+        if not pending: return False
+        if time.time()-pending.get("created_at",0)>120:
+            self.publish_pending.pop(key,None); self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد."); return True
+        desc=pending.get("description",description or "")
+        self.publish_pending.pop(key,None)
+        rooms=list(self.known_rooms) or ([self.room] if self.room else [])
+        caption=_message_template("publish","broadcast","🖼️ {publisher}\n📝 {description}\n🏠 {room}",publisher=sender,description=desc or "منشور صورة",source_label=room,code="",like="",love="",dislike="",comment="",report="",room=room)
+        ok=0
+        for target in rooms:
+            try:
+                self.send_room_media(target,media_url,"image"); self.send_room_text(target,caption); ok+=1
+            except Exception as e: self.log("[PUBLISH] failed",target,repr(e))
+        self.send_private_text(sender,f"✅ تم نشر الصورة في {ok} غرفة.")
         return True
 
     def handle_room_event(self, result):
@@ -1449,18 +1626,32 @@ class TalkinBot:
         if frm == BOT_ID:
             return
 
-        # Music and native gifts are handled before admin commands.
-        if self.handle_gift_command(room, body, frm):
-            return
-        if self.handle_music_command(room, body, frm):
-            return
+        # Music/gifts require verification; masters are always allowed.
+        is_verified = _norm_user(frm) in _verified_data() or _is_master_name(frm)
+        if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
+            if not is_verified:
+                self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام الهدايا.")
+                return
+            if self.handle_gift_command(room, body, frm):
+                return
+        if body.strip().lower().startswith(".sa "):
+            if not is_verified:
+                self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام الأغاني.")
+                return
+            if self.handle_music_command(room, body, frm):
+                return
 
         # Keep a small per-room message history for diagnostics.
         self.last_messages[room].append((frm, body, event_id))
         self.last_messages[room] = self.last_messages[room][-50:]
 
-        # Master-only administrative commands.
-        if BOT_MASTER and frm == BOT_MASTER:
+        if self._handle_management_command(room, body, frm):
+            return
+
+        # Master/admin commands.
+        if _is_master_name(frm):
+            if self._handle_management_command(room, body, frm):
+                return
             parts = body.strip().split()
             if parts:
                 cmd = parts[0].lower()
@@ -1557,7 +1748,13 @@ class TalkinBot:
                 try:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
-                    if BOT_MASTER and frm == BOT_MASTER and body:
+                    media_url = str(cm.get(6, "") or "").strip()
+                    if frm and media_url and self._handle_publish_media(self.room, frm, media_url):
+                        return
+                    if _is_master_name(frm) and body:
+                        if self._handle_management_command(self.room, body, frm):
+                            return
+                    if _is_master_name(frm) and body:
                         # Reuse room command handling with the command-context room.
                         ctx_room = self.room
                         parts = body.split(None, 1)
