@@ -1172,12 +1172,16 @@ class TalkinBot:
             self.send_query(encode_query("ack_msg", uid=uid))
 
     def send_private_text(self, username: str, text: str):
-        """Send TalkinChat private text safely under the 200-char limit."""
+        """Send private text as one complete message.
+
+        TalkinChat allows long private messages, so diagnostics sent to the
+        master must not be split or truncated. Room messages continue to use
+        _split_talkin_text() because rooms have the 200-character limit.
+        """
         username = str(username or "").strip()
         if not username or username == BOT_ID:
             return False
-        for chunk in self._split_talkin_text(text):
-            self.send_query(encode_query("chat_message", type_="text", to=username, body=chunk))
+        self.send_query(encode_query("chat_message", type_="text", to=username, body=str(text or "")))
         return True
 
     def request_occupants(self, room: str = ""):
@@ -1517,7 +1521,10 @@ class TalkinBot:
                 # Some YouTube clients expose only a combined stream or a
                 # codec other than m4a/webm. Accept the best available stream
                 # and let ffmpeg normalize it to MP3 below.
-                "format":"bestaudio/best",
+                # Prefer audio, then accept a single-file video/audio stream.
+                # Several YouTube clients no longer expose an audio-only
+                # format even though a playable combined stream exists.
+                "format":"bestaudio/best/bestvideo",
                 "format_sort":["abr", "acodec:mp4a.40.2", "asr"],
                 "outtmpl":template,
                 "socket_timeout":45,
@@ -1530,6 +1537,7 @@ class TalkinBot:
                 "concurrent_fragment_downloads":1,
                 "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
                 "extractor_args":{"youtube":{"player_client":[client]}},
+                "check_formats":False,
             }
             if YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
@@ -1555,6 +1563,8 @@ class TalkinBot:
         info=source=None
         attempts=[("android_vr",bool(YOUTUBE_COOKIE_FILE)),
                   ("web_embedded",bool(YOUTUBE_COOKIE_FILE)),
+                  ("web_safari",bool(YOUTUBE_COOKIE_FILE)),
+                  ("android",bool(YOUTUBE_COOKIE_FILE)),
                   ("tv",bool(YOUTUBE_COOKIE_FILE)),
                   ("default",bool(YOUTUBE_COOKIE_FILE))]
         for client,use_cookies in attempts:
@@ -1601,11 +1611,15 @@ class TalkinBot:
                             if not sr.ok:
                                 errors.append(f"Piped {api}: HTTP {sr.status_code}"); continue
                             data=sr.json()
-                            streams=sorted(data.get("audioStreams") or [],key=lambda s:float(s.get("bitrate") or 0),reverse=True)
+                            streams=list(data.get("audioStreams") or [])
+                            streams += [s for s in (data.get("videoStreams") or [])
+                                        if not bool(s.get("videoOnly"))]
+                            streams=sorted(streams,key=lambda s:float(s.get("bitrate") or 0),reverse=True)
                             for stream in streams:
                                 u=str(stream.get("url") or "").strip()
                                 if not u: continue
-                                ext=".m4a" if "mp4" in str(stream.get("mimeType","")).lower() else ".webm"
+                                mime=str(stream.get("mimeType","")).lower()
+                                ext=".mp4" if "mp4" in mime else (".m4a" if "m4a" in mime else ".webm")
                                 candidate=outdir/f"{stamp}{ext}"
                                 try:
                                     with requests.get(u,headers={"User-Agent":"Mozilla/5.0"},timeout=120,stream=True) as ar:
