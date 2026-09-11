@@ -681,13 +681,10 @@ class DatabaseBridge:
         if cfg_path.exists():
             try:
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                # Support both the current flat config and the older config
-                # format used by the working Talkin bot.
-                sbcfg = cfg.get("supabase") if isinstance(cfg.get("supabase"), dict) else {}
-                self.url = self.url or str(cfg.get("supabase_url", sbcfg.get("url", ""))).strip()
-                self.key = self.key or str(cfg.get("supabase_key", sbcfg.get("key", ""))).strip()
-                self.email = self.email or str(cfg.get("supabase_email", cfg.get("email", sbcfg.get("email", "")))).strip()
-                self.password = self.password or str(cfg.get("supabase_password", cfg.get("password", sbcfg.get("password", ""))))
+                self.url = self.url or str(cfg.get("supabase_url", "")).strip()
+                self.key = self.key or str(cfg.get("supabase_key", "")).strip()
+                self.email = self.email or str(cfg.get("supabase_email", cfg.get("email", ""))).strip()
+                self.password = self.password or str(cfg.get("supabase_password", cfg.get("password", "")))
             except Exception as e:
                 self.log("[DB] config read failed:", repr(e))
         if not create_client:
@@ -708,32 +705,14 @@ class DatabaseBridge:
                 self.log("[DB] client init failed:", repr(e))
 
     def sign_in(self):
-        if not self.client or not self.password:
+        if not self.client or not self.email or not self.password:
             return False
         try:
-            # The Talkin app logs in to the realtime service by username, while
-            # the Supabase Auth account is email-based. Resolve that email through
-            # the same backend RPC used by the original bot when necessary.
-            if not self.email:
-                username = str(BOT_ID or os.getenv("USERNAME", "")).strip()
-                if username:
-                    try:
-                        rr = self.client.rpc("lookup_auth_email", {"_username": username}).execute()
-                        val = getattr(rr, "data", None)
-                        if isinstance(val, str) and "@" in val:
-                            self.email = val.strip()
-                        elif isinstance(val, dict):
-                            self.email = str(val.get("email") or val.get("auth_email") or "").strip()
-                    except Exception as e:
-                        self.log("[DB] lookup_auth_email failed:", repr(e))
-            if not self.email:
-                self.log("[DB] Supabase auth email not resolved")
-                return False
             res = self.client.auth.sign_in_with_password({"email": self.email, "password": self.password})
             user = getattr(res, "user", None)
             self.log("[DB] Supabase auth:", "OK" if user else "FAILED")
             if user:
-                self.log("[DB] authenticated Supabase user ready for moderation/status")
+                self.log("[DB] authenticated Supabase user ready for native invites")
             return bool(user)
         except Exception as e:
             self.log("[DB] Supabase auth failed:", repr(e))
@@ -753,78 +732,6 @@ class DatabaseBridge:
             self.last_error = str(e)
             self.log("[DB] room lookup failed:", repr(e))
         return None
-
-    def moderation_rpc(self, room_name, target_username, operation):
-        """Use the real Talkin moderation RPC after authenticating Supabase.
-
-        Kick is kept on the proven Talkin websocket packet first. Ban/unban use
-        the backend RPCs exposed by the Talkin application.
-        """
-        room = str(room_name or "").strip()
-        username = str(target_username or "").strip().lstrip("@")
-        op = str(operation or "").lower().strip()
-        if not room or not username:
-            return False, "الغرفة أو اسم المستخدم فارغ"
-        if not self.client:
-            return False, "Supabase client غير متاح — تأكد أن config.json يحتوي supabase_url و supabase_key"
-        try:
-            rid = self.room_id(room)
-            if not rid:
-                return False, f"لم يتم العثور على room_id للغرفة: {room}"
-            q = self.client.table("profiles").select("id,username").eq("username", username).limit(1).execute()
-            rows = getattr(q, "data", None) or []
-            if not rows:
-                q = self.client.table("profiles").select("id,username").ilike("username", username).limit(1).execute()
-                rows = getattr(q, "data", None) or []
-            if not rows:
-                return False, f"لم يتم العثور على user_id للحساب: {username}"
-            uid = str(rows[0].get("id") or "").strip()
-            if not uid:
-                return False, f"user_id فارغ للحساب: {username}"
-
-            rpc_name = {"ban":"ban_room_member", "unban":"unban_room_member"}.get(op)
-            if op == "kick":
-                # This is the same proven transport used by the older working bot:
-                # room_admin -> kick.
-                return self._native_moderation_packet(room, username, "kick"), "تم إرسال أمر الطرد عبر Talkin"
-            if not rpc_name:
-                return False, f"عملية غير معروفة: {op}"
-
-            # Try the common parameter names, stopping only when the backend
-            # confirms the operation.
-            candidates = [
-                {"_room": rid, "_user": uid},
-                {"_room_id": rid, "_user_id": uid},
-                {"room_id": rid, "user_id": uid},
-                {"room_id": rid, "target_user_id": uid},
-                {"_room": rid, "_user_id": uid},
-            ]
-            errors = []
-            for params in candidates:
-                try:
-                    res = self.client.rpc(rpc_name, params).execute()
-                    self.log(f"[ADMIN] {rpc_name} OK params={list(params)} data={getattr(res,'data',None)!r}")
-                    return True, f"RPC {rpc_name} نجح"
-                except Exception as e:
-                    errors.append(str(e))
-                    low = str(e).lower()
-                    # Keep trying only for signature/argument mismatches.
-                    if not any(x in low for x in ("argument", "parameter", "function", "does not exist", "could not find", "pgrst202")):
-                        break
-            return False, f"{rpc_name} فشل: {' | '.join(errors[-3:])}"
-        except Exception as e:
-            self.last_error = str(e)
-            self.log("[ADMIN] moderation failed:", repr(e))
-            return False, str(e)
-
-    def _native_moderation_packet(self, room, username, operation):
-        if operation == "kick":
-            self.send_query(encode_query("room_admin", type_="kick", room=room, to=username, value="none"))
-            return True
-        if operation == "ban":
-            self.send_query(encode_query("room_admin", type_="ban_ip", room=room, to=username, value="outcast"))
-            return True
-        return False
 
     def room_users(self, room_name):
         if not self.client: return []
@@ -1250,10 +1157,20 @@ class TalkinBot:
         self.invite_lock = threading.Lock()
         self.invite_message_template = "{sender} يدعوك للغرفة {room}"
         self.known_rooms = set()
-        # Rooms discovered from a fresh server room-list request.
-        self.available_rooms = set()
-        self._rooms_list_lock = threading.Lock()
-        self._rooms_list_event = threading.Event()
+        # Moderation packet monitor: used to capture the real Talkin server
+        # response when another bot kicks/bans a watched account. No Supabase
+        # or config.json is required.
+        self.moderation_watch_file = BASE_DIR / "moderation_watch.json"
+        self.moderation_watch = {"enabled": False, "username": ""}
+        try:
+            _mw = _load_local_json(self.moderation_watch_file, {})
+            if isinstance(_mw, dict):
+                self.moderation_watch = {
+                    "enabled": bool(_mw.get("enabled", False)),
+                    "username": str(_mw.get("username", "")).strip(),
+                }
+        except Exception:
+            pass
         self._join_lock = threading.Lock()
         self._last_join_sent = {}
         self._rejoin_attempts = defaultdict(int)
@@ -1407,65 +1324,6 @@ class TalkinBot:
             raise RuntimeError("WebSocket is not connected")
         self.ws.send_binary(payload)
 
-    def _extract_room_name(self, item):
-        """Best-effort extraction of a Talkin room name from a decoded room item."""
-        if isinstance(item, str):
-            v=item.strip()
-            return v if v else ""
-        if not isinstance(item, dict):
-            return ""
-        # Known/likely room-name fields in the protocol, ordered by preference.
-        for key in ("name", "room", "title", "room_name", "roomName", "group_name", 2, 1, 3, 4):
-            v=item.get(key)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        # Some builds nest the room object in one field.
-        for v in item.values():
-            if isinstance(v, dict):
-                got=self._extract_room_name(v)
-                if got: return got
-        return ""
-
-    def _remember_room_list(self, rooms):
-        found=[]
-        for item in (rooms or []):
-            name=self._extract_room_name(item)
-            if name and name != BOT_MASTER:
-                found.append(name)
-        if found:
-            with self._rooms_list_lock:
-                self.available_rooms.update(found)
-            self._rooms_list_event.set()
-            self.log("[ROOM-LIST] discovered", len(found), "rooms")
-        return found
-
-    def discover_all_rooms(self, wait_seconds=3.0):
-        """Ask the server for a fresh room list and return discovered room names."""
-        self._rooms_list_event.clear()
-        with self._rooms_list_lock:
-            self.available_rooms.clear()
-        try:
-            self.send_query(encode_query("load_list_new"))
-            self.log("[ROOM-LIST] fresh load_list_new requested")
-        except Exception as e:
-            self.log("[ROOM-LIST] request failed:", repr(e))
-            return []
-        self._rooms_list_event.wait(max(0.5, float(wait_seconds)))
-        with self._rooms_list_lock:
-            return sorted(self.available_rooms)
-
-    def join_all_rooms(self):
-        """Join every room returned by the fresh server room-list request."""
-        rooms=self.discover_all_rooms()
-        joined=0
-        for room in rooms:
-            try:
-                if self.join_room(room):
-                    joined += 1
-            except Exception as e:
-                self.log("[ROOM] join-all failed", room, repr(e))
-        return rooms, joined
-
     def join_room(self, room: str, force: bool = False):
         """Join a room without spamming room_join.
 
@@ -1553,66 +1411,38 @@ class TalkinBot:
         return True
 
     def set_bot_status(self, text: str, restore_seconds: int = 0):
-        """Set the bot profile status/bio and also try the Talkin status packet.
+        """Update the bot's Talkin profile status.
 
-        The supplied Talkin/Giant web app exposes a profile ``bio`` field.  To
-        make the visible profile text actually persist, we update the bot's
-        profile through Supabase when possible.  We also send the native status
-        query for Talkin builds that expose a separate status field.
+        The protocol uses the generic Query action so this remains isolated from
+        room messaging. If the server ignores an unknown status action, the bot
+        continues normally and the failure is logged.
         """
-        text = str(text or self.bot_status_text).strip() or self.bot_status_text
-        ok = False
+        text = str(text or self.bot_status_text).strip()
+        if not text:
+            text = self.bot_status_text
         try:
-            # Persist the visible profile text.  The bot's authenticated DB
-            # identity is resolved from its username.
-            if getattr(self, "db", None) and getattr(self.db, "client", None):
-                try:
-                    # Prefer the authenticated Talkin user id returned by auth.
-                    uid = str((getattr(self, "auth", None) or {}).get("user_id") or "").strip()
-                    rows = []
-                    if uid:
-                        q = self.db.client.table("profiles").select("id,username").eq("id", uid).limit(1).execute()
-                        rows = getattr(q, "data", None) or []
-                    # Fallback for configurations where BOT_ID is the username.
-                    if not rows and BOT_ID:
-                        q = self.db.client.table("profiles").select("id,username").ilike("username", BOT_ID).limit(1).execute()
-                        rows = getattr(q, "data", None) or []
-                        if not rows:
-                            q = self.db.client.table("profiles").select("id,username").eq("username", BOT_ID).limit(1).execute()
-                            rows = getattr(q, "data", None) or []
-                    if rows and rows[0].get("id"):
-                        uid = str(rows[0]["id"])
-                        self.db.client.table("profiles").update({"bio": text}).eq("id", uid).execute()
-                        self.log("[STATUS] profile bio updated")
-                        ok = True
-                except Exception as e:
-                    self.log("[STATUS] profile update failed:", repr(e))
-
-            # Also try the Talkin native profile/status action for clients that
-            # support it. Failure here must not break the bot.
-            try:
-                with self._status_lock:
-                    self.send_query(encode_query(
-                        os.getenv("TALKIN_STATUS_ACTION", "set_status"),
-                        type_="text", body=text, value=text
-                    ))
-                self.log("[STATUS] native status sent: " + text)
-                ok = True
-            except Exception as e:
-                self.log("[STATUS] native status failed:", repr(e))
-
-            if restore_seconds > 0:
-                with self._status_lock:
+            with self._status_lock:
+                self.send_query(encode_query(
+                    os.getenv("TALKIN_STATUS_ACTION", "set_status"),
+                    type_="text",
+                    body=text,
+                    value=text,
+                ))
+                self.log("[STATUS] " + text)
+                if restore_seconds > 0:
                     if self._status_restore_timer:
-                        try: self._status_restore_timer.cancel()
-                        except Exception: pass
+                        try:
+                            self._status_restore_timer.cancel()
+                        except Exception:
+                            pass
                     self._status_restore_timer = threading.Timer(
-                        restore_seconds, self.set_bot_status,
-                        args=(self.bot_status_text, 0)
+                        restore_seconds,
+                        self.set_bot_status,
+                        args=(self.bot_status_text, 0),
                     )
                     self._status_restore_timer.daemon = True
                     self._status_restore_timer.start()
-            return ok
+            return True
         except Exception as e:
             self.log("[STATUS] failed:", repr(e))
             return False
@@ -1636,13 +1466,85 @@ class TalkinBot:
                 self.send_room_text(room, str(line))
         return True
 
+    def _save_moderation_watch(self):
+        try:
+            _save_local_json(self.moderation_watch_file, self.moderation_watch)
+        except Exception as e:
+            self.log("[MOD-WATCH] save failed:", repr(e))
+
+    def set_moderation_watch(self, username: str):
+        username = str(username or "").strip().lstrip("@").strip()
+        if not username:
+            return False
+        self.moderation_watch = {"enabled": True, "username": username}
+        self._save_moderation_watch()
+        self.log("[MOD-WATCH] watching", username)
+        return True
+
+    def clear_moderation_watch(self):
+        self.moderation_watch = {"enabled": False, "username": ""}
+        self._save_moderation_watch()
+        self.log("[MOD-WATCH] disabled")
+        return True
+
+    def _check_moderation_watch(self, raw_message: bytes, result: dict):
+        """Capture the raw Talkin moderation event for a watched account.
+
+        This is deliberately diagnostic: it does not guess an RPC name or
+        invent a Supabase call. When a real server moderation event contains
+        the watched username, the exact raw protobuf bytes plus decoded
+        RoomAdmin fields are saved and sent privately to the bot master.
+        """
+        try:
+            watch = self.moderation_watch
+            target = str(watch.get("username", "")).strip() if isinstance(watch, dict) else ""
+            if not watch.get("enabled") or not target or not isinstance(raw_message, (bytes, bytearray)):
+                return False
+            raw = bytes(raw_message)
+            target_b = target.encode("utf-8", errors="ignore")
+            target_cf = target.casefold()
+            hay = raw.casefold()
+            # Exact UTF-8 bytes are the safest trigger. Also allow the decoded
+            # RoomAdmin representation to contain the username.
+            hit = target_b and target_b.casefold() in hay
+            ra = result.get("room_admin")
+            if not hit and ra:
+                try:
+                    hit = target_cf in str(ra).casefold()
+                except Exception:
+                    hit = False
+            if not hit or not ra:
+                return False
+
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            raw_hex = raw.hex()
+            # Keep a local forensic copy as well as the private report.
+            log_path = BASE_DIR / "moderation_capture.log"
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write("\n" + "=" * 70 + "\n")
+                fh.write(f"{stamp} | watched={target}\n")
+                fh.write("decoded_room_admin=" + repr(ra) + "\n")
+                fh.write("raw_hex=" + raw_hex + "\n")
+
+            report = (
+                f"🚨 تم التقاط حدث إدارة للعضو @{target}\n"
+                f"🕒 {stamp}\n"
+                f"📦 RoomAdmin: {ra!r}\n"
+                f"🔐 الكود الخام (HEX):\n{raw_hex[:1800]}"
+            )
+            self.send_private_text(BOT_MASTER, report)
+            self.log("[MOD-WATCH] captured event for", target, "raw_len=", len(raw))
+            return True
+        except Exception as e:
+            self.log("[MOD-WATCH] failed:", repr(e))
+            return False
+
     def send_admin(self, room: str, target: str, operation: str):
-        # Real Talkin moderation is performed through the backend RPCs discovered
-        # in the supplied app source, not by a local ban list or a guessed packet.
-        if operation in ("kick", "ban", "unban"):
-            return self.db.moderation_rpc(room, target, operation)
-        # Role changes remain on the native room_admin transport until their exact
-        # backend RPC argument signature is confirmed.
+        # Exact command forms observed in the APK.
+        if operation == "kick":
+            return self.send_query(encode_query("room_admin", type_="kick", room=room, to=target, value="none"))
+        if operation == "ban":
+            return self.send_query(encode_query("room_admin", type_="ban_ip", room=room, to=target, value="outcast"))
         role_map = {
             "outcast": "outcast",
             "admin": "admin",
@@ -2237,20 +2139,13 @@ class TalkinBot:
             if not gift_path.is_file() or gift_path.stat().st_size < 64:
                 raise RuntimeError(f"ملف صورة الهدية غير صالح: {gift_path}")
             gift_text = f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة"
-            # Publish every gift to ALL rooms where the bot is currently present.
-            # The originating room is included automatically; the private requester
-            # still receives a private copy when ``private_to`` is supplied.
-            target_rooms = sorted({str(r).strip() for r in self.known_rooms if str(r).strip()})
-            if not target_rooms and room:
-                target_rooms = [room]
-            for target_room in target_rooms:
-                self.send_room_media(target_room, gift_url, "image")
-                self.send_room_text(target_room, gift_text)
             if private_to:
                 self.send_private_media(private_to, gift_url, "image")
                 self.send_private_text(private_to, gift_text)
-            # Show the gift as the bot profile status briefly, then restore the
-            # normal profile status.
+            else:
+                self.send_room_media(room, gift_url, "image")
+                self.send_room_text(room, gift_text)
+            # Show the gift as the bot status briefly, then return to music status.
             self.set_bot_status(
                 f"🎁💫 {item[1]} | من {sender_name} ➜ {target} 💫🎁",
                 restore_seconds=30,
@@ -2406,34 +2301,6 @@ class TalkinBot:
         # Master commands are accepted from both private chat and rooms.
         # Room moderation acts on the room where the command was received.
         # Confirmations and diagnostics are sent privately to the master.
-        # Fresh room discovery / room membership commands.
-        if low in ("دخول الكل", "دخول كل الغرف", "ادخل الكل", "ادخل كل الغرف", "join all", "enter all"):
-            try:
-                rooms, joined = self.join_all_rooms()
-                if rooms:
-                    self.send_command_reply(room, sender, f"✅ تم البحث عن الغرف ودخول {joined} غرفة من أصل {len(rooms)} غرفة مكتشفة.")
-                else:
-                    self.send_command_reply(room, sender, "⚠️ لم تصل قائمة الغرف من الخادم. حاول الأمر مرة أخرى بعد ثوانٍ.")
-            except Exception as e:
-                self.send_command_reply(room, sender, f"❌ تعذر البحث عن الغرف: {e}")
-            return True
-        if low in ("غرفي", "my rooms", "rooms"):
-            rooms=sorted(r for r in self.known_rooms if str(r).strip())
-            msg="🏠 الغرف التي يتواجد بها البوت:\n" + ("\n".join(f"{i}. {r}" for i,r in enumerate(rooms,1)) if rooms else "لا توجد غرف مسجلة حالياً.")
-            self.send_command_reply(room, sender, msg)
-            return True
-        m_loc=re.match(r"^\.s\s+(.+)$", text.strip(), re.I)
-        if m_loc:
-            target=m_loc.group(1).strip().lstrip("@")
-            found=[]
-            for r, users in self.room_users.items():
-                if any(_norm_user(u)==_norm_user(target) for u in users):
-                    found.append(r)
-            if found:
-                self.send_command_reply(room, sender, "📍 @%s موجود في:\n%s" % (target, "\n".join(f"{i}. {r}" for i,r in enumerate(sorted(set(found)),1))))
-            else:
-                self.send_command_reply(room, sender, f"❌ لم أجد @{target} في الغرف التي يتابعها البوت حالياً.")
-            return True
         # Add/remove master. Only the owner from BOT_MASTER may alter master list.
         if low.startswith("mas@"):
             if _norm_user(sender) != _norm_user(BOT_MASTER):
@@ -2479,43 +2346,48 @@ class TalkinBot:
         if low.startswith("unvip@") or low.startswith("un vip@"):
             target=text[text.casefold().find("vip@")+4:].strip().lstrip("@"); data=_vip_data(); data.pop(_norm_user(target),None); _save_local_json(VIP_FILE,data)
             self.send_command_reply(room, sender, f"✅ تم إزالة VIP @{target}."); return True
+        # Moderation packet monitor. Example: راقب@33333
+        m_watch = re.match(r"^(?:راقب|مراقبة|watch)@?(.+)$", text.strip(), re.I)
+        if m_watch:
+            target = m_watch.group(1).strip().lstrip("@").strip()
+            if target:
+                self.set_moderation_watch(target)
+                self.send_command_reply(room, sender, f"👁️ بدأت مراقبة @{target}. إذا استقبل البوت حدث حظر/طرد حقيقي لهذا الحساب سأرسل لك الكود الخام وأحفظه في moderation_capture.log.")
+            else:
+                self.send_command_reply(room, sender, "❌ الصيغة: راقب@اسم المستخدم")
+            return True
+        if low in ("الغاء مراقبة", "إلغاء مراقبة", "الغاءالمراقبة", "إلغاءالمراقبة", "unwatch", "watchoff"):
+            old = self.moderation_watch.get("username", "")
+            self.clear_moderation_watch()
+            self.send_command_reply(room, sender, f"✅ تم إيقاف المراقبة{(' عن @'+old) if old else ''}.")
+            return True
+        if low in ("مراقبتي", "حالة المراقبة", "watchstatus"):
+            target = self.moderation_watch.get("username", "")
+            self.send_command_reply(room, sender, f"👁️ المراقبة: {'مفعلة' if self.moderation_watch.get('enabled') else 'متوقفة'}{(' | @'+target) if target else ''}")
+            return True
+
         # Room/admin commands accepted in both room and private master chat.
         m=re.match(r"^(k@|kick\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
             if not room:
                 self.send_command_reply(room, sender, "❌ لا توجد غرفة لتنفيذ الطرد فيها."); return True
-            ok, detail = self.send_admin(room,target,"kick")
-            if ok:
-                self.send_command_reply(room, sender, f"✅ تم طرد @{target} فعليًا من الغرفة {room}.")
-            else:
-                self.send_command_reply(room, sender, f"❌ فشل تنفيذ الطرد الفعلي: {detail}")
-                self.send_private_text(BOT_MASTER, f"🛠️ تشخيص الطرد\nالأمر: k@{target}\nالغرفة: {room}\nالنتيجة: {detail}")
-            return True
+            self.send_admin(room,target,"kick")
+            self.send_command_reply(room, sender, f"✅ تم طرد @{target} من الغرفة {room}."); return True
         m=re.match(r"^(b@|ban\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
             if not room:
                 self.send_command_reply(room, sender, "❌ لا توجد غرفة لتنفيذ الحظر فيها."); return True
-            ok, detail = self.send_admin(room,target,"ban")
-            if ok:
-                self.send_command_reply(room, sender, f"✅ تم حظر @{target} فعليًا من الغرفة {room}.")
-            else:
-                self.send_command_reply(room, sender, f"❌ فشل تنفيذ الحظر الفعلي: {detail}")
-                self.send_private_text(BOT_MASTER, f"🛠️ تشخيص الحظر\nالأمر: b@{target}\nالغرفة: {room}\nالنتيجة: {detail}")
-            return True
+            self.send_admin(room,target,"ban")
+            self.send_command_reply(room, sender, f"✅ تم حظر @{target} من الغرفة {room}."); return True
         m=re.match(r"^(u@|ub@|unban\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
             if not room:
                 self.send_command_reply(room, sender, "❌ لا توجد غرفة لتنفيذ فك الحظر فيها."); return True
-            ok, detail = self.send_admin(room,target,"unban")
-            if ok:
-                self.send_command_reply(room, sender, f"✅ تم فك الحظر فعليًا عن @{target} في الغرفة {room}.")
-            else:
-                self.send_command_reply(room, sender, f"❌ فشل فك الحظر الفعلي: {detail}")
-                self.send_private_text(BOT_MASTER, f"🛠️ تشخيص فك الحظر\nالأمر: ub@{target}\nالغرفة: {room}\nالنتيجة: {detail}")
-            return True
+            self.send_admin(room,target,"member")
+            self.send_command_reply(room, sender, f"✅ تم فك الحظر عن @{target} في الغرفة {room}."); return True
         m=re.match(r"^(a@|admin\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
@@ -2576,7 +2448,7 @@ class TalkinBot:
             self.send_command_reply(room, sender, "✅ تم تشغيل الردود التلقائية." if self.auto_replies_enabled else "⛔ تم إيقاف الردود التلقائية.")
             return True
         # Custom welcome: swc+@اسم@الترحيب and on/off.
-        m_sw = re.match(r"^(?:\+swc|swc\+)@([^@]+)@(.+)$", text.strip(), re.I)
+        m_sw = re.match(r"^swc\+@([^@]+)@(.+)$", text.strip(), re.I)
         if m_sw and _is_master_name(sender):
             user, welcome = m_sw.group(1).strip().lstrip("@"), m_sw.group(2).strip()
             if user and welcome:
@@ -2584,19 +2456,6 @@ class TalkinBot:
                 self.custom_welcome_enabled = True
                 self._save_social_features()
                 self.send_command_reply(room, sender, f"✅ تم حفظ الترحيب المخصص لـ @{user}.\n💬 {welcome}")
-            return True
-        # Delete a per-user custom welcome.
-        m_del_sw = re.match(r"^(?:-swc@|del\s+swc@|حذف\s+الترحيب@|حذف\s+ترحيب@)(.+)$", text.strip(), re.I)
-        if m_del_sw and _is_master_name(sender):
-            user=m_del_sw.group(1).strip().lstrip("@")
-            if not user:
-                self.send_command_reply(room, sender, "❌ الصيغة: -swc@اسم الشخص")
-                return True
-            key=_norm_user(user)
-            existed=key in self.custom_welcomes
-            self.custom_welcomes.pop(key, None)
-            self._save_social_features()
-            self.send_command_reply(room, sender, f"{'✅ تم حذف الترحيب المخصص لـ @'+user+'.' if existed else '⚠️ لا يوجد ترحيب مخصص محفوظ لـ @'+user+'.'}")
             return True
         if re.match(r"^swc@(?:on|off)$", text.strip(), re.I) and _is_master_name(sender):
             self.custom_welcome_enabled = text.strip().lower() == "swc@on"
@@ -2809,8 +2668,7 @@ class TalkinBot:
                 self.log("[WS] unexpected text frame received")
                 return
             result = decode_result_message(message)
-            if result.get("rooms"):
-                self._remember_room_list(result.get("rooms"))
+            self._check_moderation_watch(message, result)
             if "room_event" in result:
                 self.handle_room_event(result)
             if result.get("users") or result.get("room_admin"):
@@ -2843,17 +2701,7 @@ class TalkinBot:
                         parts = body.split(None, 1)
                         cmd = parts[0].lower() if parts else ""
                         arg = parts[1].strip() if len(parts) == 2 else ""
-                        if body.strip().lower() in ("دخول الكل", "دخول كل الغرف", "ادخل الكل", "ادخل كل الغرف", "join all", "enter all"):
-                            rooms, joined = self.join_all_rooms()
-                            self.send_private_text(frm, f"✅ تم البحث عن الغرف ودخول {joined} غرفة من أصل {len(rooms)} غرفة مكتشفة." if rooms else "⚠️ لم تصل قائمة الغرف من الخادم. حاول مرة أخرى.")
-                        elif body.strip().lower() in ("غرفي", "my rooms", "rooms"):
-                            rooms=sorted(r for r in self.known_rooms if str(r).strip())
-                            self.send_private_text(frm, "🏠 غرف البوت:\n" + ("\n".join(f"{i}. {r}" for i,r in enumerate(rooms,1)) if rooms else "لا توجد غرف مسجلة حالياً."))
-                        elif re.match(r"^\.s\s+.+$", body.strip(), re.I):
-                            target=re.sub(r"^\.s\s+", "", body.strip(), flags=re.I).strip().lstrip("@")
-                            found=sorted({r for r,users in self.room_users.items() if any(_norm_user(u)==_norm_user(target) for u in users)})
-                            self.send_private_text(frm, f"📍 @{target} موجود في:\n" + ("\n".join(f"{i}. {r}" for i,r in enumerate(found,1)) if found else "❌ لم أجده في الغرف التي يتابعها البوت حالياً."))
-                        elif cmd in ("inv", "دعوات", "invite"):
+                        if cmd in ("inv", "دعوات", "invite"):
                             target_room = arg if arg else ctx_room
                             self.request_occupants(target_room)
                         elif cmd in ("دخول", "join", "ادخل", "enter") and arg:
