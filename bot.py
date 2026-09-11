@@ -1567,6 +1567,7 @@ class TalkinBot:
             if YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
             try:
+                opts.pop("extractor_args", None)
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info=ydl.extract_info(target_query,download=True)
                     if info and info.get("entries"):
@@ -1598,9 +1599,6 @@ class TalkinBot:
         if not source:
             try:
                 meta=None
-                video_id=""
-                m=re.search(r"(?:v=|/)([0-9A-Za-z_-]{11})", query)
-                if m: video_id=m.group(1)
                 opts={"quiet":True,"no_warnings":True,"noplaylist":True,
                       "skip_download":True,
                       }
@@ -1613,7 +1611,7 @@ class TalkinBot:
                         meta=ydl.extract_info("ytsearch1:"+query,download=False)
                         if meta and meta.get("entries"):
                             meta=next((x for x in meta["entries"] if x),None)
-                video_id = video_id or str((meta or {}).get("id") or "").strip()
+                video_id=str((meta or {}).get("id") or "").strip()
                 if video_id:
                     apis=[]
                     for x in os.getenv("PIPED_APIS","").split(","):
