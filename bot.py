@@ -1333,8 +1333,8 @@ class TalkinBot:
             self._save_monitored_users()
         return existed
 
-    def _monitor_report(self, event, event_type, username, room, event_id="", frm="", to="", role=""):
-        """Report meaningful account activity for a watched user across all rooms."""
+    def _monitor_report(self, event, event_type, username, room, event_id="", frm="", to="", role="", body=""):
+        """Report all meaningful activity for a watched user across all rooms."""
         key = _norm_user(username)
         with self._monitor_lock:
             if key not in self.monitored_users:
@@ -1342,28 +1342,39 @@ class TalkinBot:
             display_name = self.monitored_users.get(key, username)
 
         et = str(event_type or "").casefold().strip()
-        # Only meaningful account events are reported. Ordinary room events
-        # unrelated to the watched account are ignored.
-        ban_words = ("ban", "banned", "outcast", "blocked", "حظر", "محظور")
-        kick_words = ("kick", "kicked", "removed", "remove_user", "user_kicked", "user_removed", "طرد", "مطرود")
-        role_words = ("role", "promote", "demote", "admin", "moderator", "owner", "winner", "change_role", "رتبة", "مشرف", "ادمن", "اونر", "مالك", "owner_changed")
+        bt = str(body or "").casefold().strip()
 
-        if any(x in et for x in ban_words):
+        # The visible system messages in the app can be ordinary RoomEvents
+        # whose type is only `user_left`/`user_joined`.  The actual action is
+        # then written in the Arabic body, for example:
+        #   "تم حظره من قبل X"
+        #   "اصبح مشرف من قبل X"
+        #   "اصبح عضو من قبل X"
+        # So inspect BOTH event type and system body.
+        ban_words = ("ban", "banned", "outcast", "blocked", "حظر", "محظور", "حظره", "حظرت", "تم حظره")
+        kick_words = ("kick", "kicked", "removed", "remove_user", "user_kicked", "user_removed", "طرد", "مطرود", "طرده", "تم طرده")
+        owner_words = ("owner", "owner_changed", "اونر", "ونر", "مالك", "المالك")
+        role_words = ("role", "promote", "demote", "admin", "moderator", "مشرف", "ادمن", "رتبة", "اصبح مشرف", "اصبح ادمن", "اصبح اونر", "اصبح مالك")
+
+        if any(x in bt for x in ban_words) or any(x in et for x in ban_words):
             operation = "حظر"
-        elif any(x in et for x in kick_words):
+        elif any(x in bt for x in kick_words) or any(x in et for x in kick_words):
             operation = "طرد"
-        elif any(x in et for x in role_words):
+        elif any(x in bt for x in owner_words):
+            operation = "تغيير الونر/المالك"
+        elif any(x in bt for x in role_words) or any(x in et for x in role_words):
             operation = "تغيير صلاحية/رتبة"
         elif et in ("user_joined", "you_joined", "user_rejoined", "joined"):
-            operation = "دخول"
+            operation = "دخول / أصبح عضو"
         elif et in ("user_left", "left", "user_exit", "user_exited"):
             operation = "خروج"
         else:
-            # If the event explicitly names the watched account, keep it as a
-            # generic monitored event rather than inventing an action.
-            if key not in {_norm_user(frm), _norm_user(to), _norm_user(username)}:
+            # The account may be mentioned in a system event whose exact type
+            # is unknown. Keep it as a generic event rather than inventing an
+            # action.
+            if key not in {_norm_user(frm), _norm_user(to), _norm_user(username)} and key.casefold() not in bt:
                 return False
-            operation = "حدث"
+            operation = "حدث إداري/نظامي"
 
         dedupe = "|".join((str(event_id or ""), et, operation, key, str(room or ""), str(frm or ""), str(to or ""), str(role or "")))
         now = time.time()
@@ -1392,6 +1403,8 @@ class TalkinBot:
             lines.append(f"🎯 الهدف: @{to}")
         if event.get(5) not in (None, ""):
             lines.append(f"📌 القيمة: {event.get(5)}")
+        if body:
+            lines.append(f"📝 نص الحدث: {body}")
         return self.send_private_text(BOT_MASTER, "\n".join(lines))
 
     def _load_social_features(self):
@@ -2819,16 +2832,39 @@ class TalkinBot:
         reconnected = str(event.get(24, "") or "").strip()
         # Do not log room message contents, usernames, room names, or media events.
 
-        # Monitor the watched account in every room: entry, exit, kick, ban,
-        # and role/owner/admin changes. Join/leave are reported as join/exit,
-        # but are never mislabeled as a ban or kick.
-        monitored_target = username or to or frm
-        if monitored_target:
-            key = _norm_user(monitored_target)
-            with self._monitor_lock:
-                watched = key in self.monitored_users
-            if watched:
-                self._monitor_report(event, event_type, monitored_target, room, event_id, frm, to, role)
+        # Monitor the watched account in EVERY room.  Important: Giant/Talkin
+        # RoomEvent messages can describe the action in `body` while `frm`
+        # contains the account that performed it.  Therefore we must check
+        # username + frm + to, not just one of them.
+        monitor_candidates = [x for x in (username, frm, to) if str(x or "").strip()]
+        watched_candidates = []
+        with self._monitor_lock:
+            watched_keys = set(self.monitored_users.keys())
+        for candidate in monitor_candidates:
+            if _norm_user(candidate) in watched_keys:
+                watched_candidates.append(candidate)
+
+        # Some system events have no username field; the Arabic system text
+        # itself can contain the actor/target name.
+        if body:
+            for key in watched_keys:
+                if key and key.casefold() in body.casefold() and key not in {
+                    _norm_user(x) for x in watched_candidates
+                }:
+                    watched_candidates.append(self.monitored_users.get(key, key))
+
+        if watched_candidates:
+            # Report once per watched account mentioned in this RoomEvent.
+            seen = set()
+            for monitored_target in watched_candidates:
+                mkey = _norm_user(monitored_target)
+                if mkey in seen:
+                    continue
+                seen.add(mkey)
+                self._monitor_report(
+                    event, event_type, monitored_target, room, event_id,
+                    frm, to, role, body=body
+                )
 
         # Keep the live membership state in sync.  The APK itself uses these
         # exact event names and RoomEvent fields.
