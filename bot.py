@@ -816,11 +816,14 @@ def _message_template(section,key,default,**kwargs):
     except Exception: return text
 
 def _command_help(page=1):
+    # Organized menu style inspired by the user's reference only.
+    # The reference bot's command names/text are NOT copied here.
     pages = [
-        "📋 أوامر البوت (1/4)\n1. .sa اسم/رابط الأغنية\n2. sa@رقم_الهدية@اسم\n3. نقاطي\n4. توب\n5. دخول اسم_الغرفة\n6. خروج [الغرفة]\n7. inv\n8. invmsg نص الدعوة\n9. انشر\n10. انشر@الرسالة\n➡️ أرسل ns للقائمة التالية",
-        "📋 أوامر البوت (2/4)\n1. انشر ثم أرسل الصورة\n2. انشر@الرسالة ثم أرسل الصورة\n3. .sa اسم الأغنية\n4. sa@رقم_الهدية@اسم\n5. نقاطي\n6. توب\n7. دخول اسم_الغرفة\n8. خروج\n9. inv\n10. say النص\n➡️ أرسل ns للقائمة التالية",
-        "👑 أوامر الماستر (3/4)\n1. sb@اسم@عدد\n2. mas@اسم\n3. umas@اسم\n4. s@اسم\n5. ازالة توثيق@اسم\n6. Vip@اسم\n7. unVip@اسم\n8. المسترات\n9. دخول اسم_الغرفة\n10. خروج [الغرفة]\n➡️ أرسل ns للقائمة التالية",
-        "👑 أوامر الماستر (4/4)\n1. inv\n2. inv اسم_الغرفة\n3. invmsg نص الدعوة\n4. say النص\n5. k@ اسم للطرد\n6. b@ اسم للحظر\n7. u@ اسم لإلغاء الحظر\n8. a@ اسم مشرف\n9. o@ اسم مالك\n10. اوامر\n✅ انتهت القوائم. أرسل اوامر للبدء من جديد"
+        "📋 أوامر البوت الأساسية (1/5)\n━━━━━━━━━━━━\n🔹 .sa اسم/رابط الأغنية\n🔹 sa@رقم_الهدية@اسم\n🔹 نقاطي\n🔹 توب\n🔹 العاب\n🔹 دخول اسم_الغرفة\n🔹 خروج [الغرفة]\n🔹 inv\n🔹 انشر\n🔹 انشر@الرسالة\n━━━━━━━━━━━━\nأرسل ns للقائمة التالية",
+        "📋 أوامر النشر والتفاعل (2/5)\n━━━━━━━━━━━━\n🔹 انشر ثم أرسل الصورة\n🔹 انشر@الرسالة ثم أرسل الصورة\n🔹 .sa اسم الأغنية\n🔹 sa@رقم_الهدية@اسم\n🔹 نقاطي\n🔹 توب\n🔹 دخول اسم_الغرفة\n🔹 خروج\n🔹 inv\n🔹 say النص\n━━━━━━━━━━━━\nأرسل ns للقائمة التالية",
+        "🎮 الألعاب (3/5)\n━━━━━━━━━━━━\n🔹 العاب\n🔹 حظ\n🔹 تخمين\n🔹 نرد\n🔹 حجر / ورق / مقص\n🔹 سؤال\n━━━━━━━━━━━━\nاللعب مجاني ولا يتم خصم نقاط\nأرسل ns للقائمة التالية",
+        "👑 أوامر الماستر (4/5)\n━━━━━━━━━━━━\n🔹 sb@اسم@عدد\n🔹 mas@اسم\n🔹 umas@اسم\n🔹 s@اسم\n🔹 ازالة توثيق@اسم\n🔹 Vip@اسم\n🔹 unVip@اسم\n🔹 المسترات\n🔹 دخول اسم_الغرفة\n🔹 خروج [الغرفة]\n━━━━━━━━━━━━\nأرسل ns للقائمة التالية",
+        "👑 إدارة الغرف (5/5)\n━━━━━━━━━━━━\n🔹 inv\n🔹 inv اسم_الغرفة\n🔹 invmsg نص الدعوة\n🔹 say النص\n🔹 k@ اسم للطرد\n🔹 b@ اسم للحظر\n🔹 u@ اسم لإلغاء الحظر\n🔹 a@ اسم مشرف\n🔹 o@ اسم مالك\n━━━━━━━━━━━━\nانتهت القوائم • أرسل اوامر لعرضها من جديد"
     ]
     try: page=int(page)
     except Exception: page=1
@@ -974,12 +977,16 @@ class TalkinBot:
         self._pending_reconnect_reason = ""
         self._had_connection = False
         self.banned_words = set(BANNED_WORDS)
+        self.text_limit = max(80, int(os.getenv("TALKIN_TEXT_LIMIT", "180")))
         self.db = DatabaseBridge(self.log)
         self.db.sign_in()
         self.music_last = defaultdict(float)
         self.music_current = {}
         self.music_lock = threading.Lock()
-        self.publish_pending = {}
+        # Mini-games: free-to-play, no points are deducted.
+        self.game_lock = threading.Lock()
+        self.game_cooldown = defaultdict(float)
+        self.guess_games = {}
         self.help_pages = {}
         self.invite_message_template = _message_template("invite", "default", "{sender} يدعوك للغرفة {room}")
 
@@ -1126,10 +1133,11 @@ class TalkinBot:
                 self.log("[ROOM] leave failed", room, repr(e))
         return rooms
 
-    def _split_talkin_text(self, text: str, limit: int = 180):
-        """Talkin Chat rejects/tears down oversized text frames; keep every
-        outgoing text safely below the server's 200-character limit.
-        Prefer line boundaries, then hard-split long lines."""
+    def _split_talkin_text(self, text: str, limit: int = None):
+        """Split text into safe TalkinChat packets.
+        Each newline-separated list item becomes its own message; an
+        oversized item is further split at a word boundary."""
+        limit = int(limit or getattr(self, "text_limit", 180))
         text = str(text or "")
         if not text:
             return [""]
@@ -1148,10 +1156,16 @@ class TalkinBot:
                 chunks.append(block)
         return chunks or [""]
 
-    def send_room_text(self, room: str, text: str):
+    def _send_text_packets(self, packet_type: str, text: str, **kwargs):
         for chunk in self._split_talkin_text(text):
-            self.send_query(encode_query("room_message", type_="text", room=room, body=chunk))
+            payload = dict(kwargs)
+            payload["type_"] = "text"
+            payload["body"] = chunk
+            self.send_query(encode_query(packet_type, **payload))
         return True
+
+    def send_room_text(self, room: str, text: str):
+        return self._send_text_packets("room_message", text, room=room)
 
     def send_admin(self, room: str, target: str, operation: str):
         # Exact command forms observed in the APK.
@@ -1185,11 +1199,7 @@ class TalkinBot:
         username = str(username or "").strip()
         if not username or username == BOT_ID:
             return False
-        raw_text = str(text or "")
-        chunks = [raw_text[i:i + 180] for i in range(0, len(raw_text), 180)] or [""]
-        for chunk in chunks:
-            self.send_query(encode_query("chat_message", type_="text", to=username, body=chunk))
-        return True
+        return self._send_text_packets("chat_message", text, to=username)
 
     def send_private_media(self, username: str, media_url: str, media_type: str, duration: int = 0):
         """Send audio/image back to the private-chat sender."""
@@ -1749,6 +1759,101 @@ class TalkinBot:
             self.reply_text(room, "❌ تعذر إرسال صورة الهدية. تم إرسال الخطأ الحقيقي للماستر.", private_to)
         return True
 
+    # ----------------------------- Mini Games -----------------------------
+    def _game_award(self, username, amount):
+        if not username or _is_master_name(username):
+            return _get_points(username)
+        return _add_points(username, int(amount))
+
+    def _game_ready(self, username, room, cooldown=3.0):
+        key=(str(room or "").casefold(), _norm_user(username))
+        now=time.time()
+        with self.game_lock:
+            last=self.game_cooldown.get(key,0.0)
+            if now-last < cooldown:
+                return False, int(cooldown-(now-last))+1
+            self.game_cooldown[key]=now
+        return True,0
+
+    def game_help(self, room):
+        for line in (
+            "🎮 ألعاب البوت المجانية:",
+            "🍀 حظ — جائزة عشوائية مجانية.",
+            "🎯 تخمين — ابدأ ثم اكتب رقماً من 1 إلى 10.",
+            "🎲 نرد — ارْمِ النرد واربح نقاطاً حسب النتيجة.",
+            "✂️ حجر ورق مقص — اكتب: حجر أو ورق أو مقص.",
+            "🧠 سؤال — سؤال معلومات عامة بجائزة 15 نقطة.",
+            "📌 لا توجد أي تكلفة أو خصم نقاط عند اللعب.",
+        ): self.send_room_text(room,line)
+
+    def handle_game_command(self, room, text, sender_name):
+        raw=str(text or "").strip()
+        if not raw or not sender_name: return False
+        low=raw.casefold(); key=(str(room or "").casefold(), _norm_user(sender_name))
+        if low in ("العاب","ألعاب","لعب","games","game"):
+            self.game_help(room); return True
+
+        if re.fullmatch(r"\d{1,2}", raw):
+            with self.game_lock: game=self.guess_games.get(key)
+            if not game: return False
+            guess=int(raw); game["attempts"]+=1; target=game["number"]
+            if not 1<=guess<=10:
+                self.send_room_text(room,f"🎯 @{sender_name} اختر رقماً من 1 إلى 10."); return True
+            if guess==target:
+                reward=max(10,30-(game["attempts"]-1)*5)
+                with self.game_lock: self.guess_games.pop(key,None)
+                balance=self._game_award(sender_name,reward); suffix="♾️" if balance is None else str(balance)
+                self.send_room_text(room,f"🎯 مبروك @{sender_name}! الرقم هو {target} ✅\n🏆 ربحت {reward} نقطة.\n💰 الرصيد: {suffix}"); return True
+            if game["attempts"]>=3:
+                with self.game_lock: self.guess_games.pop(key,None)
+                self.send_room_text(room,f"🎯 انتهت المحاولات يا @{sender_name}. الرقم الصحيح كان {target}. 😄"); return True
+            hint="⬆️ الرقم أكبر" if guess<target else "⬇️ الرقم أصغر"
+            self.send_room_text(room,f"🎯 @{sender_name}: {hint} — بقيت {3-game['attempts']} محاولات."); return True
+
+        if low in ("حظ","الحظ","luck"):
+            ok,wait=self._game_ready(sender_name,room,4.0)
+            if not ok: self.send_room_text(room,f"⏳ @{sender_name} انتظر {wait} ثوانٍ."); return True
+            label,reward=random.choice((("🍀 حظ ممتاز!",30),("✨ حظ جميل!",20),("🌟 حظ متوسط!",10),("😅 حظك اليوم عادي!",5)))
+            balance=self._game_award(sender_name,reward); suffix="♾️" if balance is None else str(balance)
+            self.send_room_text(room,f"{label}\n👤 @{sender_name}\n🎁 الجائزة: {reward} نقطة\n💰 الرصيد: {suffix}"); return True
+
+        if low in ("نرد","ارم النرد","ارمي النرد","dice"):
+            ok,wait=self._game_ready(sender_name,room,3.0)
+            if not ok: self.send_room_text(room,f"⏳ @{sender_name} انتظر {wait} ثوانٍ."); return True
+            roll=random.randint(1,6); reward={1:2,2:3,3:5,4:7,5:10,6:20}[roll]
+            balance=self._game_award(sender_name,reward); suffix="♾️" if balance is None else str(balance)
+            self.send_room_text(room,f"🎲 @{sender_name} رمى النرد: {roll}\n🎁 ربحت {reward} نقطة!\n💰 الرصيد: {suffix}"); return True
+
+        if low in ("حجر","ورق","مقص"):
+            ok,wait=self._game_ready(sender_name,room,3.0)
+            if not ok: self.send_room_text(room,f"⏳ @{sender_name} انتظر {wait} ثوانٍ."); return True
+            bot_choice=random.choice(("حجر","ورق","مقص"))
+            if low==bot_choice: result,reward="🤝 تعادل!",5
+            elif (low,bot_choice) in (("حجر","مقص"),("ورق","حجر"),("مقص","ورق")): result,reward="🏆 فزت!",12
+            else: result,reward="😄 خسرت الجولة، جرّب مرة أخرى.",2
+            balance=self._game_award(sender_name,reward); suffix="♾️" if balance is None else str(balance)
+            self.send_room_text(room,f"✂️ @{sender_name}: {low}\n🤖 البوت: {bot_choice}\n{result}\n🎁 +{reward} نقطة\n💰 الرصيد: {suffix}"); return True
+
+        if low in ("تخمين","ابدأ تخمين","تخمين 1-10","guess"):
+            ok,wait=self._game_ready(sender_name,room,3.0)
+            if not ok: self.send_room_text(room,f"⏳ @{sender_name} انتظر {wait} ثوانٍ."); return True
+            with self.game_lock: self.guess_games[key]={"number":random.randint(1,10),"attempts":0,"started":time.time()}
+            self.send_room_text(room,f"🎯 @{sender_name} بدأت لعبة التخمين!\n🔢 اختر رقماً من 1 إلى 10.\n🎲 لديك 3 محاولات — اكتب الرقم فقط."); return True
+
+        if low in ("سؤال","سوال","quiz","مسابقة"):
+            ok,wait=self._game_ready(sender_name,room,5.0)
+            if not ok: self.send_room_text(room,f"⏳ @{sender_name} انتظر {wait} ثوانٍ."); return True
+            q,a=random.choice((("ما هو أكبر كوكب في المجموعة الشمسية؟","المشتري"),("كم عدد أيام الأسبوع؟","7"),("ما عاصمة اليمن؟","صنعاء"),("ما لون الموز غالباً عند النضج؟","أصفر")))
+            with self.game_lock: self.guess_games[(str(room or "").casefold(),"__quiz__")]={"answer":a,"expires":time.time()+30}
+            self.send_room_text(room,f"🧠 سؤال سريع!\n❓ {q}\n💬 أول شخص يكتب الإجابة الصحيحة يربح 15 نقطة."); return True
+
+        with self.game_lock: quiz=self.guess_games.get((str(room or "").casefold(),"__quiz__"))
+        if quiz and time.time()<=quiz.get("expires",0) and low==str(quiz.get("answer","")).casefold():
+            with self.game_lock: self.guess_games.pop((str(room or "").casefold(),"__quiz__"),None)
+            balance=self._game_award(sender_name,15); suffix="♾️" if balance is None else str(balance)
+            self.send_room_text(room,f"🧠 إجابة صحيحة يا @{sender_name}! 🎉\n🏆 +15 نقطة\n💰 الرصيد: {suffix}"); return True
+        return False
+
     def _send_help(self, room=None, private_to=None, page=1):
         text=_command_help(page)
         if private_to: self.send_private_text(private_to,text)
@@ -1794,6 +1899,16 @@ class TalkinBot:
             return True
         if not _is_master_name(sender):
             return False
+        if not is_private:
+            master_prefixes = (
+                "mas@", "umas@", "sb@", "s@", "uns@", "ازالة توثيق@", "إزالة توثيق@",
+                "vip@", "unvip@", "un vip@", "انشر", "دخول", "join", "ادخل", "enter",
+                "خروج", "leave", "exit", "inv", "دعوات", "invite", "invmsg", "رسالةدعوة",
+                "say ", "قل ", "k@", "kick", "b@", "ban", "u@", "a@", "admin", "o@", "owner"
+            )
+            if low.startswith(master_prefixes):
+                self.send_private_text(sender, "🔒 أوامر الماستر تعمل في الخاص فقط.")
+                return True
         # Add/remove master. Only the owner from BOT_MASTER may alter master list.
         if low.startswith("mas@"):
             if _norm_user(sender) != _norm_user(BOT_MASTER):
@@ -1814,12 +1929,19 @@ class TalkinBot:
             m=re.match(r"^sb@([^@]+)@(-?\d+)$",text,re.I)
             if not m: self.send_private_text(sender,"❌ الصيغة: sb@اسم المستخدم@عدد النقاط"); return True
             target,amount=m.group(1).strip(),int(m.group(2)); new=_add_points(target,amount)
-            self.send_private_text(sender,f"✅ تم تعديل نقاط @{target} بمقدار {amount}. الرصيد: {new}"); return True
+            action = "تحويل" if amount >= 0 else "خصم"
+            self.send_private_text(sender,f"✅ تم {action} نقاط @{target} بمقدار {abs(amount)}. الرصيد: {new}")
+            if _norm_user(target) != _norm_user(sender):
+                self.send_private_text(target, f"💰 إشعار النقاط: تم {action} {abs(amount)} نقطة لحسابك بواسطة @{sender}. رصيدك الحالي: {new}")
+            return True
         if low.startswith("s@"):
             target=text[2:].strip().lstrip("@");
             if not target: self.send_private_text(sender,"❌ الصيغة: s@اسم المستخدم"); return True
             data=_verified_data(); data[_norm_user(target)]={"username":target,"verified_by":sender,"created_at":int(time.time())}; _save_local_json(VERIFIED_FILE,data)
-            self.send_private_text(sender,f"✅ تم توثيق @{target} لاستخدام البوت."); return True
+            self.send_private_text(sender,f"✅ تم توثيق @{target} لاستخدام البوت.")
+            if _norm_user(target) != _norm_user(sender):
+                self.send_private_text(target, f"✅ تم توثيق حسابك لاستخدام البوت بواسطة @{sender}.")
+            return True
         if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("uns@"): 
             prefix="uns@" if low.startswith("uns@") else text.split("@",1)[0]+"@"
             target=text[len(prefix):].strip().lstrip("@"); data=_verified_data(); data.pop(_norm_user(target),None); _save_local_json(VERIFIED_FILE,data)
@@ -1875,9 +1997,8 @@ class TalkinBot:
                 self.log("[PUBLISH] failed",target,repr(e))
         # Never announce a successful publish in the room; tell the master in PM.
         self.send_private_text(sender,f"✅ تم نشر الصورة في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else ""))
-        # Errors are also visible in the source room so the master can notice them.
-        if errors and source_room:
-            self.send_room_text(source_room, "❌ خطأ في النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors)[:170])
+        if errors:
+            self.send_private_text(sender, "❌ أخطاء النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors))
         return True
 
     def handle_room_event(self, result):
@@ -1939,13 +2060,13 @@ class TalkinBot:
         is_verified = _norm_user(frm) in _verified_data() or _is_master_name(frm)
         if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
             if not is_verified:
-                self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام الهدايا.")
+                self.send_private_text(frm, f"🔒 @{frm} غير موثّق لاستخدام الهدايا.")
                 return
             if self.handle_gift_command(room, body, frm):
                 return
         if body.strip().lower().startswith(".sa "):
             if not is_verified:
-                self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام الأغاني.")
+                self.send_private_text(frm, f"🔒 @{frm} غير موثّق لاستخدام الأغاني.")
                 return
             if self.handle_music_command(room, body, frm):
                 return
@@ -1957,10 +2078,13 @@ class TalkinBot:
         if self._handle_management_command(room, body, frm):
             return
 
-        # Master/admin commands.
+        if self.handle_game_command(room, body, frm):
+            return
+
+        # Master/admin commands are private-only.
         if _is_master_name(frm):
-            if self._handle_management_command(room, body, frm):
-                return
+            self.send_private_text(frm, "🔒 أوامر الماستر تعمل في الخاص فقط.")
+            return
             parts = body.strip().split()
             if parts:
                 cmd = parts[0].lower()
@@ -2088,7 +2212,29 @@ class TalkinBot:
                                 self.send_private_text(BOT_MASTER, f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
                         elif cmd in ("invmsg", "رسالةدعوة") and arg:
                             self.invite_message_template = arg
-                            self.send_private_text(BOT_MASTER, f"✅ تم تغيير رسالة الدعوة إلى: {arg}")
+                            self.send_private_text(frm, f"✅ تم تغيير رسالة الدعوة إلى: {arg}")
+                        elif cmd in ("a@", "admin") and arg:
+                            target = arg.lstrip("@").strip()
+                            self.send_admin(ctx_room, target, "admin")
+                            self.send_private_text(frm, f"✅ تم تعيين @{target} مشرفًا في الغرفة {ctx_room}.")
+                        elif cmd in ("o@", "owner") and arg:
+                            target = arg.lstrip("@").strip()
+                            self.send_admin(ctx_room, target, "owner")
+                            self.send_private_text(frm, f"✅ تم تعيين @{target} مالكًا في الغرفة {ctx_room}.")
+                        elif cmd in ("k@", "kick") and arg:
+                            target = arg.lstrip("@").strip()
+                            self.send_admin(ctx_room, target, "kick")
+                            self.send_private_text(frm, f"✅ تم إرسال أمر الطرد إلى @{target} في الغرفة {ctx_room}.")
+                        elif cmd in ("b@", "ban") and arg:
+                            target = arg.lstrip("@").strip()
+                            self.send_admin(ctx_room, target, "ban")
+                            self.send_private_text(frm, f"✅ تم إرسال أمر الحظر إلى @{target} في الغرفة {ctx_room}.")
+                        elif cmd in ("u@", "unban") and arg:
+                            target = arg.lstrip("@").strip()
+                            self.send_admin(ctx_room, target, "member")
+                            self.send_private_text(frm, f"✅ تم إلغاء حظر @{target} في الغرفة {ctx_room}.")
+                        elif cmd in ("say", "قل") and arg:
+                            self.send_room_text(ctx_room, arg)
                 except Exception as e:
                     self.log("[CHAT_MESSAGE] private command handling failed:", repr(e))
         except Exception as e:
@@ -2274,7 +2420,7 @@ class TalkinBot:
         raise last_error
 
     def start(self):
-        print("=== Talkinchat Bot V21 - Talkin + YouTube Cookies + Giant Gift Cards ===", flush=True)
+        print("=== Talkinchat Bot V22 - Talkin + YouTube Cookies + Giant Gift Cards ===", flush=True)
         self.asset_server = start_asset_server()
         if not BOT_ID or not BOT_PWD or not self.room:
             raise SystemExit("Set BOT_ID, BOT_PWD and GROUP_TO_JOIN in .env first.")
