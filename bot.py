@@ -1077,7 +1077,35 @@ class TalkinBot:
         self.game_cooldown = defaultdict(float)
         self.guess_games = {}
         self.help_pages = {}
+        # Auto replies and per-user custom welcome messages.
+        self.auto_replies_enabled = True
+        self.auto_replies = {}
+        self.custom_welcome_enabled = True
+        self.custom_welcomes = {}
+        self._load_social_features()
         self.invite_message_template = _message_template("invite", "default", "{sender} يدعوك للغرفة {room}")
+
+    def _load_social_features(self):
+        self.auto_replies_file = BASE_DIR / "auto_replies.json"
+        self.custom_welcomes_file = BASE_DIR / "custom_welcomes.json"
+        try:
+            data = _load_local_json(self.auto_replies_file, {})
+            self.auto_replies_enabled = bool(data.get("enabled", True))
+            raw = data.get("replies", {})
+            self.auto_replies = raw if isinstance(raw, dict) else {}
+        except Exception:
+            self.auto_replies_enabled, self.auto_replies = True, {}
+        try:
+            data = _load_local_json(self.custom_welcomes_file, {})
+            self.custom_welcome_enabled = bool(data.get("enabled", True))
+            raw = data.get("welcomes", {})
+            self.custom_welcomes = raw if isinstance(raw, dict) else {}
+        except Exception:
+            self.custom_welcome_enabled, self.custom_welcomes = True, {}
+
+    def _save_social_features(self):
+        _save_local_json(self.auto_replies_file, {"enabled": self.auto_replies_enabled, "replies": self.auto_replies})
+        _save_local_json(self.custom_welcomes_file, {"enabled": self.custom_welcome_enabled, "welcomes": self.custom_welcomes})
 
     def log(self, *args):
         if DEBUG:
@@ -1803,7 +1831,7 @@ class TalkinBot:
                 )
                 # Music is broadcast to every room currently joined by the bot.
                 # The requester also receives the same post privately.
-                self.reaction_targets[code] = {"publisher": requester, "kind": "music", "created_at": time.time()}
+                self.reaction_targets[code] = {"publisher": requester, "kind": "music", "title": title, "description": title, "created_at": time.time()}
                 target_rooms=list(self.known_rooms) or ([room] if room else [])
                 for target_room in target_rooms:
                     self.send_room_text(target_room,caption)
@@ -2139,6 +2167,36 @@ class TalkinBot:
             if room and msg: self.send_room_text(room,msg)
             else: self.send_private_text(sender,"❌ استخدم say نص داخل غرفة.")
             return True
+        # Auto replies: +sr@وصف@الرد / Sr@on / Sr@off
+        m_sr = re.match(r"^\+sr@([^@]+)@(.+)$", text.strip(), re.I)
+        if m_sr and _is_master_name(sender):
+            trigger, reply = m_sr.group(1).strip(), m_sr.group(2).strip()
+            if trigger and reply:
+                self.auto_replies[trigger.casefold()] = {"trigger": trigger, "reply": reply}
+                self.auto_replies_enabled = True
+                self._save_social_features()
+                self.send_private_text(sender, f"✅ تمت إضافة الرد التلقائي\n📌 الوصف: {trigger}\n💬 الرد: {reply}")
+            return True
+        if re.match(r"^sr@(?:on|off)$", text.strip(), re.I) and _is_master_name(sender):
+            self.auto_replies_enabled = text.strip().lower() == "sr@on"
+            self._save_social_features()
+            self.send_private_text(sender, "✅ تم تشغيل الردود التلقائية." if self.auto_replies_enabled else "⛔ تم إيقاف الردود التلقائية.")
+            return True
+        # Custom welcome: swc+@اسم@الترحيب and on/off.
+        m_sw = re.match(r"^swc\+@([^@]+)@(.+)$", text.strip(), re.I)
+        if m_sw and _is_master_name(sender):
+            user, welcome = m_sw.group(1).strip().lstrip("@"), m_sw.group(2).strip()
+            if user and welcome:
+                self.custom_welcomes[_norm_user(user)] = {"username": user, "message": welcome}
+                self.custom_welcome_enabled = True
+                self._save_social_features()
+                self.send_private_text(sender, f"✅ تم حفظ الترحيب المخصص لـ @{user}.\n💬 {welcome}")
+            return True
+        if re.match(r"^swc@(?:on|off)$", text.strip(), re.I) and _is_master_name(sender):
+            self.custom_welcome_enabled = text.strip().lower() == "swc@on"
+            self._save_social_features()
+            self.send_private_text(sender, "✅ تم تشغيل الترحيب المخصص." if self.custom_welcome_enabled else "⛔ تم إيقاف الترحيب المخصص.")
+            return True
         # Publishing: master says `انشر` or `انشر@description`, then sends an image.
         if low == "انشر" or low.startswith("انشر@"):
             desc=text[5:].strip() if low.startswith("انشر@") else ""
@@ -2172,7 +2230,7 @@ class TalkinBot:
             "report": uuid.uuid4().hex[:4],
         }
         for kind,code in reaction_codes.items():
-            self.reaction_targets[code]={"publisher": sender, "kind": kind, "created_at": time.time()}
+            self.reaction_targets[code]={"publisher": sender, "kind": kind, "description": desc or "منشور صورة", "created_at": time.time()}
         caption=_message_template(
             "publish", "broadcast",
             "🖼️ {description}\n👤 {publisher}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
@@ -2218,6 +2276,13 @@ class TalkinBot:
         if event_type == "user_joined" and username:
             self.room_users[room][username] = role or "none"
             self.last_joined_room = room
+            # Welcome the master using the exact configured BOT_MASTER account.
+            if _norm_user(username) == _norm_user(BOT_MASTER):
+                self.send_room_text(room, f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}")
+            elif self.custom_welcome_enabled:
+                cw = self.custom_welcomes.get(_norm_user(username))
+                if isinstance(cw, dict) and cw.get("message"):
+                    self.send_room_text(room, str(cw["message"]).replace("{username}", username).replace("{room}", room))
         elif event_type == "user_left" and username:
             self.room_users[room].pop(username, None)
         elif event_type in ("you_joined", "you_rejoined"):
@@ -2260,8 +2325,10 @@ class TalkinBot:
             if info and time.time()-float(info.get("created_at",0)) <= 86400:
                 publisher=str(info.get("publisher") or "").strip()
                 labels={"lk":"👍 إعجاب","lv":"❤️ حب","dl":"👎 عدم إعجاب","cm":"💬 تعليق","report":"🚨 بلاغ"}
-                notice=f"{labels.get(action,action)}\n👤 المتفاعل: {frm}\n📌 على منشور: {publisher}"
-                if extra: notice += f"\n💬 {extra}"
+                source_desc = str(info.get("description") or info.get("title") or "").strip()
+                notice=f"{labels.get(action,action)}\n👤 المتفاعل: {frm}\n📌 الناشر: {publisher}"
+                if source_desc: notice += f"\n📝 وصف المنشور: {source_desc}"
+                if extra: notice += f"\n💬 رسالة التفاعل: {extra}"
                 self.send_private_text(publisher,notice)
                 return
 
@@ -2283,6 +2350,14 @@ class TalkinBot:
         # Keep a small per-room message history for diagnostics.
         self.last_messages[room].append((frm, body, event_id))
         self.last_messages[room] = self.last_messages[room][-50:]
+
+        # Exact-match automatic replies.
+        if self.auto_replies_enabled:
+            ar = self.auto_replies.get(body.strip().casefold())
+            if isinstance(ar, dict) and ar.get("reply"):
+                reply = str(ar["reply"]).replace("{username}", frm).replace("{room}", room)
+                self.send_room_text(room, reply)
+                return
 
         if self._handle_management_command(room, body, frm):
             return
