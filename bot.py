@@ -1567,7 +1567,6 @@ class TalkinBot:
             if YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
             try:
-                opts.pop("extractor_args", None)
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info=ydl.extract_info(target_query,download=True)
                     if info and info.get("entries"):
@@ -1587,7 +1586,7 @@ class TalkinBot:
                 return None
 
         info=source=None
-        attempts=[("web_embedded",True),("default",True),("native_default",False)]
+        attempts=[("web_embedded",True),("default",True),("native_default",True)]
         for client,use_cookies in attempts:
             result=try_client(client,use_cookies)
             if result:
@@ -1598,29 +1597,20 @@ class TalkinBot:
         # direct media download is blocked or incomplete.
         if not source:
             try:
-                meta={}
-                video_id=""
-                if re.match(r"^https?://",query,re.I):
-                    m=re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})",query)
-                    if m: video_id=m.group(1)
-                apis=[]
-                for x in os.getenv("PIPED_APIS","").split(","):
-                    x=x.strip().rstrip("/")
-                    if x: apis.append(x)
-                if not apis:
-                    apis=["https://piped.adminforge.de","https://pipedapi.syncpundit.io"]
-                if not video_id:
-                    for api in apis:
-                        try:
-                            rr=requests.get(f"{api}/search",params={"q":query,"filter":"videos"},timeout=20)
-                            if rr.ok:
-                                res=rr.json()
-                                if res:
-                                    video_id=str(res[0].get("url","")).split("v=")[-1][-11:] or str(res[0].get("id",""))
-                                    meta={"title":res[0].get("title",query)}
-                                    break
-                        except Exception:
-                            pass
+                meta=None
+                opts={"quiet":True,"no_warnings":True,"noplaylist":True,
+                      "skip_download":True,
+                      }
+                if YOUTUBE_COOKIE_FILE:
+                    opts["cookiefile"] = YOUTUBE_COOKIE_FILE
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    if re.match(r"^https?://",query,re.I):
+                        meta=ydl.extract_info(query,download=False)
+                    else:
+                        meta=ydl.extract_info("ytsearch1:"+query,download=False)
+                        if meta and meta.get("entries"):
+                            meta=next((x for x in meta["entries"] if x),None)
+                video_id=str((meta or {}).get("id") or "").strip()
                 if video_id:
                     apis=[]
                     for x in os.getenv("PIPED_APIS","").split(","):
