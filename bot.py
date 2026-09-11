@@ -12,6 +12,8 @@ import uuid
 import subprocess
 import re
 import queue
+import mimetypes
+from urllib.parse import urlparse, unquote
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from collections import defaultdict
 from pathlib import Path
@@ -72,11 +74,17 @@ GIFT_IMAGE_FILES = {
 # Railway exposes this service through RAILWAY_PUBLIC_DOMAIN after a public domain is generated.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 GIFT_PUBLIC_BASE_URL = os.getenv("GIFT_PUBLIC_BASE_URL", "").strip().rstrip("/")
-if not PUBLIC_BASE_URL:
-    railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
-    if railway_domain:
-        PUBLIC_BASE_URL = "https://" + railway_domain.replace("https://", "")
-MEDIA_PUBLIC_BASE_URL = PUBLIC_BASE_URL or GIFT_PUBLIC_BASE_URL
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+
+def _public_base_url():
+    domain = RAILWAY_PUBLIC_DOMAIN
+    if domain:
+        if not domain.startswith(("http://", "https://")):
+            domain = "https://" + domain
+        return domain.rstrip("/")
+    return (PUBLIC_BASE_URL or GIFT_PUBLIC_BASE_URL).rstrip("/")
+
+MEDIA_PUBLIC_BASE_URL = _public_base_url()
 ASSET_HTTP_PORT = int(os.getenv("PORT", "8080"))
 ASSET_HTTP_ENABLED = os.getenv("ASSET_HTTP_ENABLED", "1") == "1"
 
@@ -864,8 +872,7 @@ def render_gift_card(gift_id,sender_name,receiver_name):
     out=BASE_DIR/"generated_gifts"/f"gift_{gift_id}_{uuid.uuid4().hex}.png"; out.parent.mkdir(parents=True,exist_ok=True); image.save(out,"PNG",optimize=True); return out
 
 class _MediaHandler(SimpleHTTPRequestHandler):
-    def do_GET(self):
-        from urllib.parse import urlparse, unquote
+    def _resolve_target(self):
         path=unquote(urlparse(self.path).path)
         if path.startswith("/assets/"):
             rel=path[len("/assets/"):].lstrip("/"); root=ASSETS_DIR.resolve(); target=(ASSETS_DIR/rel).resolve()
@@ -874,14 +881,57 @@ class _MediaHandler(SimpleHTTPRequestHandler):
         elif path.startswith("/media/"):
             rel=path[len("/media/"):].lstrip("/"); root=(BASE_DIR/"generated_music").resolve(); target=(BASE_DIR/"generated_music"/rel).resolve()
         else:
+            return None
+        if root not in target.parents or not target.is_file(): return None
+        return target
+
+    def _ctype(self,target):
+        ctype,_=mimetypes.guess_type(str(target))
+        return ctype or {
+            ".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".webp":"image/webp",".gif":"image/gif",
+            ".mp3":"audio/mpeg",".m4a":"audio/mp4",".webm":"audio/webm",".ogg":"audio/ogg"
+        }.get(target.suffix.lower(),"application/octet-stream")
+
+    def _serve(self,head_only=False):
+        target=self._resolve_target()
+        if not target:
             self.send_error(404); return
         try:
-            if root not in target.parents or not target.is_file(): self.send_error(404); return
-            data=target.read_bytes(); ext=target.suffix.lower(); ctype="image/png" if ext==".png" else ("audio/mpeg" if ext==".mp3" else "application/octet-stream")
-            self.send_response(200); self.send_header("Content-Type",ctype); self.send_header("Content-Length",str(len(data))); self.send_header("Cache-Control","public,max-age=86400"); self.end_headers(); self.wfile.write(data)
-        except Exception: self.send_error(404)
+            total=target.stat().st_size; start=0; end=total-1; status=200
+            rh=self.headers.get("Range")
+            if rh and rh.startswith("bytes="):
+                spec=rh.split("=",1)[1].split(",",1)[0].strip(); a,_,b=spec.partition("-")
+                if a: start=int(a); end=int(b) if b else total-1
+                elif b:
+                    length=int(b); start=max(0,total-length)
+                if start>=total or end<start:
+                    self.send_response(416); self.send_header("Content-Range",f"bytes */{total}"); self.end_headers(); return
+                end=min(end,total-1); status=206
+            length=end-start+1
+            self.send_response(status)
+            self.send_header("Content-Type",self._ctype(target))
+            self.send_header("Accept-Ranges","bytes")
+            self.send_header("Content-Length",str(length))
+            if status==206: self.send_header("Content-Range",f"bytes {start}-{end}/{total}")
+            self.send_header("Cache-Control","public,max-age=86400")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers()
+            if head_only: return
+            with target.open("rb") as fh:
+                fh.seek(start); remaining=length
+                while remaining:
+                    chunk=fh.read(min(1024*1024,remaining))
+                    if not chunk: break
+                    self.wfile.write(chunk); remaining-=len(chunk)
+        except Exception:
+            try: self.send_error(404)
+            except Exception: pass
+
+    def do_HEAD(self): self._serve(True)
+    def do_GET(self): self._serve(False)
     def log_message(self,fmt,*args):
         if DEBUG: print("[MEDIA] "+(fmt%args),flush=True)
+
 
 def start_asset_server():
     if not ASSET_HTTP_ENABLED: return None
@@ -1428,62 +1478,164 @@ class TalkinBot:
         ))
 
     def _music_download(self,query):
-        """Download YouTube audio reliably and create MP3 explicitly.
-        This avoids depending on yt-dlp's FFmpeg postprocessor to rename/create
-        the final file, which was the source of the previous "no MP3" failure.
-        """
+        """Download audio with several YouTube clients, then Piped as fallback."""
         if yt_dlp is None:
             raise RuntimeError("yt-dlp غير مثبت")
+
         outdir=BASE_DIR/"generated_music"
         outdir.mkdir(parents=True,exist_ok=True)
         stamp=uuid.uuid4().hex
-        template=str(outdir/(stamp+".%(ext)s"))
-        opts={
-            "quiet":True,"no_warnings":True,"noplaylist":True,
-            "format":"bestaudio/best",
-            "outtmpl":template,
-            "socket_timeout":45,"retries":5,"fragment_retries":5,
-            "cachedir":False,"overwrites":True,
-            "http_headers":{"User-Agent":"Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36"},
-        }
-        if YOUTUBE_COOKIE_FILE:
-            opts["cookiefile"]=YOUTUBE_COOKIE_FILE
-        target_query=query if re.match(r"^https?://",query,re.I) else "ytsearch1:"+query
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info=ydl.extract_info(target_query,download=True)
-                if info and info.get("entries"):
-                    info=next((x for x in info["entries"] if x),None)
-                if not info:
-                    raise RuntimeError("لم يتم العثور على الأغنية")
-        except Exception as e:
-            msg=str(e)
-            if "Sign in to confirm" in msg or "bot" in msg.lower() or "cookies" in msg.lower():
-                raise RuntimeError("تعذر الوصول إلى YouTube؛ تحقق من متغير YOUTUBE_COOKIES في Railway")
-            raise
+        out_mp3=outdir/(stamp+".mp3")
+        errors=[]
 
-        duration=int(info.get("duration") or 0)
+        target_query=query if re.match(r"^https?://",query,re.I) else "ytsearch1:"+query
+
+        def try_client(client, use_cookies=False):
+            tmpdir=outdir/f".{stamp}_{client}_{'cookies' if use_cookies else 'nocookies'}"
+            tmpdir.mkdir(parents=True,exist_ok=True)
+            template=str(tmpdir/"source.%(ext)s")
+            opts={
+                "quiet":True,
+                "no_warnings":True,
+                "noplaylist":True,
+                "format":"bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "outtmpl":template,
+                "socket_timeout":45,
+                "retries":5,
+                "fragment_retries":5,
+                "extractor_retries":3,
+                "file_access_retries":3,
+                "cachedir":False,
+                "overwrites":True,
+                "concurrent_fragment_downloads":1,
+                "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
+                "extractor_args":{"youtube":{"player_client":[client]}},
+            }
+            if use_cookies and YOUTUBE_COOKIE_FILE:
+                opts["cookiefile"]=YOUTUBE_COOKIE_FILE
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info=ydl.extract_info(target_query,download=True)
+                    if info and info.get("entries"):
+                        info=next((x for x in info["entries"] if x),None)
+                    if not info:
+                        raise RuntimeError("لم يتم العثور على الأغنية")
+                candidates=[x for x in tmpdir.iterdir() if x.is_file() and x.suffix.lower() not in (".part",".ytdl",".temp") and x.stat().st_size>4096]
+                if not candidates:
+                    raise RuntimeError(f"يوتيوب أعاد البيانات عبر {client} لكن ملف الصوت لم يكتمل")
+                source=max(candidates,key=lambda x:x.stat().st_mtime)
+                duration=int(info.get("duration") or 0)
+                if duration>MUSIC_MAX_SECONDS:
+                    raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
+                return info,source
+            except Exception as exc:
+                errors.append(f"yt-dlp/{client}: {type(exc).__name__}: {exc}")
+                return None
+
+        info=source=None
+        attempts=[("android_vr",False),("web_embedded",False),("tv",False),("default",False)]
+        if YOUTUBE_COOKIE_FILE:
+            attempts.append(("default",True))
+        for client,use_cookies in attempts:
+            result=try_client(client,use_cookies)
+            if result:
+                info,source=result
+                break
+
+        # Piped fallback. This is used only when YouTube metadata works but
+        # direct media download is blocked or incomplete.
+        if not source:
+            try:
+                meta=None
+                opts={"quiet":True,"no_warnings":True,"noplaylist":True,
+                      "skip_download":True,
+                      "extractor_args":{"youtube":{"player_client":["web_embedded"]}}}
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    if re.match(r"^https?://",query,re.I):
+                        meta=ydl.extract_info(query,download=False)
+                    else:
+                        meta=ydl.extract_info("ytsearch1:"+query,download=False)
+                        if meta and meta.get("entries"):
+                            meta=next((x for x in meta["entries"] if x),None)
+                video_id=str((meta or {}).get("id") or "").strip()
+                if video_id:
+                    apis=[]
+                    for x in os.getenv("PIPED_APIS","").split(","):
+                        x=x.strip().rstrip("/")
+                        if x: apis.append(x)
+                    try:
+                        r=requests.get("https://piped.video/api/v1/instances",headers={"User-Agent":"Mozilla/5.0"},timeout=15)
+                        if r.ok:
+                            for item in (r.json() or []):
+                                api=str(item.get("api_url") or "").strip().rstrip("/")
+                                if api.startswith("http"): apis.append(api)
+                    except Exception as exc:
+                        errors.append(f"Piped instances: {type(exc).__name__}: {exc}")
+                    apis=list(dict.fromkeys(apis))[:12]
+                    for api in apis:
+                        try:
+                            sr=requests.get(f"{api}/streams/{video_id}",headers={"User-Agent":"Mozilla/5.0"},timeout=25)
+                            if not sr.ok:
+                                errors.append(f"Piped {api}: HTTP {sr.status_code}"); continue
+                            data=sr.json()
+                            streams=sorted(data.get("audioStreams") or [],key=lambda s:float(s.get("bitrate") or 0),reverse=True)
+                            for stream in streams:
+                                u=str(stream.get("url") or "").strip()
+                                if not u: continue
+                                ext=".m4a" if "mp4" in str(stream.get("mimeType","")).lower() else ".webm"
+                                candidate=outdir/f"{stamp}{ext}"
+                                try:
+                                    with requests.get(u,headers={"User-Agent":"Mozilla/5.0"},timeout=120,stream=True) as ar:
+                                        if not ar.ok: continue
+                                        with candidate.open("wb") as fh:
+                                            for chunk in ar.iter_content(1024*256):
+                                                if chunk: fh.write(chunk)
+                                    if candidate.is_file() and candidate.stat().st_size>4096:
+                                        source=candidate
+                                        info={"id":video_id,
+                                              "title":str(data.get("title") or (meta or {}).get("title") or query),
+                                              "uploader":str((meta or {}).get("uploader") or data.get("uploader") or "YouTube"),
+                                              "duration":int((meta or {}).get("duration") or data.get("duration") or 0)}
+                                        break
+                                except Exception as exc:
+                                    errors.append(f"Piped stream: {type(exc).__name__}: {exc}")
+                                try: candidate.unlink()
+                                except Exception: pass
+                            if source: break
+                        except Exception as exc:
+                            errors.append(f"Piped {api}: {type(exc).__name__}: {exc}")
+            except Exception as exc:
+                errors.append(f"Piped fallback: {type(exc).__name__}: {exc}")
+
+        if not source or not source.is_file() or source.stat().st_size<=4096:
+            detail=" | ".join(errors[-8:])
+            raise RuntimeError("تم العثور على الأغنية لكن لم يتم تنزيل ملف الصوت."+(f" تفاصيل: {detail[:900]}" if detail else ""))
+
+        duration=int((info or {}).get("duration") or 0)
         if duration>MUSIC_MAX_SECONDS:
+            try: source.unlink()
+            except Exception: pass
             raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
 
-        # Find only the file created by this request, then explicitly convert it.
-        candidates=[x for x in outdir.glob(stamp+".*") if x.suffix.lower() not in (".part",".ytdl")]
-        if not candidates:
-            raise RuntimeError("تم العثور على الأغنية لكن لم يتم تنزيل ملف الصوت")
-        source=max(candidates,key=lambda x:x.stat().st_mtime)
-        mp3=outdir/(stamp+".mp3")
         if source.suffix.lower()==".mp3":
             mp3=source
         else:
-            ffmpeg=subprocess.run([
-                "ffmpeg","-y","-i",str(source),"-vn","-acodec","libmp3lame",
-                "-b:a","192k",str(mp3)
-            ],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,timeout=180)
-            if ffmpeg.returncode!=0 or not mp3.is_file() or mp3.stat().st_size<1024:
-                detail=(ffmpeg.stderr or "").strip().splitlines()[-3:]
-                raise RuntimeError("فشل تحويل الصوت إلى MP3: "+" | ".join(detail)[:300])
+            ffmpeg_bin=shutil.which("ffmpeg")
+            if not ffmpeg_bin:
+                raise RuntimeError("FFmpeg غير موجود داخل Railway")
+            proc=subprocess.run([ffmpeg_bin,"-y","-hide_banner","-loglevel","error",
+                                 "-i",str(source),"-vn","-ac","2","-ar","44100",
+                                 "-codec:a","libmp3lame","-b:a","192k",str(out_mp3)],
+                                stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,timeout=180)
+            if proc.returncode!=0 or not out_mp3.is_file() or out_mp3.stat().st_size<=4096:
+                detail=" | ".join((proc.stderr or "").strip().splitlines()[-4:])
+                raise RuntimeError("فشل تحويل الصوت إلى MP3: "+detail[:500])
+            mp3=out_mp3
             try: source.unlink()
             except Exception: pass
+
+        for child in outdir.glob(f".{stamp}_*"):
+            if child.is_dir(): shutil.rmtree(child,ignore_errors=True)
         return info,mp3
 
     def handle_music_command(self,room,text,requester):
@@ -1496,8 +1648,9 @@ class TalkinBot:
         self.music_last[requester]=now
         def worker():
             try:
-                if not MEDIA_PUBLIC_BASE_URL: raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع GIFT_PUBLIC_BASE_URL")
-                info,path=self._music_download(query); title=str(info.get("title") or query); artist=str(info.get("uploader") or info.get("channel") or "YouTube"); duration=int(info.get("duration") or 0); url=MEDIA_PUBLIC_BASE_URL+"/media/"+path.name
+                public_base = _public_base_url()
+                if not public_base: raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
+                info,path=self._music_download(query); title=str(info.get("title") or query); artist=str(info.get("uploader") or info.get("channel") or "YouTube"); duration=int(info.get("duration") or 0); url=public_base+"/media/"+path.name
                 self.send_room_text(room,f"🎵 {title}\n🎤 {artist}\n👤 الطلب: {requester}"); self.send_room_media(room,url,"audio",duration)
             except Exception as e: self.log("[MUSIC] failed:",repr(e)); self.send_room_text(room,"❌ تعذر تشغيل الأغنية: "+str(e)[:300])
         threading.Thread(target=worker,name="music-request",daemon=True).start(); self.send_room_text(room,"⏳ جاري البحث عن الأغنية وتحضير الصوت..."); return True
@@ -1516,6 +1669,21 @@ class TalkinBot:
         lines.append("📌 الإرسال: sa@رقم_الهدية@اسم_المستخدم")
         self.send_room_text(room, "\n".join(lines))
 
+    def _verify_public_media_url(self, url: str, media_kind: str = "image"):
+        try:
+            r=requests.get(url,headers={"Range":"bytes=0-4095","User-Agent":"TalkinBot/22"},timeout=15,stream=True)
+            ctype=(r.headers.get("Content-Type") or "").lower()
+            if r.status_code not in (200,206):
+                raise RuntimeError(f"الرابط العام أعاد HTTP {r.status_code}")
+            if media_kind=="image" and not ctype.startswith("image/"):
+                raise RuntimeError(f"نوع الصورة غير صحيح: {ctype or 'unknown'}")
+            if media_kind=="audio" and not (ctype.startswith("audio/") or "octet-stream" in ctype):
+                raise RuntimeError(f"نوع الصوت غير صحيح: {ctype or 'unknown'}")
+            return True
+        except Exception as exc:
+            self.log("[MEDIA] public URL check failed:",repr(exc))
+            raise RuntimeError(f"الرابط العام للوسائط غير قابل للوصول: {exc}") from exc
+
     def handle_gift_command(self, room: str, text: str, sender_name: str = ""):
         raw=text.strip(); m=re.match(r"^sa@([^@]+)@(.+)$",raw,re.I)
         if not m: return False
@@ -1533,12 +1701,14 @@ class TalkinBot:
                 _add_points(sender_name,-cost); charged=True
             # Render and send the real gift card image, then send the gift text.
             # The image is hosted by the bot media server under /gifts/.
-            if not MEDIA_PUBLIC_BASE_URL:
+            public_base = _public_base_url()
+            if not public_base:
                 if charged:
                     _add_points(sender_name, cost)
                 raise RuntimeError("لا يوجد رابط عام لصور الهدايا؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
             gift_path = render_gift_card(gift_id, sender_name, target)
-            gift_url = MEDIA_PUBLIC_BASE_URL + "/gifts/" + gift_path.name
+            gift_url = public_base + "/gifts/" + gift_path.name
+            self._verify_public_media_url(gift_url, "image")
             self.send_room_media(room, gift_url, "image")
             self.send_room_text(room, f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
         except Exception as e:

@@ -6,7 +6,9 @@ Railway variables:
 - BOT_MASTER
 - GROUP_TO_JOIN
 - YOUTUBE_COOKIES (optional but recommended for YouTube)
-- GIFT_PUBLIC_BASE_URL (optional fallback public URL; RAILWAY_PUBLIC_DOMAIN is used automatically)
+- PUBLIC_BASE_URL (optional; RAILWAY_PUBLIC_DOMAIN is preferred automatically)
+- GIFT_PUBLIC_BASE_URL (optional fallback public URL)
+- PIPED_APIS (optional comma-separated Piped API instances; auto-discovery is attempted)
 - MUSIC_MAX_SECONDS=900
 - MUSIC_COOLDOWN=15
 
