@@ -815,20 +815,110 @@ def _message_template(section,key,default,**kwargs):
     try: return text.format(**kwargs)
     except Exception: return text
 
+def _command_menu():
+    return (
+        "📚 قوائم أوامر البوت\n"
+        "━━━━━━━━━━━━\n"
+        "1. help1 — الإدارة\n"
+        "2. help2 — الموسيقى والتفاعلات\n"
+        "3. help3 — الألعاب\n"
+        "4. help4 — الهدايا والنشر\n"
+        "5. help5 — النقاط\n"
+        "6. help6 — الغرف\n"
+        "7. help7 — الماستر والفلتر\n"
+        "━━━━━━━━━━━━\n"
+        "اكتب اسم القائمة مثل: help1"
+    )
+
+
+# Help pages are deliberately kept at <= 300 Unicode characters each.
+# Unlike normal bot results, only these command-menu pages are split.
+HELP_PAGES = {
+    1: (
+        "📋 أوامر الإدارة\n━━━━━━━━━━━━\n"
+        "1. k@اسم — طرد\n"
+        "2. b@اسم — حظر\n"
+        "3. ub@اسم — فك الحظر\n"
+        "4. m@اسم 10 — كتم\n"
+        "5. um@اسم — إلغاء الكتم\n"
+        "6. المكتومين — عرض المكتومين\n"
+        "7. اشراف ثم اسم — ترقية مشرف\n"
+        "8. عضو ثم اسم — إعادة عضو"
+    ),
+    2: (
+        "🎵 أوامر الموسيقى والتفاعلات\n━━━━━━━━━━━━\n"
+        "1. تشغيل اسم الأغنية — تشغيل\n"
+        "2. تيك اسم الأغنية — TikTok\n"
+        "3. مشاركة — رابط الأغنية\n"
+        "4. مشاركة اسم_الشخص — إرسال خاص\n"
+        "5. تخطي — تخطي الأغنية\n"
+        "6. ايقاف — إيقاف الأغنية\n"
+        "7. lk@CODE — إعجاب\n"
+        "8. lv@CODE — أحببتها\n"
+        "9. dl@CODE — عدم إعجاب"
+    ),
+    3: (
+        "🎮 أوامر الألعاب\n━━━━━━━━━━━━\n"
+        "1. العاب — قائمة الألعاب\n"
+        "2. مليون — فرصة مليون\n"
+        "3. حرب — حرب جماعية\n"
+        "4. عمل — لعبة العمل\n"
+        "5. كف — لعبة الكف\n"
+        "6. قتال — لعبة القتال\n"
+        "7. سباق — لعبة السباق\n"
+        "8. حظ — جائزة عشوائية\n"
+        "9. نرد — رمي النرد\n"
+        "10. تخمين — تخمين رقم"
+    ),
+    4: (
+        "🎁 أوامر الهدايا والنشر\n━━━━━━━━━━━━\n"
+        "1. gv — عرض الهدايا\n"
+        "2. gv@رقم@اسم — إرسال هدية\n"
+        "3. نشر نص — نشر النص\n"
+        "4. نشر@ — نشر الصورة التالية\n"
+        "5. نشرصورة رابط — نشر صورة\n"
+        "6. say نص — إرسال نص\n"
+        "7. انشر — نشر المحتوى"
+    ),
+    5: (
+        "💰 أوامر النقاط\n━━━━━━━━━━━━\n"
+        "1. نقاطي — عرض نقاطك\n"
+        "2. توب — المتصدرين\n"
+        "3. sb@اسم@عدد — تعديل النقاط\n"
+        "4. تحويل النقاط — تحويل النقاط\n"
+        "5. رصيدي — عرض الرصيد"
+    ),
+    6: (
+        "🚪 أوامر الغرف\n━━━━━━━━━━━━\n"
+        "1. دخول اسم_الغرفة — دخول\n"
+        "2. خروج [اسم_الغرفة] — خروج\n"
+        "3. inv — دعوة المستخدمين\n"
+        "4. inv اسم_الغرفة — دعوة من غرفة\n"
+        "5. invmsg نص_الدعوة — رسالة الدعوة\n"
+        "6. say نص — إرسال في الغرفة"
+    ),
+    7: (
+        "👑 الماستر والفلتر\n━━━━━━━━━━━━\n"
+        "1. mas@اسم — إضافة ماستر\n"
+        "2. umas@اسم — إزالة ماستر\n"
+        "3. المسترات — قائمة الماسترز\n"
+        "4. Vip@اسم — توثيق VIP\n"
+        "5. unVip@اسم — إلغاء VIP\n"
+        "6. mf@on / mf@off — الفلتر\n"
+        "7. +mf@كلمة — إضافة ممنوعة\n"
+        "8. -mf@كلمة — إزالة ممنوعة\n"
+        "9. l@mf — عرض الكلمات\n"
+        "10. clear@mf — حذف الكلمات"
+    ),
+}
+
+
 def _command_help(page=1):
-    # Organized menu style inspired by the user's reference only.
-    # The reference bot's command names/text are NOT copied here.
-    pages = [
-        "📋 أوامر البوت الأساسية (1/5)\n━━━━━━━━━━━━\n🔹 .sa اسم/رابط الأغنية\n🔹 sa@رقم_الهدية@اسم\n🔹 نقاطي\n🔹 توب\n🔹 العاب\n🔹 دخول اسم_الغرفة\n🔹 خروج [الغرفة]\n🔹 inv\n🔹 انشر\n🔹 انشر@الرسالة\n━━━━━━━━━━━━\nأرسل ns للقائمة التالية",
-        "📋 أوامر النشر والتفاعل (2/5)\n━━━━━━━━━━━━\n🔹 انشر ثم أرسل الصورة\n🔹 انشر@الرسالة ثم أرسل الصورة\n🔹 .sa اسم الأغنية\n🔹 sa@رقم_الهدية@اسم\n🔹 نقاطي\n🔹 توب\n🔹 دخول اسم_الغرفة\n🔹 خروج\n🔹 inv\n🔹 say النص\n━━━━━━━━━━━━\nأرسل ns للقائمة التالية",
-        "🎮 الألعاب (3/5)\n━━━━━━━━━━━━\n🔹 العاب\n🔹 حظ\n🔹 تخمين\n🔹 نرد\n🔹 حجر / ورق / مقص\n🔹 سؤال\n━━━━━━━━━━━━\nاللعب مجاني ولا يتم خصم نقاط\nأرسل ns للقائمة التالية",
-        "👑 أوامر الماستر (4/5)\n━━━━━━━━━━━━\n🔹 sb@اسم@عدد\n🔹 mas@اسم\n🔹 umas@اسم\n🔹 s@اسم\n🔹 ازالة توثيق@اسم\n🔹 Vip@اسم\n🔹 unVip@اسم\n🔹 المسترات\n🔹 دخول اسم_الغرفة\n🔹 خروج [الغرفة]\n━━━━━━━━━━━━\nأرسل ns للقائمة التالية",
-        "👑 إدارة الغرف (5/5)\n━━━━━━━━━━━━\n🔹 inv\n🔹 inv اسم_الغرفة\n🔹 invmsg نص الدعوة\n🔹 say النص\n🔹 k@ اسم للطرد\n🔹 b@ اسم للحظر\n🔹 u@ اسم لإلغاء الحظر\n🔹 a@ اسم مشرف\n🔹 o@ اسم مالك\n━━━━━━━━━━━━\nانتهت القوائم • أرسل اوامر لعرضها من جديد"
-    ]
-    try: page=int(page)
-    except Exception: page=1
-    page=max(1,min(len(pages),page))
-    return pages[page-1]
+    try:
+        page=int(page)
+    except Exception:
+        page=1
+    return HELP_PAGES.get(max(1, min(len(HELP_PAGES), page)), HELP_PAGES[1])
 
 # ------------------------------ Bot --------------------------------------
 
@@ -1134,38 +1224,54 @@ class TalkinBot:
         return rooms
 
     def _split_talkin_text(self, text: str, limit: int = None):
-        """Split text into safe TalkinChat packets.
-        Each newline-separated list item becomes its own message; an
-        oversized item is further split at a word boundary."""
-        limit = int(limit or getattr(self, "text_limit", 180))
+        """Compatibility helper: command menus use their own <=300 splitter."""
         text = str(text or "")
-        if not text:
-            return [""]
-        chunks = []
-        for block in text.split("\n"):
-            block = block.strip()
-            if not block:
-                continue
-            while len(block) > limit:
-                cut = block.rfind(" ", 0, limit + 1)
-                if cut < max(20, limit // 2):
-                    cut = limit
-                chunks.append(block[:cut].rstrip())
-                block = block[cut:].lstrip()
-            if block:
-                chunks.append(block)
-        return chunks or [""]
+        return [text] if text else [""]
 
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
-        for chunk in self._split_talkin_text(text):
-            payload = dict(kwargs)
-            payload["type_"] = "text"
-            payload["body"] = chunk
+        # All normal results stay in ONE message: games, music, publishing,
+        # points, admin results, etc. Only command-menu pages are split.
+        payload = dict(kwargs)
+        payload["type_"] = "text"
+        payload["body"] = str(text or "")
+        self.send_query(encode_query(packet_type, **payload))
+        return True
+
+    def _send_help_chunks(self, packet_type: str, text: str, limit: int = 300, **kwargs):
+        """Send a command list in ordered chunks, each <= 300 chars."""
+        text = str(text or "")
+        if not text:
+            return True
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        chunks=[]; current=""
+        for line in lines:
+            candidate = line if not current else current + "\n" + line
+            if len(candidate) <= limit:
+                current=candidate
+            else:
+                if current:
+                    chunks.append(current)
+                # A single command should normally fit; hard-split only if needed.
+                while len(line) > limit:
+                    cut=line.rfind(" ",0,limit+1)
+                    if cut < max(20,limit//2): cut=limit
+                    chunks.append(line[:cut].rstrip())
+                    line=line[cut:].lstrip()
+                current=line
+        if current: chunks.append(current)
+        for chunk in chunks:
+            payload=dict(kwargs); payload["type_"]="text"; payload["body"]=chunk
             self.send_query(encode_query(packet_type, **payload))
         return True
 
     def send_room_text(self, room: str, text: str):
         return self._send_text_packets("room_message", text, room=room)
+
+    def send_room_lines(self, room: str, lines):
+        for line in lines:
+            if line is not None:
+                self.send_room_text(room, str(line))
+        return True
 
     def send_admin(self, room: str, target: str, operation: str):
         # Exact command forms observed in the APK.
@@ -1681,12 +1787,27 @@ class TalkinBot:
             try:
                 public_base = _public_base_url()
                 if not public_base: raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
-                info,path=self._music_download(query); title=str(info.get("title") or query); artist=str(info.get("uploader") or info.get("channel") or "YouTube"); duration=int(info.get("duration") or 0); url=public_base+"/media/"+path.name
+                info,path=self._music_download(query)
+                title=str(info.get("title") or query)
+                artist=str(info.get("uploader") or info.get("channel") or "YouTube")
+                duration=int(info.get("duration") or 0)
+                url=public_base+"/media/"+path.name
+                # Music posts use the user's messages.json template.  The
+                # reaction code is intentionally limited to 4 characters.
+                code=uuid.uuid4().hex[:4]
+                caption=_message_template(
+                    "music", "broadcast",
+                    "🎵 {title}\n🎤 {requester_name}\n🎶 {title}\n📡 المصدر: {source_label}\n🏠 الغرفة الأصلية: {room}\n━━━━━━━━━━━━━\n👍 lk@{code}\n❤️ lv@{code}\n👎 dl@{code}\n💬 cm@{code} msg\n🚨 report@{code} msg",
+                    requester_name=requester, title=title, artist=artist,
+                    source_label=artist or "Music", room=room, code=code,
+                    url=url, duration=duration
+                )
                 if private_to:
-                    self.send_private_text(private_to,f"🎵 {title}\n🎤 {artist}\n👤 الطلب: {requester}")
+                    self.send_private_text(private_to,caption)
                     self.send_private_media(private_to,url,"audio",duration)
                 else:
-                    self.send_room_text(room,f"🎵 {title}\n🎤 {artist}\n👤 الطلب: {requester}"); self.send_room_media(room,url,"audio",duration)
+                    self.send_room_text(room,caption)
+                    self.send_room_media(room,url,"audio",duration)
             except Exception as e:
                 self.report_master_error("تشغيل الأغنية", e, room)
                 self.reply_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.", private_to)
@@ -1815,7 +1936,7 @@ class TalkinBot:
             if not ok: self.send_room_text(room,f"⏳ @{sender_name} انتظر {wait} ثوانٍ."); return True
             label,reward=random.choice((("🍀 حظ ممتاز!",30),("✨ حظ جميل!",20),("🌟 حظ متوسط!",10),("😅 حظك اليوم عادي!",5)))
             balance=self._game_award(sender_name,reward); suffix="♾️" if balance is None else str(balance)
-            self.send_room_text(room,f"{label}\n👤 @{sender_name}\n🎁 الجائزة: {reward} نقطة\n💰 الرصيد: {suffix}"); return True
+            self.send_room_text(room, f"{label}\n👤 @{sender_name}\n🎁 الجائزة: {reward} نقطة\n💰 الرصيد: {suffix}"); return True
 
         if low in ("نرد","ارم النرد","ارمي النرد","dice"):
             ok,wait=self._game_ready(sender_name,room,3.0)
@@ -1856,23 +1977,33 @@ class TalkinBot:
 
     def _send_help(self, room=None, private_to=None, page=1):
         text=_command_help(page)
-        if private_to: self.send_private_text(private_to,text)
-        elif room: self.send_room_text(room,text)
+        if private_to:
+            self._send_help_chunks("chat_message", text, to=private_to)
+        elif room:
+            self._send_help_chunks("room_message", text, room=room)
 
     def _handle_management_command(self, room, body, sender, is_private=False):
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
-        # Help is available to everyone.
+        # `اوامر` shows the organized menu only.
         if low in ("اوامر","الاوامر","help","مساعدة"):
-            key=(str(room), _norm_user(sender))
-            self.help_pages[key]=1
-            self._send_help(room=room, private_to=sender if is_private else None, page=1)
+            target = sender if is_private else None
+            if target:
+                self.send_private_text(target, _command_menu())
+            else:
+                self.send_room_text(room, _command_menu())
+            return True
+        m_help = re.fullmatch(r"help([1-7])", low)
+        if m_help:
+            page=int(m_help.group(1))
+            self.help_pages[(str(room), _norm_user(sender))]=page
+            self._send_help(room=room, private_to=sender if is_private else None, page=page)
             return True
         if low in ("ns","n","التالي","القائمة التالية","next"):
             key=(str(room), _norm_user(sender))
             page=int(self.help_pages.get(key,1) or 1)+1
-            if page>4: page=1
+            if page>7: page=1
             self.help_pages[key]=page
             self._send_help(room=room, private_to=sender if is_private else None, page=page)
             return True
