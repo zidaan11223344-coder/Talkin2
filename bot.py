@@ -1356,25 +1356,57 @@ class TalkinBot:
         owner_words = ("owner", "owner_changed", "اونر", "ونر", "مالك", "المالك")
         role_words = ("role", "promote", "demote", "admin", "moderator", "مشرف", "ادمن", "رتبة", "اصبح مشرف", "اصبح ادمن", "اصبح اونر", "اصبح مالك")
 
+        # IMPORTANT: `text` events are also used for ordinary chat messages.
+        # Never treat a random message/command containing the watched username
+        # as a moderation event.  Only accept known system-event phrases.
+        system_text = any(phrase in bt for phrase in (
+            "أصبح عضو من قبل", "اصبح عضو من قبل",
+            "تم حظره من قبل", "تم حظره",
+            "تم طرده من قبل", "تم طرده",
+            "أصبح مشرف من قبل", "اصبح مشرف من قبل",
+            "أصبح ادمن من قبل", "اصبح ادمن من قبل",
+            "أصبح مالك من قبل", "اصبح مالك من قبل",
+            "أصبح اونر من قبل", "اصبح اونر من قبل",
+            "تم تعيين" + " " + "@",
+        ))
+
+        # Ignore bot-generated command confirmations.  They are ordinary text
+        # events and were the source of the false alerts shown by the user.
+        bot_sender = _norm_user(frm) == _norm_user(BOT_ID)
+        bot_generated = any(phrase in bt for phrase in (
+            "تمت إضافة", "تمت اضافه", "إلى المراقبة", "الى المراقبة",
+            "ستصلك رسالة خاصة",
+            "تم تعيين" + " " + "@",
+        ))
+
         if any(x in bt for x in ban_words) or any(x in et for x in ban_words):
+            # For text events, require a recognizable system phrase; otherwise
+            # words like "حظر" in a normal chat message would be a false alert.
+            if et == "text" and not system_text:
+                return False
             operation = "حظر"
         elif any(x in bt for x in kick_words) or any(x in et for x in kick_words):
+            if et == "text" and not system_text:
+                return False
             operation = "طرد"
         elif any(x in bt for x in owner_words):
+            if et == "text" and not system_text:
+                return False
             operation = "تغيير الونر/المالك"
         elif any(x in bt for x in role_words) or any(x in et for x in role_words):
+            if et == "text" and not system_text:
+                return False
             operation = "تغيير صلاحية/رتبة"
         elif et in ("user_joined", "you_joined", "user_rejoined", "joined"):
             operation = "دخول / أصبح عضو"
         elif et in ("user_left", "left", "user_exit", "user_exited"):
             operation = "خروج"
         else:
-            # The account may be mentioned in a system event whose exact type
-            # is unknown. Keep it as a generic event rather than inventing an
-            # action.
-            if key not in {_norm_user(frm), _norm_user(to), _norm_user(username)} and key.casefold() not in bt:
-                return False
-            operation = "حدث إداري/نظامي"
+            # Unknown ordinary text/command: do not report it.
+            return False
+
+        if et == "text" and (bot_sender or bot_generated):
+            return False
 
         dedupe = "|".join((str(event_id or ""), et, operation, key, str(room or ""), str(frm or ""), str(to or ""), str(role or "")))
         now = time.time()
