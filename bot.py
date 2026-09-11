@@ -681,10 +681,13 @@ class DatabaseBridge:
         if cfg_path.exists():
             try:
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                self.url = self.url or str(cfg.get("supabase_url", "")).strip()
-                self.key = self.key or str(cfg.get("supabase_key", "")).strip()
-                self.email = self.email or str(cfg.get("supabase_email", cfg.get("email", ""))).strip()
-                self.password = self.password or str(cfg.get("supabase_password", cfg.get("password", "")))
+                # Support both the current flat config and the older config
+                # format used by the working Talkin bot.
+                sbcfg = cfg.get("supabase") if isinstance(cfg.get("supabase"), dict) else {}
+                self.url = self.url or str(cfg.get("supabase_url", sbcfg.get("url", ""))).strip()
+                self.key = self.key or str(cfg.get("supabase_key", sbcfg.get("key", ""))).strip()
+                self.email = self.email or str(cfg.get("supabase_email", cfg.get("email", sbcfg.get("email", "")))).strip()
+                self.password = self.password or str(cfg.get("supabase_password", cfg.get("password", sbcfg.get("password", ""))))
             except Exception as e:
                 self.log("[DB] config read failed:", repr(e))
         if not create_client:
@@ -705,14 +708,32 @@ class DatabaseBridge:
                 self.log("[DB] client init failed:", repr(e))
 
     def sign_in(self):
-        if not self.client or not self.email or not self.password:
+        if not self.client or not self.password:
             return False
         try:
+            # The Talkin app logs in to the realtime service by username, while
+            # the Supabase Auth account is email-based. Resolve that email through
+            # the same backend RPC used by the original bot when necessary.
+            if not self.email:
+                username = str(BOT_ID or os.getenv("USERNAME", "")).strip()
+                if username:
+                    try:
+                        rr = self.client.rpc("lookup_auth_email", {"_username": username}).execute()
+                        val = getattr(rr, "data", None)
+                        if isinstance(val, str) and "@" in val:
+                            self.email = val.strip()
+                        elif isinstance(val, dict):
+                            self.email = str(val.get("email") or val.get("auth_email") or "").strip()
+                    except Exception as e:
+                        self.log("[DB] lookup_auth_email failed:", repr(e))
+            if not self.email:
+                self.log("[DB] Supabase auth email not resolved")
+                return False
             res = self.client.auth.sign_in_with_password({"email": self.email, "password": self.password})
             user = getattr(res, "user", None)
             self.log("[DB] Supabase auth:", "OK" if user else "FAILED")
             if user:
-                self.log("[DB] authenticated Supabase user ready for native invites")
+                self.log("[DB] authenticated Supabase user ready for moderation/status")
             return bool(user)
         except Exception as e:
             self.log("[DB] Supabase auth failed:", repr(e))
@@ -734,78 +755,76 @@ class DatabaseBridge:
         return None
 
     def moderation_rpc(self, room_name, target_username, operation):
-        """Execute Talkin's real moderation RPCs discovered from the app.
+        """Use the real Talkin moderation RPC after authenticating Supabase.
 
-        The old wire-level room_admin packet was only a guessed transport action.
-        The Talkin backend exposes native RPCs: kick_room_member,
-        ban_room_member and unban_room_member.  We resolve both room and user IDs
-        first, then try the parameter names used by the app/database conventions.
-        Returns (ok, detail).
+        Kick is kept on the proven Talkin websocket packet first. Ban/unban use
+        the backend RPCs exposed by the Talkin application.
         """
-        if not self.client:
-            return False, "Supabase client غير متاح"
         room = str(room_name or "").strip()
         username = str(target_username or "").strip().lstrip("@")
+        op = str(operation or "").lower().strip()
         if not room or not username:
             return False, "الغرفة أو اسم المستخدم فارغ"
-        rpc_name = {
-            "kick": "kick_room_member",
-            "ban": "ban_room_member",
-            "unban": "unban_room_member",
-        }.get(str(operation).lower())
-        if not rpc_name:
-            return False, "عملية غير معروفة: " + str(operation)
+        if not self.client:
+            return False, "Supabase client غير متاح — تأكد أن config.json يحتوي supabase_url و supabase_key"
         try:
             rid = self.room_id(room)
             if not rid:
                 return False, f"لم يتم العثور على room_id للغرفة: {room}"
-            q = self.client.table("profiles").select("id,username").ilike("username", username).limit(1).execute()
+            q = self.client.table("profiles").select("id,username").eq("username", username).limit(1).execute()
             rows = getattr(q, "data", None) or []
             if not rows:
-                # Exact case-sensitive fallback.
-                q = self.client.table("profiles").select("id,username").eq("username", username).limit(1).execute()
+                q = self.client.table("profiles").select("id,username").ilike("username", username).limit(1).execute()
                 rows = getattr(q, "data", None) or []
             if not rows:
                 return False, f"لم يتم العثور على user_id للحساب: {username}"
             uid = str(rows[0].get("id") or "").strip()
             if not uid:
-                return False, f"الحساب موجود لكن user_id فارغ: {username}"
+                return False, f"user_id فارغ للحساب: {username}"
 
-            # Try the common SQL argument spellings. A failed RPC is retried only
-            # when PostgREST reports a missing/incorrect argument signature.
+            rpc_name = {"ban":"ban_room_member", "unban":"unban_room_member"}.get(op)
+            if op == "kick":
+                # This is the same proven transport used by the older working bot:
+                # room_admin -> kick.
+                return self._native_moderation_packet(room, username, "kick"), "تم إرسال أمر الطرد عبر Talkin"
+            if not rpc_name:
+                return False, f"عملية غير معروفة: {op}"
+
+            # Try the common parameter names, stopping only when the backend
+            # confirms the operation.
             candidates = [
+                {"_room": rid, "_user": uid},
                 {"_room_id": rid, "_user_id": uid},
                 {"room_id": rid, "user_id": uid},
+                {"room_id": rid, "target_user_id": uid},
                 {"_room": rid, "_user_id": uid},
-                {"_room_id": rid, "_username": username},
-                {"room_id": rid, "username": username},
-                {"_room": room, "_username": username},
-                {"room": room, "username": username},
             ]
-            errors=[]
+            errors = []
             for params in candidates:
                 try:
                     res = self.client.rpc(rpc_name, params).execute()
-                    data = getattr(res, "data", None)
-                    self.log(f"[ADMIN] RPC {rpc_name} OK params={list(params.keys())} data={data!r}")
+                    self.log(f"[ADMIN] {rpc_name} OK params={list(params)} data={getattr(res,'data',None)!r}")
                     return True, f"RPC {rpc_name} نجح"
                 except Exception as e:
-                    msg = str(e)
-                    errors.append(f"{list(params.keys())}: {msg}")
-                    # Stop early on permission/business errors; keep trying on
-                    # signature errors so the correct argument names can be found.
-                    low = msg.lower()
-                    signature = any(x in low for x in ("argument", "parameter", "function", "does not exist", "could not find"))
-                    if not signature:
+                    errors.append(str(e))
+                    low = str(e).lower()
+                    # Keep trying only for signature/argument mismatches.
+                    if not any(x in low for x in ("argument", "parameter", "function", "does not exist", "could not find", "pgrst202")):
                         break
-            detail = " | ".join(errors[-3:]) if errors else "لا توجد تفاصيل"
-            self.last_error = detail
-            self.log(f"[ADMIN] RPC {rpc_name} failed: {detail}")
-            return False, f"{rpc_name} فشل: {detail}"
+            return False, f"{rpc_name} فشل: {' | '.join(errors[-3:])}"
         except Exception as e:
             self.last_error = str(e)
-            self.log("[ADMIN] moderation RPC failed:", repr(e))
+            self.log("[ADMIN] moderation failed:", repr(e))
             return False, str(e)
+
+    def _native_moderation_packet(self, room, username, operation):
+        if operation == "kick":
+            self.send_query(encode_query("room_admin", type_="kick", room=room, to=username, value="none"))
+            return True
+        if operation == "ban":
+            self.send_query(encode_query("room_admin", type_="ban_ip", room=room, to=username, value="outcast"))
+            return True
+        return False
 
     def room_users(self, room_name):
         if not self.client: return []
