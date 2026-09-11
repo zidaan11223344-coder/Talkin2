@@ -993,6 +993,9 @@ class TalkinBot:
         location = f" | الغرفة: {room}" if room else ""
         message = f"❌ خطأ {context}{location}\nالتفاصيل: {detail}"
         self.log(f"[{context}]", repr(error))
+        # Music/gift failures must remain visible in Railway Logs even when
+        # DEBUG=0; the master also receives the complete diagnostic privately.
+        print(f"[{context}] {detail}", flush=True)
         if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
             try:
                 self.send_private_text(BOT_MASTER, message)
@@ -1172,16 +1175,20 @@ class TalkinBot:
             self.send_query(encode_query("ack_msg", uid=uid))
 
     def send_private_text(self, username: str, text: str):
-        """Send private text as one complete message.
+        """Send the complete private text in safe sequential chunks.
 
-        TalkinChat allows long private messages, so diagnostics sent to the
-        master must not be split or truncated. Room messages continue to use
-        _split_talkin_text() because rooms have the 200-character limit.
+        The private chat may display long reports, but one oversized protobuf
+        can make Talkin close the entire WebSocket with code 1009. Chunking
+        preserves every character while keeping each packet below the safe
+        room/server limit.
         """
         username = str(username or "").strip()
         if not username or username == BOT_ID:
             return False
-        self.send_query(encode_query("chat_message", type_="text", to=username, body=str(text or "")))
+        raw_text = str(text or "")
+        chunks = [raw_text[i:i + 180] for i in range(0, len(raw_text), 180)] or [""]
+        for chunk in chunks:
+            self.send_query(encode_query("chat_message", type_="text", to=username, body=chunk))
         return True
 
     def request_occupants(self, room: str = ""):
