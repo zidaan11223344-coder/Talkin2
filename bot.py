@@ -1515,7 +1515,13 @@ class TalkinBot:
         ))
 
     def _music_download(self,query):
-        """Download audio with several YouTube clients, then Piped as fallback."""
+        """Search/download public audio and return an MP3 ready for TalkinChat.
+
+        Primary source: SoundCloud (public audio, independent of YouTube).
+        Fallback: YouTube through yt-dlp with optional YOUTUBE_COOKIES.
+        Public YouTube/Spotify URLs are first resolved to a title so the
+        SoundCloud route can still be used when YouTube extraction is blocked.
+        """
         if yt_dlp is None:
             raise RuntimeError("yt-dlp غير مثبت")
 
@@ -1525,176 +1531,133 @@ class TalkinBot:
         out_mp3=outdir/(stamp+".mp3")
         errors=[]
 
-        target_query=query if re.match(r"^https?://",query,re.I) else "ytsearch1:"+query
+        def resolve_public_title(value):
+            """Get public page title without downloading media."""
+            try:
+                u=str(value or "").strip()
+                if not re.match(r"^https?://",u,re.I):
+                    return ""
+                if "youtube.com" in u.lower() or "youtu.be" in u.lower():
+                    r=requests.get("https://www.youtube.com/oembed",params={"url":u,"format":"json"},
+                                   headers={"User-Agent":"Mozilla/5.0"},timeout=15)
+                    if r.ok:
+                        data=r.json()
+                        return str(data.get("title") or "").strip()
+                if "open.spotify.com" in u.lower():
+                    r=requests.get(u,headers={"User-Agent":"Mozilla/5.0"},timeout=15)
+                    if r.ok:
+                        m=re.search(r'<meta[^>]+property=[\"\']og:title[\"\'][^>]+content=[\"\']([^\"\']+)',r.text,re.I)
+                        if not m:
+                            m=re.search(r'<meta[^>]+content=[\"\']([^\"\']+)[\"\'][^>]+property=[\"\']og:title[\"\']',r.text,re.I)
+                        if m:
+                            title=re.sub(r'\s*\|\s*Spotify\s*$','',m.group(1),flags=re.I).strip()
+                            return title
+            except Exception as exc:
+                errors.append(f"Public metadata: {type(exc).__name__}: {exc}")
+            return ""
 
-        def try_client(client, use_cookies=False):
-            tmpdir=outdir/f".{stamp}_{client}_{'cookies' if use_cookies else 'nocookies'}"
+        def normalize_to_mp3(source, duration=0):
+            if duration and int(duration) > MUSIC_MAX_SECONDS:
+                raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
+            source=Path(source)
+            if source.suffix.lower()==".mp3":
+                return source
+            ffmpeg_bin=shutil.which("ffmpeg")
+            if not ffmpeg_bin:
+                raise RuntimeError("FFmpeg غير موجود داخل Railway")
+            proc=subprocess.run([
+                ffmpeg_bin,"-y","-hide_banner","-loglevel","error",
+                "-i",str(source),"-vn","-ac","2","-ar","44100",
+                "-codec:a","libmp3lame","-b:a","192k",str(out_mp3)
+            ],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,timeout=180)
+            if proc.returncode!=0 or not out_mp3.is_file() or out_mp3.stat().st_size<=4096:
+                detail=" | ".join((proc.stderr or "").strip().splitlines()[-4:])
+                raise RuntimeError("فشل تحويل الصوت إلى MP3: "+detail[:500])
+            try: source.unlink()
+            except Exception: pass
+            return out_mp3
+
+        def download_with_ydl(target,label,cookies=False):
+            tmpdir=outdir/f".{stamp}_{label}"
             tmpdir.mkdir(parents=True,exist_ok=True)
             template=str(tmpdir/"source.%(ext)s")
             opts={
-                "quiet":True,
-                "no_warnings":True,
-                "noplaylist":True,
-                # Some YouTube clients expose only a combined stream or a
-                # codec other than m4a/webm. Accept the best available stream
-                # and let ffmpeg normalize it to MP3 below.
-                # Prefer audio, then accept a single-file video/audio stream.
-                # Several YouTube clients no longer expose an audio-only
-                # format even though a playable combined stream exists.
-                # Explicit audio IDs are more reliable on the current
-                # YouTube player than the generic bestaudio selector.
-                "format":"bestaudio/best",
-                "format_sort":["abr", "acodec:mp4a.40.2", "asr"],
-                "outtmpl":template,
-                "socket_timeout":45,
-                "retries":5,
-                "fragment_retries":5,
-                "extractor_retries":3,
-                "file_access_retries":3,
-                "cachedir":False,
-                "overwrites":True,
+                "quiet":True,"no_warnings":True,"noplaylist":True,
+                "format":"bestaudio/best","outtmpl":template,
+                "socket_timeout":45,"retries":5,"fragment_retries":5,
+                "extractor_retries":3,"file_access_retries":3,
+                "cachedir":False,"overwrites":True,
                 "concurrent_fragment_downloads":1,
-                "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
-                "extractor_args":{"youtube":{"player_client":[client]}},
+                "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"},
                 "check_formats":False,
                 "js_runtimes":{"node":{}},
                 "remote_components":{"ejs":"github"},
             }
-            if client == "native_default":
-                # Let yt-dlp choose the working player instead of forcing a
-                # client that may expose no audio formats.
-                opts.pop("extractor_args", None)
-            if YOUTUBE_COOKIE_FILE:
+            if cookies and YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
+            if label.startswith("youtube_"):
+                client=label.split("_",1)[1]
+                if client != "native_default":
+                    opts["extractor_args"]={"youtube":{"player_client":[client]}}
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info=ydl.extract_info(target_query,download=True)
+                    info=ydl.extract_info(target,download=True)
                     if info and info.get("entries"):
                         info=next((x for x in info["entries"] if x),None)
                     if not info:
                         raise RuntimeError("لم يتم العثور على الأغنية")
                 candidates=[x for x in tmpdir.iterdir() if x.is_file() and x.suffix.lower() not in (".part",".ytdl",".temp") and x.stat().st_size>4096]
                 if not candidates:
-                    raise RuntimeError(f"يوتيوب أعاد البيانات عبر {client} لكن ملف الصوت لم يكتمل")
+                    raise RuntimeError("تم العثور على الأغنية لكن لم يكتمل الملف الصوتي")
                 source=max(candidates,key=lambda x:x.stat().st_mtime)
                 duration=int(info.get("duration") or 0)
-                if duration>MUSIC_MAX_SECONDS:
-                    raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
-                return info,source
+                mp3=normalize_to_mp3(source,duration)
+                return {
+                    "id":str(info.get("id") or ""),
+                    "title":str(info.get("title") or query),
+                    "uploader":str(info.get("uploader") or info.get("channel") or ""),
+                    "duration":duration,
+                },mp3
             except Exception as exc:
-                errors.append(f"yt-dlp/{client}: {type(exc).__name__}: {exc}")
+                errors.append(f"{label}: {type(exc).__name__}: {exc}")
+                shutil.rmtree(tmpdir,ignore_errors=True)
                 return None
 
-        info=source=None
-        attempts=[("web_embedded",True),("default",True),("native_default",True),("web_embedded",False)]
-        for client,use_cookies in attempts:
-            result=try_client(client,use_cookies)
+        # Resolve URL to a searchable title when possible. This lets a
+        # blocked YouTube/Spotify URL still use SoundCloud as the source.
+        search_query=str(query or "").strip()
+        if re.match(r"^https?://",search_query,re.I):
+            title=resolve_public_title(search_query)
+            if title:
+                search_query=title
+
+        # -------- SoundCloud primary source --------
+        sc_targets=[]
+        if re.match(r"^https?://",query,re.I) and "soundcloud.com" in query.lower():
+            sc_targets=[query]
+        elif search_query:
+            sc_targets=["scsearch1:"+search_query]
+
+        for target in sc_targets:
+            result=download_with_ydl(target,"soundcloud",cookies=False)
             if result:
-                info,source=result
-                break
+                info,mp3=result
+                for child in outdir.glob(f".{stamp}_*"):
+                    if child.is_dir(): shutil.rmtree(child,ignore_errors=True)
+                return info,mp3
 
-        # Piped fallback. This is used only when YouTube metadata works but
-        # direct media download is blocked or incomplete.
-        if not source:
-            try:
-                meta=None
-                opts={"quiet":True,"no_warnings":True,"noplaylist":True,
-                      "skip_download":True,
-                      }
-                if YOUTUBE_COOKIE_FILE:
-                    opts["cookiefile"] = YOUTUBE_COOKIE_FILE
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    if re.match(r"^https?://",query,re.I):
-                        meta=ydl.extract_info(query,download=False)
-                    else:
-                        meta=ydl.extract_info("ytsearch1:"+query,download=False)
-                        if meta and meta.get("entries"):
-                            meta=next((x for x in meta["entries"] if x),None)
-                video_id=str((meta or {}).get("id") or "").strip()
-                if video_id:
-                    apis=[]
-                    for x in os.getenv("PIPED_APIS","").split(","):
-                        x=x.strip().rstrip("/")
-                        if x: apis.append(x)
-                    try:
-                        r=requests.get("https://piped.video/api/v1/instances",headers={"User-Agent":"Mozilla/5.0"},timeout=15)
-                        if r.ok:
-                            for item in (r.json() or []):
-                                api=str(item.get("api_url") or "").strip().rstrip("/")
-                                if api.startswith("http"): apis.append(api)
-                    except Exception as exc:
-                        errors.append(f"Piped instances: {type(exc).__name__}: {exc}")
-                    apis=list(dict.fromkeys(apis))[:12]
-                    for api in apis:
-                        try:
-                            sr=requests.get(f"{api}/streams/{video_id}",headers={"User-Agent":"Mozilla/5.0"},timeout=25)
-                            if not sr.ok:
-                                errors.append(f"Piped {api}: HTTP {sr.status_code}"); continue
-                            data=sr.json()
-                            streams=list(data.get("audioStreams") or [])
-                            streams += [s for s in (data.get("videoStreams") or [])
-                                        if not bool(s.get("videoOnly"))]
-                            streams=sorted(streams,key=lambda s:float(s.get("bitrate") or 0),reverse=True)
-                            for stream in streams:
-                                u=str(stream.get("url") or "").strip()
-                                if not u: continue
-                                mime=str(stream.get("mimeType","")).lower()
-                                ext=".mp4" if "mp4" in mime else (".m4a" if "m4a" in mime else ".webm")
-                                candidate=outdir/f"{stamp}{ext}"
-                                try:
-                                    with requests.get(u,headers={"User-Agent":"Mozilla/5.0"},timeout=120,stream=True) as ar:
-                                        if not ar.ok: continue
-                                        with candidate.open("wb") as fh:
-                                            for chunk in ar.iter_content(1024*256):
-                                                if chunk: fh.write(chunk)
-                                    if candidate.is_file() and candidate.stat().st_size>4096:
-                                        source=candidate
-                                        info={"id":video_id,
-                                              "title":str(data.get("title") or (meta or {}).get("title") or query),
-                                              "uploader":str((meta or {}).get("uploader") or data.get("uploader") or "YouTube"),
-                                              "duration":int((meta or {}).get("duration") or data.get("duration") or 0)}
-                                        break
-                                except Exception as exc:
-                                    errors.append(f"Piped stream: {type(exc).__name__}: {exc}")
-                                try: candidate.unlink()
-                                except Exception: pass
-                            if source: break
-                        except Exception as exc:
-                            errors.append(f"Piped {api}: {type(exc).__name__}: {exc}")
-            except Exception as exc:
-                errors.append(f"Piped fallback: {type(exc).__name__}: {exc}")
+        # -------- YouTube fallback --------
+        youtube_target=query if re.match(r"^https?://",query,re.I) else "ytsearch1:"+query
+        for client in ("web_embedded","default","native_default"):
+            result=download_with_ydl(youtube_target,f"youtube_{client}",cookies=True)
+            if result:
+                info,mp3=result
+                for child in outdir.glob(f".{stamp}_*"):
+                    if child.is_dir(): shutil.rmtree(child,ignore_errors=True)
+                return info,mp3
 
-        if not source or not source.is_file() or source.stat().st_size<=4096:
-            detail=" | ".join(errors[-8:])
-            hint = " أضف YOUTUBE_COOKIES بصيغة Netscape من حساب YouTube يعمل على Railway." if not YOUTUBE_COOKIE_FILE else ""
-            raise RuntimeError("تم العثور على الأغنية لكن لم يتم تنزيل ملف الصوت." + hint + (f" تفاصيل: {detail[:900]}" if detail else ""))
-
-        duration=int((info or {}).get("duration") or 0)
-        if duration>MUSIC_MAX_SECONDS:
-            try: source.unlink()
-            except Exception: pass
-            raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
-
-        if source.suffix.lower()==".mp3":
-            mp3=source
-        else:
-            ffmpeg_bin=shutil.which("ffmpeg")
-            if not ffmpeg_bin:
-                raise RuntimeError("FFmpeg غير موجود داخل Railway")
-            proc=subprocess.run([ffmpeg_bin,"-y","-hide_banner","-loglevel","error",
-                                 "-i",str(source),"-vn","-ac","2","-ar","44100",
-                                 "-codec:a","libmp3lame","-b:a","192k",str(out_mp3)],
-                                stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,timeout=180)
-            if proc.returncode!=0 or not out_mp3.is_file() or out_mp3.stat().st_size<=4096:
-                detail=" | ".join((proc.stderr or "").strip().splitlines()[-4:])
-                raise RuntimeError("فشل تحويل الصوت إلى MP3: "+detail[:500])
-            mp3=out_mp3
-            try: source.unlink()
-            except Exception: pass
-
-        for child in outdir.glob(f".{stamp}_*"):
-            if child.is_dir(): shutil.rmtree(child,ignore_errors=True)
-        return info,mp3
+        detail=" | ".join(errors[-10:])
+        raise RuntimeError("تعذر تنزيل ملف صوت من SoundCloud أو YouTube."+(f" تفاصيل: {detail[:1200]}" if detail else ""))
 
     def handle_music_command(self,room,text,requester,private_to=""):
         raw=text.strip()
