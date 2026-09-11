@@ -19,6 +19,11 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from collections import defaultdict
 from pathlib import Path
 
+try:
+    from fontTools.ttLib import TTFont
+except Exception:
+    TTFont = None
+
 import requests
 try:
     from supabase import create_client
@@ -868,60 +873,150 @@ def _shape_name(text):
     return str(text or "")
 
 _GIFT_FONT_CACHE = {}
+_FONT_COVERAGE_CACHE = {}
+
+def _font_coverage(path):
+    key=str(path)
+    if key in _FONT_COVERAGE_CACHE:
+        return _FONT_COVERAGE_CACHE[key]
+    coverage=set()
+    if TTFont is not None:
+        try:
+            font=TTFont(key, lazy=True)
+            for table in font["cmap"].tables:
+                coverage.update(table.cmap.keys())
+            font.close()
+        except Exception:
+            coverage=set()
+    _FONT_COVERAGE_CACHE[key]=coverage
+    return coverage
+
 def _load_font(path, size):
     key=(str(path),int(size))
     if key not in _GIFT_FONT_CACHE:
-        _GIFT_FONT_CACHE[key]=ImageFont.truetype(str(path),int(size))
+        f=ImageFont.truetype(str(path),int(size))
+        try:
+            f._source_path=str(path)
+            f._coverage=_font_coverage(path)
+        except Exception:
+            pass
+        _GIFT_FONT_CACHE[key]=f
     return _GIFT_FONT_CACHE[key]
 
 def _gift_font(text,size):
-    # Arabic font for the main text; rare decorative symbols are drawn with fallback fonts.
+    # Primary font for Arabic names. Decorative Unicode is handled by the
+    # coverage-aware fallback chain below; the input username is never changed.
     path=BASE_DIR/"assets"/"NotoSansArabic-SemiBold.ttf"
-    if not path.is_file(): path=BASE_DIR/"assets"/"DejaVuSans.ttf"
+    if not path.is_file(): path=BASE_DIR/"assets"/"NotoSansArabic-Regular.ttf"
+    if not path.is_file(): path=BASE_DIR/"assets"/"Amiri-Bold.ttf"
     return _load_font(path,size)
 
 def _fallback_fonts(size):
+    # Broad Unicode fallback chain. This is important for decorated Talkin
+    # usernames containing Arabic Presentation Forms, Egyptian hieroglyphs,
+    # symbols, music symbols and Mathematical Alphanumeric characters.
     paths=[
-        BASE_DIR/"assets"/"DejaVuSans.ttf",
-        BASE_DIR/"assets"/"Amiri-Bold.ttf",
+        BASE_DIR/"assets"/"NotoSansArabic-Regular.ttf",
         BASE_DIR/"assets"/"NotoSansArabic-SemiBold.ttf",
+        BASE_DIR/"assets"/"Amiri-Bold.ttf",
+        BASE_DIR/"assets"/"NotoSans-Regular.ttf",
+        BASE_DIR/"assets"/"NotoSansMath-Regular.ttf",
+        BASE_DIR/"assets"/"NotoSansSymbols-Regular.ttf",
         BASE_DIR/"assets"/"NotoSansSymbols2-Regular.ttf",
         BASE_DIR/"assets"/"NotoSansEgyptianHieroglyphs-Regular.ttf",
         BASE_DIR/"assets"/"NotoMusic-Regular.ttf",
+        BASE_DIR/"assets"/"DejaVuSans.ttf",
     ]
     return [_load_font(p,size) for p in paths if p.is_file()]
 
 def _font_has_glyph(font, ch):
+    # Do not trust FreeType's getmask() alone: missing glyphs can still return
+    # a .notdef box. Use the actual font cmap when available.
     try:
-        return font.getmask(ch).getbbox() is not None and font.getlength(ch) > 0
+        coverage=getattr(font,"_coverage",None)
+        if coverage:
+            return ord(ch) in coverage
+        return font.getlength(ch) > 0 and font.getmask(ch).getbbox() is not None
     except Exception:
         return False
 
-def _draw_exact_text(draw, xy, raw_text, size, fill, stroke_width=2, stroke_fill=(0,0,0,220)):
-    """Draw mixed Arabic/decorative Unicode without tofu boxes.
-    Arabic runs use Noto Arabic; missing symbols are drawn from dedicated fallback fonts.
-    The original Unicode string is never transliterated or stripped.
-    """
-    text=_shape_name(raw_text)
-    base=_gift_font(text,size)
-    fallbacks=_fallback_fonts(size)
-    # Build runs by glyph coverage. Keep combining marks with the preceding run where possible.
-    runs=[]
-    cur_font=None; cur=[]
-    for ch in text:
-        chosen=base if _font_has_glyph(base,ch) else next((f for f in fallbacks if _font_has_glyph(f,ch)), base)
-        if cur_font is None or chosen is cur_font:
-            cur.append(ch)
+def _text_clusters(text):
+    # Keep combining marks attached to the character they decorate so a
+    # decorative username is not visually broken when fallback fonts are used.
+    import unicodedata
+    clusters=[]
+    for ch in _shape_name(text):
+        if clusters and (unicodedata.combining(ch) or unicodedata.category(ch) in ("Cf",)):
+            clusters[-1]+=ch
         else:
-            runs.append((cur_font,''.join(cur))); cur=[ch]
+            clusters.append(ch)
+    return clusters
+
+def _cluster_font(cluster, base, fallbacks):
+    # Prefer a font containing every code point in the cluster.
+    for f in [base]+fallbacks:
+        if all(_font_has_glyph(f,ch) for ch in cluster):
+            return f
+    # If a combining mark has no complete-font match, use the first font that
+    # can draw the base character. Unsupported characters are left unchanged
+    # in the source string and only fall back visually when unavoidable.
+    base_ch=cluster[0] if cluster else ""
+    return next((f for f in [base]+fallbacks if _font_has_glyph(f,base_ch)), base)
+
+def _build_text_runs(raw_text,size):
+    text=_shape_name(raw_text)
+    base=_gift_font(text,size); fallbacks=_fallback_fonts(size)
+    runs=[]; cur_font=None; cur=[]
+    for cluster in _text_clusters(text):
+        chosen=_cluster_font(cluster,base,fallbacks)
+        if cur_font is None or chosen is cur_font:
+            cur.append(cluster)
+        else:
+            runs.append((cur_font,"".join(cur))); cur=[cluster]
         cur_font=chosen
-    if cur: runs.append((cur_font,''.join(cur)))
+    if cur: runs.append((cur_font,"".join(cur)))
+    return runs
+
+def _measure_runs(runs):
+    total=0
+    for font,run in runs:
+        try: total += font.getlength(run)
+        except Exception: total += sum(font.getlength(ch) for ch in run)
+    return total
+
+def _draw_exact_text(draw, xy, raw_text, size, fill, stroke_width=2, stroke_fill=(0,0,0,220)):
+    """Render the EXACT username string with Unicode-aware font fallback.
+
+    No transliteration, normalization or replacement of the sender/receiver
+    name is performed. If one font cannot render a decorative character, the
+    same character is drawn from another bundled Unicode font.
+    """
+    runs=_build_text_runs(raw_text,size)
     x,y=xy
     for font,run in runs:
         draw.text((x,y),run,font=font,fill=fill,stroke_width=stroke_width,stroke_fill=stroke_fill)
         try: x += draw.textlength(run,font=font)
-        except Exception: x += font.getlength(run)
+        except Exception: x += _measure_runs([(font,run)])
     return x
+
+def _fit_text_size(raw_text, initial_size, max_width):
+    size=int(initial_size)
+    while size>12:
+        if _measure_runs(_build_text_runs(raw_text,size)) <= max_width:
+            return size
+        size-=2
+    return max(12,size)
+
+def _draw_centered(draw,center,raw_text,size,fill,max_width):
+    size=_fit_text_size(raw_text,size,max_width)
+    runs=_build_text_runs(raw_text,size)
+    width=_measure_runs(runs)
+    # Pillow draws the runs in their logical sequence; for Talkin decorated
+    # names we preserve the exact Unicode sequence received from the server.
+    x=center[0]-width/2
+    bbox=_gift_font(raw_text,size).getbbox("Hg")
+    y=center[1]-(bbox[3]-bbox[1])/2-bbox[1]
+    _draw_exact_text(draw,(x,y),raw_text,size,fill,stroke_width=3,stroke_fill=(0,0,0,220))
 
 def _fit_crop(im,size):
     im=im.convert("RGB"); tw,th=size; scale=max(tw/im.width,th/im.height); nw,nh=max(tw,int(im.width*scale)),max(th,int(im.height*scale)); im=im.resize((nw,nh),Image.LANCZOS); left=max(0,(nw-tw)//2); top=max(0,(nh-th)//2); return im.crop((left,top,left+tw,top+th))
