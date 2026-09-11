@@ -1531,7 +1531,7 @@ class TalkinBot:
                 # Prefer audio, then accept a single-file video/audio stream.
                 # Several YouTube clients no longer expose an audio-only
                 # format even though a playable combined stream exists.
-                "format":"bestaudio/best/bestvideo",
+                "format":"bestaudio/best",
                 "format_sort":["abr", "acodec:mp4a.40.2", "asr"],
                 "outtmpl":template,
                 "socket_timeout":45,
@@ -1545,6 +1545,8 @@ class TalkinBot:
                 "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
                 "extractor_args":{"youtube":{"player_client":[client]}},
                 "check_formats":False,
+                "js_runtimes":{"node":{}},
+                "remote_components":{"ejs":"github"},
             }
             if YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
@@ -1568,7 +1570,10 @@ class TalkinBot:
                 return None
 
         info=source=None
-        attempts=[("android_vr",bool(YOUTUBE_COOKIE_FILE)),
+        attempts=[("web",bool(YOUTUBE_COOKIE_FILE)),
+                  ("web_creator",bool(YOUTUBE_COOKIE_FILE)),
+                  ("web_music",bool(YOUTUBE_COOKIE_FILE)),
+                  ("android_vr",bool(YOUTUBE_COOKIE_FILE)),
                   ("web_embedded",bool(YOUTUBE_COOKIE_FILE)),
                   ("web_safari",bool(YOUTUBE_COOKIE_FILE)),
                   ("android",bool(YOUTUBE_COOKIE_FILE)),
