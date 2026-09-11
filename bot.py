@@ -830,11 +830,11 @@ def _command_help(page=1):
 # ------------------------------ Bot --------------------------------------
 
 def _shape_name(text):
-    text=str(text or "")
-    if arabic_reshaper and get_display and any("\u0600"<=c<="\u06ff" for c in text):
-        try: return get_display(arabic_reshaper.reshape(text))
-        except Exception: pass
-    return text
+    # Keep the exact logical string. Applying bidi/get_display to usernames
+    # that mix Arabic, Latin and decorative Unicode reverses their visual
+    # order (for example: ۦاݪــۛـسـ𓆩♛𓆪ـۧۦ). Pillow/font shaping is preferred
+    # over mutating the user's text; English and ornaments remain unchanged.
+    return str(text or "")
 
 def _gift_font(text,size):
     arabic=any("\u0600"<=c<="\u06ff" for c in str(text))
@@ -1527,7 +1527,7 @@ class TalkinBot:
                 "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
                 "extractor_args":{"youtube":{"player_client":[client]}},
             }
-            if use_cookies and YOUTUBE_COOKIE_FILE:
+            if YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1549,9 +1549,10 @@ class TalkinBot:
                 return None
 
         info=source=None
-        attempts=[("android_vr",False),("web_embedded",False),("tv",False),("default",False)]
-        if YOUTUBE_COOKIE_FILE:
-            attempts.append(("default",True))
+        attempts=[("android_vr",bool(YOUTUBE_COOKIE_FILE)),
+                  ("web_embedded",bool(YOUTUBE_COOKIE_FILE)),
+                  ("tv",bool(YOUTUBE_COOKIE_FILE)),
+                  ("default",bool(YOUTUBE_COOKIE_FILE))]
         for client,use_cookies in attempts:
             result=try_client(client,use_cookies)
             if result:
@@ -1625,7 +1626,8 @@ class TalkinBot:
 
         if not source or not source.is_file() or source.stat().st_size<=4096:
             detail=" | ".join(errors[-8:])
-            raise RuntimeError("تم العثور على الأغنية لكن لم يتم تنزيل ملف الصوت."+(f" تفاصيل: {detail[:900]}" if detail else ""))
+            hint = " أضف YOUTUBE_COOKIES بصيغة Netscape من حساب YouTube يعمل على Railway." if not YOUTUBE_COOKIE_FILE else ""
+            raise RuntimeError("تم العثور على الأغنية لكن لم يتم تنزيل ملف الصوت." + hint + (f" تفاصيل: {detail[:900]}" if detail else ""))
 
         duration=int((info or {}).get("duration") or 0)
         if duration>MUSIC_MAX_SECONDS:
