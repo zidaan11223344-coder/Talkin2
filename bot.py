@@ -133,6 +133,9 @@ WS_HOSTS = [x.strip() for x in os.getenv("WS_HOSTS", "chatp.net").split(",") if 
 DEFAULT_PORT = os.getenv("SOCKET_PORT", "5335").strip()
 WS_PATHS = [x.strip() if x.strip().startswith("/") else "/" + x.strip()
             for x in os.getenv("WS_PATHS", "/server").split(",") if x.strip()]
+# RawWebSocket uses this timeout as the heartbeat interval. The receive loop
+# sends a WebSocket ping whenever the interval expires without traffic.
+WS_HEARTBEAT_SECONDS = max(5, int(os.getenv("WS_HEARTBEAT_SECONDS", "20")))
 if not WS_PATHS:
     WS_PATHS = ["/server"]
 REFERRER_URL = os.getenv("REFERRER_URL", "")
@@ -1167,6 +1170,9 @@ class TalkinBot:
         self.music_last = defaultdict(float)
         self.music_current = {}
         self.music_lock = threading.Lock()
+        # Reaction/publish state used by music and image publishing.
+        self.reaction_targets = {}
+        self.publish_pending = {}
         # Mini-games: free-to-play, no points are deducted.
         self.game_lock = threading.Lock()
         self.game_cooldown = defaultdict(float)
@@ -2293,8 +2299,10 @@ class TalkinBot:
             self.send_private_text(sender, "✅ تم تشغيل الترحيب المخصص." if self.custom_welcome_enabled else "⛔ تم إيقاف الترحيب المخصص.")
             return True
         # Publishing: master says `انشر` or `انشر@description`, then sends an image.
-        if low == "انشر" or low.startswith("انشر@"):
-            desc=text[5:].strip() if low.startswith("انشر@") else ""
+        # Accept both forms strictly and preserve the description exactly.
+        m_publish = re.match(r"^انشر(?:@(.+))?$", text, re.I)
+        if m_publish:
+            desc = (m_publish.group(1) or "").strip()
             # The image may be sent later in a room or in private chat.
             # Key the pending publish by sender, not by the command room, so
             # sending the image from another room still completes the publish.
@@ -2693,7 +2701,12 @@ class TalkinBot:
                         # Y9/v Client.smali does not copy the HTTP auth Session
                         # cookies into the WebSocket handshake. Keep the WS request
                         # limited to the headers actually built by the APK.
-                        self.ws = RawWebSocket(url, list(header_lines), timeout=20, debug=RAW_DIAGNOSTIC)
+                        self.ws = RawWebSocket(
+                            url,
+                            list(header_lines),
+                            timeout=WS_HEARTBEAT_SECONDS,
+                            debug=RAW_DIAGNOSTIC,
+                        )
                         self.ws.connect()
                         self.log("[WS] CONNECTED:", url)
                         self.log("[WS] custom headers:", [x.split(":",1)[0] + ": <redacted>" if x.lower().startswith(("username:", "password:")) else x for x in header_lines])
@@ -2711,9 +2724,19 @@ class TalkinBot:
                             try:
                                 kind, message = self.ws.recv()
                             except socket.timeout:
-                                # An idle room is normal. Do not reconnect just
-                                # because no WebSocket frame arrived during the
-                                # read timeout.
+                                # Keep the realtime WebSocket alive. The server may
+                                # close an otherwise idle connection with code 1000.
+                                # Sending a client ping prevents idle disconnects
+                                # while preserving the normal reconnect path if the
+                                # socket is genuinely dead.
+                                try:
+                                    if self.ws:
+                                        self.ws.send_control(0x9, b"talkin")
+                                        self.log("[WS] heartbeat ping sent")
+                                except Exception as heartbeat_error:
+                                    raise ConnectionError(
+                                        f"WebSocket heartbeat failed: {heartbeat_error}"
+                                    )
                                 continue
                             if kind == "binary":
                                 self.on_message(self.ws, message)
@@ -2724,7 +2747,18 @@ class TalkinBot:
                             elif kind == "text":
                                 self.log("[WS] unexpected text frame received")
                             elif kind == "close":
-                                raise ConnectionError(f"WebSocket closed by server: {message}")
+                                if isinstance(message, dict):
+                                    code = message.get("code")
+                                    reason = str(message.get("reason") or "").strip()
+                                    if code == 1000:
+                                        detail = "WebSocket closed normally (1000)"
+                                    else:
+                                        detail = f"WebSocket closed by server ({code})"
+                                    if reason:
+                                        detail += f": {reason}"
+                                else:
+                                    detail = f"WebSocket closed by server: {message}"
+                                raise ConnectionError(detail)
                         return
                     except Exception as e:
                         last_error = e
@@ -2754,8 +2788,11 @@ class TalkinBot:
                     self._pending_reconnect_reason = raw_reason[:1000]
                 print("[BOT] error:", repr(e), flush=True)
             if not self.stop_event.is_set():
-                print("[BOT] reconnecting in 10s...", flush=True)
-                time.sleep(10)
+                # Short backoff: the room list is preserved and restored once
+                # after the new authenticated WebSocket is established.
+                reconnect_delay = float(os.getenv("RECONNECT_DELAY_SECONDS", "3"))
+                print(f"[BOT] reconnecting in {reconnect_delay:g}s...", flush=True)
+                time.sleep(max(1.0, reconnect_delay))
 
 
 if __name__ == "__main__":
