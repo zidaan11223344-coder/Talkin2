@@ -2794,14 +2794,18 @@ class TalkinBot:
         reconnected = str(event.get(24, "") or "").strip()
         # Do not log room message contents, usernames, room names, or media events.
 
-        # Monitor explicit moderation events from every room the bot receives events for.
-        # We intentionally do not treat a plain user_left as a ban, because that could be a normal exit.
-        event_type_low = event_type.casefold()
-        moderation_words = ("ban", "banned", "kick", "kicked", "outcast", "blocked", "حظر", "محظور", "طرد", "مطرد")
-        is_moderation_event = any(word in event_type_low for word in moderation_words)
+        # Monitor the watched account in ALL room events. Some Talkin server
+        # versions report a ban/kick as a generic user_left event, so checking
+        # only the event name can miss the moderation completely. We therefore
+        # report the first event concerning the watched account and include the
+        # real event id/type/fields so the master can identify what the server sent.
         monitored_target = username or to
-        if is_moderation_event and monitored_target:
-            self._monitor_report(event, event_type, monitored_target, room, event_id, frm, to)
+        if monitored_target:
+            key = _norm_user(monitored_target)
+            with self._monitor_lock:
+                watched = key in self.monitored_users
+            if watched:
+                self._monitor_report(event, event_type, monitored_target, room, event_id, frm, to)
 
         # Keep the live membership state in sync.  The APK itself uses these
         # exact event names and RoomEvent fields.
