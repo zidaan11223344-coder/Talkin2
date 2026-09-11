@@ -833,13 +833,13 @@ def _command_menu():
 
 def _default_help_pages():
     return {
-        1: "📋 أوامر الإدارة\n━━━━━━━━━━━━\nk@اسم — طرد\nb@اسم — حظر\nub@اسم — فك الحظر\nm@اسم 10 — كتم\num@اسم — إلغاء الكتم\nالمكتومين — عرض المكتومين\nاشراف ثم اسم — ترقية مشرف\nعضو ثم اسم — إعادة عضو",
-        2: "🎵 أوامر الموسيقى والتفاعلات\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل\nتيك اسم الأغنية — TikTok\nمشاركة — رابط الأغنية\nمشاركة اسم_الشخص — إرسال خاص\nتخطي — تخطي الأغنية\nايقاف — إيقاف الأغنية\nlk@CODE — إعجاب\nlv@CODE — أحببتها\ndl@CODE — عدم إعجاب",
-        3: "🎮 أوامر الألعاب\n━━━━━━━━━━━━\nالعاب — قائمة الألعاب\nمليون — فرصة مليون\nحرب — حرب جماعية\nعمل — لعبة العمل\nكف — لعبة الكف\nقتال — لعبة القتال\nسباق — لعبة السباق\nحظ — جائزة عشوائية\nنرد — رمي النرد\nتخمين — تخمين رقم",
-        4: "🎁 أوامر الهدايا والنشر\n━━━━━━━━━━━━\ngv — عرض الهدايا\ngv@رقم@اسم — إرسال هدية\nنشر نص — نشر النص\nنشر@ — نشر الصورة التالية\nنشرصورة رابط — نشر صورة\nsay نص — إرسال نص\nانشر — نشر المحتوى",
-        5: "💰 أوامر النقاط\n━━━━━━━━━━━━\nنقاطي — عرض نقاطك\nتوب — المتصدرين\nsb@اسم@عدد — تعديل النقاط\nتحويل النقاط — تحويل النقاط\nرصيدي — عرض الرصيد",
-        6: "🚪 أوامر الغرف\n━━━━━━━━━━━━\nدخول اسم_الغرفة — دخول\nخروج [اسم_الغرفة] — خروج\ninv — دعوة المستخدمين\ninv اسم_الغرفة — دعوة من غرفة\ninvmsg نص_الدعوة — رسالة الدعوة\nsay نص — إرسال في الغرفة",
-        7: "👑 الماستر والفلتر\n━━━━━━━━━━━━\nmas@اسم — إضافة ماستر\numas@اسم — إزالة ماستر\nالمسترات — قائمة الماسترز\nVip@اسم — توثيق VIP\nunVip@اسم — إلغاء VIP\nmf@on / mf@off — الفلتر\n+mf@كلمة — إضافة ممنوعة\n-mf@كلمة — إزالة ممنوعة\nl@mf — عرض الكلمات\nclear@mf — حذف الكلمات",
+        1: '📋 أوامر الإدارة\n━━━━━━━━━━━━\nk@اسم — طرد\nb@اسم — حظر\nub@اسم — فك الحظر\na@اسم — تعيين مشرف\no@اسم — تعيين مالك',
+        2: '🎵 الموسيقى\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل',
+        3: '🎮 الألعاب\n━━━━━━━━━━━━\nالعاب — عرض الألعاب\nحظ — جائزة عشوائية\nنرد — رمي النرد\nتخمين — تخمين رقم\nحجر — حجر ورق مقص\nورق — حجر ورق مقص\nمقص — حجر ورق مقص\nسؤال — مسابقة',
+        4: '🎁 الهدايا والنشر\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nانشر — نشر صورة\nانشر@وصف — نشر صورة بوصف\nsay نص — إرسال نص',
+        5: '💰 النقاط\n━━━━━━━━━━━━\nنقاطي — عرض النقاط\nتوب — المتصدرين\nsb@اسم@عدد — تعديل النقاط',
+        6: '🚪 الغرف\n━━━━━━━━━━━━\nدخول اسم_الغرفة — دخول غرفة\nخروج — خروج من الغرف\nخروج اسم_الغرفة — خروج من غرفة\ninv — دعوة المستخدمين\ninv اسم_الغرفة — دعوة من غرفة\ninvmsg نص — تغيير رسالة الدعوة\nsay نص — إرسال نص',
+        7: '👑 الماستر والفلتر\n━━━━━━━━━━━━\nmas@اسم — إضافة ماستر\numas@اسم — إزالة ماستر\nالمسترات — عرض الماسترز\ns@اسم — توثيق\nuns@اسم — إزالة التوثيق\nVip@اسم — توثيق VIP\nunVip@اسم — إلغاء VIP\nmf@on / mf@off — تشغيل أو إيقاف الفلتر\n+mf@كلمة — إضافة كلمة ممنوعة\n-mf@كلمة — إزالة كلمة ممنوعة\nl@mf — عرض الكلمات\nclear@mf — حذف الكلمات',
     }
 
 def _help_pages_from_messages():
@@ -864,29 +864,87 @@ def _command_help(page=1):
 # ------------------------------ Bot --------------------------------------
 
 def _shape_name(text):
-    # Keep the exact logical string. Applying bidi/get_display to usernames
-    # that mix Arabic, Latin and decorative Unicode reverses their visual
-    # order (for example: ۦاݪــۛـسـ𓆩♛𓆪ـۧۦ). Pillow/font shaping is preferred
-    # over mutating the user's text; English and ornaments remain unchanged.
+    # Keep the exact logical username. Do not reverse or normalize decorative Arabic.
     return str(text or "")
 
+_GIFT_FONT_CACHE = {}
+def _load_font(path, size):
+    key=(str(path),int(size))
+    if key not in _GIFT_FONT_CACHE:
+        _GIFT_FONT_CACHE[key]=ImageFont.truetype(str(path),int(size))
+    return _GIFT_FONT_CACHE[key]
+
 def _gift_font(text,size):
-    arabic=any("\u0600"<=c<="\u06ff" for c in str(text))
-    path=BASE_DIR/"assets"/("NotoSansArabic-SemiBold.ttf" if arabic else "DejaVuSans.ttf")
+    # Arabic font for the main text; rare decorative symbols are drawn with fallback fonts.
+    path=BASE_DIR/"assets"/"NotoSansArabic-SemiBold.ttf"
     if not path.is_file(): path=BASE_DIR/"assets"/"DejaVuSans.ttf"
-    return ImageFont.truetype(str(path),size)
+    return _load_font(path,size)
+
+def _fallback_fonts(size):
+    paths=[
+        BASE_DIR/"assets"/"DejaVuSans.ttf",
+        BASE_DIR/"assets"/"Amiri-Bold.ttf",
+        BASE_DIR/"assets"/"NotoSansArabic-SemiBold.ttf",
+        BASE_DIR/"assets"/"NotoSansSymbols2-Regular.ttf",
+        BASE_DIR/"assets"/"NotoSansEgyptianHieroglyphs-Regular.ttf",
+        BASE_DIR/"assets"/"NotoMusic-Regular.ttf",
+    ]
+    return [_load_font(p,size) for p in paths if p.is_file()]
+
+def _font_has_glyph(font, ch):
+    try:
+        return font.getmask(ch).getbbox() is not None and font.getlength(ch) > 0
+    except Exception:
+        return False
+
+def _draw_exact_text(draw, xy, raw_text, size, fill, stroke_width=2, stroke_fill=(0,0,0,220)):
+    """Draw mixed Arabic/decorative Unicode without tofu boxes.
+    Arabic runs use Noto Arabic; missing symbols are drawn from dedicated fallback fonts.
+    The original Unicode string is never transliterated or stripped.
+    """
+    text=_shape_name(raw_text)
+    base=_gift_font(text,size)
+    fallbacks=_fallback_fonts(size)
+    # Build runs by glyph coverage. Keep combining marks with the preceding run where possible.
+    runs=[]
+    cur_font=None; cur=[]
+    for ch in text:
+        chosen=base if _font_has_glyph(base,ch) else next((f for f in fallbacks if _font_has_glyph(f,ch)), base)
+        if cur_font is None or chosen is cur_font:
+            cur.append(ch)
+        else:
+            runs.append((cur_font,''.join(cur))); cur=[ch]
+        cur_font=chosen
+    if cur: runs.append((cur_font,''.join(cur)))
+    x,y=xy
+    for font,run in runs:
+        draw.text((x,y),run,font=font,fill=fill,stroke_width=stroke_width,stroke_fill=stroke_fill)
+        try: x += draw.textlength(run,font=font)
+        except Exception: x += font.getlength(run)
+    return x
 
 def _fit_crop(im,size):
     im=im.convert("RGB"); tw,th=size; scale=max(tw/im.width,th/im.height); nw,nh=max(tw,int(im.width*scale)),max(th,int(im.height*scale)); im=im.resize((nw,nh),Image.LANCZOS); left=max(0,(nw-tw)//2); top=max(0,(nh-th)//2); return im.crop((left,top,left+tw,top+th))
 
 def _draw_centered(draw,center,raw_text,size,fill,max_width):
-    shaped=_shape_name(raw_text); size=int(size); font=_gift_font(raw_text,size)
-    while size>16:
-        box=draw.textbbox((0,0),shaped,font=font,stroke_width=2)
-        if box[2]-box[0]<=max_width: break
-        size-=2; font=_gift_font(raw_text,size)
-    box=draw.textbbox((0,0),shaped,font=font,stroke_width=3); x=center[0]-(box[2]-box[0])/2-box[0]; y=center[1]-(box[3]-box[1])/2-box[1]
-    draw.text((x,y),shaped,font=font,fill=fill,stroke_width=3,stroke_fill=(0,0,0,220))
+    size=int(size)
+    # Measure using the actual mixed-font renderer; shrink until it fits.
+    while size>14:
+        tmp=_gift_font(raw_text,size)
+        # approximate mixed width from runs
+        x=0
+        for ch in _shape_name(raw_text):
+            f=tmp if _font_has_glyph(tmp,ch) else next((f for f in _fallback_fonts(size) if _font_has_glyph(f,ch)),tmp)
+            x += f.getlength(ch)
+        if x<=max_width: break
+        size-=2
+    # Draw from centered x. For Arabic the exact visual shaping is retained by Noto Arabic runs.
+    tmp=_gift_font(raw_text,size)
+    width=sum((tmp if _font_has_glyph(tmp,ch) else next((f for f in _fallback_fonts(size) if _font_has_glyph(f,ch)),tmp)).getlength(ch) for ch in _shape_name(raw_text))
+    bbox=tmp.getbbox("Hg")
+    x=center[0]-width/2
+    y=center[1]-(bbox[3]-bbox[1])/2-bbox[1]
+    _draw_exact_text(draw,(x,y),raw_text,size,fill,stroke_width=3,stroke_fill=(0,0,0,220))
 
 def render_gift_card(gift_id,sender_name,receiver_name):
     if not PIL_AVAILABLE: raise RuntimeError("Pillow غير مثبت")
@@ -1743,12 +1801,15 @@ class TalkinBot:
                     source_label=artist or "Music", room=room, code=code,
                     url=url, duration=duration
                 )
-                if private_to:
-                    self.send_private_text(private_to,caption)
-                    self.send_private_media(private_to,url,"audio",duration)
-                else:
-                    self.send_room_text(room,caption)
-                    self.send_room_media(room,url,"audio",duration)
+                # Music is broadcast to every room currently joined by the bot.
+                # The requester also receives the same post privately.
+                self.reaction_targets[code] = {"publisher": requester, "kind": "music", "created_at": time.time()}
+                target_rooms=list(self.known_rooms) or ([room] if room else [])
+                for target_room in target_rooms:
+                    self.send_room_text(target_room,caption)
+                    self.send_room_media(target_room,url,"audio",duration)
+                self.send_private_text(requester,caption)
+                self.send_private_media(requester,url,"audio",duration)
             except Exception as e:
                 self.report_master_error("تشغيل الأغنية", e, room)
                 self.reply_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.", private_to)
@@ -1838,15 +1899,8 @@ class TalkinBot:
         return True,0
 
     def game_help(self, room):
-        for line in (
-            "🎮 ألعاب البوت المجانية:",
-            "🍀 حظ — جائزة عشوائية مجانية.",
-            "🎯 تخمين — ابدأ ثم اكتب رقماً من 1 إلى 10.",
-            "🎲 نرد — ارْمِ النرد واربح نقاطاً حسب النتيجة.",
-            "✂️ حجر ورق مقص — اكتب: حجر أو ورق أو مقص.",
-            "🧠 سؤال — سؤال معلومات عامة بجائزة 15 نقطة.",
-            "📌 لا توجد أي تكلفة أو خصم نقاط عند اللعب.",
-        ): self.send_room_text(room,line)
+        # Game results/help are one message; only command menus are chunked.
+        self.send_room_text(room, "🎮 ألعاب البوت المجانية:\n━━━━━━━━━━━━\n🍀 حظ — جائزة عشوائية مجانية.\n🎯 تخمين — ابدأ ثم اكتب رقماً من 1 إلى 10.\n🎲 نرد — ارْمِ النرد واربح نقاطاً حسب النتيجة.\n✂️ حجر ورق مقص — اكتب: حجر أو ورق أو مقص.\n🧠 سؤال — سؤال معلومات عامة بجائزة 15 نقطة.\n📌 لا توجد أي تكلفة أو خصم نقاط عند اللعب.")
 
     def handle_game_command(self, room, text, sender_name):
         raw=str(text or "").strip()
@@ -2110,13 +2164,22 @@ class TalkinBot:
         # In rooms, the successful publish message contains ONLY the reaction
         # controls. The publish status/result is sent privately to the master.
         base_code=uuid.uuid4().hex[:4]
+        reaction_codes={
+            "like": base_code,
+            "love": uuid.uuid4().hex[:4],
+            "dislike": uuid.uuid4().hex[:4],
+            "comment": uuid.uuid4().hex[:4],
+            "report": uuid.uuid4().hex[:4],
+        }
+        for kind,code in reaction_codes.items():
+            self.reaction_targets[code]={"publisher": sender, "kind": kind, "created_at": time.time()}
         caption=_message_template(
             "publish", "broadcast",
             "🖼️ {description}\n👤 {publisher}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
             publisher=sender, description=desc or "منشور صورة",
             source_label=source_room, code=base_code,
-            like=base_code, love=uuid.uuid4().hex[:4], dislike=uuid.uuid4().hex[:4],
-            comment=uuid.uuid4().hex[:4], report=uuid.uuid4().hex[:4], room=source_room
+            like=reaction_codes["like"], love=reaction_codes["love"], dislike=reaction_codes["dislike"],
+            comment=reaction_codes["comment"], report=reaction_codes["report"], room=source_room
         )
         ok=0
         errors=[]
@@ -2188,6 +2251,19 @@ class TalkinBot:
             return
         if frm == BOT_ID:
             return
+
+        # Reactions/comments/reports: notify the original publisher privately.
+        reaction=re.match(r"^(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?$", body.strip(), re.I)
+        if reaction:
+            action,code,extra=reaction.group(1).lower(),reaction.group(2).lower(),(reaction.group(3) or "").strip()
+            info=self.reaction_targets.get(code)
+            if info and time.time()-float(info.get("created_at",0)) <= 86400:
+                publisher=str(info.get("publisher") or "").strip()
+                labels={"lk":"👍 إعجاب","lv":"❤️ حب","dl":"👎 عدم إعجاب","cm":"💬 تعليق","report":"🚨 بلاغ"}
+                notice=f"{labels.get(action,action)}\n👤 المتفاعل: {frm}\n📌 على منشور: {publisher}"
+                if extra: notice += f"\n💬 {extra}"
+                self.send_private_text(publisher,notice)
+                return
 
         # Music/gifts require verification; masters are always allowed.
         is_verified = _norm_user(frm) in _verified_data() or _is_master_name(frm)
