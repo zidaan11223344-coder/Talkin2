@@ -1514,7 +1514,11 @@ class TalkinBot:
                 "quiet":True,
                 "no_warnings":True,
                 "noplaylist":True,
-                "format":"bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                # Some YouTube clients expose only a combined stream or a
+                # codec other than m4a/webm. Accept the best available stream
+                # and let ffmpeg normalize it to MP3 below.
+                "format":"bestaudio/best",
+                "format_sort":["abr", "acodec:mp4a.40.2", "asr"],
                 "outtmpl":template,
                 "socket_timeout":45,
                 "retries":5,
@@ -1567,6 +1571,8 @@ class TalkinBot:
                 opts={"quiet":True,"no_warnings":True,"noplaylist":True,
                       "skip_download":True,
                       "extractor_args":{"youtube":{"player_client":["web_embedded"]}}}
+                if YOUTUBE_COOKIE_FILE:
+                    opts["cookiefile"] = YOUTUBE_COOKIE_FILE
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     if re.match(r"^https?://",query,re.I):
                         meta=ydl.extract_info(query,download=False)
@@ -2265,7 +2271,10 @@ class TalkinBot:
             except Exception as e:
                 self.last_error = str(e)
                 if self._had_connection:
-                    self._pending_reconnect_reason = " ".join(str(e).split())[:1000]
+                    raw_reason = " ".join(str(e).split())
+                    if "code': 1000" in raw_reason or '"code": 1000' in raw_reason:
+                        raw_reason = "الخادم أغلق WebSocket إغلاقًا طبيعيًا (1000)، وسيتم إعادة الاتصال تلقائيًا"
+                    self._pending_reconnect_reason = raw_reason[:1000]
                 print("[BOT] error:", repr(e), flush=True)
             if not self.stop_event.is_set():
                 print("[BOT] reconnecting in 10s...", flush=True)
