@@ -1191,6 +1191,16 @@ class TalkinBot:
             self.send_query(encode_query("chat_message", type_="text", to=username, body=chunk))
         return True
 
+    def send_private_media(self, username: str, media_url: str, media_type: str, duration: int = 0):
+        """Send audio/image back to the private-chat sender."""
+        return self.send_query(encode_query(
+            "chat_message", type_=media_type, to=username, url=media_url,
+            length=str(max(0, int(duration or 0))) if media_type == "audio" else None
+        ))
+
+    def reply_text(self, room: str, text: str, private_to: str = ""):
+        return self.send_private_text(private_to, text) if private_to else self.send_room_text(room, text)
+
     def request_occupants(self, room: str = ""):
         """Load users from ALL rooms currently joined by the bot.
 
@@ -1550,6 +1560,10 @@ class TalkinBot:
                 "js_runtimes":{"node":{}},
                 "remote_components":{"ejs":"github"},
             }
+            if client == "native_default":
+                # Let yt-dlp choose the working player instead of forcing a
+                # client that may expose no audio formats.
+                opts.pop("extractor_args", None)
             if YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
             try:
@@ -1580,7 +1594,8 @@ class TalkinBot:
                   ("web_safari",bool(YOUTUBE_COOKIE_FILE)),
                   ("android",bool(YOUTUBE_COOKIE_FILE)),
                   ("tv",bool(YOUTUBE_COOKIE_FILE)),
-                  ("default",bool(YOUTUBE_COOKIE_FILE))]
+                  ("default",bool(YOUTUBE_COOKIE_FILE)),
+                  ("native_default",bool(YOUTUBE_COOKIE_FILE))]
         for client,use_cookies in attempts:
             result=try_client(client,use_cookies)
             if result:
@@ -1690,24 +1705,28 @@ class TalkinBot:
             if child.is_dir(): shutil.rmtree(child,ignore_errors=True)
         return info,mp3
 
-    def handle_music_command(self,room,text,requester):
+    def handle_music_command(self,room,text,requester,private_to=""):
         raw=text.strip()
         if not raw.lower().startswith(".sa "): return False
         query=raw[4:].strip()
-        if not query: self.send_room_text(room,"❌ اكتب: .sa اسم الأغنية"); return True
+        if not query: self.reply_text(room,"❌ اكتب: .sa اسم الأغنية",private_to); return True
         now=time.time(); last=self.music_last.get(requester,0)
-        if now-last<MUSIC_COOLDOWN: self.send_room_text(room,f"⏳ انتظر {int(MUSIC_COOLDOWN-(now-last))+1} ثانية."); return True
+        if now-last<MUSIC_COOLDOWN: self.reply_text(room,f"⏳ انتظر {int(MUSIC_COOLDOWN-(now-last))+1} ثانية.",private_to); return True
         self.music_last[requester]=now
         def worker():
             try:
                 public_base = _public_base_url()
                 if not public_base: raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
                 info,path=self._music_download(query); title=str(info.get("title") or query); artist=str(info.get("uploader") or info.get("channel") or "YouTube"); duration=int(info.get("duration") or 0); url=public_base+"/media/"+path.name
-                self.send_room_text(room,f"🎵 {title}\n🎤 {artist}\n👤 الطلب: {requester}"); self.send_room_media(room,url,"audio",duration)
+                if private_to:
+                    self.send_private_text(private_to,f"🎵 {title}\n🎤 {artist}\n👤 الطلب: {requester}")
+                    self.send_private_media(private_to,url,"audio",duration)
+                else:
+                    self.send_room_text(room,f"🎵 {title}\n🎤 {artist}\n👤 الطلب: {requester}"); self.send_room_media(room,url,"audio",duration)
             except Exception as e:
                 self.report_master_error("تشغيل الأغنية", e, room)
-                self.send_room_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.")
-        threading.Thread(target=worker,name="music-request",daemon=True).start(); self.send_room_text(room,"⏳ جاري البحث عن الأغنية وتحضير الصوت..."); return True
+                self.reply_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.", private_to)
+        threading.Thread(target=worker,name="music-request",daemon=True).start(); self.reply_text(room,"⏳ جاري البحث عن الأغنية وتحضير الصوت...",private_to); return True
 
     def send_gift_native(self, room: str, gift_id: str, target_username: str):
         """Legacy/native packet kept for diagnostics only. Gift command now sends the real asset image."""
@@ -1738,12 +1757,12 @@ class TalkinBot:
             self.log("[MEDIA] public URL check failed:",repr(exc))
             raise RuntimeError(f"الرابط العام للوسائط غير قابل للوصول: {exc}") from exc
 
-    def handle_gift_command(self, room: str, text: str, sender_name: str = ""):
+    def handle_gift_command(self, room: str, text: str, sender_name: str = "", private_to: str = ""):
         raw=text.strip(); m=re.match(r"^sa@([^@]+)@(.+)$",raw,re.I)
         if not m: return False
         gift_id=m.group(1).strip(); target=m.group(2).strip().lstrip("@"); item=GIFT_CATALOG.get(gift_id)
         if not item or not target:
-            self.send_room_text(room,"❌ الصيغة: sa@رقم_الهدية@اسم_المستخدم"); return True
+            self.reply_text(room,"❌ الصيغة: sa@رقم_الهدية@اسم_المستخدم",private_to); return True
         try:
             sender_name = str(sender_name or BOT_ID).strip()
             # Giant Chat point costs; owner/masters have unlimited points.
@@ -1751,7 +1770,7 @@ class TalkinBot:
             if not _is_master_name(sender_name):
                 balance=_get_points(sender_name)
                 if balance < cost:
-                    self.send_room_text(room,f"❌ رصيدك غير كافٍ. الهدية تحتاج {cost} نقطة، ورصيدك {balance}."); return True
+                    self.reply_text(room,f"❌ رصيدك غير كافٍ. الهدية تحتاج {cost} نقطة، ورصيدك {balance}.",private_to); return True
                 _add_points(sender_name,-cost); charged=True
             # Render and send the real gift card image, then send the gift text.
             # The image is hosted by the bot media server under /gifts/.
@@ -1765,11 +1784,15 @@ class TalkinBot:
             self._verify_public_media_url(gift_url, "image")
             if not gift_path.is_file() or gift_path.stat().st_size < 64:
                 raise RuntimeError(f"ملف صورة الهدية غير صالح: {gift_path}")
-            self.send_room_media(room, gift_url, "image")
-            self.send_room_text(room, f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
+            if private_to:
+                self.send_private_media(private_to, gift_url, "image")
+                self.send_private_text(private_to, f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
+            else:
+                self.send_room_media(room, gift_url, "image")
+                self.send_room_text(room, f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
         except Exception as e:
             self.report_master_error("إرسال صورة الهدية", e, room)
-            self.send_room_text(room, "❌ تعذر إرسال صورة الهدية. تم إرسال الخطأ الحقيقي للماستر.")
+            self.reply_text(room, "❌ تعذر إرسال صورة الهدية. تم إرسال الخطأ الحقيقي للماستر.", private_to)
         return True
 
     def _send_help(self, room=None, private_to=None, page=1):
@@ -1777,7 +1800,7 @@ class TalkinBot:
         if private_to: self.send_private_text(private_to,text)
         elif room: self.send_room_text(room,text)
 
-    def _handle_management_command(self, room, body, sender):
+    def _handle_management_command(self, room, body, sender, is_private=False):
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
@@ -1785,14 +1808,14 @@ class TalkinBot:
         if low in ("اوامر","الاوامر","help","مساعدة"):
             key=(str(room), _norm_user(sender))
             self.help_pages[key]=1
-            self._send_help(room=room, private_to=sender if room == BOT_MASTER else None, page=1)
+            self._send_help(room=room, private_to=sender if is_private else None, page=1)
             return True
         if low in ("ns","n","التالي","القائمة التالية","next"):
             key=(str(room), _norm_user(sender))
             page=int(self.help_pages.get(key,1) or 1)+1
             if page>4: page=1
             self.help_pages[key]=page
-            self._send_help(room=room, private_to=sender if room == BOT_MASTER else None, page=page)
+            self._send_help(room=room, private_to=sender if is_private else None, page=page)
             return True
         if low in ("نقاطي","points"):
             pts=_get_points(sender)
@@ -1805,13 +1828,15 @@ class TalkinBot:
                 except Exception: pass
             rows.sort(reverse=True)
             msg="🏆 المتصدرين:\n"+"\n".join(f"{i}. @{u} — {p}" for i,(p,u) in enumerate(rows[:10],1)) if rows else "🏆 لا توجد نقاط بعد."
-            self.send_room_text(room,msg)
+            if is_private: self.send_private_text(sender,msg)
+            else: self.send_room_text(room,msg)
             return True
         if low in ("المسترات", "masters"):
             masters=_master_list()
             names=[BOT_MASTER] + [x for x in masters if _norm_user(x)!=_norm_user(BOT_MASTER)]
             msg="👑 الماسترز:\n"+"\n".join(f"{i}. @{u}" for i,u in enumerate(names,1)) if names and any(names) else "👑 لا يوجد ماستر مسجل."
-            self.send_room_text(room,msg)
+            if is_private: self.send_private_text(sender,msg)
+            else: self.send_room_text(room,msg)
             return True
         if not _is_master_name(sender):
             return False
@@ -2079,7 +2104,13 @@ class TalkinBot:
                     if frm and media_url and self._handle_publish_media(self.room, frm, media_url):
                         return
                     if _is_master_name(frm) and body:
-                        if self._handle_management_command(self.room, body, frm):
+                        if self._handle_management_command(self.room, body, frm, is_private=True):
+                            return
+                    if body.strip().lower().startswith(".sa "):
+                        if self.handle_music_command(self.room, body, frm, private_to=frm):
+                            return
+                    if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
+                        if self.handle_gift_command(self.room, body, frm, private_to=frm):
                             return
                     if _is_master_name(frm) and body:
                         # Reuse room command handling with the command-context room.
