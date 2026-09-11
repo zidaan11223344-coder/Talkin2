@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 import subprocess
+import shutil
 import re
 import queue
 import mimetypes
@@ -984,6 +985,18 @@ class TalkinBot:
         if DEBUG:
             print(*args, flush=True)
 
+    def report_master_error(self, context: str, error, room: str = ""):
+        """Send the real diagnostic privately without exceeding Talkin's limit."""
+        detail = " ".join(str(error or "خطأ غير معروف").split())
+        location = f" | الغرفة: {room}" if room else ""
+        message = f"❌ خطأ {context}{location}\nالتفاصيل: {detail}"
+        self.log(f"[{context}]", repr(error))
+        if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
+            try:
+                self.send_private_text(BOT_MASTER, message)
+            except Exception as notify_error:
+                self.log("[MASTER-ERROR] failed:", repr(notify_error))
+
     def authenticate(self):
         body = encode_auth_request(BOT_ID, BOT_PWD)
         url = API_BASE_URL + "auth_new"
@@ -1652,7 +1665,9 @@ class TalkinBot:
                 if not public_base: raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
                 info,path=self._music_download(query); title=str(info.get("title") or query); artist=str(info.get("uploader") or info.get("channel") or "YouTube"); duration=int(info.get("duration") or 0); url=public_base+"/media/"+path.name
                 self.send_room_text(room,f"🎵 {title}\n🎤 {artist}\n👤 الطلب: {requester}"); self.send_room_media(room,url,"audio",duration)
-            except Exception as e: self.log("[MUSIC] failed:",repr(e)); self.send_room_text(room,"❌ تعذر تشغيل الأغنية: "+str(e)[:300])
+            except Exception as e:
+                self.report_master_error("تشغيل الأغنية", e, room)
+                self.send_room_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.")
         threading.Thread(target=worker,name="music-request",daemon=True).start(); self.send_room_text(room,"⏳ جاري البحث عن الأغنية وتحضير الصوت..."); return True
 
     def send_gift_native(self, room: str, gift_id: str, target_username: str):
@@ -1709,10 +1724,13 @@ class TalkinBot:
             gift_path = render_gift_card(gift_id, sender_name, target)
             gift_url = public_base + "/gifts/" + gift_path.name
             self._verify_public_media_url(gift_url, "image")
+            if not gift_path.is_file() or gift_path.stat().st_size < 64:
+                raise RuntimeError(f"ملف صورة الهدية غير صالح: {gift_path}")
             self.send_room_media(room, gift_url, "image")
             self.send_room_text(room, f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
         except Exception as e:
-            self.log("[GIFT] failed:",repr(e)); self.send_room_text(room,"❌ تعذر تجهيز الهدية: "+str(e)[:180])
+            self.report_master_error("إرسال صورة الهدية", e, room)
+            self.send_room_text(room, "❌ تعذر إرسال صورة الهدية. تم إرسال الخطأ الحقيقي للماستر.")
         return True
 
     def _send_help(self, room=None, private_to=None, page=1):
@@ -2140,8 +2158,14 @@ class TalkinBot:
             elif kind == "close":
                 raise ConnectionError(f"WebSocket closed during room-list bootstrap: {message}")
 
-        self.known_rooms.add(self.room)
-        self.join_room(self.room, force=True)
+        # Keep every room selected by the master. A reconnect restores the
+        # existing room set once; room-event handlers never leave/rejoin in a
+        # loop, which avoids the visible leave/join cycle.
+        rooms_to_restore = {str(r).strip() for r in self.known_rooms if str(r).strip()}
+        if self.room:
+            rooms_to_restore.add(str(self.room).strip())
+        for room in sorted(rooms_to_restore):
+            self.join_room(room, force=True)
 
     def run_once(self):
         self.authenticate()
