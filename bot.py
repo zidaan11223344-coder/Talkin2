@@ -1333,24 +1333,48 @@ class TalkinBot:
             self._save_monitored_users()
         return existed
 
-    def _monitor_report(self, event, event_type, username, room, event_id="", frm="", to=""):
-        """Report only an explicit server moderation event; never invent a ban code."""
+    def _monitor_report(self, event, event_type, username, room, event_id="", frm="", to="", role=""):
+        """Report meaningful account activity for a watched user across all rooms."""
         key = _norm_user(username)
         with self._monitor_lock:
             if key not in self.monitored_users:
                 return False
             display_name = self.monitored_users.get(key, username)
 
-        # Prevent duplicate reports when the same RoomEvent is delivered more than once.
-        dedupe = "|".join((str(event_id or ""), str(event_type or ""), key, str(room or "")))
-        if dedupe.strip("|") in self.monitor_seen_events:
-            return False
-        self.monitor_seen_events[dedupe] = time.time()
-        if len(self.monitor_seen_events) > 500:
-            cutoff = time.time() - 3600
-            self.monitor_seen_events = {k:v for k,v in self.monitor_seen_events.items() if v >= cutoff}
+        et = str(event_type or "").casefold().strip()
+        # Only meaningful account events are reported. Ordinary room events
+        # unrelated to the watched account are ignored.
+        ban_words = ("ban", "banned", "outcast", "blocked", "حظر", "محظور")
+        kick_words = ("kick", "kicked", "removed", "remove_user", "user_kicked", "user_removed", "طرد", "مطرود")
+        role_words = ("role", "promote", "demote", "admin", "moderator", "owner", "winner", "change_role", "رتبة", "مشرف", "ادمن", "اونر", "مالك", "owner_changed")
 
-        operation = "حظر" if "ban" in event_type.casefold() or "حظر" in event_type else "طرد"
+        if any(x in et for x in ban_words):
+            operation = "حظر"
+        elif any(x in et for x in kick_words):
+            operation = "طرد"
+        elif any(x in et for x in role_words):
+            operation = "تغيير صلاحية/رتبة"
+        elif et in ("user_joined", "you_joined", "user_rejoined", "joined"):
+            operation = "دخول"
+        elif et in ("user_left", "left", "user_exit", "user_exited"):
+            operation = "خروج"
+        else:
+            # If the event explicitly names the watched account, keep it as a
+            # generic monitored event rather than inventing an action.
+            if key not in {_norm_user(frm), _norm_user(to), _norm_user(username)}:
+                return False
+            operation = "حدث"
+
+        dedupe = "|".join((str(event_id or ""), et, operation, key, str(room or ""), str(frm or ""), str(to or ""), str(role or "")))
+        now = time.time()
+        with self._monitor_lock:
+            if dedupe in self.monitor_seen_events:
+                return False
+            self.monitor_seen_events[dedupe] = now
+            if len(self.monitor_seen_events) > 1000:
+                cutoff = now - 3600
+                self.monitor_seen_events = {k:v for k,v in self.monitor_seen_events.items() if v >= cutoff}
+
         code_text = str(event_id or "").strip() or "غير موجود في الحدث"
         lines = [
             "🚨 تنبيه مراقبة حساب",
@@ -1360,14 +1384,15 @@ class TalkinBot:
             f"🧩 نوع الحدث: {event_type or 'غير معروف'}",
             f"🔢 كود/معرّف الحدث: {code_text}",
         ]
+        if role:
+            lines.append(f"👑 الرتبة: {role}")
         if frm:
             lines.append(f"👮 المنفّذ/المرسل: @{frm}")
         if to:
             lines.append(f"🎯 الهدف: @{to}")
         if event.get(5) not in (None, ""):
             lines.append(f"📌 القيمة: {event.get(5)}")
-        self.send_private_text(BOT_MASTER, "\n".join(lines))
-        return True
+        return self.send_private_text(BOT_MASTER, "\n".join(lines))
 
     def _load_social_features(self):
         self.auto_replies_file = BASE_DIR / "auto_replies.json"
@@ -2794,18 +2819,16 @@ class TalkinBot:
         reconnected = str(event.get(24, "") or "").strip()
         # Do not log room message contents, usernames, room names, or media events.
 
-        # Monitor the watched account in ALL room events. Some Talkin server
-        # versions report a ban/kick as a generic user_left event, so checking
-        # only the event name can miss the moderation completely. We therefore
-        # report the first event concerning the watched account and include the
-        # real event id/type/fields so the master can identify what the server sent.
-        monitored_target = username or to
+        # Monitor the watched account in every room: entry, exit, kick, ban,
+        # and role/owner/admin changes. Join/leave are reported as join/exit,
+        # but are never mislabeled as a ban or kick.
+        monitored_target = username or to or frm
         if monitored_target:
             key = _norm_user(monitored_target)
             with self._monitor_lock:
                 watched = key in self.monitored_users
             if watched:
-                self._monitor_report(event, event_type, monitored_target, room, event_id, frm, to)
+                self._monitor_report(event, event_type, monitored_target, room, event_id, frm, to, role)
 
         # Keep the live membership state in sync.  The APK itself uses these
         # exact event names and RoomEvent fields.
