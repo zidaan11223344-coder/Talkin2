@@ -1600,7 +1600,7 @@ class TalkinBot:
                 meta=None
                 opts={"quiet":True,"no_warnings":True,"noplaylist":True,
                       "skip_download":True,
-                      "extractor_args":{"youtube":{"player_client":["web_embedded"]}}}
+                      "extractor_args":{}}
                 if YOUTUBE_COOKIE_FILE:
                     opts["cookiefile"] = YOUTUBE_COOKIE_FILE
                 with yt_dlp.YoutubeDL(opts) as ydl:
