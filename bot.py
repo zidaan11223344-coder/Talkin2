@@ -1586,7 +1586,7 @@ class TalkinBot:
                 return None
 
         info=source=None
-        attempts=[("web_embedded",True),("default",True),("native_default",True)]
+        attempts=[("web_embedded",False),("default",False),("native_default",False)]
         for client,use_cookies in attempts:
             result=try_client(client,use_cookies)
             if result:
