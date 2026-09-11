@@ -123,6 +123,7 @@ POINTS_FILE = DATA_DIR / "points.json"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 PUBLISHED_FILE = DATA_DIR / "published_posts.json"
 MONITORED_USERS_FILE = DATA_DIR / "monitored_users.json"
+MONITOR_DEBUG = os.getenv("MONITOR_DEBUG", "1") == "1"
 
 # Giant Chat gift costs/labels; images remain the local Giant assets.
 GIFT_COSTS = {"1":10,"2":20,"3":30,"4":50,"5":80,"6":150,"7":200,"8":500,"9":800,"10":1000,"11":1500,"12":3000,"13":5000,"14":8000}
@@ -1418,7 +1419,21 @@ class TalkinBot:
                 cutoff = now - 3600
                 self.monitor_seen_events = {k:v for k,v in self.monitor_seen_events.items() if v >= cutoff}
 
-        code_text = str(event_id or "").strip() or "غير موجود في الحدث"
+        # Prefer the RoomEvent id. If the protocol does not provide it, keep
+        # the other server identifiers visible instead of inventing a code.
+        code_candidates = [
+            ("event_id", event_id),
+            ("uid", event.get("_result_uid", "") if isinstance(event, dict) else ""),
+            ("handler_id", event.get("_handler_id", "") if isinstance(event, dict) else ""),
+            ("value", event.get("_result_value", "") if isinstance(event, dict) else ""),
+        ]
+        code_text = "غير موجود في الحدث"
+        for label, value in code_candidates:
+            if str(value or "").strip():
+                code_text = str(value).strip()
+                if label != "event_id":
+                    code_text = f"{label}={code_text}"
+                break
         lines = [
             "🚨 تنبيه مراقبة حساب",
             f"👤 الحساب: @{display_name}",
@@ -1772,12 +1787,24 @@ class TalkinBot:
     def _set_default_bot_status(self):
         self.set_bot_status(self.bot_status_text, 0)
 
-    def send_command_reply(self, room: str, sender: str, text: str):
-        """Send command responses to the room whenever a room context exists."""
+    def send_command_reply(self, room: str, sender: str, text: str, is_private: bool = False):
+        """Route command replies to the same context that received the command.
+
+        Private command -> private reply. Room command -> room reply.
+        Error/warning replies are always sent privately to avoid exposing
+        diagnostics in public rooms.
+        """
         room = str(room or "").strip()
+        sender = str(sender or "").strip()
+        text = str(text or "")
+        is_error = text.lstrip().startswith(("❌", "⚠️", "🚫")) or "فشل" in text[:80]
+        if sender and (is_private or is_error):
+            return self.send_private_text(sender, text)
         if room:
             return self.send_room_text(room, text)
-        return self.send_command_reply(room, sender, text)
+        if sender:
+            return self.send_private_text(sender, text)
+        return False
 
     def send_room_text(self, room: str, text: str):
         return self._send_text_packets("room_message", text, room=room)
@@ -2511,6 +2538,8 @@ class TalkinBot:
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
+        def _reply(msg):
+            return self.send_command_reply(room, sender, msg, is_private=is_private)
         # `اوامر` shows the organized menu only.
         if low in ("اوامر","الاوامر","help","مساعدة"):
             target = sender if is_private else None
@@ -2534,7 +2563,7 @@ class TalkinBot:
             return True
         if low in ("نقاطي","points"):
             pts=_get_points(sender)
-            self.send_command_reply(room, sender, "♾️ نقاطك: لا محدود" if pts is None else f"💰 نقاطك: {pts}")
+            _reply("♾️ نقاطك: لا محدود" if pts is None else f"💰 نقاطك: {pts}")
             return True
         if low in ("توب","top"):
             data=_points_data(); rows=[]
@@ -2543,14 +2572,14 @@ class TalkinBot:
                 except Exception: pass
             rows.sort(reverse=True)
             msg="🏆 المتصدرين:\n"+"\n".join(f"{i}. @{u} — {p}" for i,(p,u) in enumerate(rows[:10],1)) if rows else "🏆 لا توجد نقاط بعد."
-            if is_private: self.send_command_reply(room, sender, msg)
+            if is_private: _reply(msg)
             else: self.send_room_text(room,msg)
             return True
         if low in ("المسترات", "masters"):
             masters=_master_list()
             names=[BOT_MASTER] + [x for x in masters if _norm_user(x)!=_norm_user(BOT_MASTER)]
             msg="👑 الماسترز:\n"+"\n".join(f"{i}. @{u}" for i,u in enumerate(names,1)) if names and any(names) else "👑 لا يوجد ماستر مسجل."
-            if is_private: self.send_command_reply(room, sender, msg)
+            if is_private: _reply(msg)
             else: self.send_room_text(room,msg)
             return True
         if not _is_master_name(sender):
@@ -2560,19 +2589,19 @@ class TalkinBot:
         if m_monitor:
             target=m_monitor.group(1).lstrip("@").strip()
             added=self._monitor_add(target)
-            self.send_command_reply(room, sender, f"{'✅ تمت إضافة' if added else 'ℹ️ الحساب مراقَب بالفعل'} @{target} إلى المراقبة.\n📌 ستصلك رسالة خاصة عند ورود حدث طرد/حظر صريح من الخادم.")
+            _reply(f"{'✅ تمت إضافة' if added else 'ℹ️ الحساب مراقَب بالفعل'} @{target} إلى المراقبة.\n📌 ستصلك رسالة خاصة عند ورود أي حدث للحساب: دخول، خروج، طرد، حظر، رتبة، مشرف، ونر، أو حدث إداري.")
             return True
         m_unmonitor = re.match(r"^(?:إلغاء مراقبة|الغاء مراقبة|unmonitor)@\s*(@?[A-Za-z0-9_.-]+)$", text, re.I)
         if m_unmonitor:
             target=m_unmonitor.group(1).lstrip("@").strip()
             removed=self._monitor_remove(target)
-            self.send_command_reply(room, sender, f"{'✅ تم إلغاء مراقبة' if removed else 'ℹ️ الحساب غير موجود في المراقبة'} @{target}.")
+            _reply(f"{'✅ تم إلغاء مراقبة' if removed else 'ℹ️ الحساب غير موجود في المراقبة'} @{target}.")
             return True
         if low in ("المراقبة", "المراقبين", "المراقبون", "monitors", "monitor list"):
             with self._monitor_lock:
                 names=list(self.monitored_users.values())
             msg="👁️ الحسابات تحت المراقبة:\n" + ("\n".join(f"{i}. @{u}" for i,u in enumerate(sorted(names, key=_norm_user),1)) if names else "لا توجد حسابات مراقبة حالياً.")
-            self.send_command_reply(room, sender, msg)
+            _reply(msg)
             return True
         # Master commands are accepted from both private chat and rooms.
         # Room moderation acts on the room where the command was received.
@@ -2582,16 +2611,16 @@ class TalkinBot:
             try:
                 rooms, joined = self.join_all_rooms()
                 if rooms:
-                    self.send_command_reply(room, sender, f"✅ تم البحث عن الغرف ودخول {joined} غرفة من أصل {len(rooms)} غرفة مكتشفة.")
+                    _reply(f"✅ تم البحث عن الغرف ودخول {joined} غرفة من أصل {len(rooms)} غرفة مكتشفة.")
                 else:
-                    self.send_command_reply(room, sender, "⚠️ لم تصل قائمة الغرف من الخادم. حاول الأمر مرة أخرى بعد ثوانٍ.")
+                    _reply("⚠️ لم تصل قائمة الغرف من الخادم. حاول الأمر مرة أخرى بعد ثوانٍ.")
             except Exception as e:
-                self.send_command_reply(room, sender, f"❌ تعذر البحث عن الغرف: {e}")
+                _reply(f"❌ تعذر البحث عن الغرف: {e}")
             return True
         if low in ("غرفي", "my rooms", "rooms"):
             rooms=sorted(r for r in self.known_rooms if str(r).strip())
             msg="🏠 الغرف التي يتواجد بها البوت:\n" + ("\n".join(f"{i}. {r}" for i,r in enumerate(rooms,1)) if rooms else "لا توجد غرف مسجلة حالياً.")
-            self.send_command_reply(room, sender, msg)
+            _reply(msg)
             return True
         m_loc=re.match(r"^\.s\s+(.+)$", text.strip(), re.I)
         if m_loc:
@@ -2601,135 +2630,135 @@ class TalkinBot:
                 if any(_norm_user(u)==_norm_user(target) for u in users):
                     found.append(r)
             if found:
-                self.send_command_reply(room, sender, "📍 @%s موجود في:\n%s" % (target, "\n".join(f"{i}. {r}" for i,r in enumerate(sorted(set(found)),1))))
+                _reply("📍 @%s موجود في:\n%s" % (target, "\n".join(f"{i}. {r}" for i,r in enumerate(sorted(set(found)),1))))
             else:
-                self.send_command_reply(room, sender, f"❌ لم أجد @{target} في الغرف التي يتابعها البوت حالياً.")
+                _reply(f"❌ لم أجد @{target} في الغرف التي يتابعها البوت حالياً.")
             return True
         # Add/remove master. Only the owner from BOT_MASTER may alter master list.
         if low.startswith("mas@"):
             if _norm_user(sender) != _norm_user(BOT_MASTER):
-                self.send_command_reply(room, sender, "🚫 إضافة الماسترز متاحة لصاحب البوت فقط."); return True
+                _reply("🚫 إضافة الماسترز متاحة لصاحب البوت فقط."); return True
             target=text[4:].strip().lstrip("@");
-            if not target: self.send_command_reply(room, sender, "❌ الصيغة: mas@اسم المستخدم"); return True
+            if not target: _reply("❌ الصيغة: mas@اسم المستخدم"); return True
             masters=_master_list()
             if not any(_norm_user(x)==_norm_user(target) for x in masters): masters.append(target); _save_local_json(MASTERS_FILE,masters)
-            self.send_command_reply(room, sender, f"✅ تم إضافة @{target} كماستر متحكم بالبوت."); return True
+            _reply(f"✅ تم إضافة @{target} كماستر متحكم بالبوت."); return True
         if low.startswith("umas@") or low.startswith("umas "):
             if _norm_user(sender) != _norm_user(BOT_MASTER):
-                self.send_command_reply(room, sender, "🚫 إزالة الماسترز متاحة لصاحب البوت فقط."); return True
+                _reply("🚫 إزالة الماسترز متاحة لصاحب البوت فقط."); return True
             target=text[5:].strip().lstrip("@"); masters=[x for x in _master_list() if _norm_user(x)!=_norm_user(target)]; _save_local_json(MASTERS_FILE,masters)
-            self.send_command_reply(room, sender, f"✅ تم إزالة @{target} من الماسترز."); return True
+            _reply(f"✅ تم إزالة @{target} من الماسترز."); return True
         if low.startswith("sb@"):
             if not _is_master_name(sender):
-                self.send_command_reply(room, sender, "🚫 أمر النقاط للماستر فقط."); return True
+                _reply("🚫 أمر النقاط للماستر فقط."); return True
             m=re.match(r"^sb@([^@]+)@(-?\d+)$",text,re.I)
-            if not m: self.send_command_reply(room, sender, "❌ الصيغة: sb@اسم المستخدم@عدد النقاط"); return True
+            if not m: _reply("❌ الصيغة: sb@اسم المستخدم@عدد النقاط"); return True
             target,amount=m.group(1).strip(),int(m.group(2)); new=_add_points(target,amount)
             action = "تحويل" if amount >= 0 else "خصم"
-            self.send_command_reply(room, sender, f"✅ تم {action} نقاط @{target} بمقدار {abs(amount)}. الرصيد: {new}")
+            _reply(f"✅ تم {action} نقاط @{target} بمقدار {abs(amount)}. الرصيد: {new}")
             if _norm_user(target) != _norm_user(sender):
                 self.send_private_text(target, f"💰 إشعار النقاط: تم {action} {abs(amount)} نقطة لحسابك بواسطة @{sender}. رصيدك الحالي: {new}")
             return True
         if low.startswith("s@"):
             target=text[2:].strip().lstrip("@");
-            if not target: self.send_command_reply(room, sender, "❌ الصيغة: s@اسم المستخدم"); return True
+            if not target: _reply("❌ الصيغة: s@اسم المستخدم"); return True
             data=_verified_data(); data[_norm_user(target)]={"username":target,"verified_by":sender,"created_at":int(time.time())}; _save_local_json(VERIFIED_FILE,data)
-            self.send_command_reply(room, sender, f"✅ تم توثيق @{target} لاستخدام البوت.")
+            _reply(f"✅ تم توثيق @{target} لاستخدام البوت.")
             if _norm_user(target) != _norm_user(sender):
                 self.send_private_text(target, f"✅ تم توثيق حسابك لاستخدام البوت بواسطة @{sender}.")
             return True
         if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("uns@"): 
             prefix="uns@" if low.startswith("uns@") else text.split("@",1)[0]+"@"
             target=text[len(prefix):].strip().lstrip("@"); data=_verified_data(); data.pop(_norm_user(target),None); _save_local_json(VERIFIED_FILE,data)
-            self.send_command_reply(room, sender, f"✅ تم إزالة توثيق @{target}."); return True
+            _reply(f"✅ تم إزالة توثيق @{target}."); return True
         if low.startswith("vip@"):
             target=text[4:].strip().lstrip("@");
-            if not target: self.send_command_reply(room, sender, "❌ الصيغة: Vip@اسم المستخدم"); return True
+            if not target: _reply("❌ الصيغة: Vip@اسم المستخدم"); return True
             data=_vip_data(); data[_norm_user(target)]={"username":target,"granted_by":sender,"created_at":int(time.time())}; _save_local_json(VIP_FILE,data)
-            self.send_command_reply(room, sender, f"✅ تم توثيق VIP @{target}."); return True
+            _reply(f"✅ تم توثيق VIP @{target}."); return True
         if low.startswith("unvip@") or low.startswith("un vip@"):
             target=text[text.casefold().find("vip@")+4:].strip().lstrip("@"); data=_vip_data(); data.pop(_norm_user(target),None); _save_local_json(VIP_FILE,data)
-            self.send_command_reply(room, sender, f"✅ تم إزالة VIP @{target}."); return True
+            _reply(f"✅ تم إزالة VIP @{target}."); return True
         # Room/admin commands accepted in both room and private master chat.
         m=re.match(r"^(k@|kick\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
             if not room:
-                self.send_command_reply(room, sender, "❌ لا توجد غرفة لتنفيذ الطرد فيها."); return True
+                _reply("❌ لا توجد غرفة لتنفيذ الطرد فيها."); return True
             ok, detail = self.send_admin(room,target,"kick")
             if ok:
-                self.send_command_reply(room, sender, f"✅ تم طرد @{target} فعليًا من الغرفة {room}.")
+                _reply(f"✅ تم طرد @{target} فعليًا من الغرفة {room}.")
             else:
-                self.send_command_reply(room, sender, f"❌ فشل تنفيذ الطرد الفعلي: {detail}")
+                _reply(f"❌ فشل تنفيذ الطرد الفعلي: {detail}")
                 self.send_private_text(BOT_MASTER, f"🛠️ تشخيص الطرد\nالأمر: k@{target}\nالغرفة: {room}\nالنتيجة: {detail}")
             return True
         m=re.match(r"^(b@|ban\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
             if not room:
-                self.send_command_reply(room, sender, "❌ لا توجد غرفة لتنفيذ الحظر فيها."); return True
+                _reply("❌ لا توجد غرفة لتنفيذ الحظر فيها."); return True
             ok, detail = self.send_admin(room,target,"ban")
             if ok:
-                self.send_command_reply(room, sender, f"✅ تم حظر @{target} فعليًا من الغرفة {room}.")
+                _reply(f"✅ تم حظر @{target} فعليًا من الغرفة {room}.")
             else:
-                self.send_command_reply(room, sender, f"❌ فشل تنفيذ الحظر الفعلي: {detail}")
+                _reply(f"❌ فشل تنفيذ الحظر الفعلي: {detail}")
                 self.send_private_text(BOT_MASTER, f"🛠️ تشخيص الحظر\nالأمر: b@{target}\nالغرفة: {room}\nالنتيجة: {detail}")
             return True
         m=re.match(r"^(u@|ub@|unban\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
             if not room:
-                self.send_command_reply(room, sender, "❌ لا توجد غرفة لتنفيذ فك الحظر فيها."); return True
+                _reply("❌ لا توجد غرفة لتنفيذ فك الحظر فيها."); return True
             ok, detail = self.send_admin(room,target,"unban")
             if ok:
-                self.send_command_reply(room, sender, f"✅ تم فك الحظر فعليًا عن @{target} في الغرفة {room}.")
+                _reply(f"✅ تم فك الحظر فعليًا عن @{target} في الغرفة {room}.")
             else:
-                self.send_command_reply(room, sender, f"❌ فشل فك الحظر الفعلي: {detail}")
+                _reply(f"❌ فشل فك الحظر الفعلي: {detail}")
                 self.send_private_text(BOT_MASTER, f"🛠️ تشخيص فك الحظر\nالأمر: ub@{target}\nالغرفة: {room}\nالنتيجة: {detail}")
             return True
         m=re.match(r"^(a@|admin\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
             if not room:
-                self.send_command_reply(room, sender, "❌ لا توجد غرفة لتعيين المشرف فيها."); return True
+                _reply("❌ لا توجد غرفة لتعيين المشرف فيها."); return True
             self.send_admin(room,target,"admin")
-            self.send_command_reply(room, sender, f"✅ تم تعيين @{target} مشرفًا في الغرفة {room}."); return True
+            _reply(f"✅ تم تعيين @{target} مشرفًا في الغرفة {room}."); return True
         m=re.match(r"^(o@|owner\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
             if not room:
-                self.send_command_reply(room, sender, "❌ لا توجد غرفة لتعيين المالك فيها."); return True
+                _reply("❌ لا توجد غرفة لتعيين المالك فيها."); return True
             self.send_admin(room,target,"owner")
-            self.send_command_reply(room, sender, f"✅ تم تعيين @{target} مالكًا في الغرفة {room}."); return True
+            _reply(f"✅ تم تعيين @{target} مالكًا في الغرفة {room}."); return True
         if low.startswith(("دخول ","join ","ادخل ","enter ")):
             parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
             if not target:
-                self.send_command_reply(room, sender, "❌ الصيغة: دخول اسم_الغرفة"); return True
+                _reply("❌ الصيغة: دخول اسم_الغرفة"); return True
             self.join_room(target)
-            self.send_command_reply(room, sender, f"✅ دخلت الغرفة: {target} | الغرف الحالية: {len(self.known_rooms)}"); return True
+            _reply(f"✅ دخلت الغرفة: {target} | الغرف الحالية: {len(self.known_rooms)}"); return True
         if low in ("خروج","leave","exit") or low.startswith(("خروج ","leave ","exit ")):
             parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
             if target:
                 ok=self.leave_room(target)
-                self.send_command_reply(room, sender, f"{'✅ خرجت من الغرفة' if ok else '❌ تعذر الخروج'}: {target}")
+                _reply(f"{'✅ خرجت من الغرفة' if ok else '❌ تعذر الخروج'}: {target}")
             else:
                 rooms=self.leave_all_rooms()
-                self.send_command_reply(room, sender, f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
+                _reply(f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
             return True
         if low.startswith("invmsg") or low.startswith("رسالةدعوة"):
             parts=text.split(None,1); template=parts[1].strip() if len(parts)==2 else "{sender} يدعوك للغرفة {room}"
             self.invite_message_template=template
-            self.send_command_reply(room, sender, f"✅ تم تغيير نص الدعوة إلى: {template}"); return True
+            _reply(f"✅ تم تغيير نص الدعوة إلى: {template}"); return True
         if low == "inv" or low.startswith("inv ") or low in ("دعوات","invite") or low.startswith(("دعوات ","invite ")):
             parts=text.split(None,1); target_room=parts[1].strip() if len(parts)==2 else room
             if not target_room:
-                self.send_command_reply(room, sender, "❌ استخدم: inv اسم_الغرفة"); return True
+                _reply("❌ استخدم: inv اسم_الغرفة"); return True
             self.request_occupants(target_room)
-            self.send_command_reply(room, sender, f"📨 بدأت دعوات المستخدمين في: {target_room}"); return True
+            _reply(f"📨 بدأت دعوات المستخدمين في: {target_room}"); return True
         if low.startswith("say ") or low.startswith("قل "):
             parts=text.split(None,1); msg=parts[1].strip() if len(parts)==2 else ""
             if room and msg: self.send_room_text(room,msg)
-            else: self.send_command_reply(room, sender, "❌ استخدم say نص داخل غرفة.")
+            else: _reply("❌ استخدم say نص داخل غرفة.")
             return True
         # Auto replies: +sr@وصف@الرد / Sr@on / Sr@off
         m_sr = re.match(r"^\+sr@([^@]+)@(.+)$", text.strip(), re.I)
@@ -2739,12 +2768,12 @@ class TalkinBot:
                 self.auto_replies[trigger.casefold()] = {"trigger": trigger, "reply": reply}
                 self.auto_replies_enabled = True
                 self._save_social_features()
-                self.send_command_reply(room, sender, f"✅ تمت إضافة الرد التلقائي\n📌 الوصف: {trigger}\n💬 الرد: {reply}")
+                _reply(f"✅ تمت إضافة الرد التلقائي\n📌 الوصف: {trigger}\n💬 الرد: {reply}")
             return True
         if re.match(r"^sr@(?:on|off)$", text.strip(), re.I) and _is_master_name(sender):
             self.auto_replies_enabled = text.strip().lower() == "sr@on"
             self._save_social_features()
-            self.send_command_reply(room, sender, "✅ تم تشغيل الردود التلقائية." if self.auto_replies_enabled else "⛔ تم إيقاف الردود التلقائية.")
+            _reply("✅ تم تشغيل الردود التلقائية." if self.auto_replies_enabled else "⛔ تم إيقاف الردود التلقائية.")
             return True
         # Custom welcome: swc+@اسم@الترحيب and on/off.
         m_sw = re.match(r"^(?:\+swc|swc\+)@([^@]+)@(.+)$", text.strip(), re.I)
@@ -2754,25 +2783,25 @@ class TalkinBot:
                 self.custom_welcomes[_norm_user(user)] = {"username": user, "message": welcome}
                 self.custom_welcome_enabled = True
                 self._save_social_features()
-                self.send_command_reply(room, sender, f"✅ تم حفظ الترحيب المخصص لـ @{user}.\n💬 {welcome}")
+                _reply(f"✅ تم حفظ الترحيب المخصص لـ @{user}.\n💬 {welcome}")
             return True
         # Delete a per-user custom welcome.
         m_del_sw = re.match(r"^(?:-swc@|del\s+swc@|حذف\s+الترحيب@|حذف\s+ترحيب@)(.+)$", text.strip(), re.I)
         if m_del_sw and _is_master_name(sender):
             user=m_del_sw.group(1).strip().lstrip("@")
             if not user:
-                self.send_command_reply(room, sender, "❌ الصيغة: -swc@اسم الشخص")
+                _reply("❌ الصيغة: -swc@اسم الشخص")
                 return True
             key=_norm_user(user)
             existed=key in self.custom_welcomes
             self.custom_welcomes.pop(key, None)
             self._save_social_features()
-            self.send_command_reply(room, sender, f"{'✅ تم حذف الترحيب المخصص لـ @'+user+'.' if existed else '⚠️ لا يوجد ترحيب مخصص محفوظ لـ @'+user+'.'}")
+            _reply(f"{'✅ تم حذف الترحيب المخصص لـ @'+user+'.' if existed else '⚠️ لا يوجد ترحيب مخصص محفوظ لـ @'+user+'.'}")
             return True
         if re.match(r"^swc@(?:on|off)$", text.strip(), re.I) and _is_master_name(sender):
             self.custom_welcome_enabled = text.strip().lower() == "swc@on"
             self._save_social_features()
-            self.send_command_reply(room, sender, "✅ تم تشغيل الترحيب المخصص." if self.custom_welcome_enabled else "⛔ تم إيقاف الترحيب المخصص.")
+            _reply("✅ تم تشغيل الترحيب المخصص." if self.custom_welcome_enabled else "⛔ تم إيقاف الترحيب المخصص.")
             return True
         # Publishing: master says `انشر` or `انشر@description`, then sends an image.
         # Accept both forms strictly and preserve the description exactly.
@@ -2797,7 +2826,7 @@ class TalkinBot:
             return True
         return False
 
-    def _handle_publish_media(self, room, sender, media_url, description=""):
+    def _handle_publish_media(self, room, sender, media_url, description="", private_to=None):
         if not media_url: return False
         # Accept the pending image from ANY room (or private chat).
         key=_norm_user(sender); pending=self.publish_pending.get(key)
@@ -2806,7 +2835,10 @@ class TalkinBot:
             pending_room = str(pending.get("source_room") or room or self.room or "")
             self.publish_pending.pop(key,None)
             if pending_room:
-                self.send_room_text(pending_room, "⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد.")
+                if private_to:
+                    self.send_private_text(private_to, "⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد.")
+                else:
+                    self.send_room_text(pending_room, "⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد.")
             return True
         desc=pending.get("description",description or "")
         source_room=str(pending.get("source_room") or room or "")
@@ -2843,9 +2875,9 @@ class TalkinBot:
                 errors.append((target,str(e)))
                 self.log("[PUBLISH] failed",target,repr(e))
         # Never announce a successful publish in the room; tell the master in PM.
-        self.send_command_reply(room, sender, f"✅ تم نشر الصورة في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else ""))
+        self.send_command_reply(source_room, sender, f"✅ تم نشر الصورة في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else ""), is_private=bool(private_to))
         if errors:
-            self.send_command_reply(room, sender, "❌ أخطاء النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors))
+            self.send_command_reply(source_room, sender, "❌ أخطاء النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors), is_private=bool(private_to))
         return True
 
     def handle_room_event(self, result):
@@ -2858,6 +2890,11 @@ class TalkinBot:
         if room and room != BOT_MASTER:
             self.known_rooms.add(room)
         event_id = str(event.get(41, ""))
+        # Carry ResultMessage identifiers into the nested event for the monitor.
+        if isinstance(event, dict):
+            event["_result_uid"] = str(result.get("uid", "") or "")
+            event["_handler_id"] = str(result.get("handler_id", "") or "")
+            event["_result_value"] = str(result.get("value", "") or "")
         username = str(event.get(22, "") or "").strip()
         role = str(event.get(8, "") or "").strip().lower()
         count = str(event.get(23, "") or "").strip()
@@ -3018,12 +3055,34 @@ class TalkinBot:
                 self._remember_room_list(result.get("rooms"))
             if "room_event" in result:
                 self.handle_room_event(result)
+                try:
+                    ev_text = repr(result.get("room_event"))
+                    with self._monitor_lock:
+                        watched = list(self.monitored_users.values())
+                    if MONITOR_DEBUG and any(_norm_user(u) and _norm_user(u) in ev_text.casefold() for u in watched):
+                        self.log("[MONITOR DEBUG][ROOM_EVENT]", ev_text[:4000])
+                        self.log("[MONITOR DEBUG][RESULT]", {k: result.get(k) for k in ("handler_id", "type", "uid", "value", "int_value")})
+                except Exception as e:
+                    self.log("[MONITOR DEBUG] room_event inspect failed:", repr(e))
             if result.get("users") or result.get("room_admin"):
                 self.process_occupants_for_invite(result)
             if result.get("stream_event"):
                 self.log("[STREAM]", result["stream_event"])
             if result.get("room_admin"):
-                self.log("[ROOM_ADMIN]", result["room_admin"])
+                ra = result["room_admin"]
+                self.log("[ROOM_ADMIN]", ra)
+                # Last-resort monitor diagnostics: some moderation actions are
+                # delivered as RoomAdmin rather than RoomEvent. Log the exact
+                # decoded payload when a watched username is present.
+                try:
+                    ra_text = repr(ra)
+                    with self._monitor_lock:
+                        watched = list(self.monitored_users.values())
+                    if MONITOR_DEBUG and any(_norm_user(u) and _norm_user(u) in ra_text.casefold() for u in watched):
+                        self.log("[MONITOR DEBUG][ROOM_ADMIN]", ra_text[:4000])
+                        self.log("[MONITOR DEBUG][RESULT]", {k: result.get(k) for k in ("handler_id", "type", "uid", "value", "int_value")})
+                except Exception as e:
+                    self.log("[MONITOR DEBUG] room_admin inspect failed:", repr(e))
             if result.get("chat_message"):
                 # Private master commands are also accepted as ChatMessage frames.
                 cm = result["chat_message"]
@@ -3031,7 +3090,7 @@ class TalkinBot:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
                     media_url = str(cm.get(6, "") or "").strip()
-                    if frm and media_url and self._handle_publish_media(self.room, frm, media_url):
+                    if frm and media_url and self._handle_publish_media(self.room, frm, media_url, private_to=frm):
                         return
                     if _is_master_name(frm) and body:
                         if self._handle_management_command(self.room, body, frm, is_private=True):
@@ -3042,61 +3101,8 @@ class TalkinBot:
                     if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
                         if self.handle_gift_command(self.room, body, frm, private_to=frm):
                             return
-                    if _is_master_name(frm) and body:
-                        # Reuse room command handling with the command-context room.
-                        ctx_room = self.room
-                        parts = body.split(None, 1)
-                        cmd = parts[0].lower() if parts else ""
-                        arg = parts[1].strip() if len(parts) == 2 else ""
-                        if body.strip().lower() in ("دخول الكل", "دخول كل الغرف", "ادخل الكل", "ادخل كل الغرف", "join all", "enter all"):
-                            rooms, joined = self.join_all_rooms()
-                            self.send_private_text(frm, f"✅ تم البحث عن الغرف ودخول {joined} غرفة من أصل {len(rooms)} غرفة مكتشفة." if rooms else "⚠️ لم تصل قائمة الغرف من الخادم. حاول مرة أخرى.")
-                        elif body.strip().lower() in ("غرفي", "my rooms", "rooms"):
-                            rooms=sorted(r for r in self.known_rooms if str(r).strip())
-                            self.send_private_text(frm, "🏠 غرف البوت:\n" + ("\n".join(f"{i}. {r}" for i,r in enumerate(rooms,1)) if rooms else "لا توجد غرف مسجلة حالياً."))
-                        elif re.match(r"^\.s\s+.+$", body.strip(), re.I):
-                            target=re.sub(r"^\.s\s+", "", body.strip(), flags=re.I).strip().lstrip("@")
-                            found=sorted({r for r,users in self.room_users.items() if any(_norm_user(u)==_norm_user(target) for u in users)})
-                            self.send_private_text(frm, f"📍 @{target} موجود في:\n" + ("\n".join(f"{i}. {r}" for i,r in enumerate(found,1)) if found else "❌ لم أجده في الغرف التي يتابعها البوت حالياً."))
-                        elif cmd in ("inv", "دعوات", "invite"):
-                            target_room = arg if arg else ctx_room
-                            self.request_occupants(target_room)
-                        elif cmd in ("دخول", "join", "ادخل", "enter") and arg:
-                            target_room = arg
-                            self.join_room(target_room)
-                            self.send_private_text(BOT_MASTER, f"✅ دخلت الغرفة: {target_room} | الغرف الحالية: {len(self.known_rooms)}")
-                        elif cmd in ("خروج", "leave", "exit"):
-                            if arg:
-                                ok = self.leave_room(arg)
-                                self.send_private_text(BOT_MASTER, f"{'✅ خرجت من الغرفة' if ok else '❌ تعذر الخروج'}: {arg}")
-                            else:
-                                rooms = self.leave_all_rooms()
-                                self.send_private_text(BOT_MASTER, f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
-                        elif cmd in ("invmsg", "رسالةدعوة") and arg:
-                            self.invite_message_template = arg
-                            self.send_private_text(frm, f"✅ تم تغيير رسالة الدعوة إلى: {arg}")
-                        elif cmd in ("a@", "admin") and arg:
-                            target = arg.lstrip("@").strip()
-                            self.send_admin(ctx_room, target, "admin")
-                            self.send_private_text(frm, f"✅ تم تعيين @{target} مشرفًا في الغرفة {ctx_room}.")
-                        elif cmd in ("o@", "owner") and arg:
-                            target = arg.lstrip("@").strip()
-                            self.send_admin(ctx_room, target, "owner")
-                            self.send_private_text(frm, f"✅ تم تعيين @{target} مالكًا في الغرفة {ctx_room}.")
-                        elif cmd in ("k@", "kick") and arg:
-                            target = arg.lstrip("@").strip()
-                            self.send_admin(ctx_room, target, "kick")
-                            self.send_private_text(frm, f"✅ تم إرسال أمر الطرد إلى @{target} في الغرفة {ctx_room}.")
-                        elif cmd in ("b@", "ban") and arg:
-                            target = arg.lstrip("@").strip()
-                            self.send_admin(ctx_room, target, "ban")
-                            self.send_private_text(frm, f"✅ تم إرسال أمر الحظر إلى @{target} في الغرفة {ctx_room}.")
-                        elif cmd in ("u@", "unban") and arg:
-                            target = arg.lstrip("@").strip()
-                            self.send_admin(ctx_room, target, "member")
-                            self.send_private_text(frm, f"✅ تم إلغاء حظر @{target} في الغرفة {ctx_room}.")
-                        elif cmd in ("say", "قل") and arg:
-                            self.send_room_text(ctx_room, arg)
+                    # All master/private management commands are handled once above.
+                    # This prevents private commands from being duplicated or answered in a room.
                 except Exception as e:
                     self.log("[CHAT_MESSAGE] private command handling failed:", repr(e))
         except Exception as e:
