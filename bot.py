@@ -1567,7 +1567,6 @@ class TalkinBot:
             if YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
             try:
-                opts.pop("extractor_args", None)
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info=ydl.extract_info(target_query,download=True)
                     if info and info.get("entries"):
@@ -1608,7 +1607,7 @@ class TalkinBot:
                     if re.match(r"^https?://",query,re.I):
                         meta=ydl.extract_info(query,download=False)
                     else:
-                        meta=None
+                        meta=ydl.extract_info("ytsearch1:"+query,download=False)
                         if meta and meta.get("entries"):
                             meta=next((x for x in meta["entries"] if x),None)
                 video_id=str((meta or {}).get("id") or "").strip()
