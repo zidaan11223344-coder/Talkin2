@@ -971,6 +971,8 @@ class TalkinBot:
         self._last_join_sent = {}
         self._rejoin_attempts = defaultdict(int)
         self._last_reconnect = 0.0
+        self._pending_reconnect_reason = ""
+        self._had_connection = False
         self.banned_words = set(BANNED_WORDS)
         self.db = DatabaseBridge(self.log)
         self.db.sign_in()
@@ -1475,19 +1477,20 @@ class TalkinBot:
 
 
     def send_room_media(self, room: str, media_url: str, media_type: str, duration: int = 0):
-        """Exact media shape observed in TalkinChat Android RoomActivity.
+        """Send room media using Query's normal room/url fields.
 
-        image: action=room_message, type=image, password=<room>, url=<url>
-        audio: action=room_message, type=audio, password=<room>, url=<url>,
-               room=<duration seconds>
+        Text messages already prove that Query field ``room`` (field 6) is
+        the room identifier. Media uses the same field; ``length`` (field 3)
+        carries the optional audio duration. Putting the room in ``password``
+        made Talkin accept the packet but discard the image/audio payload.
         """
         if media_type == "audio":
             return self.send_query(encode_query(
-                "room_message", type_="audio", password=room,
-                url=media_url, room=str(max(0, int(duration or 0)))
+                "room_message", type_="audio",
+                length=str(max(0, int(duration or 0))), room=room, url=media_url
             ))
         return self.send_query(encode_query(
-            "room_message", type_=media_type, password=room, url=media_url
+            "room_message", type_=media_type, room=room, url=media_url
         ))
 
     def _music_download(self,query):
@@ -2210,6 +2213,14 @@ class TalkinBot:
                         self.log("[WS] CONNECTED:", url)
                         self.log("[WS] custom headers:", [x.split(":",1)[0] + ": <redacted>" if x.lower().startswith(("username:", "password:")) else x for x in header_lines])
                         self.bootstrap_after_connect()
+                        if self._pending_reconnect_reason and BOT_MASTER:
+                            reason = self._pending_reconnect_reason
+                            self._pending_reconnect_reason = ""
+                            self.send_private_text(BOT_MASTER, f"⚠️ انقطع الاتصال ثم عاد. السبب: {reason}")
+                            self.send_private_text(BOT_MASTER, "✅ تم الدخول والعودة للغرفة بنجاح.")
+                        elif not self._had_connection and BOT_MASTER:
+                            self.send_private_text(BOT_MASTER, "✅ تم الدخول للغرفة والاتصال بنجاح.")
+                        self._had_connection = True
 
                         while not self.stop_event.is_set():
                             try:
@@ -2251,6 +2262,8 @@ class TalkinBot:
                 self.run_once()
             except Exception as e:
                 self.last_error = str(e)
+                if self._had_connection:
+                    self._pending_reconnect_reason = " ".join(str(e).split())[:1000]
                 print("[BOT] error:", repr(e), flush=True)
             if not self.stop_event.is_set():
                 print("[BOT] reconnecting in 10s...", flush=True)
