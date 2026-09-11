@@ -819,106 +819,47 @@ def _command_menu():
     return (
         "📚 قوائم أوامر البوت\n"
         "━━━━━━━━━━━━\n"
-        "1. help1 — الإدارة\n"
-        "2. help2 — الموسيقى والتفاعلات\n"
-        "3. help3 — الألعاب\n"
-        "4. help4 — الهدايا والنشر\n"
-        "5. help5 — النقاط\n"
-        "6. help6 — الغرف\n"
-        "7. help7 — الماستر والفلتر\n"
+        "help1 — الإدارة\n"
+        "help2 — الموسيقى والتفاعلات\n"
+        "help3 — الألعاب\n"
+        "help4 — الهدايا والنشر\n"
+        "help5 — النقاط\n"
+        "help6 — الغرف\n"
+        "help7 — الماستر والفلتر\n"
         "━━━━━━━━━━━━\n"
         "اكتب اسم القائمة مثل: help1"
     )
 
 
-# Help pages are deliberately kept at <= 300 Unicode characters each.
-# Unlike normal bot results, only these command-menu pages are split.
-HELP_PAGES = {
-    1: (
-        "📋 أوامر الإدارة\n━━━━━━━━━━━━\n"
-        "1. k@اسم — طرد\n"
-        "2. b@اسم — حظر\n"
-        "3. ub@اسم — فك الحظر\n"
-        "4. m@اسم 10 — كتم\n"
-        "5. um@اسم — إلغاء الكتم\n"
-        "6. المكتومين — عرض المكتومين\n"
-        "7. اشراف ثم اسم — ترقية مشرف\n"
-        "8. عضو ثم اسم — إعادة عضو"
-    ),
-    2: (
-        "🎵 أوامر الموسيقى والتفاعلات\n━━━━━━━━━━━━\n"
-        "1. تشغيل اسم الأغنية — تشغيل\n"
-        "2. تيك اسم الأغنية — TikTok\n"
-        "3. مشاركة — رابط الأغنية\n"
-        "4. مشاركة اسم_الشخص — إرسال خاص\n"
-        "5. تخطي — تخطي الأغنية\n"
-        "6. ايقاف — إيقاف الأغنية\n"
-        "7. lk@CODE — إعجاب\n"
-        "8. lv@CODE — أحببتها\n"
-        "9. dl@CODE — عدم إعجاب"
-    ),
-    3: (
-        "🎮 أوامر الألعاب\n━━━━━━━━━━━━\n"
-        "1. العاب — قائمة الألعاب\n"
-        "2. مليون — فرصة مليون\n"
-        "3. حرب — حرب جماعية\n"
-        "4. عمل — لعبة العمل\n"
-        "5. كف — لعبة الكف\n"
-        "6. قتال — لعبة القتال\n"
-        "7. سباق — لعبة السباق\n"
-        "8. حظ — جائزة عشوائية\n"
-        "9. نرد — رمي النرد\n"
-        "10. تخمين — تخمين رقم"
-    ),
-    4: (
-        "🎁 أوامر الهدايا والنشر\n━━━━━━━━━━━━\n"
-        "1. gv — عرض الهدايا\n"
-        "2. gv@رقم@اسم — إرسال هدية\n"
-        "3. نشر نص — نشر النص\n"
-        "4. نشر@ — نشر الصورة التالية\n"
-        "5. نشرصورة رابط — نشر صورة\n"
-        "6. say نص — إرسال نص\n"
-        "7. انشر — نشر المحتوى"
-    ),
-    5: (
-        "💰 أوامر النقاط\n━━━━━━━━━━━━\n"
-        "1. نقاطي — عرض نقاطك\n"
-        "2. توب — المتصدرين\n"
-        "3. sb@اسم@عدد — تعديل النقاط\n"
-        "4. تحويل النقاط — تحويل النقاط\n"
-        "5. رصيدي — عرض الرصيد"
-    ),
-    6: (
-        "🚪 أوامر الغرف\n━━━━━━━━━━━━\n"
-        "1. دخول اسم_الغرفة — دخول\n"
-        "2. خروج [اسم_الغرفة] — خروج\n"
-        "3. inv — دعوة المستخدمين\n"
-        "4. inv اسم_الغرفة — دعوة من غرفة\n"
-        "5. invmsg نص_الدعوة — رسالة الدعوة\n"
-        "6. say نص — إرسال في الغرفة"
-    ),
-    7: (
-        "👑 الماستر والفلتر\n━━━━━━━━━━━━\n"
-        "1. mas@اسم — إضافة ماستر\n"
-        "2. umas@اسم — إزالة ماستر\n"
-        "3. المسترات — قائمة الماسترز\n"
-        "4. Vip@اسم — توثيق VIP\n"
-        "5. unVip@اسم — إلغاء VIP\n"
-        "6. mf@on / mf@off — الفلتر\n"
-        "7. +mf@كلمة — إضافة ممنوعة\n"
-        "8. -mf@كلمة — إزالة ممنوعة\n"
-        "9. l@mf — عرض الكلمات\n"
-        "10. clear@mf — حذف الكلمات"
-    ),
-}
+def _default_help_pages():
+    return {
+        1: "📋 أوامر الإدارة\n━━━━━━━━━━━━\nk@اسم — طرد\nb@اسم — حظر\nub@اسم — فك الحظر\nm@اسم 10 — كتم\num@اسم — إلغاء الكتم\nالمكتومين — عرض المكتومين\nاشراف ثم اسم — ترقية مشرف\nعضو ثم اسم — إعادة عضو",
+        2: "🎵 أوامر الموسيقى والتفاعلات\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل\nتيك اسم الأغنية — TikTok\nمشاركة — رابط الأغنية\nمشاركة اسم_الشخص — إرسال خاص\nتخطي — تخطي الأغنية\nايقاف — إيقاف الأغنية\nlk@CODE — إعجاب\nlv@CODE — أحببتها\ndl@CODE — عدم إعجاب",
+        3: "🎮 أوامر الألعاب\n━━━━━━━━━━━━\nالعاب — قائمة الألعاب\nمليون — فرصة مليون\nحرب — حرب جماعية\nعمل — لعبة العمل\nكف — لعبة الكف\nقتال — لعبة القتال\nسباق — لعبة السباق\nحظ — جائزة عشوائية\nنرد — رمي النرد\nتخمين — تخمين رقم",
+        4: "🎁 أوامر الهدايا والنشر\n━━━━━━━━━━━━\ngv — عرض الهدايا\ngv@رقم@اسم — إرسال هدية\nنشر نص — نشر النص\nنشر@ — نشر الصورة التالية\nنشرصورة رابط — نشر صورة\nsay نص — إرسال نص\nانشر — نشر المحتوى",
+        5: "💰 أوامر النقاط\n━━━━━━━━━━━━\nنقاطي — عرض نقاطك\nتوب — المتصدرين\nsb@اسم@عدد — تعديل النقاط\nتحويل النقاط — تحويل النقاط\nرصيدي — عرض الرصيد",
+        6: "🚪 أوامر الغرف\n━━━━━━━━━━━━\nدخول اسم_الغرفة — دخول\nخروج [اسم_الغرفة] — خروج\ninv — دعوة المستخدمين\ninv اسم_الغرفة — دعوة من غرفة\ninvmsg نص_الدعوة — رسالة الدعوة\nsay نص — إرسال في الغرفة",
+        7: "👑 الماستر والفلتر\n━━━━━━━━━━━━\nmas@اسم — إضافة ماستر\numas@اسم — إزالة ماستر\nالمسترات — قائمة الماسترز\nVip@اسم — توثيق VIP\nunVip@اسم — إلغاء VIP\nmf@on / mf@off — الفلتر\n+mf@كلمة — إضافة ممنوعة\n-mf@كلمة — إزالة ممنوعة\nl@mf — عرض الكلمات\nclear@mf — حذف الكلمات",
+    }
 
+def _help_pages_from_messages():
+    defaults=_default_help_pages()
+    data=_load_local_json(MESSAGES_FILE,{})
+    raw=data.get("help_pages") if isinstance(data,dict) else None
+    if isinstance(raw,list) and raw:
+        pages={}
+        for i,v in enumerate(raw,1):
+            if isinstance(v,str) and v.strip():
+                pages[i]=v.replace("\\n","\n")
+        if pages: return pages
+    return defaults
 
 def _command_help(page=1):
-    try:
-        page=int(page)
-    except Exception:
-        page=1
-    return HELP_PAGES.get(max(1, min(len(HELP_PAGES), page)), HELP_PAGES[1])
+    try: page=int(page)
+    except Exception: page=1
+    pages=_help_pages_from_messages()
+    page=max(1,min(len(pages),page))
+    return pages.get(page,_default_help_pages()[1])
 
 # ------------------------------ Bot --------------------------------------
 
@@ -2030,16 +1971,9 @@ class TalkinBot:
             return True
         if not _is_master_name(sender):
             return False
-        if not is_private:
-            master_prefixes = (
-                "mas@", "umas@", "sb@", "s@", "uns@", "ازالة توثيق@", "إزالة توثيق@",
-                "vip@", "unvip@", "un vip@", "انشر", "دخول", "join", "ادخل", "enter",
-                "خروج", "leave", "exit", "inv", "دعوات", "invite", "invmsg", "رسالةدعوة",
-                "say ", "قل ", "k@", "kick", "b@", "ban", "u@", "a@", "admin", "o@", "owner"
-            )
-            if low.startswith(master_prefixes):
-                self.send_private_text(sender, "🔒 أوامر الماستر تعمل في الخاص فقط.")
-                return True
+        # Master commands are accepted from both private chat and rooms.
+        # Room moderation acts on the room where the command was received.
+        # Confirmations and diagnostics are sent privately to the master.
         # Add/remove master. Only the owner from BOT_MASTER may alter master list.
         if low.startswith("mas@"):
             if _norm_user(sender) != _norm_user(BOT_MASTER):
@@ -2085,6 +2019,72 @@ class TalkinBot:
         if low.startswith("unvip@") or low.startswith("un vip@"):
             target=text[text.casefold().find("vip@")+4:].strip().lstrip("@"); data=_vip_data(); data.pop(_norm_user(target),None); _save_local_json(VIP_FILE,data)
             self.send_private_text(sender,f"✅ تم إزالة VIP @{target}."); return True
+        # Room/admin commands accepted in both room and private master chat.
+        m=re.match(r"^(k@|kick\s+)(@?[^\s]+)$", text, re.I)
+        if m:
+            target=m.group(2).lstrip("@").strip()
+            if not room:
+                self.send_private_text(sender,"❌ لا توجد غرفة لتنفيذ الطرد فيها."); return True
+            self.send_admin(room,target,"kick")
+            self.send_private_text(sender,f"✅ تم طرد @{target} من الغرفة {room}."); return True
+        m=re.match(r"^(b@|ban\s+)(@?[^\s]+)$", text, re.I)
+        if m:
+            target=m.group(2).lstrip("@").strip()
+            if not room:
+                self.send_private_text(sender,"❌ لا توجد غرفة لتنفيذ الحظر فيها."); return True
+            self.send_admin(room,target,"ban")
+            self.send_private_text(sender,f"✅ تم حظر @{target} من الغرفة {room}."); return True
+        m=re.match(r"^(u@|ub@|unban\s+)(@?[^\s]+)$", text, re.I)
+        if m:
+            target=m.group(2).lstrip("@").strip()
+            if not room:
+                self.send_private_text(sender,"❌ لا توجد غرفة لتنفيذ فك الحظر فيها."); return True
+            self.send_admin(room,target,"member")
+            self.send_private_text(sender,f"✅ تم فك الحظر عن @{target} في الغرفة {room}."); return True
+        m=re.match(r"^(a@|admin\s+)(@?[^\s]+)$", text, re.I)
+        if m:
+            target=m.group(2).lstrip("@").strip()
+            if not room:
+                self.send_private_text(sender,"❌ لا توجد غرفة لتعيين المشرف فيها."); return True
+            self.send_admin(room,target,"admin")
+            self.send_private_text(sender,f"✅ تم تعيين @{target} مشرفًا في الغرفة {room}."); return True
+        m=re.match(r"^(o@|owner\s+)(@?[^\s]+)$", text, re.I)
+        if m:
+            target=m.group(2).lstrip("@").strip()
+            if not room:
+                self.send_private_text(sender,"❌ لا توجد غرفة لتعيين المالك فيها."); return True
+            self.send_admin(room,target,"owner")
+            self.send_private_text(sender,f"✅ تم تعيين @{target} مالكًا في الغرفة {room}."); return True
+        if low.startswith(("دخول ","join ","ادخل ","enter ")):
+            parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
+            if not target:
+                self.send_private_text(sender,"❌ الصيغة: دخول اسم_الغرفة"); return True
+            self.join_room(target)
+            self.send_private_text(sender,f"✅ دخلت الغرفة: {target} | الغرف الحالية: {len(self.known_rooms)}"); return True
+        if low in ("خروج","leave","exit") or low.startswith(("خروج ","leave ","exit ")):
+            parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
+            if target:
+                ok=self.leave_room(target)
+                self.send_private_text(sender,f"{'✅ خرجت من الغرفة' if ok else '❌ تعذر الخروج'}: {target}")
+            else:
+                rooms=self.leave_all_rooms()
+                self.send_private_text(sender,f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
+            return True
+        if low.startswith("invmsg") or low.startswith("رسالةدعوة"):
+            parts=text.split(None,1); template=parts[1].strip() if len(parts)==2 else "{sender} يدعوك للغرفة {room}"
+            self.invite_message_template=template
+            self.send_private_text(sender,f"✅ تم تغيير نص الدعوة إلى: {template}"); return True
+        if low == "inv" or low.startswith("inv ") or low in ("دعوات","invite") or low.startswith(("دعوات ","invite ")):
+            parts=text.split(None,1); target_room=parts[1].strip() if len(parts)==2 else room
+            if not target_room:
+                self.send_private_text(sender,"❌ استخدم: inv اسم_الغرفة"); return True
+            self.request_occupants(target_room)
+            self.send_private_text(sender,f"📨 بدأت دعوات المستخدمين في: {target_room}"); return True
+        if low.startswith("say ") or low.startswith("قل "):
+            parts=text.split(None,1); msg=parts[1].strip() if len(parts)==2 else ""
+            if room and msg: self.send_room_text(room,msg)
+            else: self.send_private_text(sender,"❌ استخدم say نص داخل غرفة.")
+            return True
         # Publishing: master says `انشر` or `انشر@description`, then sends an image.
         if low == "انشر" or low.startswith("انشر@"):
             desc=text[5:].strip() if low.startswith("انشر@") else ""
@@ -2109,12 +2109,14 @@ class TalkinBot:
         rooms=list(self.known_rooms) or ([self.room] if self.room else [])
         # In rooms, the successful publish message contains ONLY the reaction
         # controls. The publish status/result is sent privately to the master.
+        base_code=uuid.uuid4().hex[:4]
         caption=_message_template(
-            "publish", "reaction_only",
-            "🆔 {code}\n👍 lk@{code}\n❤️ lv@{code}\n👎 dl@{code}\n💬 cm@{code} msg\n🚨 report@{code} msg",
+            "publish", "broadcast",
+            "🖼️ {description}\n👤 {publisher}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
             publisher=sender, description=desc or "منشور صورة",
-            source_label=source_room, code=uuid.uuid4().hex[:8],
-            like="", love="", dislike="", comment="", report="", room=source_room
+            source_label=source_room, code=base_code,
+            like=base_code, love=uuid.uuid4().hex[:4], dislike=uuid.uuid4().hex[:4],
+            comment=uuid.uuid4().hex[:4], report=uuid.uuid4().hex[:4], room=source_room
         )
         ok=0
         errors=[]
@@ -2210,67 +2212,6 @@ class TalkinBot:
             return
 
         if self.handle_game_command(room, body, frm):
-            return
-
-        # Master/admin commands are private-only.
-        if _is_master_name(frm):
-            self.send_private_text(frm, "🔒 أوامر الماستر تعمل في الخاص فقط.")
-            return
-            parts = body.strip().split()
-            if parts:
-                cmd = parts[0].lower()
-                target = parts[1].lstrip("@").strip() if len(parts) >= 2 else ""
-                try:
-                    if cmd in ("a@", "admin") and target:
-                        self.send_admin(room, target, "admin")
-                    elif cmd in ("o@", "owner") and target:
-                        self.send_admin(room, target, "owner")
-                    elif cmd in ("k@", "kick") and target:
-                        self.send_admin(room, target, "kick")
-                    elif cmd in ("b@", "ban") and target:
-                        self.send_admin(room, target, "ban")
-                    elif cmd in ("u@", "unban") and target:
-                        self.send_admin(room, target, "member")
-                    elif cmd in ("دخول", "join", "ادخل", "enter") and target:
-                        # Master can command the bot from private chat: "دخول اسم الغرفة".
-                        # Joining is done on the existing WebSocket; no reconnect is needed.
-                        # Keep every previously joined room. room_join is sent
-                        # for the new room without replacing the current room.
-                        self.join_room(target)
-                        self.send_private_text(BOT_MASTER, f"✅ دخلت الغرفة: {target} | الغرف الحالية: {len(self.known_rooms)}")
-                    elif cmd in ("خروج", "leave", "exit"):
-                        if target:
-                            ok = self.leave_room(target)
-                            self.send_private_text(BOT_MASTER, f"{'✅ خرجت من الغرفة' if ok else '❌ تعذر الخروج'}: {target}")
-                        else:
-                            rooms = self.leave_all_rooms()
-                            self.send_private_text(BOT_MASTER, f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
-                    elif cmd in ("invmsg", "رسالةدعوة"):
-                        template = body.split(None, 1)[1].strip() if len(parts) >= 2 else "{sender} يدعوك للغرفة {room}"
-                        self.invite_message_template = template
-                        self.send_private_text(BOT_MASTER, f"✅ تم تغيير نص الدعوة إلى: {template}")
-                    elif cmd in ("inv", "دعوات", "invite"):
-                        # In a room: `inv` always uses THIS room's name in the invitation.
-                        # From private master chat: `inv اسم_الغرفة` targets that explicit room.
-                        target_room = target if target else room
-                        if target_room and target_room != BOT_MASTER:
-                            self.request_occupants(target_room)
-                            self.send_private_text(BOT_MASTER, f"📨 بدأت دعوات جميع الغرف النشطة. اسم الدعوة: {target_room}")
-                    elif cmd in ("say", "قل") and len(parts) >= 2:
-                        self.send_room_text(room, body.split(None, 1)[1])
-                    elif cmd in ("help", "مساعدة") and AUTO_HELP:
-                        self.send_room_text(room, "أوامر البوت: .sa اسم/رابط الأغنية، sa@رقم_الهدية@اسم، k@ اسم للطرد، b@ اسم للحظر، a@ اسم مشرف، o@ اسم مالك، دخول اسم_الغرفة، خروج [اسم_الغرفة]، inv، invmsg نص الدعوة، say النص")
-                    else:
-                        return
-                    self.log("[ADMIN/MASTER]", cmd, target)
-                    if cmd in ("k@", "kick", "b@", "ban") and target:
-                        try:
-                            action_ar = "الطرد" if cmd in ("k@", "kick") else "الحظر"
-                            self.send_private_text(BOT_MASTER, f"✅ تم إرسال أمر {action_ar} الفعلي إلى @{target} في الغرفة {room}.")
-                        except Exception as e2:
-                            self.log("[ADMIN] confirmation failed:", repr(e2))
-                except Exception as e:
-                    self.log("[ADMIN] failed:", e)
             return
 
         # Optional automatic word filter. It uses the same room ban operation
