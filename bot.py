@@ -1543,7 +1543,7 @@ class TalkinBot:
                 # format even though a playable combined stream exists.
                 # Explicit audio IDs are more reliable on the current
                 # YouTube player than the generic bestaudio selector.
-                "format":"140/139/251/249/233/234/bestaudio/best",
+                "format":"bestaudio*/bestaudio/best",
                 "format_sort":["abr", "acodec:mp4a.40.2", "asr"],
                 "outtmpl":template,
                 "socket_timeout":45,
