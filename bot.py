@@ -1543,14 +1543,13 @@ class TalkinBot:
                 # format even though a playable combined stream exists.
                 # Explicit audio IDs are more reliable on the current
                 # YouTube player than the generic bestaudio selector.
-                "format":"bestaudio[ext=m4a]/bestaudio/best",
+                "format":"bestaudio/best",
                 "format_sort":["abr", "acodec:mp4a.40.2", "asr"],
                 "outtmpl":template,
                 "socket_timeout":45,
                 "retries":5,
                 "fragment_retries":5,
                 "extractor_retries":3,
-                "force_ipv4":True,
                 "file_access_retries":3,
                 "cachedir":False,
                 "overwrites":True,
@@ -1587,16 +1586,7 @@ class TalkinBot:
                 return None
 
         info=source=None
-        attempts=[("web",bool(YOUTUBE_COOKIE_FILE)),
-                  ("web_creator",bool(YOUTUBE_COOKIE_FILE)),
-                  ("web_music",bool(YOUTUBE_COOKIE_FILE)),
-                  ("android_vr",bool(YOUTUBE_COOKIE_FILE)),
-                  ("web_embedded",bool(YOUTUBE_COOKIE_FILE)),
-                  ("web_safari",bool(YOUTUBE_COOKIE_FILE)),
-                  ("android",bool(YOUTUBE_COOKIE_FILE)),
-                  ("tv",bool(YOUTUBE_COOKIE_FILE)),
-                  ("default",bool(YOUTUBE_COOKIE_FILE)),
-                  ("native_default",bool(YOUTUBE_COOKIE_FILE))]
+        attempts=[("native_default",False)]
         for client,use_cookies in attempts:
             result=try_client(client,use_cookies)
             if result:
