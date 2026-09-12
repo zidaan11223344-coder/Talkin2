@@ -123,7 +123,7 @@ POINTS_FILE = DATA_DIR / "points.json"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 PUBLISHED_FILE = DATA_DIR / "published_posts.json"
 MONITORED_USERS_FILE = DATA_DIR / "monitored_users.json"
-MONITOR_DEBUG = os.getenv("MONITOR_DEBUG", "1") == "1"
+MONITOR_DEBUG = os.getenv("MONITOR_DEBUG", "0") == "1"
 
 # Giant Chat gift costs/labels; images remain the local Giant assets.
 GIFT_COSTS = {"1":10,"2":20,"3":30,"4":50,"5":80,"6":150,"7":200,"8":500,"9":800,"10":1000,"11":1500,"12":3000,"13":5000,"14":8000}
@@ -223,7 +223,7 @@ AUTH_VER = "444"
 AUTH_METHOD = "1"
 
 # Keep these enabled for easy troubleshooting.
-DEBUG = os.getenv("DEBUG", "1") == "1"
+DEBUG = os.getenv("DEBUG", "0") == "1"
 RAW_DIAGNOSTIC = os.getenv("RAW_DIAGNOSTIC", "0") == "1"
 ACK_ROOM_EVENTS = os.getenv("ACK_ROOM_EVENTS", "1") == "1"
 AUTO_HELP = os.getenv("AUTO_HELP", "1") == "1"
@@ -889,6 +889,11 @@ def _verified_data():
     data=_load_local_json(VERIFIED_FILE,{})
     return data if isinstance(data,dict) else {}
 
+def _is_verified_user(name):
+    """Return True for verified users and masters."""
+    key=_norm_user(name)
+    return bool(key and (key in _verified_data() or _is_master_name(name)))
+
 def _vip_data():
     data=_load_local_json(VIP_FILE,{})
     return data if isinstance(data,dict) else {}
@@ -1272,6 +1277,8 @@ class TalkinBot:
         # Reaction/publish state used by music and image publishing.
         self.reaction_targets = {}
         self.publish_pending = {}
+        self.verification_requests = {}
+        self.verification_request_cooldown = float(os.getenv("VERIFICATION_REQUEST_COOLDOWN", "300"))
         # Persistent account monitoring. Master can add usernames with: راقب@username
         self.monitored_users = {}
         self.monitor_seen_events = {}
@@ -2534,6 +2541,41 @@ class TalkinBot:
         elif room:
             self._send_help_chunks("room_message", text, room=room)
 
+    def _require_verified(self, sender, room="", action="استخدام هذا الأمر", is_private=False):
+        """Gate user-only features behind persistent verification.
+
+        Masters bypass verification. Unverified users receive a clear message and
+        the master receives a private verification request. A cooldown prevents
+        a noisy user from filling the master's private chat with duplicate requests.
+        """
+        if _is_verified_user(sender):
+            return True
+        sender=str(sender or "").strip().lstrip("@")
+        if not sender:
+            return False
+        master_name=str(BOT_MASTER or "").strip().lstrip("@") or "الماستر"
+        msg=(
+            "🔒 حسابك ليس موثقاً.\n"
+            f"📩 يرجى مراسلة الماستر لتوثيق حسابك هنا: @{master_name}"
+        )
+        if is_private:
+            self.send_private_text(sender,msg)
+        elif room:
+            self.send_room_text(room,msg)
+        else:
+            self.send_private_text(sender,msg)
+        now=time.time(); key=_norm_user(sender)
+        last=float(self.verification_requests.get(key,0) or 0)
+        if now-last >= self.verification_request_cooldown:
+            self.verification_requests[key]=now
+            self.send_private_text(
+                BOT_MASTER,
+                f"📨 طلب توثيق جديد\n👤 الحساب: @{sender}\n"
+                f"🔐 الطلب: {action}.\n"
+                f"✅ لتوثيقه استخدم: s@{sender}"
+            )
+        return False
+
     def _handle_management_command(self, room, body, sender, is_private=False):
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
@@ -2582,6 +2624,30 @@ class TalkinBot:
             if is_private: _reply(msg)
             else: self.send_room_text(room,msg)
             return True
+        # Publishing is available to verified users and masters.
+        # Keep it before the master-only section so verified non-masters can publish.
+        m_publish_user = re.match(r"^انشر(?:@(.+))?$", text, re.I)
+        if m_publish_user:
+            if not self._require_verified(sender, room, "النشر", is_private=is_private):
+                return True
+            desc = (m_publish_user.group(1) or "").strip()
+            source_room = str(room or self.room or "")
+            self.publish_pending[_norm_user(sender)]={
+                "description": desc,
+                "source_room": source_room,
+                "created_at": time.time()
+            }
+            publish_wait_message = _message_template(
+                "publish", "waiting",
+                "🖼️ تم استلام أمر النشر. أرسل الصورة الآن خلال 10 دقائق في الروم أو الخاص، وسيتم نشرها في جميع الغرف.",
+                sender=sender, room=source_room, description=desc
+            )
+            if is_private:
+                self.send_private_text(sender, publish_wait_message)
+            elif source_room:
+                self.send_room_text(source_room, publish_wait_message)
+            return True
+
         if not _is_master_name(sender):
             return False
         # Persistent monitored accounts. These commands are master-only.
@@ -2803,31 +2869,13 @@ class TalkinBot:
             self._save_social_features()
             _reply("✅ تم تشغيل الترحيب المخصص." if self.custom_welcome_enabled else "⛔ تم إيقاف الترحيب المخصص.")
             return True
-        # Publishing: master says `انشر` or `انشر@description`, then sends an image.
-        # Accept both forms strictly and preserve the description exactly.
-        m_publish = re.match(r"^انشر(?:@(.+))?$", text, re.I)
-        if m_publish:
-            desc = (m_publish.group(1) or "").strip()
-            # The image may be sent later in a room or in private chat.
-            # Key the pending publish by sender, not by the command room, so
-            # sending the image from another room still completes the publish.
-            source_room = str(room or self.room or "")
-            self.publish_pending[_norm_user(sender)]={"description":desc,"source_room":source_room,"created_at":time.time()}
-            publish_wait_message = _message_template(
-                "publish", "waiting",
-                "🖼️ تم استلام أمر النشر. أرسل الصورة الآن خلال 10 دقائق في الروم أو الخاص، وسيتم نشرها في جميع الغرف.",
-                sender=sender, room=source_room, description=desc
-            )
-            # Reply to the publish command IN THE SAME ROOM, not by private message.
-            # If the command came from private chat and no room is available,
-            # do not send this waiting message privately.
-            if source_room:
-                self.send_room_text(source_room, publish_wait_message)
-            return True
         return False
 
     def _handle_publish_media(self, room, sender, media_url, description="", private_to=None):
         if not media_url: return False
+        if not _is_verified_user(sender):
+            self._require_verified(sender, room, "النشر", is_private=bool(private_to))
+            return False
         # Accept the pending image from ANY room (or private chat).
         key=_norm_user(sender); pending=self.publish_pending.get(key)
         if not pending: return False
@@ -2996,19 +3044,21 @@ class TalkinBot:
                 self.send_private_text(publisher,notice)
                 return
 
-        # Music/gifts require verification; masters are always allowed.
-        is_verified = _norm_user(frm) in _verified_data() or _is_master_name(frm)
+        # Music, gifts and publishing require verification; masters are always allowed.
         if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
-            if not is_verified:
-                self.send_private_text(frm, f"🔒 @{frm} غير موثّق لاستخدام الهدايا.")
+            if not self._require_verified(frm, room, "إرسال الهدايا"):
                 return
             if self.handle_gift_command(room, body, frm):
                 return
         if body.strip().lower().startswith(".sa "):
-            if not is_verified:
-                self.send_private_text(frm, f"🔒 @{frm} غير موثّق لاستخدام الأغاني.")
+            if not self._require_verified(frm, room, "تشغيل الأغاني"):
                 return
             if self.handle_music_command(room, body, frm):
+                return
+        if re.match(r"^انشر(?:@.*)?$", body.strip(), re.I):
+            if not self._require_verified(frm, room, "النشر"):
+                return
+            if self._handle_management_command(room, body, frm):
                 return
 
         # Keep a small per-room message history for diagnostics.
@@ -3096,10 +3146,19 @@ class TalkinBot:
                         if self._handle_management_command(self.room, body, frm, is_private=True):
                             return
                     if body.strip().lower().startswith(".sa "):
+                        if not self._require_verified(frm, self.room, "تشغيل الأغاني", is_private=True):
+                            return
                         if self.handle_music_command(self.room, body, frm, private_to=frm):
                             return
                     if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
+                        if not self._require_verified(frm, self.room, "إرسال الهدايا", is_private=True):
+                            return
                         if self.handle_gift_command(self.room, body, frm, private_to=frm):
+                            return
+                    if re.match(r"^انشر(?:@.*)?$", body.strip(), re.I):
+                        if not self._require_verified(frm, self.room, "النشر", is_private=True):
+                            return
+                        if self._handle_management_command(self.room, body, frm, is_private=True):
                             return
                     # All master/private management commands are handled once above.
                     # This prevents private commands from being duplicated or answered in a room.
