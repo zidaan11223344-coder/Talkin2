@@ -2576,6 +2576,47 @@ class TalkinBot:
             )
         return False
 
+    def _looks_like_bot_command(self, text):
+        """Return True only for commands actually recognized by the bot.
+
+        This is deliberately narrower than "any room message" so the
+        unverified-account notice is not sent for ordinary conversation.
+        """
+        t=str(text or "").strip()
+        low=t.casefold()
+        if not t:
+            return False
+        exact={
+            "اوامر","الاوامر","help","مساعدة",
+            "ns","n","التالي","القائمة التالية","next",
+            "نقاطي","points","توب","top","المسترات","masters",
+            "العاب","ألعاب","لعب","games","game",
+            "حظ","الحظ","luck","نرد","ارم النرد","ارمي النرد","dice",
+            "حجر","ورق","مقص","تخمين","ابدأ تخمين","guess",
+            "سؤال","سوال","quiz","مسابقة",
+            "خروج","leave","exit","غرفي","my rooms","rooms",
+            "دخول الكل","دخول كل الغرف","ادخل الكل","ادخل كل الغرف","join all","enter all",
+            "inv","دعوات","invite",
+        }
+        if low in exact or re.fullmatch(r"help[1-7]", low):
+            return True
+        patterns=(
+            r"^\.sa\s+", r"^sa@[^@]+@.+$", r"^انشر(?:@.*)?$",
+            r"^(?:k@|kick\s+)", r"^(?:b@|ban\s+)", r"^(?:u@|ub@|unban\s+)",
+            r"^(?:a@|admin\s+)", r"^(?:o@|owner\s+)",
+            r"^(?:دخول|join|ادخل|enter)\s+", r"^(?:خروج|leave|exit)\s+",
+            r"^inv(?:msg)?(?:\s|$)", r"^(?:رسالةدعوة)(?:\s|$)",
+            r"^(?:دعوات|invite)\s+", r"^(?:say|قل)\s+",
+            r"^(?:mas|umas|sb|s|uns|ازالة توثيق|إزالة توثيق|vip|unvip)@",
+            r"^(?:mf|\+mf|-mf|l@mf|clear@mf)",
+            r"^(?:\+sr@|sr@(?:on|off)$)",
+            r"^(?:\+swc|swc\+)@", r"^(?:-swc@|del\s+swc@|حذف\s+الترحيب@|حذف\s+ترحيب@)",
+            r"^swc@(?:on|off)$",
+            r"^(?:راقب|راقبة|monitor)@", r"^(?:إلغاء مراقبة|الغاء مراقبة|unmonitor)@",
+            r"^\.s\s+",
+        )
+        return any(re.match(pat,t,re.I) for pat in patterns)
+
     def _handle_management_command(self, room, body, sender, is_private=False):
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
@@ -3043,6 +3084,12 @@ class TalkinBot:
                 if extra: notice += f"\n💬 رسالة التفاعل: {extra}"
                 self.send_private_text(publisher,notice)
                 return
+
+        # Verification is checked only when the message is a real bot command.
+        # Ordinary conversation in the room must never trigger the notice.
+        if self._looks_like_bot_command(body) and not _is_verified_user(frm):
+            self._require_verified(frm, room, "استخدام أوامر البوت")
+            return
 
         # Music, gifts and publishing require verification; masters are always allowed.
         if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
