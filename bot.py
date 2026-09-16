@@ -1628,7 +1628,7 @@ def _get_points(username):
     return int(item.get("points",0) or 0)
 
 def _fmt_points(value):
-    """Compact point balances for chat: 1,000 -> 1k and 1,000,000,000 -> 1m."""
+    """Compact point balances for chat: 1k -> 1k and 1k,000,000 -> 1m."""
     if value is None:
         return "♾️"
     try:
@@ -1663,18 +1663,12 @@ def _points_summary_text(username):
     # غير المحدودة تبقى مخفية وتُطبق فقط داخل منطق الألعاب/العمليات.
     pts = _get_points(username)
     plays, level = _game_level(username)
-    labels=[("رهان","bet"),("مضاربة","duel"),("مليار","billion"),("حظي","luck"),("استثمار","investment"),("حظ","luck_free"),("حجر/ورق/مقص","rps"),("زرع","farm"),("فيس","fruit"),("ألعاب أخرى","misc")]
-    details=[]
-    for label,key in labels:
-        g=_game_stats(username,key)
-        details.append(f"🎮 {label}: لعب {g['plays']} | نقاط {g['points']:+d} | رهان {g['staked']}")
     return (f"╭━━━〔 💎 نقاطي 〕━━━╮\n"
             f"┃ 👤 @{str(username).strip().lstrip('@')}\n"
             f"┃ 💰 الرصيد: {_fmt_points(pts)}\n"
             f"┃ ⭐ المستوى: {level}\n"
             f"┃ 🎮 مرات اللعب: {plays}\n"
-            f"╰━━━━━━━━━━━━━━╯\n"
-            + "\n".join(details))
+            f"╰━━━━━━━━━━━━━━╯")
 
 def _ensure_replies_file():
     data = _load_local_json(REPLIES_FILE, {})
@@ -1867,9 +1861,9 @@ def _default_help_sections():
             '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — يبحث البوت عن صورة عشوائية ويرسلها في الروم\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
         ],
         3: [
-            '🎮 الألعاب — 1: التحديات\n━━━━━━━━━━━━\nالعاب / ألعاب / لعب / games / game — عرض قائمة الألعاب\nرهان@المبلغ — رهان لاعب ضد لاعب\nمراهنة@المبلغ — مراهنة لاعب ضد لاعب\nمضاربة@المبلغ — مضاربة لاعب ضد لاعب\nاستثمار@المبلغ — استثمار لاعب ضد لاعب\nحظي@المبلغ — تحدي حظ لاعب ضد لاعب\nاستثمار — استثمار مجاني مع البوت\nحظ@المبلغ — حظ بمبلغ\nحظ — حظ عشوائي\nحجر / ورق / مقص — لعبة ضد البوت',
-            '🎮 الألعاب — 2: الألعاب الفردية\n━━━━━━━━━━━━\nمليار — لعبة المليار\nبنك مليون — جائزة مليون بنفس نظام المليار\nزرع@رمز_المحصول — زراعة محصول\nفيس@الرمز — مطابقة/تحدي الفيس\nاسرق — سرقة عشوائية من عضو\nاسرق@اسم — سرقة من عضو محدد\nاسرق اسم — سرقة من عضو محدد\n\n🌱 الزراعة: حتى 5 أنواع مختلفة في نفس الوقت.\n📌 كل لعبة لها نظام تبريد خاص بها عند تطبيقه.',
-            '🎮 الألعاب — 3: الألعاب العالمية\n━━━━━━━━━━━━\nسنارة — تحدي عالمي، الفائز +500\nبرق — تحدي عالمي، الفائز +500\nياقوت — تحدي عالمي، الفائز +500\nصدام — تحدي عالمي، الفائز +500\nكاشف — تحدي عالمي، الفائز +500\n\n📌 أول لاعب يفتح الجولة، والثاني ينضم من أي غرفة موجود فيها البوت.\n📌 نتيجة الجولة والصورة تظهر للمشاركين فقط.',
+            '🎮 الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عملة@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n1️⃣1️⃣ نجم\n1️⃣2️⃣ طاولة\n1️⃣3️⃣ اونو\n\n📌 هذه الألعاب ضد البوت ونتائجها نصية فقط بدون صور.',
+            '🎮 الألعاب — 2: ضد لاعب / ألعاب الجوائز\n━━━━━━━━━━━━\n1️⃣ رهان@المبلغ\n2️⃣ مراهنة@المبلغ\n3️⃣ مضاربة@المبلغ\n4️⃣ استثمار@المبلغ\n5️⃣ حظي@المبلغ\n6️⃣ مليار\n7️⃣ بنك أو بنك مليون\n8️⃣ زرع@رمز_المحصول\n9️⃣ فيس@الرمز\n🔟 اسرق / اسرق@اسم\n📌 ألعاب المليار والبنك والزرع والفيس تحتفظ بصورها ونظامها الحالي.',
+            '🎮 الألعاب — 3: الألعاب العالمية + الشبيه\n━━━━━━━━━━━━\n1️⃣ سنارة — جائزة 500\n2️⃣ برق — جائزة 500\n3️⃣ ياقوت — جائزة 500\n4️⃣ صدام — جائزة 500\n5️⃣ كاشف — جائزة 500\n6️⃣ شبيه@اسم\n\n📌 الإجمالي المعتمد في القائمة: 29 لعبة/ميزة كما تم الاتفاق.\n📌 شبيه يبحث عن صورة عشوائية مرحة ويرسلها داخل الروم.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -4850,7 +4844,7 @@ class TalkinBot:
             "🐎 حصانه — يحصّن المستخدم من السرقة لمدة دقيقة.\n"
             "🕵️ اسرق — اختر عضوًا عشوائيًا من الموجودين حالياً في نفس الغرفة وحاول سرقة 500 نقطة منه.\n"
             "🏆 توب رهان | توب مضاربة | توب حظي | توب استثمار\n"
-            "🤖 ألعاب جديدة مع البوت — عملة | عجلة | صندوق@1..3 | كوب@1..3 | سباق | صيد | وحش | بركان | طائر | نجم.\n"            "📝 ألعاب البوت الجديدة نصية فقط وبدون أي صور.")
+            "🤖 ألعاب جديدة مع البوت — عملة | عجلة | صندوق@1..3 | كوب@1..3 | وحش | بركان | طائر | نجم.\n"            "📝 ألعاب البوت الجديدة نصية فقط وبدون أي صور.")
 
     def _game_balance_ok(self, username, amount):
         return _is_primary_master(username) or _get_points(username) >= int(amount)
@@ -5202,20 +5196,20 @@ class TalkinBot:
         if raw.casefold()=="زرع":
             self.send_room_text(
                 room,
-                "🌱╔════════════════════╗\n"
-                "🌱║      قائمة الزرع      ║\n"
-                "🌱╠════════════════════╣\n"
-                "🌱║ 🍎  5 دقائق  → 1,000  ║\n"
-                "🌱║ 🍐 10 دقائق  → 2,000  ║\n"
-                "🌱║ 🍊 15 دقيقة   → 3,000  ║\n"
-                "🌱║ 🍋 20 دقيقة   → 4,000  ║\n"
-                "🌱║ 🍇 25 دقيقة   → 5,000  ║\n"
-                "🌱║ 🍉 30 دقيقة   → 6,000  ║\n"
-                "🌱║ 🍓 35 دقيقة   → 7,000  ║\n"
-                "🌱║ 🥕 40 دقيقة   → 8,000  ║\n"
-                "🌱║ 🌽 45 دقيقة   → 9,000  ║\n"
-                "🌱║ 🥭 50 دقيقة  → 10,000  ║\n"
-                "🌱╚════════════════════╝\n"
+                "╔════════════════════╗\n"
+                "║      قائمة الزرع      ║\n"
+                "╠════════════════════╣\n"
+                "║ 🍎  5 دقائق  → 1k  ║\n"
+                "║ 🍐 10 دقائق  → 2k  ║\n"
+                "║ 🍊 15 دقيقة   → 3k  ║\n"
+                "║ 🍋 20 دقيقة   → 4k  ║\n"
+                "║ 🍇 25 دقيقة   → 5k  ║\n"
+                "║ 🍉 30 دقيقة   → 6k  ║\n"
+                "║ 🍓 35 دقيقة   → 7k  ║\n"
+                "║ 🥕 40 دقيقة   → 8k  ║\n"
+                "║ 🌽 45 دقيقة   → 9k  ║\n"
+                "║ 🥭 50 دقيقة  → 10k  ║\n"
+                "╚════════════════════╝\n"
                 "📌 للزراعة: زرع@🍎 أو زرع 🍎\n"
                 "💡 عند اكتمال الزراعة تصلك المكافأة تلقائياً في الخاص."
             )
@@ -5352,25 +5346,32 @@ class TalkinBot:
         if not self._game_cooldown_notice(room, sender, 30.0, "استثمار"):
             return True
         """Free investment game against the bot. No @amount and no image."""
-        # Pure random outcome; no stake and no dependency on command order.
-        roll=secrets.randbelow(1000)+1
-        if roll <= 120:
+        # Free investment against the bot: a reward is granted only when the
+        # player gets a winning outcome; losses and draws receive no points.
+        roll=secrets.randbelow(100) + 1
+        if roll <= 20:
             reward=100
-        elif roll <= 320:
+            result="🏆 فوز كبير!"
+        elif roll <= 40:
             reward=50
-        elif roll <= 600:
+            result="🏆 فزت!"
+        elif roll <= 55:
             reward=30
-        elif roll <= 850:
+            result="🏆 فزت!"
+        elif roll <= 70:
             reward=20
+            result="🏆 فزت!"
         else:
-            reward=10
+            reward=0
+            result="❌ لم تفز هذه المرة."
         balance=self._game_award(sender, reward)
         _record_game(sender, "investment", reward, 0)
         self.send_room_text(
             room,
             f"📊✨ استثمار مع البوت\n━━━━━━━━━━━━\n"
             f"👤 اللاعب: @{sender}\n"
-            f"🎁 النتيجة: +{_fmt_points(reward)} نقطة\n"
+            f"{result}\n"
+            f"🎁 المكافأة: +{_fmt_points(reward)} نقطة\n"
             f"💰 الرصيد: {_fmt_points(balance)}"
         )
         if reward > 0:
@@ -5803,8 +5804,8 @@ class TalkinBot:
             reward = 0
             result = "💀 الوحش هزمك."
         else:
-            reward = 25
-            result = "🤝 تعادل مع الوحش."
+            reward = 0
+            result = "🤝 تعادل مع الوحش — لا توجد جائزة."
         balance = self._game_award(sender, reward)
         _record_game(sender, "monster", reward, 0)
         self.send_room_text(room, f"👹 معركة الوحش\n━━━━━━━━━━━━━━\n👤 قوتك: {player}\n👹 قوة الوحش: {monster}\n{result}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
@@ -6009,14 +6010,14 @@ class TalkinBot:
                 if not winner_photo:
                     winner_photo = self._lookup_profile_photo(sender_name)
 
-                zeros = "⭐" * 9  # 1,000,000,000 contains nine zeros.
+                zeros = "⭐" * 9  # 1k,000,000 contains nine zeros.
                 self.send_room_text(
                     room,
                     f"🏆✨ مبروك! تم الحصول على المليار ✨🏆\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"✅ @{sender_name}\n"
                     f"💰 لقد حصلت علي مليار\n"
-                    f"🔢 رقم المليار: 1,000,000,000\n"
+                    f"🔢 رقم المليار: 1k,000,000\n"
                     f"🎉 مبروك يا بطل!\n"
                     f"{zeros}\n"
                     f"━━━━━━━━━━━━━━━━"
@@ -6036,7 +6037,7 @@ class TalkinBot:
                             try:
                                 self.send_room_text(
                                     target_room,
-                                    f"🏆✨ تم الحصول على المليار!\n👑 الفائز: @{sender_name}\n💰 1,000,000,000\n{zeros}"
+                                    f"🏆✨ تم الحصول على المليار!\n👑 الفائز: @{sender_name}\n💰 1k,000,000\n{zeros}"
                                 )
                                 self.log("[GAME] game result image disabled")
                             except Exception as exc:
@@ -6061,7 +6062,7 @@ class TalkinBot:
                 return True
             bot_choice=secrets.choice(("حجر","ورق","مقص"))
             win=(low,bot_choice) in (("حجر","مقص"),("ورق","حجر"),("مقص","ورق"))
-            if low==bot_choice: result="🤝 تعادل"; reward=5
+            if low==bot_choice: result="🤝 تعادل"; reward=0
             elif win: result="🏆 فزت"; reward=15
             else: result="❌ خسرت"; reward=0
             balance=self._game_award(sender_name,reward)
