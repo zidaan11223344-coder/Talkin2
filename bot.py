@@ -1518,8 +1518,8 @@ def _looks_like_bot_command(text):
         "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "تحويل للكل@", "خاص@", "رسالة@", "broadcast@", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
-        "العاب", "ألعاب", "حظ", "نرد", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "فيس", "سنارة", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "رشوة", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@",
-        "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "is@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
+        "العاب", "ألعاب", "حظ", "نرد", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@",
+        "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "is@", "صورتي", "صورتك", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
     )
     prefixes = prefixes + ("bl@",)
     return low.startswith(prefixes) or low in ("help", "مساعدة", "games", "game") or low in {x.casefold() for x in GAME_COMMANDS}
@@ -1864,7 +1864,7 @@ def _default_help_sections():
         ],
         2: [
             '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال:\n.sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
-            '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
+            '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — يبحث البوت عن صورة عشوائية ويرسلها في الروم\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
         ],
         3: [
             '🎮 الألعاب — 1: التحديات\n━━━━━━━━━━━━\nالعاب / ألعاب / لعب / games / game — عرض قائمة الألعاب\nرهان@المبلغ — رهان لاعب ضد لاعب\nمراهنة@المبلغ — مراهنة لاعب ضد لاعب\nمضاربة@المبلغ — مضاربة لاعب ضد لاعب\nاستثمار@المبلغ — استثمار لاعب ضد لاعب\nحظي@المبلغ — تحدي حظ لاعب ضد لاعب\nاستثمار — استثمار مجاني مع البوت\nحظ@المبلغ — حظ بمبلغ\nحظ — حظ عشوائي\nحجر / ورق / مقص — لعبة ضد البوت',
@@ -4850,7 +4850,7 @@ class TalkinBot:
             "🐎 حصانه — يحصّن المستخدم من السرقة لمدة دقيقة.\n"
             "🕵️ اسرق — اختر عضوًا عشوائيًا من الموجودين حالياً في نفس الغرفة وحاول سرقة 500 نقطة منه.\n"
             "🏆 توب رهان | توب مضاربة | توب حظي | توب استثمار\n"
-            "📝 جميع نتائج الألعاب نصية بدون إرسال صور الألعاب.")
+            "🤖 ألعاب جديدة مع البوت — عملة | عجلة | صندوق@1..3 | كوب@1..3 | سباق | صيد | وحش | بركان | طائر | نجم.\n"            "📝 ألعاب البوت الجديدة نصية فقط وبدون أي صور.")
 
     def _game_balance_ok(self, username, amount):
         return _is_primary_master(username) or _get_points(username) >= int(amount)
@@ -5384,6 +5384,74 @@ class TalkinBot:
                     self.log("[GAME] investment result image failed:", repr(exc))
         return True
 
+    def _handle_random_picture_command(self, room, body, sender):
+        """صورتي/صورتك: search for a random public picture and send it to the room."""
+        if not room:
+            return True
+        text = str(body or "").strip().casefold()
+        if text not in {"صورتي", "صورتك"}:
+            return False
+
+        busy = getattr(self, "_random_picture_busy", set())
+        key = (_norm_user(sender), str(room))
+        if key in busy:
+            self.send_room_text(room, f"⏳ @{sender} جاري البحث عن صورتك...")
+            return True
+        busy.add(key)
+        self._random_picture_busy = busy
+        self.send_room_text(room, f"🔎 @{sender} جاري البحث عن صورة عشوائية...")
+
+        def worker():
+            try:
+                recent = getattr(self, "_random_picture_recent", {})
+                room_key = str(room)
+                excluded = set(recent.get(room_key, []))
+                variants = (
+                    "صورة عشوائية مضحكة",
+                    "صورة جميلة عشوائية",
+                    "funny random picture",
+                    "cute random picture",
+                    "random funny meme",
+                    "random animal funny",
+                )
+                query = secrets.choice(variants)
+                image_url = _search_lookalike_image(query, exclude_urls=excluded)
+                if image_url and image_url in excluded:
+                    excluded.clear()
+                    image_url = _search_lookalike_image(query)
+                if not image_url:
+                    self.send_room_text(room, "❌ لم أجد صورة عشوائية مناسبة حالياً.")
+                    return
+                local = _download_lookalike_image(image_url, sender)
+                if not local:
+                    self.send_room_text(room, "❌ وجدت صورة لكن تعذر تحميلها حالياً.")
+                    return
+                history = list(recent.get(room_key, []))
+                history.append(image_url)
+                recent[room_key] = history[-10:]
+                self._random_picture_recent = recent
+                base = _public_base_url()
+                if not base:
+                    self.send_room_text(room, "❌ رابط الصور العام غير مضبوط في إعدادات البوت.")
+                    return
+                public_url = f"{base}/lookalikes/{local.name}"
+                self.send_room_text(room, f"🖼️ صورتك هي يا @{sender}")
+                self.send_room_media(room, public_url, "image")
+            except Exception as exc:
+                self.log("[RANDOM-PICTURE] failed:", repr(exc))
+                try:
+                    self.send_room_text(room, "❌ تعذر البحث عن الصورة حالياً.")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    busy.discard(key)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name="random-picture-search", daemon=True).start()
+        return True
+
     def _handle_lookalike_command(self, room, body, sender):
         """Handle شبيه@username / شبيه username in a background worker."""
         if not room:
@@ -5412,15 +5480,24 @@ class TalkinBot:
 
         def worker():
             try:
-                # Searching the username itself usually gives the most relevant
-                # public results; Arabic "شبيه" is added to broaden lookalike-style results.
+                # This command is intentionally a playful random-image game.
+                # Do not try to infer the person's real appearance or identity.
+                # Instead, search public images using lighthearted animal/funny
+                # themes, then send one result to the room.
                 recent = getattr(self, "_lookalike_recent", {})
                 target_key = _norm_user(target)
                 excluded = set(recent.get(target_key, []))
-                # Vary the search slightly on every request as an extra guard
-                # against a search engine returning the same first result.
-                variants = ("شبيه", "lookalike", "similar", "شبيه شخص")
-                query = f"{target} {secrets.choice(variants)}"
+                # Randomize the theme so repeated commands can return different
+                # images. Keep the queries non-explicit and suitable for chat.
+                variants = (
+                    "قرد مضحك",
+                    "قرد مضحك meme",
+                    "صورة مضحكة",
+                    "شخصية كرتونية مضحكة",
+                    "funny monkey",
+                    "funny face meme",
+                )
+                query = secrets.choice(variants)
                 image_url = _search_lookalike_image(query, exclude_urls=excluded)
                 if image_url and image_url in excluded:
                     # If all current results were previously used, clear the
@@ -5588,6 +5665,183 @@ class TalkinBot:
         _record_game(victim, "steal", -500, 500)
         return True
 
+
+    # --------------------- 10 Text-Only Bot Games ---------------------
+    def _table_bot_game(self, room, sender):
+        import random
+        if not self._game_cooldown_notice(room, sender, 40.0, "طاولة"):
+            return True
+        player = random.randint(1, 6) + random.randint(1, 6)
+        bot = random.randint(1, 6) + random.randint(1, 6)
+        if player > bot:
+            reward = 100
+            self._game_award(sender, reward)
+            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🏆 فزت بـ {reward} نقطة!"
+        elif player < bot:
+            reward = 0
+            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🤖 البوت فاز!"
+        else:
+            reward = 0
+            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🤝 تعادل!"
+        _record_game(sender, "طاولة", 1, reward)
+        self.send_room_text(room, result)
+        return True
+
+    def _uno_bot_game(self, room, sender):
+        import random
+        if not self._game_cooldown_notice(room, sender, 40.0, "اونو"):
+            return True
+        colors = ["🔴", "🟡", "🟢", "🔵"]
+        p_color, p_num = random.choice(colors), random.randint(0, 9)
+        b_color, b_num = random.choice(colors), random.randint(0, 9)
+        if p_num > b_num:
+            reward = 100
+            self._game_award(sender, reward)
+            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🏆 فزت بـ {reward} نقطة!"
+        elif p_num < b_num:
+            reward = 0
+            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🤖 البوت فاز!"
+        else:
+            reward = 0
+            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🤝 تعادل!"
+        _record_game(sender, "اونو", 1, reward)
+        self.send_room_text(room, result)
+        return True
+
+    def _bot_game_text(self, room, sender, game_key, title, body, reward):
+        """Shared helper for the new bot-vs-player text games. No images."""
+        if not self._game_cooldown_notice(room, sender, 40.0, game_key):
+            return True
+        balance = self._game_award(sender, reward)
+        _record_game(sender, game_key, reward, 0)
+        self.send_room_text(
+            room,
+            f"{title}\n━━━━━━━━━━━━━━\n{body}\n"
+            f"🎁 المكافأة: +{_fmt_points(reward)} نقطة\n"
+            f"💰 رصيدك: {_fmt_points(balance)}\n━━━━━━━━━━━━━━"
+        )
+        return True
+
+    def _coin_bot_game(self, room, sender, choice=""):
+        if not self._game_cooldown_notice(room, sender, 40.0, "عملة"):
+            return True
+        result = secrets.choice(("وجه", "كتابة"))
+        choice = str(choice or "").strip()
+        if choice in ("وجه", "كتابة"):
+            won = (choice == result)
+            reward = 40 if won else 0
+            text = f"🪙 النتيجة: {result}\n" + ("🏆 توقّعك صحيح!" if won else "❌ توقّعك خطأ.")
+        else:
+            reward = 0
+            text = f"🪙 ظهرت: {result}\n📌 للتوقع اكتب: عملة@وجه أو عملة@كتابة"
+        balance = self._game_award(sender, reward)
+        _record_game(sender, "coin", reward, 0)
+        self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n{text}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+        return True
+
+    def _wheel_bot_game(self, room, sender):
+        if not self._game_cooldown_notice(room, sender, 40.0, "عجلة"):
+            return True
+        rewards = [0, 10, 20, 30, 50, 75, 100, 150]
+        reward = secrets.choice(rewards)
+        balance = self._game_award(sender, reward)
+        _record_game(sender, "wheel", reward, 0)
+        self.send_room_text(
+            room,
+            f"🎡 عجلة الحظ\n━━━━━━━━━━━━━━\n@{sender}\n"
+            f"🎯 دارت العجلة وتوقفت على: {_fmt_points(reward)} نقطة\n"
+            f"🎁 المكافأة: +{_fmt_points(reward)} نقطة\n"
+            f"💰 رصيدك: {_fmt_points(balance)}\n━━━━━━━━━━━━━━"
+        )
+        return True
+
+    def _box_bot_game(self, room, sender, raw):
+        m = re.fullmatch(r"صندوق[@ ]([1-3])", str(raw or "").strip(), re.I)
+        if not self._game_cooldown_notice(room, sender, 40.0, "صندوق"):
+            return True
+        chosen = int(m.group(1)) if m else None
+        prize_box = secrets.randbelow(3) + 1
+        reward = secrets.choice([0, 20, 50, 100, 200]) if chosen == prize_box else 0
+        if chosen is None:
+            body = "📦 اختر صندوقاً: صندوق@1 أو صندوق@2 أو صندوق@3"
+        elif reward:
+            body = f"📦 اخترت الصندوق {chosen}\n🏆 الصندوق الرابح: {prize_box}\n✅ ربحت!"
+        else:
+            body = f"📦 اخترت الصندوق {chosen}\n🎲 الصندوق الرابح كان: {prize_box}\n❌ لم تربح."
+        balance = self._game_award(sender, reward)
+        _record_game(sender, "box", reward, 0)
+        self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n{body}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+        return True
+
+    def _cup_bot_game(self, room, sender, raw):
+        m = re.fullmatch(r"(?:كوب|كأس)[@ ]([1-3])", str(raw or "").strip(), re.I)
+        if not self._game_cooldown_notice(room, sender, 40.0, "كوب"):
+            return True
+        chosen = int(m.group(1)) if m else None
+        hidden = secrets.randbelow(3) + 1
+        reward = secrets.choice([25, 50, 100, 150]) if chosen == hidden else 0
+        if chosen is None:
+            body = "🥤 اختر الكوب: كوب@1 أو كوب@2 أو كوب@3"
+        elif reward:
+            body = f"🥤 اخترت الكوب {chosen}\n🏆 الكأس الصحيح: {hidden}\n✅ وجدت الجائزة!"
+        else:
+            body = f"🥤 اخترت الكوب {chosen}\n🎲 الجائزة كانت في الكوب: {hidden}\n❌ الكوب الخطأ."
+        balance = self._game_award(sender, reward)
+        _record_game(sender, "cup", reward, 0)
+        self.send_room_text(room, f"🥤 لعبة الكؤوس\n━━━━━━━━━━━━━━\n@{sender}\n{body}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+        return True
+
+    def _monster_bot_game(self, room, sender):
+        if not self._game_cooldown_notice(room, sender, 40.0, "وحش"):
+            return True
+        player = secrets.randbelow(6) + 1
+        monster = secrets.randbelow(6) + 1
+        if player > monster:
+            reward = 80
+            result = "⚔️ هزمت الوحش!"
+        elif player < monster:
+            reward = 0
+            result = "💀 الوحش هزمك."
+        else:
+            reward = 25
+            result = "🤝 تعادل مع الوحش."
+        balance = self._game_award(sender, reward)
+        _record_game(sender, "monster", reward, 0)
+        self.send_room_text(room, f"👹 معركة الوحش\n━━━━━━━━━━━━━━\n👤 قوتك: {player}\n👹 قوة الوحش: {monster}\n{result}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+        return True
+
+    def _volcano_bot_game(self, room, sender):
+        if not self._game_cooldown_notice(room, sender, 40.0, "بركان"):
+            return True
+        result = secrets.randbelow(5)
+        reward_map = {0: 0, 1: 20, 2: 40, 3: 80, 4: 150}
+        reward = reward_map[result]
+        outcome = "🌋 خرجت الجائزة من البركان!" if reward else "🌋 انفجر البركان ولم تجد جائزة."
+        balance = self._game_award(sender, reward)
+        _record_game(sender, "volcano", reward, 0)
+        self.send_room_text(room, f"🌋 لعبة البركان\n━━━━━━━━━━━━━━\n@{sender}\n{outcome}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+        return True
+
+    def _bird_bot_game(self, room, sender):
+        if not self._game_cooldown_notice(room, sender, 40.0, "طائر"):
+            return True
+        birds = [("🐦 عصفور", 15), ("🦅 نسر", 75), ("🦉 بومة", 35), ("🦜 ببغاء", 25), ("🌫️ لم يظهر طائر", 0)]
+        bird, reward = secrets.choice(birds)
+        balance = self._game_award(sender, reward)
+        _record_game(sender, "bird", reward, 0)
+        self.send_room_text(room, f"🪶 صيد الطائر\n━━━━━━━━━━━━━━\n@{sender}\n🎯 ظهر: {bird}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+        return True
+
+    def _star_bot_game(self, room, sender):
+        if not self._game_cooldown_notice(room, sender, 40.0, "نجم"):
+            return True
+        stars = [("⭐ عادية", 10), ("🌟 لامعة", 30), ("💫 نادرة", 75), ("✨ أسطورية", 200), ("🌑 لم تلتقط نجماً", 0)]
+        star, reward = secrets.choice(stars)
+        balance = self._game_award(sender, reward)
+        _record_game(sender, "star", reward, 0)
+        self.send_room_text(room, f"⭐ لعبة النجمة\n━━━━━━━━━━━━━━\n@{sender}\n🎯 حظك: {star}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+        return True
+
     def _million_bank_game(self, room, sender_name):
         if not self._game_cooldown_notice(room, sender_name, 30.0, "بنك مليون"):
             return True
@@ -5705,6 +5959,29 @@ class TalkinBot:
         m=re.fullmatch(r"حظ[@\s]+([0-9]+)", raw, re.I)
         if m:
             return self._lottery_game(room, sender_name, int(m.group(1)))
+        if low == "طاولة":
+            return self._table_bot_game(room, sender_name)
+        if low == "اونو":
+            return self._uno_bot_game(room, sender_name)
+        if low == "عملة":
+            return self._coin_bot_game(room, sender_name)
+        m = re.fullmatch(r"عملة[@ ](وجه|كتابة)", raw, re.I)
+        if m:
+            return self._coin_bot_game(room, sender_name, m.group(1))
+        if low == "عجلة":
+            return self._wheel_bot_game(room, sender_name)
+        if low.startswith("صندوق"):
+            return self._box_bot_game(room, sender_name, raw)
+        if low.startswith("كوب") or low.startswith("كأس"):
+            return self._cup_bot_game(room, sender_name, raw)
+        if low == "وحش":
+            return self._monster_bot_game(room, sender_name)
+        if low == "بركان":
+            return self._volcano_bot_game(room, sender_name)
+        if low == "طائر":
+            return self._bird_bot_game(room, sender_name)
+        if low == "نجم":
+            return self._star_bot_game(room, sender_name)
         if low == "بنك مليون":
             return self._million_bank_game(room, sender_name)
         if low in ("مليار","billion"):
@@ -5797,7 +6074,7 @@ class TalkinBot:
             return self._steal_game(room, sender_name, m.group(1).strip().lstrip("@"))
         if low == "اسرق":
             return self._steal_game(room, sender_name)
-        if low in ("سرقة", "رشوة"):
+        if low in ("سرقة"):
             if not self._game_cooldown_notice(room, sender_name, 30.0, "سرقة" if low == "سرقة" else "رشوة"):
                 return True
             label = "🕵️ سرقة" if low == "سرقة" else "💼 رشوة"
@@ -6966,6 +7243,10 @@ class TalkinBot:
                 self.log("[WORD-FILTER] native room ban", frm, "word=", hit, "room=", room)
             except Exception as exc:
                 self.log("[WORD-FILTER] failed:", repr(exc))
+            return
+
+        # صورتي/صورتك: صورة عشوائية من الويب داخل الغرفة.
+        if self._handle_random_picture_command(room, body, frm):
             return
 
         # شبيه: متاح كأمر غرفة مستقل ولا يحتاج توثيقاً.
