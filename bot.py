@@ -1861,9 +1861,7 @@ def _default_help_sections():
             '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — يبحث البوت عن صورة عشوائية ويرسلها في الروم\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
         ],
         3: [
-            '🎮 الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عملة@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n1️⃣1️⃣ نجم\n1️⃣2️⃣ طاولة\n1️⃣3️⃣ اونو\n\n📌 هذه الألعاب ضد البوت ونتائجها نصية فقط بدون صور.',
-            '🎮 الألعاب — 2: ضد لاعب / ألعاب الجوائز\n━━━━━━━━━━━━\n1️⃣ رهان@المبلغ\n2️⃣ مراهنة@المبلغ\n3️⃣ مضاربة@المبلغ\n4️⃣ استثمار@المبلغ\n5️⃣ حظي@المبلغ\n6️⃣ مليار\n7️⃣ بنك أو بنك مليون\n8️⃣ زرع@رمز_المحصول\n9️⃣ فيس@الرمز\n🔟 اسرق / اسرق@اسم\n📌 ألعاب المليار والبنك والزرع والفيس تحتفظ بصورها ونظامها الحالي.',
-            '🎮 الألعاب — 3: الألعاب العالمية + الشبيه\n━━━━━━━━━━━━\n1️⃣ سنارة — جائزة 500\n2️⃣ برق — جائزة 500\n3️⃣ ياقوت — جائزة 500\n4️⃣ صدام — جائزة 500\n5️⃣ كاشف — جائزة 500\n6️⃣ شبيه@اسم\n\n📌 الإجمالي المعتمد في القائمة: 29 لعبة/ميزة كما تم الاتفاق.\n📌 شبيه يبحث عن صورة عشوائية مرحة ويرسلها داخل الروم.',
+            '🎮 الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عملة@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n\u200e1️⃣1️⃣\u200e نجم\n\u200e1️⃣2️⃣\u200e طاولة\n\u200e1️⃣3️⃣\u200e اونو\n\n📌 هذه الألعاب ضد البوت ونتائجها نصية فقط بدون صور.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -4806,9 +4804,20 @@ class TalkinBot:
         return _add_points(username, int(amount))
 
     def _game_ready(self, username, room, cooldown=30.0, game_name=""):
-        # فاصل 30 ثانية لكل لعبة على حدة لكل لاعب.
-        # لعب لعبة أخرى لا يفعّل فاصل هذه اللعبة، والفاصل موحّد عبر الغرف.
-        game_key=_norm_user(game_name) or "general"
+        # ألعاب البوت الجديدة لها فاصل عالمي موحّد: 40 ثانية بين أي لعبتين،
+        # وليس فاصلًا منفصلًا لكل لعبة. مثال: نجم ثم نجم، أو نجم ثم عملة،
+        # كلاهما يخضع لنفس المؤقت. المؤقت موحّد عبر جميع الغرف.
+        bot_games = {
+            "عملة", "عجلة", "صندوق", "كوب", "كأس", "وحش",
+            "بركان", "طائر", "نجم", "طاولة", "اونو", "نرد", "كنز",
+            "حجر/ورق/مقص", "استثمار", "حظ"
+        }
+        normalized_game = _norm_user(game_name)
+        if normalized_game in {_norm_user(x) for x in bot_games}:
+            game_key = "bot_games_global"
+            cooldown = 40.0
+        else:
+            game_key = normalized_game or "general"
         key=(game_key, _norm_user(username))
         now=time.time()
         with self.game_lock:
@@ -4821,7 +4830,22 @@ class TalkinBot:
     def _game_cooldown_notice(self, room, username, cooldown=30.0, game_name=""):
         ok, left = self._game_ready(username, room, cooldown, game_name)
         if not ok:
-            self.send_room_text(room, f"⏳ @{username} انتظر {left} ثانية قبل لعب لعبة أخرى.")
+            normalized_game = _norm_user(game_name)
+            bot_games = {
+                _norm_user(x) for x in (
+                    "عملة", "عجلة", "صندوق", "كوب", "كأس", "وحش",
+                    "بركان", "طائر", "نجم", "طاولة", "اونو", "نرد", "كنز",
+                    "حجر/ورق/مقص", "استثمار", "حظ"
+                )
+            }
+            if normalized_game in bot_games:
+                self.send_room_text(
+                    room,
+                    f"⏳ @{username} انتظر {left} ثانية قبل لعب لعبة أخرى.\n"
+                    f"🎮 الفاصل بين ألعاب البوت: 40 ثانية."
+                )
+            else:
+                self.send_room_text(room, f"⏳ @{username} انتظر {left} ثانية قبل لعب لعبة أخرى.")
         return ok
 
     def _send_game_result(self, room, text, game_key):
@@ -6142,15 +6166,35 @@ class TalkinBot:
             return True
         if _body_low in ("ns", "n", "التالي", "القائمة التالية", "next"):
             key = (str(room), _norm_user(sender))
+            sections_map = _help_sections_from_messages()
             current_page = int(self.help_pages.get(key, 1) or 1)
-            sections = _help_sections_from_messages().get(current_page, [])
+            current_page = max(1, min(6, current_page))
+            sections = sections_map.get(current_page, [])
             total = max(1, len(sections))
             part = int(self.help_page_part.get(key, 1) or 1)
-            part = (part % total) + 1
-            self.help_page_part[key] = part
-            self.help_game_part[key] = part
-            self._send_help(room=room, private_to=sender if is_private else None,
-                            page=current_page, game_part=part)
+
+            # ns moves only inside the category the user opened.
+            # It must NEVER jump from a3 to a2 (or between a1..a6).
+            if part < total:
+                part += 1
+                self.help_pages[key] = current_page
+                self.help_page_part[key] = part
+                self.help_game_part[key] = part
+                self._send_help(room=room, private_to=sender if is_private else None,
+                                page=current_page, game_part=part)
+            else:
+                # The current category is finished. Stay on it and tell the
+                # user that there are no more lists in this category.
+                self.help_pages[key] = current_page
+                self.help_page_part[key] = part
+                self.help_game_part[key] = part
+                label = {1: "الإدارة", 2: "الموسيقى والتفاعلات", 3: "الألعاب",
+                         4: "الهدايا والنشر", 5: "النقاط", 6: "الغرف"}.get(current_page, "القائمة")
+                msg = f"✅ انتهت قوائم {label}.\n📌 للانتقال إلى قائمة أخرى اكتب a1 إلى a6."
+                if is_private:
+                    self.send_private_text(sender, msg)
+                elif room:
+                    self.send_room_text(room, msg)
             return True
 
         is_publish = str(body or "").strip().casefold() == "انشر" or str(body or "").strip().casefold().startswith("انشر@")
@@ -6346,14 +6390,32 @@ class TalkinBot:
             return True
         if low in ("ns","n","التالي","القائمة التالية","next"):
             key=(str(room), _norm_user(sender))
+            sections_map = _help_sections_from_messages()
             current_page=int(self.help_pages.get(key,1) or 1)
-            sections = _help_sections_from_messages().get(current_page, [])
-            total = max(1, len(sections))
-            part = int(self.help_page_part.get(key, self.help_game_part.get(key,1)) or 1)
-            part = (part % total) + 1
-            self.help_page_part[key]=part
-            self.help_game_part[key]=part
-            self._send_help(room=room, private_to=sender if is_private else None, page=current_page, game_part=part)
+            current_page=max(1,min(6,current_page))
+            sections=sections_map.get(current_page, [])
+            total=max(1,len(sections))
+            part=int(self.help_page_part.get(key, self.help_game_part.get(key,1)) or 1)
+
+            # ns moves only inside the currently opened category.
+            # Do not jump from a3 to a2/a4 or between any other categories.
+            if part < total:
+                part += 1
+                self.help_pages[key]=current_page
+                self.help_page_part[key]=part
+                self.help_game_part[key]=part
+                self._send_help(room=room, private_to=sender if is_private else None, page=current_page, game_part=part)
+            else:
+                self.help_pages[key]=current_page
+                self.help_page_part[key]=part
+                self.help_game_part[key]=part
+                label={1:"الإدارة",2:"الموسيقى والتفاعلات",3:"الألعاب",
+                       4:"الهدايا والنشر",5:"النقاط",6:"الغرف"}.get(current_page,"القائمة")
+                msg=f"✅ انتهت قوائم {label}.\n📌 للانتقال إلى قائمة أخرى اكتب a1 إلى a6."
+                if is_private:
+                    self.send_private_text(sender,msg)
+                else:
+                    self.send_room_text(room,msg)
             return True
         if low in ("نقاطي","points"):
             self.send_private_text(sender, _points_summary_text(sender))
