@@ -1518,7 +1518,7 @@ def _looks_like_bot_command(text):
         "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "تحويل للكل@", "خاص@", "رسالة@", "broadcast@", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
-        "العاب", "ألعاب", "حظ", "نرد", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@",
+        "العاب", "ألعاب", "حظ", "نرد", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "is@", "صورتي", "صورتك", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
     )
     prefixes = prefixes + ("bl@",)
@@ -1847,21 +1847,22 @@ def _command_menu_for(is_master=False, is_private=False):
 
 
 def _default_help_sections():
-    """Complete help catalog. Each help page may contain multiple sections.
-
-    ``Ns`` advances to the next section within the same help page.
-    """
+    """Complete help catalog. ``ns`` advances only inside the opened category."""
     return {
         1: [
             '📋 أوامر الإدارة — 1\n━━━━━━━━━━━━\nk@اسم — طرد عضو\nkick اسم — طرد عضو\nb@اسم — حظر عضو\nban اسم — حظر عضو\nbl@اسم — حظر عضو بالقائمة\nub@اسم — فك الحظر\nu@اسم — فك الحظر\nunban اسم — فك الحظر\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك',
             '📋 أوامر الإدارة — 2\n━━━━━━━━━━━━\nتشغيل الحماية — تشغيل حماية الغرفة\nإيقاف الحماية — إيقاف حماية الغرفة\nmr@عدد — تحديد حد التكرار\nخاص@النص — إرسال رسالة خاصة لجميع المستخدمين\nرسالة@النص — نفس الأمر\nbroadcast@النص — نفس الأمر\nنسخ احتياطي — إنشاء نسخة احتياطية\nإعادة تشغيل البوت — إعادة تشغيل البوت\nتشغيل الماستر — تشغيل حساب الماستر\nإيقاف الماستر — إيقاف حساب الماستر\nحالة الماستر — حالة حساب الماستر\n\n📌 هذه الأوامر مخصصة للماستر/الإدارة حسب صلاحية الأمر.',
         ],
         2: [
-            '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال:\n.sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
+            '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال:\.sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
             '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — يبحث البوت عن صورة عشوائية ويرسلها في الروم\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
         ],
         3: [
-            '🎮 الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عملة@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n\u200e1️⃣1️⃣\u200e نجم\n\u200e1️⃣2️⃣\u200e طاولة\n\u200e1️⃣3️⃣\u200e اونو\n\n📌 هذه الألعاب ضد البوت ونتائجها نصية فقط بدون صور.',
+            '🎮 الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عملة@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n\u20661️⃣1️⃣\u2069 نجم\n\u20661️⃣2️⃣\u2069 طاولة\n\u20661️⃣3️⃣\u2069 اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
+            '💰 الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n1️⃣4️⃣ رهان@المبلغ\n1️⃣5️⃣ مضاربة@المبلغ\n1️⃣6️⃣ حظي@المبلغ\n1️⃣7️⃣ استثمار@المبلغ\n1️⃣8️⃣ حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
+            '🏦 الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n1️⃣9️⃣ بنك أو بنك مليون\n2️⃣0️⃣ مليار\n2️⃣1️⃣ زرع@رمز\n2️⃣2️⃣ فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
+            '🌐 الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n2️⃣4️⃣ سنارة أو سناره\n2️⃣5️⃣ برق\n2️⃣6️⃣ ياقوت\n2️⃣7️⃣ صدام\n2️⃣8️⃣ كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
+            '🎭 الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n2️⃣9️⃣ اسرق أو اسرق@اسم\n3️⃣0️⃣ شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n\n📌 هذه آخر قائمة في a3.\n📌 اكتب ns لمعرفة نهاية قوائم الألعاب.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -1872,11 +1873,10 @@ def _default_help_sections():
             '💸 النقاط — 2: التحويل\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل نقاط لمستخدم\n\nمثال:\nsb@ahmd555@1000\n\n📌 التحويل متاح للمستخدم الموثق، ويُخصم من رصيد المرسل ويُضاف للمستلم.\n\nللاطلاع على الرصيد استخدم: نقاطي',
         ],
         6: [
-            '🚪 الغرف — 1\n━━━━━━━━━━━━\nدخول@اسم_الغرفة — دخول غرفة\nمثال: دخول@مشاعر\nخروج — الخروج من الغرفة الحالية\nخروج اسم_الغرفة — الخروج من غرفة محددة\nغرفي — عرض الغرف التي يتواجد بها البوت\nmyrooms — نفس الأمر\n\ninv — دعوة أعضاء الغرفة الحالية\ninv اسم_الغرفة — دعوة أعضاء غرفة محددة\nدعوات — نفس أمر inv\ninvite — نفس أمر inv\ninvmsg نص — تغيير رسالة الدعوة\ni@اسم — دعوة مستخدم واحد\n\n📌 الدعوات تقرأ قائمة إعدادات الغرفة كاملة: الأونرات، المشرفين، والأعضاء، ولا تخلط أعضاء الغرف الأخرى.\n📌 inv يعمل داخل الغرفة المطلوبة، ويتطلب رفع البوت أونر عند الحاجة.',
+            '🚪 الغرف — 1\n━━━━━━━━━━━━\nدخول@اسم_الغرفة — دخول غرفة\nمثال: دخول@مشاعر\nخروج — الخروج من الغرفة الحالية\nخروج اسم_الغرفة — الخروج من غرفة محددة\nغرفي — عرض الغرف التي يتواجد بها البوت\nmyrooms — نفس الأمر\n\ninv — دعوة أعضاء الغرفة الحالية\ninv اسم_الغرفة — دعوة أعضاء غرفة محددة\nدعوات — نفس أمر inv\ninvite — نفس أمر inv\ninvmsg نص — تغيير رسالة الدعوة\ni@اسم — دعوة مستخدم واحد',
             '🏠 الغرف والترحيب — 2\n━━━━━━━━━━━━\nsay نص — إرسال نص داخل الغرفة\nقل نص — إرسال نص داخل الغرفة\n\n+sr@اسم_المستخدم@النص — إضافة رد/ترحيب مخصص (ماستر)\nsr@on — تشغيل الردود المخصصة\nsr@off — إيقاف الردود المخصصة\nswc+@اسم_الحساب@النص — إضافة ترحيب مخصص (ماستر)\nswc@on — تشغيل الترحيبات\nswc@off — إيقاف الترحيبات\n\n🛡️ حماية وتكرار الغرفة تُدار من صلاحيات الإدارة.',
         ],
     }
-
 
 def _default_help_pages():
     """First section of each help page, kept for backward compatibility."""
@@ -5905,6 +5905,10 @@ class TalkinBot:
         if not _looks_like_bot_command(raw):
             return False
         low=raw.casefold()
+        # Game-name normalization: Arabic ه/ة variants are treated as the same
+        # command (e.g. سناره/سنارة, حصانه/حصانة), while preserving raw text
+        # for commands that contain user arguments.
+        game_low = low.replace("ة", "ه")
 
         # Master-only diagnostic: send the current billion-game image privately
         # to the master, without publishing it in the room.
@@ -5955,7 +5959,7 @@ class TalkinBot:
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
-        if low in ("حصانه", "حصانة", "حصانه!", "حصانة!"):
+        if game_low in ("حصانه", "حصانه!"):
             return self._horse_game(room, sender_name)
         if low.startswith("زرع"):
             return self._crop_command(room, sender_name, raw)
@@ -5966,8 +5970,11 @@ class TalkinBot:
         # first verified player opens it, the next verified player joins, then
         # the winner receives +500 and the loser loses 500.
         fixed_games=("سنارة","برق","ياقوت","صدام","كاشف")
-        if low in tuple(x.casefold() for x in fixed_games):
-            game_name=next(x for x in fixed_games if x.casefold()==low)
+        # Use the same ة→ه normalization for canonical names so both
+        # سنارة and سناره reach the exact same game handler.
+        fixed_lookup={_norm_user(x.replace("ة", "ه")): x for x in fixed_games}
+        if _norm_user(game_low) in fixed_lookup:
+            game_name=fixed_lookup[_norm_user(game_low)]
             return self._queue_fixed_game(room,sender_name,game_name,500)
         # PvP games: outcome is decided by strong random selection, never by
         # who entered first or second.
@@ -5979,21 +5986,21 @@ class TalkinBot:
         if m:
             return self._queue_wager(room, sender_name, "استثمار", int(m.group(1)))
         # Plain "استثمار" is a free game against the bot, text only.
-        if low == "استثمار":
+        if game_low == "استثمار":
             return self._investment_bot_game(room, sender_name)
         m=re.fullmatch(r"حظ[@\s]+([0-9]+)", raw, re.I)
         if m:
             return self._lottery_game(room, sender_name, int(m.group(1)))
-        if low == "طاولة":
+        if game_low == "طاوله":
             return self._table_bot_game(room, sender_name)
-        if low == "اونو":
+        if game_low == "اونو":
             return self._uno_bot_game(room, sender_name)
-        if low == "عملة":
+        if game_low == "عمله":
             return self._coin_bot_game(room, sender_name)
         m = re.fullmatch(r"عملة[@ ](وجه|كتابة)", raw, re.I)
         if m:
             return self._coin_bot_game(room, sender_name, m.group(1))
-        if low == "عجلة":
+        if game_low == "عجله":
             return self._wheel_bot_game(room, sender_name)
         if low.startswith("صندوق"):
             return self._box_bot_game(room, sender_name, raw)
@@ -6007,7 +6014,7 @@ class TalkinBot:
             return self._bird_bot_game(room, sender_name)
         if low == "نجم":
             return self._star_bot_game(room, sender_name)
-        if low == "بنك مليون":
+        if game_low in ("بنك مليون", "بنك"):
             return self._million_bank_game(room, sender_name)
         if low in ("مليار","billion"):
             if not self._game_cooldown_notice(room, sender_name, 420.0, "مليار"):
@@ -6079,7 +6086,7 @@ class TalkinBot:
                     f"━━━━━━━━━━━━━━"
                 )
             return True
-        if low in ("حظ","الحظ","luck"):
+        if game_low in ("حظ","الحظ","luck"):
             return self._lottery_game(room, sender_name, 0)
         if low in ("حجر","ورق","مقص"):
             if not self._game_cooldown_notice(room, sender_name, 30.0, "حجر_ورق_مقص"):
@@ -6099,7 +6106,7 @@ class TalkinBot:
             return self._steal_game(room, sender_name, m.group(1).strip().lstrip("@"))
         if low == "اسرق":
             return self._steal_game(room, sender_name)
-        if low in ("سرقة"):
+        if game_low in ("سرقه"):
             if not self._game_cooldown_notice(room, sender_name, 30.0, "سرقة" if low == "سرقة" else "رشوة"):
                 return True
             label = "🕵️ سرقة" if low == "سرقة" else "💼 رشوة"
@@ -6124,10 +6131,19 @@ class TalkinBot:
                 text += "\n\n📌 للقائمة التالية اكتب ns"
             else:
                 text += "\n\n✅ انتهت أقسام هذه القائمة."
-        if private_to:
-            self._send_help_chunks("chat_message", text, to=private_to)
-        elif room:
-            self._send_help_chunks("room_message", text, room=room)
+        # a3 is intentionally one single message: the 13 bot-vs-bot games
+        # must never be split into two chat bubbles. Other help sections keep
+        # the normal safe line batching.
+        if int(page) == 3:
+            if private_to:
+                self._send_text_packets("chat_message", text, to=private_to)
+            elif room:
+                self._send_text_packets("room_message", text, room=room)
+        else:
+            if private_to:
+                self._send_help_chunks("chat_message", text, to=private_to)
+            elif room:
+                self._send_help_chunks("room_message", text, room=room)
 
     def _send_game_help_section(self, room=None, private_to=None, part=1):
         # Backward-compatible wrapper for older callers.
