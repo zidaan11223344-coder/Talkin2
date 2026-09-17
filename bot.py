@@ -1292,17 +1292,6 @@ if GITHUB_SYNC_ENABLED and not _GITHUB_WORKER_STARTED:
     _GITHUB_WORKER_STARTED = True
 
 
-def _is_ns_command(text):
-    """Fast-path for Next/NS navigation commands.
-
-    NS is navigation, not game logic. It must never be delayed by transport
-    de-duplication or by a game handler that is sleeping in another command.
-    """
-    return str(text or "").strip().casefold() in {
-        "ns", "n", "التالي", "القائمة التالية", "next"
-    }
-
-
 def _norm_user(name):
     return str(name or "").strip().lstrip("@").casefold()
 
@@ -1879,11 +1868,11 @@ def _default_help_sections():
             '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — يقول جاري البحث عن صورتك يا @اسم ثم يبحث عن صورة ويرسلها في الروم\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
         ],
         3: [
-            '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عمله@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n1️⃣1️⃣ نجم\n1️⃣2️⃣ طاولة\n1️⃣3️⃣ اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
-            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n1️⃣4️⃣ رهان@المبلغ\n1️⃣5️⃣ مضاربة@المبلغ\n1️⃣6️⃣ حظي@المبلغ\n1️⃣7️⃣ استثمار@المبلغ\n1️⃣8️⃣ حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
-            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n1️⃣9️⃣ بنك أو بنك مليون\n2️⃣0️⃣ مليار\n2️⃣1️⃣ زرع@رمز\n2️⃣2️⃣ فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n2️⃣3️⃣ سنارة أو سناره\n2️⃣4️⃣ برق\n2️⃣5️⃣ ياقوت\n2️⃣6️⃣ صدام\n2️⃣7️⃣ كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
-            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n2️⃣8️⃣ اسرق أو اسرق@اسم\n2️⃣9️⃣ شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في A3.\n📌 اكتب Ns للقائمة التالية.',
+            '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عمله@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n‎11‎ نجم\n‎12‎ طاولة\n‎13‎ اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
+            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n‎14‎ رهان@المبلغ\n‎15‎ مضاربة@المبلغ\n‎16‎ حظي@المبلغ\n‎17‎ استثمار@المبلغ\n‎18‎ حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
+            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n‎19‎ بنك أو بنك مليون\n‎20‎ مليار\n‎21‎ زرع@رمز\n‎22‎ فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n‎23‎ سنارة أو سناره\n‎24‎ برق\n‎25‎ ياقوت\n‎26‎ صدام\n‎27‎ كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
+            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n‎28‎ اسرق أو اسرق@اسم\n‎29‎ شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في A3.\n📌 اكتب Ns للقائمة التالية.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -5963,31 +5952,6 @@ class TalkinBot:
             return True
         return False
 
-    def _run_game_command_async(self, room, text, sender_name):
-        """Run game logic outside the WebSocket receive callback.
-
-        Some legacy games intentionally use time.sleep() for their reveal
-        animation. Keeping them off the receive thread means a following NS
-        command is received and handled immediately instead of waiting for the
-        game to finish sleeping.
-        """
-        def worker():
-            try:
-                self.handle_game_command(room, text, sender_name)
-            except Exception as exc:
-                self.log("[GAME] async handler failed:", repr(exc))
-                try:
-                    self.report_master_error("الألعاب", exc, room)
-                except Exception:
-                    pass
-        threading.Thread(
-            target=worker,
-            name="game-command",
-            daemon=True,
-        ).start()
-        return True
-
-
     def handle_game_command(self, room, text, sender_name):
         raw=str(text or "").strip()
         if not raw or not sender_name: return False
@@ -7244,15 +7208,11 @@ class TalkinBot:
             _save_persistent_rooms(self.known_rooms)
         event_id = str(event.get(41, ""))
         username = str(event.get(22, "") or "").strip()
-        # NS is a navigation command. Every newly received NS must be accepted
-        # immediately; do not let the transport replay/duplicate cache suppress
-        # rapid NS presses.
-        is_ns_navigation = event_type == "text" and _is_ns_command(body)
         role = str(event.get(8, "") or "").strip().lower()
         count = str(event.get(23, "") or "").strip()
         reconnected = str(event.get(24, "") or "").strip()
         # Do not log room message contents, usernames, room names, or media events.
-        if (not is_ns_navigation) and self._is_duplicate_incoming(
+        if self._is_duplicate_incoming(
             "room",
             (event_type, room, frm, to, body, str(event.get(7, "") or "")),
             event_id,
@@ -7526,7 +7486,7 @@ class TalkinBot:
         if self._handle_management_command(room, body, frm):
             return
 
-        if self._run_game_command_async(room, body, frm):
+        if self.handle_game_command(room, body, frm):
             return
 
         if body.lower().strip() in ("!help", "مساعدة") and AUTO_HELP:
@@ -7599,9 +7559,7 @@ class TalkinBot:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
                     media_url = str(cm.get(6, "") or "").strip()
-                    # Every NS is a fresh navigation request. Do not suppress
-                    # rapid NS commands with the normal transport de-dup cache.
-                    if (not _is_ns_command(body)) and self._is_duplicate_incoming(
+                    if self._is_duplicate_incoming(
                         "private",
                         (frm, body, media_url),
                         str(cm.get(41, "") or result.get("uid", "") or ""),
@@ -7665,7 +7623,7 @@ class TalkinBot:
                         else:
                             self.send_private_text(frm, f"🔒 @{frm} يحتاج توثيقاً لاستخدام الهدايا.\n{_verification_notice()}")
                             return
-                    if body and _is_verified_user(frm) and self._run_game_command_async(self.room, body, frm):
+                    if body and _is_verified_user(frm) and self.handle_game_command(self.room, body, frm):
                         return
                     if _is_master_name(frm) and body:
                         # Reuse room command handling with the command-context room.
