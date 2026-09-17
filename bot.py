@@ -2735,6 +2735,49 @@ def _search_lookalike_image(query, exclude_urls=None):
         return None
 
 
+def _search_monkey_image(exclude_urls=None):
+    """Search Wikimedia Commons for a real monkey image and return a direct image URL."""
+    excluded = {str(x).strip() for x in (exclude_urls or []) if str(x).strip()}
+    headers = {
+        "User-Agent": "TalkinBot/1.0 (image search; contact bot administrator)",
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": "monkey",
+                "gsrnamespace": 6,
+                "gsrlimit": 20,
+                "prop": "imageinfo",
+                "iiprop": "url|mime",
+                "iiurlwidth": 1200,
+                "format": "json",
+                "formatversion": 2,
+            },
+            headers=headers,
+            timeout=LOOKALIKE_TIMEOUT,
+        )
+        r.raise_for_status()
+        pages = r.json().get("query", {}).get("pages", [])
+        urls = []
+        for page in pages:
+            info = (page.get("imageinfo") or [{}])[0]
+            url = info.get("thumburl") or info.get("url")
+            mime = str(info.get("mime") or "").lower()
+            if not url or mime not in {"image/jpeg", "image/png", "image/webp"}:
+                continue
+            if url not in excluded and url not in urls:
+                urls.append(url)
+        if not urls:
+            return None
+        return secrets.choice(urls)
+    except Exception:
+        return None
+
+
 def _download_lookalike_image(image_url, target_name):
     """Download, validate, and lightly optimize a found image."""
     if not image_url:
@@ -5470,17 +5513,13 @@ class TalkinBot:
         return "unknown"
 
     def _picture_search_queries_for_name(self, name):
-        """اختيار مرح بوزن 10% شباب، 10% بنات، و80% قرود.
-
-        الاسم يبقى مفيداً لعرضه في الرسالة، لكن لا يغيّر الاحتمالات؛
-        هذا يمنع تكرار صور البنات لمجرد أن الاسم مؤنث.
-        """
+        """اختيار عشوائي متنوع: 40% شباب، 40% بنات، و20% قرود."""
         roll = secrets.randbelow(100)
-        if roll < 10:
-            return ("شباب حلوين",)
-        if roll < 20:
-            return ("بنات حلوات",)
-        return ("قرود",)
+        if roll < 40:
+            return ("شباب حلوين", "شباب عرب", "شباب وسيمين")
+        if roll < 80:
+            return ("بنات حلوات", "بنات عرب", "بنات جميلات")
+        return ("قرود", "قرد مضحك", "قرود مضحكة", "funny monkey")
 
     def _handle_random_picture_command(self, room, body, sender):
         """Handle صورتي/صورتك and .صوره username with name-aware playful searches."""
@@ -5507,14 +5546,30 @@ class TalkinBot:
                     room_key = str(room); excluded = set(recent.get(room_key, []))
                     variants = self._picture_search_queries_for_name(target)
                     query = secrets.choice(variants)
-                    image_url = _search_lookalike_image(query, exclude_urls=excluded)
+                    image_url = None
+                    # For monkey results, use Wikimedia Commons first, then Bing as a fallback.
+                    if query in {"قرود", "قرد مضحك", "قرود مضحكة", "funny monkey"}:
+                        image_url = _search_monkey_image(exclude_urls=excluded)
+                    if not image_url:
+                        image_url = _search_lookalike_image(query, exclude_urls=excluded)
                     if image_url and image_url in excluded:
-                        excluded.clear(); image_url = _search_lookalike_image(query)
+                        excluded.clear()
+                        if query in {"قرود", "قرد مضحك", "قرود مضحكة", "funny monkey"}:
+                            image_url = _search_monkey_image()
+                        if not image_url:
+                            image_url = _search_lookalike_image(query)
                     if not image_url:
                         self.send_room_text(room, "❌ لم أجد صورة مناسبة حالياً."); return
                     local = _download_lookalike_image(image_url, target)
+                    # If the first source refuses the download, immediately try the other source.
                     if not local:
-                        self.send_room_text(room, "❌ وجدت صورة لكن تعذر تحميلها حالياً."); return
+                        fallback = _search_lookalike_image(query, exclude_urls=excluded | {image_url})
+                        if fallback:
+                            local = _download_lookalike_image(fallback, target)
+                            if local:
+                                image_url = fallback
+                    if not local:
+                        self.send_room_text(room, "❌ تعذر تحميل الصورة من المصادر المتاحة حالياً."); return
                     history = list(recent.get(room_key, [])); history.append(image_url)
                     recent[room_key] = history[-10:]; self._user_picture_recent = recent
                     base = _public_base_url()
