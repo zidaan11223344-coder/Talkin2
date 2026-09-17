@@ -5429,8 +5429,60 @@ class TalkinBot:
             self._send_game_winner_card("investment", sender, [room])
         return True
 
+    def _classify_picture_name(self, name):
+        """Guess whether a display/user name is commonly masculine or feminine.
+        This is only a playful name-based guess; it does not identify the real
+        person's gender. Unknown names fall back to a mixed search.
+        """
+        raw = str(name or "").strip().lstrip("@").strip()
+        compact = re.sub(r"[\s_.-]+", "", raw.casefold())
+        male = {
+            "احمد", "محمد", "محمود", "علي", "عمر", "عثمان", "خالد", "وليد",
+            "مازن", "ياسر", "يحيى", "عبدالله", "عبد الله", "عبدالرحمن", "عبد الرحمن",
+            "ابراهيم", "إبراهيم", "اسماعيل", "إسماعيل", "سعيد", "سالم", "حسن", "حسين",
+            "حامد", "رامي", "سامر", "سامي", "طارق", "فهد", "فيصل", "بدر", "بشار",
+            "زياد", "زكريا", "أنس", "انس", "معاذ", "مصعب", "هيثم", "كريم", "نبيل",
+            "ahmed", "mohammed", "mohamed", "mohamad", "ali", "omar", "khaled",
+            "waleed", "walid", "mazen", "yasser", "yaser", "yahia", "abdullah",
+            "ibrahim", "ismail", "said", "salem", "hassan", "hussein", "rami",
+            "samer", "sami", "tariq", "fahad", "faisal", "badr", "ziad", "anas",
+            "muaz", "moath", "musab", "karim", "nabil"
+        }
+        female = {
+            "اميرة", "أميرة", "اميره", "أميره", "سارة", "ساره", "نور", "ريم", "رنا",
+            "رؤى", "روى", "ليان", "ليلى", "ليلا", "مريم", "مها", "منى", "منال",
+            "هدى", "هبة", "هبه", "دعاء", "دينا", "رانيا", "رغد", "شهد", "شيماء",
+            "سلمى", "سما", "سمر", "حنان", "وفاء", "إيمان", "ايمان", "أروى", "اروى",
+            "جنى", "جنان", "تالا", "لارا", "لينا", "ياسمين", "اسيل", "أسيل",
+            "amerah", "amira", "sarah", "sara", "noor", "reem", "rana", "roya",
+            "layan", "layla", "leila", "maryam", "mariam", "maha", "mona", "manal",
+            "huda", "heba", "hiba", "doaa", "dina", "rania", "raghad", "shahd",
+            "shimaa", "salma", "sama", "samar", "hanan", "wafa", "eman", "arwa",
+            "jana", "janna", "tala", "lara", "lina", "yasmin", "yasmine", "aseel"
+        }
+        if compact in {re.sub(r"[\s_.-]+", "", x.casefold()) for x in male}:
+            return "male"
+        if compact in {re.sub(r"[\s_.-]+", "", x.casefold()) for x in female}:
+            return "female"
+        # Common Arabic feminine endings; useful for names not in the lists.
+        if raw.endswith(("ة", "ه", "ى")) and len(raw) >= 3:
+            return "female"
+        return "unknown"
+
+    def _picture_search_queries_for_name(self, name):
+        """Return playful search themes matching the guessed name category."""
+        gender = self._classify_picture_name(name)
+        if gender == "male":
+            person = ("شباب حلوين", "شباب وسيمين")
+        elif gender == "female":
+            person = ("بنات حلوات", "بنات جميلات")
+        else:
+            person = ("شباب حلوين", "بنات حلوات")
+        # Always mix in monkeys, so the command can randomly surprise the room.
+        return person + ("قرود",)
+
     def _handle_random_picture_command(self, room, body, sender):
-        """Handle صورتي/صورتك and .صوره username using restricted safe image themes."""
+        """Handle صورتي/صورتك and .صوره username with name-aware playful searches."""
         if not room:
             return True
         text = str(body or "").strip()
@@ -5452,7 +5504,7 @@ class TalkinBot:
                 try:
                     recent = getattr(self, "_user_picture_recent", {})
                     room_key = str(room); excluded = set(recent.get(room_key, []))
-                    variants = ("شباب حلوين", "بنات حلوات", "قرود")
+                    variants = self._picture_search_queries_for_name(target)
                     query = secrets.choice(variants)
                     image_url = _search_lookalike_image(query, exclude_urls=excluded)
                     if image_url and image_url in excluded:
