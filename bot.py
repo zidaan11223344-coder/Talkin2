@@ -1530,7 +1530,7 @@ def _looks_like_bot_command(text):
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "تحويل للكل@", "خاص@", "رسالة@", "broadcast@", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "حظ", "نرد", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@",
-        "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "is@", "صورتي", "صورتك", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
+        "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "is@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
     )
     prefixes = prefixes + ("bl@",)
     normalized_low = low.replace("ة", "ه")
@@ -5430,70 +5430,91 @@ class TalkinBot:
         return True
 
     def _handle_random_picture_command(self, room, body, sender):
-        """صورتي/صورتك: search for a random public picture and send it to the room."""
+        """Handle صورتي/صورتك and .صوره username using restricted safe image themes."""
         if not room:
             return True
-        text = str(body or "").strip().casefold()
-        if text not in {"صورتي", "صورتك"}:
-            return False
-
-        busy = getattr(self, "_random_picture_busy", set())
-        key = (_norm_user(sender), str(room))
-        if key in busy:
-            self.send_room_text(room, f"⏳ @{sender} جاري البحث عن صورتك...")
+        text = str(body or "").strip()
+        low = text.casefold()
+        m = re.fullmatch(r"\.صوره(?:@|\s+)(.+)", text, re.I)
+        if m:
+            target = m.group(1).strip().lstrip("@").strip()
+            if not target:
+                self.send_room_text(room, "❌ الصيغة: .صوره اسم_المستخدم")
+                return True
+            busy = getattr(self, "_user_picture_busy", set())
+            key = (_norm_user(sender), str(room), _norm_user(target))
+            if key in busy:
+                self.send_room_text(room, f"⏳ جاري البحث عن صوره {target}...")
+                return True
+            busy.add(key); self._user_picture_busy = busy
+            self.send_room_text(room, f"🔎 جاري البحث عن صوره {target}...")
+            def worker():
+                try:
+                    recent = getattr(self, "_user_picture_recent", {})
+                    room_key = str(room); excluded = set(recent.get(room_key, []))
+                    variants = ("شباب حلوين", "بنات حلوات", "قرود")
+                    query = secrets.choice(variants)
+                    image_url = _search_lookalike_image(query, exclude_urls=excluded)
+                    if image_url and image_url in excluded:
+                        excluded.clear(); image_url = _search_lookalike_image(query)
+                    if not image_url:
+                        self.send_room_text(room, "❌ لم أجد صورة مناسبة حالياً."); return
+                    local = _download_lookalike_image(image_url, target)
+                    if not local:
+                        self.send_room_text(room, "❌ وجدت صورة لكن تعذر تحميلها حالياً."); return
+                    history = list(recent.get(room_key, [])); history.append(image_url)
+                    recent[room_key] = history[-10:]; self._user_picture_recent = recent
+                    base = _public_base_url()
+                    if not base:
+                        self.send_room_text(room, "❌ رابط الصور العام غير مضبوط في إعدادات البوت."); return
+                    public_url = f"{base}/lookalikes/{local.name}"
+                    self.send_room_text(room, f"🖼️ صورتك يا {target} هي")
+                    self.send_room_media(room, public_url, "image")
+                except Exception as exc:
+                    self.log("[USER-PICTURE] failed:", repr(exc))
+                    try: self.send_room_text(room, "❌ تعذر البحث عن الصورة حالياً.")
+                    except Exception: pass
+                finally:
+                    try: busy.discard(key)
+                    except Exception: pass
+            threading.Thread(target=worker, name="user-picture-search", daemon=True).start()
             return True
-        busy.add(key)
-        self._random_picture_busy = busy
+        if low not in {"صورتي", "صورتك"}:
+            return False
+        busy = getattr(self, "_random_picture_busy", set()); key = (_norm_user(sender), str(room))
+        if key in busy:
+            self.send_room_text(room, f"⏳ @{sender} جاري البحث عن صورتك..."); return True
+        busy.add(key); self._random_picture_busy = busy
         self.send_room_text(room, f"🔎 جاري البحث عن صورتك يا @{sender}...")
-
         def worker():
             try:
-                recent = getattr(self, "_random_picture_recent", {})
-                room_key = str(room)
+                recent = getattr(self, "_random_picture_recent", {}); room_key = str(room)
                 excluded = set(recent.get(room_key, []))
-                variants = (
-                    "قرد مضحك",
-                    "قرد مضحك meme",
-                    "شباب وسيمين",
-                    "handsome young men",
-                    "صور بنات مضحكة",
-                    "funny girls meme",
-                )
+                variants = ("شباب حلوين", "بنات حلوات", "قرود")
                 query = secrets.choice(variants)
                 image_url = _search_lookalike_image(query, exclude_urls=excluded)
                 if image_url and image_url in excluded:
-                    excluded.clear()
-                    image_url = _search_lookalike_image(query)
+                    excluded.clear(); image_url = _search_lookalike_image(query)
                 if not image_url:
-                    self.send_room_text(room, "❌ لم أجد صورة عشوائية مناسبة حالياً.")
-                    return
+                    self.send_room_text(room, "❌ لم أجد صورة مناسبة حالياً."); return
                 local = _download_lookalike_image(image_url, sender)
                 if not local:
-                    self.send_room_text(room, "❌ وجدت صورة لكن تعذر تحميلها حالياً.")
-                    return
-                history = list(recent.get(room_key, []))
-                history.append(image_url)
-                recent[room_key] = history[-10:]
-                self._random_picture_recent = recent
+                    self.send_room_text(room, "❌ وجدت صورة لكن تعذر تحميلها حالياً."); return
+                history = list(recent.get(room_key, [])); history.append(image_url)
+                recent[room_key] = history[-10:]; self._random_picture_recent = recent
                 base = _public_base_url()
                 if not base:
-                    self.send_room_text(room, "❌ رابط الصور العام غير مضبوط في إعدادات البوت.")
-                    return
+                    self.send_room_text(room, "❌ رابط الصور العام غير مضبوط في إعدادات البوت."); return
                 public_url = f"{base}/lookalikes/{local.name}"
-                self.send_room_text(room, f"🖼️ صورتك هي يا @{sender}")
+                self.send_room_text(room, f"🖼️ صورتك يا @{sender} هي")
                 self.send_room_media(room, public_url, "image")
             except Exception as exc:
                 self.log("[RANDOM-PICTURE] failed:", repr(exc))
-                try:
-                    self.send_room_text(room, "❌ تعذر البحث عن الصورة حالياً.")
-                except Exception:
-                    pass
+                try: self.send_room_text(room, "❌ تعذر البحث عن الصورة حالياً.")
+                except Exception: pass
             finally:
-                try:
-                    busy.discard(key)
-                except Exception:
-                    pass
-
+                try: busy.discard(key)
+                except Exception: pass
         threading.Thread(target=worker, name="random-picture-search", daemon=True).start()
         return True
 
