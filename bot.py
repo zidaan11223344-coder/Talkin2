@@ -1868,7 +1868,7 @@ def _default_help_sections():
             '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — يقول جاري البحث عن صورتك يا @اسم ثم يبحث عن صورة ويرسلها في الروم\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
         ],
         3: [
-            '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عمله@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n‎11‎ نجم\n‎12‎ طاولة\n‎13‎ اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
+            '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1. حجر / ورق / مقص\n2. استثمار\n3. حظ\n4. عملة أو عمله@وجه/كتابة\n5. عجلة\n6. صندوق أو صندوق@1..3\n7. كوب أو كأس@1..3\n8. وحش\n9. بركان\n10. طائر\n‎11‎ نجم\n‎12‎ طاولة\n‎13‎ اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n‎14‎ رهان@المبلغ\n‎15‎ مضاربة@المبلغ\n‎16‎ حظي@المبلغ\n‎17‎ استثمار@المبلغ\n‎18‎ حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n‎19‎ بنك أو بنك مليون\n‎20‎ مليار\n‎21‎ زرع@رمز\n‎22‎ فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n‎23‎ سنارة أو سناره\n‎24‎ برق\n‎25‎ ياقوت\n‎26‎ صدام\n‎27‎ كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
@@ -3531,9 +3531,9 @@ class TalkinBot:
             f"مرحبا عزيزي @{username}\n"
             "الماستر نائم الآن\n"
             "كيف يمكنني خدمتك؟\n"
-            "1️⃣ توثيق\n"
-            "2️⃣ شكاوي أو مقترحات\n"
-            "3️⃣ توثيق لحساب اخر\n"
+            "1. توثيق\n"
+            "2. شكاوي أو مقترحات\n"
+            "3. توثيق لحساب اخر\n"
             "ارسل رقم 1 او 2 او 3"
         )
 
@@ -3602,12 +3602,12 @@ class TalkinBot:
             sessions.pop(key, None)
             return True
 
-        if low in ("2", "🟦2", "🟦2️⃣", "2️⃣", "شكوى", "شكاوي", "شكاوى", "مقترحات", "اقتراح"):
+        if low in ("2", "🟦2", "🟦2.", "2.", "شكوى", "شكاوي", "شكاوى", "مقترحات", "اقتراح"):
             sessions[key] = "complaint"
             self.send_private_text(sender, "✍️ تفضل أرسل الشكوى أو المقترح الآن.")
             return True
 
-        if low in ("1", "🟦1", "🟦1️⃣", "1️⃣", "توثيق", "وثق", "التوثيق"):
+        if low in ("1", "🟦1", "🟦1.", "1.", "توثيق", "وثق", "التوثيق"):
             # The primary bot NEVER grants verification while the master is
             # away. Verification is an action performed by the master account.
             # Forward the request to the master/support account and leave the
@@ -3743,7 +3743,7 @@ class TalkinBot:
             return False
 
         # Option 1: verify the sender's own account.
-        if low in ("1", "🟦1", "🟦1️⃣", "1️⃣", "توثيق", "وثق", "التوثيق"):
+        if low in ("1", "🟦1", "🟦1.", "1.", "توثيق", "وثق", "التوثيق"):
             target_bot = PRIMARY_BOT_ID.strip()
             if not target_bot:
                 self.send_private_text(sender, "❌ لم يتم ضبط PRIMARY_BOT_ID للبوت الأساسي.")
@@ -3762,7 +3762,7 @@ class TalkinBot:
         # Option 2: complaint/suggestion. One prompt only; the actual complaint
         # is sent privately to MASTER_SUPPORT_USERNAME and not to the master
         # account unless that username is explicitly the same account.
-        if low in ("2", "🟦2", "🟦2️⃣", "2️⃣", "شكوى", "شكاوي", "شكاوى", "مقترحات", "اقتراح"):
+        if low in ("2", "🟦2", "🟦2.", "2.", "شكوى", "شكاوي", "شكاوى", "مقترحات", "اقتراح"):
             sessions[key] = "complaint"
             self.send_private_text(sender, "✍️ تفضل أرسل الشكوى أو المقترح الآن.")
             return True
@@ -3786,7 +3786,7 @@ class TalkinBot:
             return True
 
         # Option 3: verify another account on behalf of the requester.
-        if low in ("3", "🟦3", "🟦3️⃣", "3️⃣", "توثيق لحساب اخر", "توثيق لحساب آخر", "وثق حساب اخر", "وثق حساب آخر"):
+        if low in ("3", "🟦3", "🟦3.", "3.", "توثيق لحساب اخر", "توثيق لحساب آخر", "وثق حساب اخر", "وثق حساب آخر"):
             sessions[key] = "verify_other"
             self.send_private_text(sender, "👤 أرسل اسم المستخدم الذي تريد توثيقه الآن.")
             return True
@@ -5770,7 +5770,7 @@ class TalkinBot:
             self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n🎯 اختيارك: {choice}\n🪙 النتيجة: {result}\n{('🏆 فزت!' if won else '❌ لم تفز هذه المرة.')}\n🎁 +{_fmt_points(reward)} نقطة\n💰 رصيدك: {_fmt_points(balance)}")
             return True
         self.pending_bot_choices[key] = {"game": "coin", "created": time.time(), "result": secrets.choice(("وجه", "كتابة"))}
-        self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n1️⃣ وجه\n2️⃣ كتابة\n\n📌 أرسل الرقم فقط")
+        self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n1. وجه\n2. كتابة\n\n📌 أرسل الرقم فقط")
         return True
 
     def _wheel_bot_game(self, room, sender):
@@ -5802,7 +5802,7 @@ class TalkinBot:
                 "prize_box": secrets.randbelow(3) + 1,
                 "reward": secrets.choice([0, 20, 50, 100, 200]),
             }
-            self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n1️⃣ صندوق 1\n2️⃣ صندوق 2\n3️⃣ صندوق 3\n\n📌 أرسل الرقم فقط")
+            self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n1. صندوق 1\n2. صندوق 2\n3. صندوق 3\n\n📌 أرسل الرقم فقط")
             return True
         prize_box = secrets.randbelow(3) + 1
         reward = secrets.choice([0, 20, 50, 100, 200]) if chosen == prize_box else 0
@@ -5909,9 +5909,9 @@ class TalkinBot:
         digit_map = {
             "1": 1, "2": 2, "3": 3,
             "١": 1, "٢": 2, "٣": 3,
-            "1️⃣": 1, "2️⃣": 2, "3️⃣": 3,
+            "1.": 1, "2.": 2, "3.": 3,
             "🟦1": 1, "🟦2": 2, "🟦3": 3,
-            "🟦1️⃣": 1, "🟦2️⃣": 2, "🟦3️⃣": 3,
+            "🟦1.": 1, "🟦2.": 2, "🟦3.": 3,
         }
         choice = digit_map.get(raw)
         if choice is None:
@@ -5927,7 +5927,7 @@ class TalkinBot:
         game = pending.get("game")
         if game == "coin":
             if choice not in (1, 2):
-                self.send_room_text(room, "❌ اختر 1 أو 2 فقط.\n1️⃣ وجه\n2️⃣ كتابة")
+                self.send_room_text(room, "❌ اختر 1 أو 2 فقط.\n1. وجه\n2. كتابة")
                 return True
             result = pending.get("result") or secrets.choice(("وجه", "كتابة"))
             selected = "وجه" if choice == 1 else "كتابة"
