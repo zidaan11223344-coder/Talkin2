@@ -5470,16 +5470,17 @@ class TalkinBot:
         return "unknown"
 
     def _picture_search_queries_for_name(self, name):
-        """Return playful search themes matching the guessed name category."""
-        gender = self._classify_picture_name(name)
-        if gender == "male":
-            person = ("شباب حلوين", "شباب وسيمين")
-        elif gender == "female":
-            person = ("بنات حلوات", "بنات جميلات")
-        else:
-            person = ("شباب حلوين", "بنات حلوات")
-        # Always mix in monkeys, so the command can randomly surprise the room.
-        return person + ("قرود",)
+        """اختيار مرح بوزن 10% شباب، 10% بنات، و80% قرود.
+
+        الاسم يبقى مفيداً لعرضه في الرسالة، لكن لا يغيّر الاحتمالات؛
+        هذا يمنع تكرار صور البنات لمجرد أن الاسم مؤنث.
+        """
+        roll = secrets.randbelow(100)
+        if roll < 10:
+            return ("شباب حلوين",)
+        if roll < 20:
+            return ("بنات حلوات",)
+        return ("قرود",)
 
     def _handle_random_picture_command(self, room, body, sender):
         """Handle صورتي/صورتك and .صوره username with name-aware playful searches."""
