@@ -1869,10 +1869,10 @@ def _default_help_sections():
         ],
         3: [
             '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عمله@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n1️⃣1️⃣ نجم\n1️⃣2️⃣ طاولة\n1️⃣3️⃣ اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
-            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n🔢 14 — رهان@المبلغ\n🔢 15 — مضاربة@المبلغ\n🔢 16 — حظي@المبلغ\n🔢 17 — استثمار@المبلغ\n🔢 18 — حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
-            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n🔢 19 — بنك أو بنك مليون\n🔢 20 — مليار\n🔢 21 — زرع@رمز\n🔢 22 — فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n🔢 23 — سنارة أو سناره\n🔢 24 — برق\n🔢 25 — ياقوت\n🔢 26 — صدام\n🔢 27 — كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
-            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n🔢 28 — اسرق أو اسرق@اسم\n🔢 29 — شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في A3.\n📌 اكتب Ns للقائمة التالية.',
+            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n1️⃣4️⃣ رهان@المبلغ\n1️⃣5️⃣ مضاربة@المبلغ\n1️⃣6️⃣ حظي@المبلغ\n1️⃣7️⃣ استثمار@المبلغ\n1️⃣8️⃣ حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
+            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n1️⃣9️⃣ بنك أو بنك مليون\n2️⃣0️⃣ مليار\n2️⃣1️⃣ زرع@رمز\n2️⃣2️⃣ فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n2️⃣3️⃣ سنارة أو سناره\n2️⃣4️⃣ برق\n2️⃣5️⃣ ياقوت\n2️⃣6️⃣ صدام\n2️⃣7️⃣ كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
+            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n2️⃣8️⃣ اسرق أو اسرق@اسم\n2️⃣9️⃣ شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في A3.\n📌 اكتب Ns للقائمة التالية.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -6196,8 +6196,21 @@ class TalkinBot:
                 self._send_help_chunks("room_message", text, room=room)
 
     def _send_game_help_section(self, room=None, private_to=None, part=1):
-        # Backward-compatible wrapper for older callers.
-        self._send_help_section(room=room, private_to=private_to, page=3, part=part)
+        # A3 is always one complete message per list; no batching or delay.
+        sections = _help_sections_from_messages().get(3, [])
+        if not sections:
+            return False
+        idx = max(1, min(int(part), len(sections))) - 1
+        text = sections[idx]
+        if idx < len(sections) - 1:
+            text += "\n\n📌 للقائمة التالية اكتب Ns"
+        else:
+            text += "\n\n📌 هذه آخر قائمة في A3."
+        if private_to:
+            return self._send_text_packets("chat_message", text, to=private_to)
+        if room:
+            return self._send_text_packets("room_message", text, room=room)
+        return False
 
     def _send_help(self, room=None, private_to=None, page=1, game_part=1):
         self._send_help_section(room=room, private_to=private_to, page=page, part=game_part)
@@ -6489,7 +6502,10 @@ class TalkinBot:
                 self.help_pages[key]=current_page
                 self.help_page_part[key]=part
                 self.help_game_part[key]=part
-                self._send_help(room=room, private_to=sender if is_private else None, page=current_page, game_part=part)
+                if current_page == 3:
+                    self._send_game_help_section(room=room, private_to=sender if is_private else None, part=part)
+                else:
+                    self._send_help(room=room, private_to=sender if is_private else None, page=current_page, game_part=part)
             else:
                 self.help_pages[key]=current_page
                 self.help_page_part[key]=part
