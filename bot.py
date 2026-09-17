@@ -1292,6 +1292,17 @@ if GITHUB_SYNC_ENABLED and not _GITHUB_WORKER_STARTED:
     _GITHUB_WORKER_STARTED = True
 
 
+def _is_ns_command(text):
+    """Fast-path for Next/NS navigation commands.
+
+    NS is navigation, not game logic. It must never be delayed by transport
+    de-duplication or by a game handler that is sleeping in another command.
+    """
+    return str(text or "").strip().casefold() in {
+        "ns", "n", "التالي", "القائمة التالية", "next"
+    }
+
+
 def _norm_user(name):
     return str(name or "").strip().lstrip("@").casefold()
 
@@ -5952,6 +5963,31 @@ class TalkinBot:
             return True
         return False
 
+    def _run_game_command_async(self, room, text, sender_name):
+        """Run game logic outside the WebSocket receive callback.
+
+        Some legacy games intentionally use time.sleep() for their reveal
+        animation. Keeping them off the receive thread means a following NS
+        command is received and handled immediately instead of waiting for the
+        game to finish sleeping.
+        """
+        def worker():
+            try:
+                self.handle_game_command(room, text, sender_name)
+            except Exception as exc:
+                self.log("[GAME] async handler failed:", repr(exc))
+                try:
+                    self.report_master_error("الألعاب", exc, room)
+                except Exception:
+                    pass
+        threading.Thread(
+            target=worker,
+            name="game-command",
+            daemon=True,
+        ).start()
+        return True
+
+
     def handle_game_command(self, room, text, sender_name):
         raw=str(text or "").strip()
         if not raw or not sender_name: return False
@@ -7208,11 +7244,15 @@ class TalkinBot:
             _save_persistent_rooms(self.known_rooms)
         event_id = str(event.get(41, ""))
         username = str(event.get(22, "") or "").strip()
+        # NS is a navigation command. Every newly received NS must be accepted
+        # immediately; do not let the transport replay/duplicate cache suppress
+        # rapid NS presses.
+        is_ns_navigation = event_type == "text" and _is_ns_command(body)
         role = str(event.get(8, "") or "").strip().lower()
         count = str(event.get(23, "") or "").strip()
         reconnected = str(event.get(24, "") or "").strip()
         # Do not log room message contents, usernames, room names, or media events.
-        if self._is_duplicate_incoming(
+        if (not is_ns_navigation) and self._is_duplicate_incoming(
             "room",
             (event_type, room, frm, to, body, str(event.get(7, "") or "")),
             event_id,
@@ -7486,7 +7526,7 @@ class TalkinBot:
         if self._handle_management_command(room, body, frm):
             return
 
-        if self.handle_game_command(room, body, frm):
+        if self._run_game_command_async(room, body, frm):
             return
 
         if body.lower().strip() in ("!help", "مساعدة") and AUTO_HELP:
@@ -7559,7 +7599,9 @@ class TalkinBot:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
                     media_url = str(cm.get(6, "") or "").strip()
-                    if self._is_duplicate_incoming(
+                    # Every NS is a fresh navigation request. Do not suppress
+                    # rapid NS commands with the normal transport de-dup cache.
+                    if (not _is_ns_command(body)) and self._is_duplicate_incoming(
                         "private",
                         (frm, body, media_url),
                         str(cm.get(41, "") or result.get("uid", "") or ""),
@@ -7623,7 +7665,7 @@ class TalkinBot:
                         else:
                             self.send_private_text(frm, f"🔒 @{frm} يحتاج توثيقاً لاستخدام الهدايا.\n{_verification_notice()}")
                             return
-                    if body and _is_verified_user(frm) and self.handle_game_command(self.room, body, frm):
+                    if body and _is_verified_user(frm) and self._run_game_command_async(self.room, body, frm):
                         return
                     if _is_master_name(frm) and body:
                         # Reuse room command handling with the command-context room.
