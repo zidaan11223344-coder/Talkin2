@@ -5513,13 +5513,32 @@ class TalkinBot:
         return "unknown"
 
     def _picture_search_queries_for_name(self, name):
-        """اختيار عشوائي متنوع: 40% شباب، 40% بنات، و20% قرود."""
-        roll = secrets.randbelow(100)
-        if roll < 40:
-            return ("شباب حلوين", "شباب عرب", "شباب وسيمين")
-        if roll < 80:
-            return ("بنات حلوات", "بنات عرب", "بنات جميلات")
-        return ("قرود", "قرد مضحك", "قرود مضحكة", "funny monkey")
+        """
+        اختيار البحث لـ .صوره اسم_المستخدم:
+        - 80% قرود كما طلب المستخدم.
+        - 20% صور بشرية، مع محاولة مطابقة جنس الاسم.
+        - لا نغيّر محرك البحث الحالي؛ نغيّر فقط الاستعلام الذي يرسله له.
+        """
+        # 80% من الطلبات: صورة قرد/قرود.
+        if secrets.randbelow(100) < 80:
+            return ("قرود", "قرد مضحك", "قرود مضحكة", "funny monkey")
+
+        gender = self._classify_picture_name(name)
+        if gender == "male":
+            return (
+                "شباب قبيحين", "شباب بشعين", "رجال قبيحين",
+                "ugly men", "ugly guys"
+            )
+        if gender == "female":
+            return (
+                "بنات قبيحات", "بنات بشعات", "نساء قبيحات",
+                "ugly women", "ugly girls"
+            )
+        # اسم غير معروف: لا نفترض الجنس، ونترك البحث مختلطاً.
+        return (
+            "شخص قبيح", "شخص بشع", "ugly person",
+            "شباب قبيحين", "بنات قبيحات"
+        )
 
     def _handle_random_picture_command(self, room, body, sender):
         """Handle صورتي/صورتك and .صوره username with name-aware playful searches."""
@@ -5598,7 +5617,15 @@ class TalkinBot:
             try:
                 recent = getattr(self, "_random_picture_recent", {}); room_key = str(room)
                 excluded = set(recent.get(room_key, []))
-                variants = ("شباب حلوين", "بنات حلوات", "قرود")
+                # صورتي/صورتك: لا نعتبر الجنس حقيقة؛ نستخدم اسم الحساب فقط
+                # كتخمين مرح، ثم نبحث عن صورة من الفئة المناسبة.
+                gender = self._classify_picture_name(sender)
+                if gender == "male":
+                    variants = ("شباب قبيحين", "شباب بشعين", "ugly men", "ugly guys")
+                elif gender == "female":
+                    variants = ("بنات قبيحات", "بنات بشعات", "ugly women", "ugly girls")
+                else:
+                    variants = ("شخص قبيح", "شخص بشع", "ugly person", "شباب قبيحين", "بنات قبيحات")
                 query = secrets.choice(variants)
                 image_url = _search_lookalike_image(query, exclude_urls=excluded)
                 if image_url and image_url in excluded:
