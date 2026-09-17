@@ -1292,6 +1292,17 @@ if GITHUB_SYNC_ENABLED and not _GITHUB_WORKER_STARTED:
     _GITHUB_WORKER_STARTED = True
 
 
+def _is_ns_command(text):
+    """Fast-path for Next/NS navigation commands.
+
+    NS is navigation, not game logic. It must never be delayed by transport
+    de-duplication or by a game handler that is sleeping in another command.
+    """
+    return str(text or "").strip().casefold() in {
+        "ns", "n", "التالي", "القائمة التالية", "next"
+    }
+
+
 def _norm_user(name):
     return str(name or "").strip().lstrip("@").casefold()
 
@@ -1868,11 +1879,11 @@ def _default_help_sections():
             '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — يقول جاري البحث عن صورتك يا @اسم ثم يبحث عن صورة ويرسلها في الروم\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
         ],
         3: [
-            '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1. حجر / ورق / مقص\n2. استثمار\n3. حظ\n4. عملة أو عمله@وجه/كتابة\n5. عجلة\n6. صندوق أو صندوق@1..3\n7. كوب أو كأس@1..3\n8. وحش\n9. بركان\n10. طائر\n‎11‎ نجم\n‎12‎ طاولة\n‎13‎ اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
-            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n‎14‎ رهان@المبلغ\n‎15‎ مضاربة@المبلغ\n‎16‎ حظي@المبلغ\n‎17‎ استثمار@المبلغ\n‎18‎ حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
-            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n‎19‎ بنك أو بنك مليون\n‎20‎ مليار\n‎21‎ زرع@رمز\n‎22‎ فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n‎23‎ سنارة أو سناره\n‎24‎ برق\n‎25‎ ياقوت\n‎26‎ صدام\n‎27‎ كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
-            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n‎28‎ اسرق أو اسرق@اسم\n‎29‎ شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في A3.\n📌 اكتب Ns للقائمة التالية.',
+            '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n\u20661.\u2069 حجر / ورق / مقص\n\u20662.\u2069 استثمار\n\u20663.\u2069 حظ\n\u20664.\u2069 عملة أو عمله@وجه/كتابة\n\u20665.\u2069 عجلة\n\u20666.\u2069 صندوق أو صندوق@1..3\n\u20667.\u2069 كوب أو كأس@1..3\n\u20668.\u2069 وحش\n\u20669.\u2069 بركان\n🔟 طائر\n\u206611.\u2069 نجم\n\u206612.\u2069 طاولة\n\u206613.\u2069 اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
+            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n\u206614.\u2069 رهان@المبلغ\n\u206615.\u2069 مضاربة@المبلغ\n\u206616.\u2069 حظي@المبلغ\n\u206617.\u2069 استثمار@المبلغ\n\u206618.\u2069 حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
+            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n\u206619.\u2069 بنك أو بنك مليون\n\u206620.\u2069 مليار\n\u206621.\u2069 زرع@رمز\n\u206622.\u2069 فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n\u206623.\u2069 سنارة أو سناره\n\u206624.\u2069 برق\n\u206625.\u2069 ياقوت\n\u206626.\u2069 صدام\n\u206627.\u2069 كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
+            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n\u206628.\u2069 اسرق أو اسرق@اسم\n\u206629.\u2069 شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في A3.\n📌 اكتب Ns للقائمة التالية.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -3531,9 +3542,9 @@ class TalkinBot:
             f"مرحبا عزيزي @{username}\n"
             "الماستر نائم الآن\n"
             "كيف يمكنني خدمتك؟\n"
-            "1. توثيق\n"
-            "2. شكاوي أو مقترحات\n"
-            "3. توثيق لحساب اخر\n"
+            "\u20661.\u2069 توثيق\n"
+            "\u20662.\u2069 شكاوي أو مقترحات\n"
+            "\u20663.\u2069 توثيق لحساب اخر\n"
             "ارسل رقم 1 او 2 او 3"
         )
 
@@ -3602,12 +3613,12 @@ class TalkinBot:
             sessions.pop(key, None)
             return True
 
-        if low in ("2", "🟦2", "🟦2.", "2.", "شكوى", "شكاوي", "شكاوى", "مقترحات", "اقتراح"):
+        if low in ("2", "🟦2", "🟦\u20662.\u2069", "\u20662.\u2069", "شكوى", "شكاوي", "شكاوى", "مقترحات", "اقتراح"):
             sessions[key] = "complaint"
             self.send_private_text(sender, "✍️ تفضل أرسل الشكوى أو المقترح الآن.")
             return True
 
-        if low in ("1", "🟦1", "🟦1.", "1.", "توثيق", "وثق", "التوثيق"):
+        if low in ("1", "🟦1", "🟦\u20661.\u2069", "\u20661.\u2069", "توثيق", "وثق", "التوثيق"):
             # The primary bot NEVER grants verification while the master is
             # away. Verification is an action performed by the master account.
             # Forward the request to the master/support account and leave the
@@ -3743,7 +3754,7 @@ class TalkinBot:
             return False
 
         # Option 1: verify the sender's own account.
-        if low in ("1", "🟦1", "🟦1.", "1.", "توثيق", "وثق", "التوثيق"):
+        if low in ("1", "🟦1", "🟦\u20661.\u2069", "\u20661.\u2069", "توثيق", "وثق", "التوثيق"):
             target_bot = PRIMARY_BOT_ID.strip()
             if not target_bot:
                 self.send_private_text(sender, "❌ لم يتم ضبط PRIMARY_BOT_ID للبوت الأساسي.")
@@ -3762,7 +3773,7 @@ class TalkinBot:
         # Option 2: complaint/suggestion. One prompt only; the actual complaint
         # is sent privately to MASTER_SUPPORT_USERNAME and not to the master
         # account unless that username is explicitly the same account.
-        if low in ("2", "🟦2", "🟦2.", "2.", "شكوى", "شكاوي", "شكاوى", "مقترحات", "اقتراح"):
+        if low in ("2", "🟦2", "🟦\u20662.\u2069", "\u20662.\u2069", "شكوى", "شكاوي", "شكاوى", "مقترحات", "اقتراح"):
             sessions[key] = "complaint"
             self.send_private_text(sender, "✍️ تفضل أرسل الشكوى أو المقترح الآن.")
             return True
@@ -3786,7 +3797,7 @@ class TalkinBot:
             return True
 
         # Option 3: verify another account on behalf of the requester.
-        if low in ("3", "🟦3", "🟦3.", "3.", "توثيق لحساب اخر", "توثيق لحساب آخر", "وثق حساب اخر", "وثق حساب آخر"):
+        if low in ("3", "🟦3", "🟦\u20663.\u2069", "\u20663.\u2069", "توثيق لحساب اخر", "توثيق لحساب آخر", "وثق حساب اخر", "وثق حساب آخر"):
             sessions[key] = "verify_other"
             self.send_private_text(sender, "👤 أرسل اسم المستخدم الذي تريد توثيقه الآن.")
             return True
@@ -5770,7 +5781,7 @@ class TalkinBot:
             self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n🎯 اختيارك: {choice}\n🪙 النتيجة: {result}\n{('🏆 فزت!' if won else '❌ لم تفز هذه المرة.')}\n🎁 +{_fmt_points(reward)} نقطة\n💰 رصيدك: {_fmt_points(balance)}")
             return True
         self.pending_bot_choices[key] = {"game": "coin", "created": time.time(), "result": secrets.choice(("وجه", "كتابة"))}
-        self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n1. وجه\n2. كتابة\n\n📌 أرسل الرقم فقط")
+        self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n\u20661.\u2069 وجه\n\u20662.\u2069 كتابة\n\n📌 أرسل الرقم فقط")
         return True
 
     def _wheel_bot_game(self, room, sender):
@@ -5802,7 +5813,7 @@ class TalkinBot:
                 "prize_box": secrets.randbelow(3) + 1,
                 "reward": secrets.choice([0, 20, 50, 100, 200]),
             }
-            self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n1. صندوق 1\n2. صندوق 2\n3. صندوق 3\n\n📌 أرسل الرقم فقط")
+            self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n\u20661.\u2069 صندوق 1\n\u20662.\u2069 صندوق 2\n\u20663.\u2069 صندوق 3\n\n📌 أرسل الرقم فقط")
             return True
         prize_box = secrets.randbelow(3) + 1
         reward = secrets.choice([0, 20, 50, 100, 200]) if chosen == prize_box else 0
@@ -5909,9 +5920,9 @@ class TalkinBot:
         digit_map = {
             "1": 1, "2": 2, "3": 3,
             "١": 1, "٢": 2, "٣": 3,
-            "1.": 1, "2.": 2, "3.": 3,
+            "\u20661.\u2069": 1, "\u20662.\u2069": 2, "\u20663.\u2069": 3,
             "🟦1": 1, "🟦2": 2, "🟦3": 3,
-            "🟦1.": 1, "🟦2.": 2, "🟦3.": 3,
+            "🟦\u20661.\u2069": 1, "🟦\u20662.\u2069": 2, "🟦\u20663.\u2069": 3,
         }
         choice = digit_map.get(raw)
         if choice is None:
@@ -5927,7 +5938,7 @@ class TalkinBot:
         game = pending.get("game")
         if game == "coin":
             if choice not in (1, 2):
-                self.send_room_text(room, "❌ اختر 1 أو 2 فقط.\n1. وجه\n2. كتابة")
+                self.send_room_text(room, "❌ اختر 1 أو 2 فقط.\n\u20661.\u2069 وجه\n\u20662.\u2069 كتابة")
                 return True
             result = pending.get("result") or secrets.choice(("وجه", "كتابة"))
             selected = "وجه" if choice == 1 else "كتابة"
@@ -5951,6 +5962,31 @@ class TalkinBot:
             self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender_name}\n{body}\n🎁 +{_fmt_points(reward)} نقطة\n💰 رصيدك: {_fmt_points(balance)}")
             return True
         return False
+
+    def _run_game_command_async(self, room, text, sender_name):
+        """Run game logic outside the WebSocket receive callback.
+
+        Some legacy games intentionally use time.sleep() for their reveal
+        animation. Keeping them off the receive thread means a following NS
+        command is received and handled immediately instead of waiting for the
+        game to finish sleeping.
+        """
+        def worker():
+            try:
+                self.handle_game_command(room, text, sender_name)
+            except Exception as exc:
+                self.log("[GAME] async handler failed:", repr(exc))
+                try:
+                    self.report_master_error("الألعاب", exc, room)
+                except Exception:
+                    pass
+        threading.Thread(
+            target=worker,
+            name="game-command",
+            daemon=True,
+        ).start()
+        return True
+
 
     def handle_game_command(self, room, text, sender_name):
         raw=str(text or "").strip()
@@ -7208,11 +7244,15 @@ class TalkinBot:
             _save_persistent_rooms(self.known_rooms)
         event_id = str(event.get(41, ""))
         username = str(event.get(22, "") or "").strip()
+        # NS is a navigation command. Every newly received NS must be accepted
+        # immediately; do not let the transport replay/duplicate cache suppress
+        # rapid NS presses.
+        is_ns_navigation = event_type == "text" and _is_ns_command(body)
         role = str(event.get(8, "") or "").strip().lower()
         count = str(event.get(23, "") or "").strip()
         reconnected = str(event.get(24, "") or "").strip()
         # Do not log room message contents, usernames, room names, or media events.
-        if self._is_duplicate_incoming(
+        if (not is_ns_navigation) and self._is_duplicate_incoming(
             "room",
             (event_type, room, frm, to, body, str(event.get(7, "") or "")),
             event_id,
@@ -7486,7 +7526,7 @@ class TalkinBot:
         if self._handle_management_command(room, body, frm):
             return
 
-        if self.handle_game_command(room, body, frm):
+        if self._run_game_command_async(room, body, frm):
             return
 
         if body.lower().strip() in ("!help", "مساعدة") and AUTO_HELP:
@@ -7559,7 +7599,9 @@ class TalkinBot:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
                     media_url = str(cm.get(6, "") or "").strip()
-                    if self._is_duplicate_incoming(
+                    # Every NS is a fresh navigation request. Do not suppress
+                    # rapid NS commands with the normal transport de-dup cache.
+                    if (not _is_ns_command(body)) and self._is_duplicate_incoming(
                         "private",
                         (frm, body, media_url),
                         str(cm.get(41, "") or result.get("uid", "") or ""),
@@ -7623,7 +7665,7 @@ class TalkinBot:
                         else:
                             self.send_private_text(frm, f"🔒 @{frm} يحتاج توثيقاً لاستخدام الهدايا.\n{_verification_notice()}")
                             return
-                    if body and _is_verified_user(frm) and self.handle_game_command(self.room, body, frm):
+                    if body and _is_verified_user(frm) and self._run_game_command_async(self.room, body, frm):
                         return
                     if _is_master_name(frm) and body:
                         # Reuse room command handling with the command-context room.
