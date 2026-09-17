@@ -2716,12 +2716,15 @@ def _search_lookalike_image(query, exclude_urls=None):
     try:
         r = requests.get(
             "https://www.bing.com/images/search",
-            params={"q": q, "form": "HDRSC2", "first": "1"},
+            params={"q": q, "form": "HDRSC2", "first": "1", "safeSearch": "Strict"},
             headers=headers,
             timeout=LOOKALIKE_TIMEOUT,
         )
         r.raise_for_status()
         urls = _extract_image_urls_from_bing(r.text)
+        # Secondary conservative URL filter in addition to Bing SafeSearch=Strict.
+        blocked = ("porn", "xxx", "nsfw", "nude", "naked", "sex", "hentai", "18+", "adult")
+        urls = [u for u in urls if not any(x in str(u).casefold() for x in blocked)]
         excluded = {str(x).strip() for x in (exclude_urls or []) if str(x).strip()}
         fresh = [u for u in urls if u not in excluded]
         if not fresh:
@@ -5513,32 +5516,21 @@ class TalkinBot:
         return "unknown"
 
     def _picture_search_queries_for_name(self, name):
-        """
-        اختيار البحث لـ .صوره اسم_المستخدم:
-        - 80% قرود كما طلب المستخدم.
-        - 20% صور بشرية، مع محاولة مطابقة جنس الاسم.
-        - لا نغيّر محرك البحث الحالي؛ نغيّر فقط الاستعلام الذي يرسله له.
-        """
-        # 80% من الطلبات: صورة قرد/قرود.
-        if secrets.randbelow(100) < 80:
+        """استعلامات صور مرحة ومحتشمة؛ 80% قرود و20% أشخاص عاديون."""
+        roll = secrets.randbelow(100)
+        if roll < 80:
             return ("قرود", "قرد مضحك", "قرود مضحكة", "funny monkey")
 
         gender = self._classify_picture_name(name)
+        safe_suffix = " محترم محتشم ملابس عادية"
         if gender == "male":
-            return (
-                "شباب قبيحين", "شباب بشعين", "رجال قبيحين",
-                "ugly men", "ugly guys"
-            )
+            return ("شباب عاديين" + safe_suffix, "شباب عرب" + safe_suffix,
+                    "رجال عاديين" + safe_suffix, "men casual portrait")
         if gender == "female":
-            return (
-                "بنات قبيحات", "بنات بشعات", "نساء قبيحات",
-                "ugly women", "ugly girls"
-            )
-        # اسم غير معروف: لا نفترض الجنس، ونترك البحث مختلطاً.
-        return (
-            "شخص قبيح", "شخص بشع", "ugly person",
-            "شباب قبيحين", "بنات قبيحات"
-        )
+            return ("بنات عاديين" + safe_suffix, "بنات عرب" + safe_suffix,
+                    "نساء عاديين" + safe_suffix, "women casual portrait modest")
+        return ("شخص عادي محترم محتشم", "شخص عربي بملابس عادية",
+                "شخص casual portrait modest", "family friendly portrait")
 
     def _handle_random_picture_command(self, room, body, sender):
         """Handle صورتي/صورتك and .صوره username with name-aware playful searches."""
@@ -5617,15 +5609,13 @@ class TalkinBot:
             try:
                 recent = getattr(self, "_random_picture_recent", {}); room_key = str(room)
                 excluded = set(recent.get(room_key, []))
-                # صورتي/صورتك: لا نعتبر الجنس حقيقة؛ نستخدم اسم الحساب فقط
-                # كتخمين مرح، ثم نبحث عن صورة من الفئة المناسبة.
                 gender = self._classify_picture_name(sender)
                 if gender == "male":
-                    variants = ("شباب قبيحين", "شباب بشعين", "ugly men", "ugly guys")
+                    variants = ("شباب عاديين محترمين محتشمين", "شباب عرب بملابس عادية", "men casual portrait")
                 elif gender == "female":
-                    variants = ("بنات قبيحات", "بنات بشعات", "ugly women", "ugly girls")
+                    variants = ("بنات عاديات محترمات محتشمات", "بنات عرب بملابس عادية", "women casual portrait modest")
                 else:
-                    variants = ("شخص قبيح", "شخص بشع", "ugly person", "شباب قبيحين", "بنات قبيحات")
+                    variants = ("شخص عادي محترم محتشم", "شخص عربي بملابس عادية", "family friendly portrait")
                 query = secrets.choice(variants)
                 image_url = _search_lookalike_image(query, exclude_urls=excluded)
                 if image_url and image_url in excluded:
