@@ -1522,7 +1522,17 @@ def _looks_like_bot_command(text):
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "is@", "صورتي", "صورتك", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
     )
     prefixes = prefixes + ("bl@",)
-    return low.startswith(prefixes) or low in ("help", "مساعدة", "games", "game") or low in {x.casefold() for x in GAME_COMMANDS}
+    normalized_low = low.replace("ة", "ه")
+    normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
+    normalized_games = {str(x).casefold().replace("ة", "ه") for x in GAME_COMMANDS}
+    return (
+        low.startswith(prefixes)
+        or normalized_low.startswith(normalized_prefixes)
+        or low in ("help", "مساعدة", "games", "game")
+        or normalized_low in ("مساعده", "games", "game")
+        or low in {x.casefold() for x in GAME_COMMANDS}
+        or normalized_low in normalized_games
+    )
 
 def _looks_like_admin_command(text):
     low = str(text or "").strip().casefold()
@@ -1858,11 +1868,11 @@ def _default_help_sections():
             '❤️ التفاعلات والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — يقول جاري البحث عن صورتك يا @اسم ثم يبحث عن صورة ويرسلها في الروم\nشبيه@اسم — البحث عن الشبيه\nشبيهك@اسم — البحث عن شبيهك\n\n📌 التفاعل يكون على كود المنشور/المحتوى المرسل من البوت.',
         ],
         3: [
-            '🎮 الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عملة@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n\u20661️⃣1️⃣\u2069 نجم\n\u20661️⃣2️⃣\u2069 طاولة\n\u20661️⃣3️⃣\u2069 اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
-            '💰 الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n⁦1️⃣4️⃣⁩ رهان@المبلغ\n⁦1️⃣5️⃣⁩ مضاربة@المبلغ\n⁦1️⃣6️⃣⁩ حظي@المبلغ\n⁦1️⃣7️⃣⁩ استثمار@المبلغ\n⁦1️⃣8️⃣⁩ حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
-            '🏦 الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n⁦1️⃣9️⃣⁩ بنك أو بنك مليون\n⁦2️⃣0️⃣⁩ مليار\n⁦2️⃣1️⃣⁩ زرع@رمز\n⁦2️⃣2️⃣⁩ فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
-            '🌐 الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n⁦2️⃣4️⃣⁩ سنارة أو سناره\n⁦2️⃣5️⃣⁩ برق\n⁦2️⃣6️⃣⁩ ياقوت\n⁦2️⃣7️⃣⁩ صدام\n⁦2️⃣8️⃣⁩ كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
-            '🎭 الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n⁦2️⃣9️⃣⁩ اسرق أو اسرق@اسم\n⁦3️⃣0️⃣⁩ شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n\n📌 هذه آخر قائمة في a3.\n📌 اكتب ns لمعرفة نهاية قوائم الألعاب.',
+            '🎮 الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1️⃣ حجر / ورق / مقص\n2️⃣ استثمار\n3️⃣ حظ\n4️⃣ عملة أو عمله@وجه/كتابة\n5️⃣ عجلة\n6️⃣ صندوق أو صندوق@1..3\n7️⃣ كوب أو كأس@1..3\n8️⃣ وحش\n9️⃣ بركان\n🔟 طائر\n🔢 11 — نجم\n🔢 12 — طاولة\n🔢 13 — اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
+            '💰 الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n🔢 14 — رهان@المبلغ\n🔢 15 — مضاربة@المبلغ\n🔢 16 — حظي@المبلغ\n🔢 17 — استثمار@المبلغ\n🔢 18 — حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
+            '🏦 الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n🔢 19 — بنك أو بنك مليون\n🔢 20 — مليار\n🔢 21 — زرع@رمز\n🔢 22 — فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
+            '🌐 الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n🔢 23 — سنارة أو سناره\n🔢 24 — برق\n🔢 25 — ياقوت\n🔢 26 — صدام\n🔢 27 — كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
+            '🎭 الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n🔢 28 — اسرق أو اسرق@اسم\n🔢 29 — شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في a3.\n📌 اكتب ns لمعرفة نهاية قوائم الألعاب.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -2942,6 +2952,7 @@ class TalkinBot:
         self.help_pages = {}
         self.help_game_part = {}  # legacy alias used by older code
         self.help_page_part = {}
+        self.pending_bot_choices = {}
         # Global wager queues, crop timers, and fruit-match state.
         self.wager_waiting = {}
         # Global fixed-prize PvP queues: one open challenge per game name.
@@ -4848,9 +4859,45 @@ class TalkinBot:
                 self.send_room_text(room, f"⏳ @{username} انتظر {left} ثانية قبل لعب لعبة أخرى.")
         return ok
 
-    def _send_game_result(self, room, text, game_key):
-        """Send game results as text only; games never send result images."""
+    def _send_game_result(self, room, text, game_key, winner_name="", target_rooms=None):
+        """Send the text result and, when the game has artwork, its winner card."""
         self.send_room_text(room, text)
+        if winner_name and game_key:
+            self._send_game_winner_card(game_key, winner_name, target_rooms or [room])
+
+    def _send_game_winner_card(self, game_key, winner_name, target_rooms):
+        """Render the existing game artwork with winner name/avatar and send it."""
+        base = _public_base_url()
+        if not base:
+            self.log("[GAME] winner card skipped: public media URL is not configured")
+            return False
+        filename = GAME_IMAGE_FILES.get(game_key)
+        image = ASSETS_DIR / filename if filename else None
+        if not image or not image.is_file():
+            self.log("[GAME] winner card skipped: no artwork", game_key)
+            return False
+        try:
+            winner_key = _norm_user(winner_name)
+            winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
+            if not winner_photo:
+                winner_photo = self._lookup_profile_photo(winner_name)
+            card = render_game_winner_card(game_key, winner_name, winner_photo)
+            url = f"{base}/games/{card.name}"
+            self._verify_public_media_url(url, "image")
+            rooms = []
+            seen = set()
+            for r in (target_rooms or []):
+                r = str(r or "").strip()
+                k = r.casefold()
+                if r and k not in seen:
+                    seen.add(k); rooms.append(r)
+            for r in rooms:
+                self.send_room_media(r, url, "image")
+            self.log("[GAME] winner card sent", game_key, winner_name, len(rooms))
+            return bool(rooms)
+        except Exception as exc:
+            self.log("[GAME] winner card send failed:", game_key, repr(exc))
+            return False
 
     def game_help(self, room):
         self.send_room_text(room, "🎮✨ ألعاب البوت\n━━━━━━━━━━━━\n"
@@ -4939,20 +4986,7 @@ class TalkinBot:
         for result_room in result_rooms:
             self.send_room_text(result_room, text)
 
-        base = ""  # Game results are text-only; do not send game images.
-        if base:
-            try:
-                winner_name = str(winner.get("user") or "")
-                winner_photo = getattr(self, "user_photos", {}).get(_norm_user(winner_name), "")
-                if not winner_photo:
-                    winner_photo = self._lookup_profile_photo(winner_name)
-                card = render_game_winner_card(game_key, winner_name, winner_photo)
-                url = f"{base}/games/{card.name}"
-                self._verify_public_media_url(url, "image")
-                for result_room in result_rooms:
-                    self.log("[GAME] game result image disabled")
-            except Exception as exc:
-                self.log("[GAME] wager winner card failed:", game_key, repr(exc))
+        self._send_game_winner_card(game_key, str(winner.get("user") or ""), result_rooms)
 
     def _queue_wager(self, room, sender, game_name, amount):
         try:
@@ -5101,20 +5135,7 @@ class TalkinBot:
         for result_room in result_rooms:
             self.send_room_text(result_room,text)
 
-        base=_public_base_url()
-        if base:
-            try:
-                winner_name = str(winner.get("user") or "")
-                winner_photo = self.user_photos.get(_norm_user(winner_name), "")
-                if not winner_photo:
-                    winner_photo = self._lookup_profile_photo(winner_name)
-                card = render_game_winner_card(game_key, winner_name, winner_photo)
-                url = f"{base}/games/{card.name}"
-                self._verify_public_media_url(url, "image")
-                for result_room in result_rooms:
-                    self.log("[GAME] game result image disabled")
-            except Exception as exc:
-                self.log("[GAME] fixed winner card failed:", game_name, repr(exc))
+        self._send_game_winner_card(game_key, str(winner.get("user") or ""), result_rooms)
 
     def _queue_fixed_game(self, room, sender, game_name, prize=500):
         """Global two-player queue; both players may enter from the same room or different rooms."""
@@ -5356,14 +5377,7 @@ class TalkinBot:
         )
         self.send_room_text(room, text)
         if reward > 0:
-            filename = GAME_IMAGE_FILES.get("luck")
-            base = _public_base_url()
-            image = ASSETS_DIR / filename if filename else None
-            if base and image and image.is_file():
-                try:
-                    self.log("[GAME] game result image disabled")
-                except Exception as exc:
-                    self.log("[GAME] luck result image failed:", repr(exc))
+            self._send_game_winner_card("luck", sender, [room])
         return True
 
     def _investment_bot_game(self, room, sender):
@@ -5399,14 +5413,7 @@ class TalkinBot:
             f"💰 الرصيد: {_fmt_points(balance)}"
         )
         if reward > 0:
-            filename = GAME_IMAGE_FILES.get("investment")
-            base = _public_base_url()
-            image = ASSETS_DIR / filename if filename else None
-            if base and image and image.is_file():
-                try:
-                    self.log("[GAME] game result image disabled")
-                except Exception as exc:
-                    self.log("[GAME] investment result image failed:", repr(exc))
+            self._send_game_winner_card("investment", sender, [room])
         return True
 
     def _handle_random_picture_command(self, room, body, sender):
@@ -5565,15 +5572,15 @@ class TalkinBot:
         threading.Thread(target=worker, name="lookalike-search", daemon=True).start()
         return True
 
-    def _send_steal_image(self, room, game_key):
-        filename = GAME_IMAGE_FILES.get(game_key)
-        base = _public_base_url()
-        image = ASSETS_DIR / filename if filename else None
-        if base and image and image.is_file():
-            try:
-                self.log("[GAME] game result image disabled")
-            except Exception as exc:
-                self.log("[GAME] steal result image failed:", repr(exc))
+    def _send_steal_image(self, room, game_key, winner_name=""):
+        if winner_name:
+            self._send_game_winner_card(game_key, winner_name, [room])
+        else:
+            base = _public_base_url()
+            filename = GAME_IMAGE_FILES.get(game_key)
+            image = ASSETS_DIR / filename if filename else None
+            if base and image and image.is_file():
+                self.send_room_media(room, f"{base}/assets/{filename}", "image")
 
     def _room_member_usernames_for_steal(self, room, exclude_username=""):
         """Return only users currently present in the same live room."""
@@ -5750,18 +5757,18 @@ class TalkinBot:
     def _coin_bot_game(self, room, sender, choice=""):
         if not self._game_cooldown_notice(room, sender, 40.0, "عملة"):
             return True
-        result = secrets.choice(("وجه", "كتابة"))
         choice = str(choice or "").strip()
+        key = (str(room), _norm_user(sender))
         if choice in ("وجه", "كتابة"):
-            won = (choice == result)
+            result = secrets.choice(("وجه", "كتابة"))
+            won = choice == result
             reward = 40 if won else 0
-            text = f"🪙 النتيجة: {result}\n" + ("🏆 توقّعك صحيح!" if won else "❌ توقّعك خطأ.")
-        else:
-            reward = 0
-            text = f"🪙 ظهرت: {result}\n📌 للتوقع اكتب: عملة@وجه أو عملة@كتابة"
-        balance = self._game_award(sender, reward)
-        _record_game(sender, "coin", reward, 0)
-        self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n{text}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+            balance = self._game_award(sender, reward)
+            _record_game(sender, "coin", reward, 0)
+            self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n🎯 اختيارك: {choice}\n🪙 النتيجة: {result}\n{('🏆 فزت!' if won else '❌ لم تفز هذه المرة.')}\n🎁 +{_fmt_points(reward)} نقطة\n💰 رصيدك: {_fmt_points(balance)}")
+            return True
+        self.pending_bot_choices[key] = {"game": "coin", "created": time.time(), "result": secrets.choice(("وجه", "كتابة"))}
+        self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n1️⃣ وجه\n2️⃣ كتابة\n\n📌 أرسل الرقم فقط")
         return True
 
     def _wheel_bot_game(self, room, sender):
@@ -5781,21 +5788,26 @@ class TalkinBot:
         return True
 
     def _box_bot_game(self, room, sender, raw):
-        m = re.fullmatch(r"صندوق[@ ]([1-3])", str(raw or "").strip(), re.I)
+        raw = str(raw or "").strip()
+        m = re.fullmatch(r"صندوق[@ ]([1-3])", raw, re.I)
         if not self._game_cooldown_notice(room, sender, 40.0, "صندوق"):
             return True
+        key = (str(room), _norm_user(sender))
         chosen = int(m.group(1)) if m else None
+        if chosen is None:
+            self.pending_bot_choices[key] = {
+                "game": "box", "created": time.time(),
+                "prize_box": secrets.randbelow(3) + 1,
+                "reward": secrets.choice([0, 20, 50, 100, 200]),
+            }
+            self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n1️⃣ صندوق 1\n2️⃣ صندوق 2\n3️⃣ صندوق 3\n\n📌 أرسل الرقم فقط")
+            return True
         prize_box = secrets.randbelow(3) + 1
         reward = secrets.choice([0, 20, 50, 100, 200]) if chosen == prize_box else 0
-        if chosen is None:
-            body = "📦 اختر صندوقاً: صندوق@1 أو صندوق@2 أو صندوق@3"
-        elif reward:
-            body = f"📦 اخترت الصندوق {chosen}\n🏆 الصندوق الرابح: {prize_box}\n✅ ربحت!"
-        else:
-            body = f"📦 اخترت الصندوق {chosen}\n🎲 الصندوق الرابح كان: {prize_box}\n❌ لم تربح."
+        body = (f"📦 اخترت الصندوق {chosen}\n🏆 الصندوق الرابح: {prize_box}\n✅ ربحت!" if reward else f"📦 اخترت الصندوق {chosen}\n🎲 الصندوق الرابح كان: {prize_box}\n❌ لم تربح.")
         balance = self._game_award(sender, reward)
         _record_game(sender, "box", reward, 0)
-        self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n{body}\n🎁 +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
+        self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n{body}\n🎁 +{_fmt_points(reward)} نقطة\n💰 رصيدك: {_fmt_points(balance)}")
         return True
 
     def _cup_bot_game(self, room, sender, raw):
@@ -5884,21 +5896,65 @@ class TalkinBot:
         target_rooms = self._active_rooms() or [room]
         for target_room in target_rooms:
             self.send_room_text(target_room, winner_text)
-        try:
-            base = ""  # Game results are text-only.
-            card = render_game_winner_card("بنك مليون", sender_name, winner_photo)
-            if base and card.is_file():
-                url = f"{base}/games/{card.name}"
-                self._verify_public_media_url(url, "image")
-                for target_room in target_rooms:
-                    self.log("[GAME] game result image disabled")
-        except Exception as exc:
-            self.log("[GAME] million bank winner card failed:", repr(exc))
+        self._send_game_winner_card("بنك مليون", sender_name, target_rooms)
         return True
+
+    def _handle_pending_bot_choice(self, room, text, sender_name):
+        """Resolve number-only replies for عملة/صندوق choice prompts."""
+        raw = str(text or "").strip()
+        if not raw or not sender_name:
+            return False
+        digit_map = {
+            "1": 1, "2": 2, "3": 3,
+            "١": 1, "٢": 2, "٣": 3,
+            "1️⃣": 1, "2️⃣": 2, "3️⃣": 3,
+            "🟦1": 1, "🟦2": 2, "🟦3": 3,
+            "🟦1️⃣": 1, "🟦2️⃣": 2, "🟦3️⃣": 3,
+        }
+        choice = digit_map.get(raw)
+        if choice is None:
+            return False
+        key = (str(room), _norm_user(sender_name))
+        pending = self.pending_bot_choices.get(key)
+        if not isinstance(pending, dict):
+            return False
+        if time.time() - float(pending.get("created", 0) or 0) > 120:
+            self.pending_bot_choices.pop(key, None)
+            self.send_room_text(room, f"⏰ @{sender_name} انتهى وقت الاختيار. أرسل أمر اللعبة من جديد.")
+            return True
+        game = pending.get("game")
+        if game == "coin":
+            if choice not in (1, 2):
+                self.send_room_text(room, "❌ اختر 1 أو 2 فقط.\n1️⃣ وجه\n2️⃣ كتابة")
+                return True
+            result = pending.get("result") or secrets.choice(("وجه", "كتابة"))
+            selected = "وجه" if choice == 1 else "كتابة"
+            won = selected == result
+            reward = 40 if won else 0
+            self.pending_bot_choices.pop(key, None)
+            balance = self._game_award(sender_name, reward)
+            _record_game(sender_name, "coin", reward, 0)
+            self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender_name}\n🎯 اختيارك: {selected}\n🪙 النتيجة: {result}\n{('🏆 فزت!' if won else '❌ لم تفز هذه المرة.')}\n🎁 +{_fmt_points(reward)} نقطة\n💰 رصيدك: {_fmt_points(balance)}")
+            return True
+        if game == "box":
+            if choice not in (1, 2, 3):
+                self.send_room_text(room, "❌ اختر 1 أو 2 أو 3 فقط.")
+                return True
+            prize_box = int(pending.get("prize_box") or 1)
+            reward = int(pending.get("reward") or 0) if choice == prize_box else 0
+            self.pending_bot_choices.pop(key, None)
+            balance = self._game_award(sender_name, reward)
+            _record_game(sender_name, "box", reward, 0)
+            body = (f"📦 اخترت الصندوق {choice}\n🏆 الصندوق الرابح: {prize_box}\n✅ ربحت!" if reward else f"📦 اخترت الصندوق {choice}\n🎲 الصندوق الرابح كان: {prize_box}\n❌ لم تربح.")
+            self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender_name}\n{body}\n🎁 +{_fmt_points(reward)} نقطة\n💰 رصيدك: {_fmt_points(balance)}")
+            return True
+        return False
 
     def handle_game_command(self, room, text, sender_name):
         raw=str(text or "").strip()
         if not raw or not sender_name: return False
+        if self._handle_pending_bot_choice(room, raw, sender_name):
+            return True
         # Do not run the verification gate for ordinary conversation.  The
         # caller may pass every room message here, so first require a known
         # bot/game command; unrelated text must be ignored silently.
@@ -5997,7 +6053,7 @@ class TalkinBot:
             return self._uno_bot_game(room, sender_name)
         if game_low == "عمله":
             return self._coin_bot_game(room, sender_name)
-        m = re.fullmatch(r"عملة[@ ](وجه|كتابة)", raw, re.I)
+        m = re.fullmatch(r"(?:عملة|عمله)[@ ](وجه|كتابة)", raw, re.I)
         if m:
             return self._coin_bot_game(room, sender_name, m.group(1))
         if game_low == "عجله":
@@ -6055,26 +6111,17 @@ class TalkinBot:
                 )
 
                 try:
+                    base = _public_base_url()
+                    if not base:
+                        raise RuntimeError("PUBLIC_BASE_URL أو RAILWAY_PUBLIC_DOMAIN غير مضبوط")
                     card = render_billion_card(sender_name, winner_photo)
-                    base = ""  # Game results are text-only.
-                    if base and card.is_file():
-                        url = f"{base}/billion/{card.name}"
-                        self._verify_public_media_url(url, "image")
-                        self.log("[GAME] game result image disabled")
-                        # Publish the same generated winner card to every room.
-                        for target_room in self._active_rooms():
-                            if str(target_room).casefold() == str(room).casefold():
-                                continue
-                            try:
-                                self.send_room_text(
-                                    target_room,
-                                    f"🏆✨ تم الحصول على المليار!\n👑 الفائز: @{sender_name}\n💰 1k,000,000\n{zeros}"
-                                )
-                                self.log("[GAME] game result image disabled")
-                            except Exception as exc:
-                                self.log("[GAME] billion publish failed:", target_room, repr(exc))
-                    else:
-                        self.log("[GAME] billion card public URL unavailable")
+                    url = f"{base}/billion/{card.name}"
+                    self._verify_public_media_url(url, "image")
+                    # Publish the same generated winner card to every active room.
+                    target_rooms = self._active_rooms() or [room]
+                    for target_room in target_rooms:
+                        self.send_room_media(target_room, url, "image")
+                    self.log("[GAME] billion winner card sent", sender_name, len(target_rooms))
                 except Exception as exc:
                     self.log("[GAME] billion winner card failed:", repr(exc))
             else:
