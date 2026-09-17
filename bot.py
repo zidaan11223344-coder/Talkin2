@@ -4815,17 +4815,19 @@ class TalkinBot:
         return _add_points(username, int(amount))
 
     def _game_ready(self, username, room, cooldown=30.0, game_name=""):
-        # ألعاب البوت الجديدة لها فاصل عالمي موحّد: 40 ثانية بين أي لعبتين،
-        # وليس فاصلًا منفصلًا لكل لعبة. مثال: نجم ثم نجم، أو نجم ثم عملة،
-        # كلاهما يخضع لنفس المؤقت. المؤقت موحّد عبر جميع الغرف.
+        # فاصل 40 ثانية لكل لعبة على حدة لكل مستخدم.
+        # مثال: صندوق ثم صندوق = ينتظر 40 ثانية، لكن صندوق ثم عملة
+        # لا يحسب فاصلًا واحدًا على اللعبة الأخرى. الفاصل موحّد عبر الغرف
+        # لنفس اللعبة، وليس موحّدًا بين جميع الألعاب.
         bot_games = {
             "عملة", "عجلة", "صندوق", "كوب", "كأس", "وحش",
             "بركان", "طائر", "نجم", "طاولة", "اونو", "نرد", "كنز",
             "حجر/ورق/مقص", "استثمار", "حظ"
         }
-        normalized_game = _norm_user(game_name)
-        if normalized_game in {_norm_user(x) for x in bot_games}:
-            game_key = "bot_games_global"
+        normalized_game = _norm_user(str(game_name).replace("ة", "ه"))
+        normalized_bot_games = {_norm_user(str(x).replace("ة", "ه")) for x in bot_games}
+        if normalized_game in normalized_bot_games:
+            game_key = normalized_game
             cooldown = 40.0
         else:
             game_key = normalized_game or "general"
@@ -4841,9 +4843,9 @@ class TalkinBot:
     def _game_cooldown_notice(self, room, username, cooldown=30.0, game_name=""):
         ok, left = self._game_ready(username, room, cooldown, game_name)
         if not ok:
-            normalized_game = _norm_user(game_name)
+            normalized_game = _norm_user(str(game_name).replace("ة", "ه"))
             bot_games = {
-                _norm_user(x) for x in (
+                _norm_user(str(x).replace("ة", "ه")) for x in (
                     "عملة", "عجلة", "صندوق", "كوب", "كأس", "وحش",
                     "بركان", "طائر", "نجم", "طاولة", "اونو", "نرد", "كنز",
                     "حجر/ورق/مقص", "استثمار", "حظ"
@@ -5961,6 +5963,7 @@ class TalkinBot:
         if not _looks_like_bot_command(raw):
             return False
         low=raw.casefold()
+        normalized_raw = raw.replace("ة", "ه")
         # Game-name normalization: Arabic ه/ة variants are treated as the same
         # command (e.g. سناره/سنارة, حصانه/حصانة), while preserving raw text
         # for commands that contain user arguments.
@@ -6017,10 +6020,10 @@ class TalkinBot:
             return True
         if game_low in ("حصانه", "حصانه!"):
             return self._horse_game(room, sender_name)
-        if low.startswith("زرع"):
+        if low.replace("ة", "ه").startswith("زرع"):
             return self._crop_command(room, sender_name, raw)
-        if low.startswith("فيس"):
-            m=re.fullmatch(r"فيس[@ ](.+)", raw, re.I)
+        if low.replace("ة", "ه").startswith("فيس"):
+            m=re.fullmatch(r"فيس[@ ](.+)", normalized_raw, re.I)
             return self._fruit_match(room, sender_name, m.group(1).strip() if m else "")
         # New fixed-prize global games. Each one has a single worldwide queue:
         # first verified player opens it, the next verified player joins, then
@@ -6034,17 +6037,17 @@ class TalkinBot:
             return self._queue_fixed_game(room,sender_name,game_name,500)
         # PvP games: outcome is decided by strong random selection, never by
         # who entered first or second.
-        m=re.fullmatch(r"(مراهنة|مراهنه|رهان|مضاربة|مضاربه|حظي)[@\s]+([0-9]+)", raw, re.I)
+        m=re.fullmatch(r"(مراهنه|رهان|مضاربه|حظي)[@\s]+([0-9]+)", normalized_raw, re.I)
         if m:
             return self._queue_wager(room, sender_name, m.group(1), int(m.group(2)))
         # Investment with a stake is PvP, exactly like the wager games.
-        m=re.fullmatch(r"استثمار[@\s]+([0-9]+)", raw, re.I)
+        m=re.fullmatch(r"استثمار[@\s]+([0-9]+)", normalized_raw, re.I)
         if m:
             return self._queue_wager(room, sender_name, "استثمار", int(m.group(1)))
         # Plain "استثمار" is a free game against the bot, text only.
         if game_low == "استثمار":
             return self._investment_bot_game(room, sender_name)
-        m=re.fullmatch(r"حظ[@\s]+([0-9]+)", raw, re.I)
+        m=re.fullmatch(r"حظ[@\s]+([0-9]+)", normalized_raw, re.I)
         if m:
             return self._lottery_game(room, sender_name, int(m.group(1)))
         if game_low == "طاوله":
@@ -6058,10 +6061,10 @@ class TalkinBot:
             return self._coin_bot_game(room, sender_name, m.group(1))
         if game_low == "عجله":
             return self._wheel_bot_game(room, sender_name)
-        if low.startswith("صندوق"):
-            return self._box_bot_game(room, sender_name, raw)
-        if low.startswith("كوب") or low.startswith("كأس"):
-            return self._cup_bot_game(room, sender_name, raw)
+        if low.replace("ة", "ه").startswith("صندوق"):
+            return self._box_bot_game(room, sender_name, normalized_raw)
+        if low.replace("ة", "ه").startswith("كوب") or low.replace("ة", "ه").startswith("كاس"):
+            return self._cup_bot_game(room, sender_name, normalized_raw)
         if low == "وحش":
             return self._monster_bot_game(room, sender_name)
         if low == "بركان":
@@ -6229,6 +6232,16 @@ class TalkinBot:
             return True
         if _body_low in ("ns", "n", "التالي", "القائمة التالية", "next"):
             key = (str(room), _norm_user(sender))
+            # ns only works after the user explicitly opened a category with a1..a6.
+            # Never default to a1, otherwise a bare ns in a room would expose admin help.
+            if key not in self.help_pages:
+                target = "a1 إلى a6" if (_is_primary_master(sender) and is_private) else "a2 إلى a6"
+                msg = f"📌 اكتب {target} أولًا لفتح قائمة الأوامر، ثم استخدم ns للتالي."
+                if is_private:
+                    self.send_private_text(sender, msg)
+                elif room:
+                    self.send_room_text(room, msg)
+                return True
             sections_map = _help_sections_from_messages()
             current_page = int(self.help_pages.get(key, 1) or 1)
             current_page = max(1, min(6, current_page))
@@ -6453,6 +6466,15 @@ class TalkinBot:
             return True
         if low in ("ns","n","التالي","القائمة التالية","next"):
             key=(str(room), _norm_user(sender))
+            # Do not assume a1 when ns is sent without opening a category.
+            if key not in self.help_pages:
+                target = "a1 إلى a6" if (_is_primary_master(sender) and is_private) else "a2 إلى a6"
+                msg=f"📌 اكتب {target} أولًا لفتح قائمة الأوامر، ثم استخدم ns للتالي."
+                if is_private:
+                    self.send_private_text(sender,msg)
+                elif room:
+                    self.send_room_text(room,msg)
+                return True
             sections_map = _help_sections_from_messages()
             current_page=int(self.help_pages.get(key,1) or 1)
             current_page=max(1,min(6,current_page))
