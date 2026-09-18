@@ -263,7 +263,7 @@ def _stop_master_process():
 
 # Persistent bot data. Runtime code is replaceable; these JSON files are not.
 # The data directory can be set once with BOT_DATA_DIR/PERSISTENT_DATA_DIR.
-# On Railway, /data/chatbuz_bot is preferred so a mounted volume can keep all
+# On Railway, /data/talkin1 is preferred so a mounted volume can keep all
 # bot state across deployments. When no volume is mounted, the code falls back
 # to a local data/ directory beside bot.py and migrates any old JSON files there.
 def _select_persistent_data_dir():
@@ -272,7 +272,7 @@ def _select_persistent_data_dir():
     if configured:
         candidates.append(Path(configured).expanduser())
     # Railway volume mount /data is the recommended permanent location.
-    candidates.append(Path("/data/chatbuz_bot"))
+    candidates.append(Path("/data/talkin1"))
     candidates.append(BASE_DIR / "data")
     for candidate in candidates:
         try:
@@ -436,7 +436,7 @@ def android_build_info():
 # Android ID or Android system properties for publishing.  Talkin's wire
 # protocol still requires device_id/device_model fields, so keep a stable
 # synthetic profile in the exact APK fingerprint format without probing Android.
-DEVICE_ID = "chatbuz-railway"
+DEVICE_ID = "talkin1-railway"
 _MANUFACTURER = "samsung"
 _MODEL = "SM-G998B"
 SDK = os.getenv("SDK", "35").strip() or "35"
@@ -1068,12 +1068,28 @@ def _load_local_json(path, default):
         pass
     return default
 
+_LOCAL_JSON_WRITE_LOCK = threading.RLock()
+
 def _save_local_json(path, data):
+    """Atomically save local JSON without sharing one fixed .tmp file.
+
+    A fixed ``file.json.tmp`` is unsafe when two game events save at the same
+    time: one writer can replace/delete the temporary file while another is
+    still using it.  Use a per-write temporary file plus a process lock.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    with _LOCAL_JSON_WRITE_LOCK:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
     _github_sync_after_local_save(path, data)
 
 # GitHub-backed persistent state. Set GITHUB_TOKEN and GITHUB_REPO in the
