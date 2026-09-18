@@ -5404,7 +5404,9 @@ class TalkinBot:
         game_label, verb, command = game_labels.get(game_name, (game_name, "لاعب", game_name))
         opening = (
             f"🎮 بدأت لعبة {game_label}\n"
-            f"🎯 طريقة اللعب: {command}@المبلغ"
+            f"👤 @{sender}\n"
+            f"💰 المبلغ: {_fmt_points(amount)} نقطة\n"
+            f"🎯 اكتب {command}@المبلغ لبدء الرهان"
         )
         # GLOBAL challenge announcement: every tracked bot room sees the same
         # open challenge, regardless of where the first player started it.
@@ -5476,7 +5478,9 @@ class TalkinBot:
 
         challenge=(
             f"🎮 بدأت لعبة {game_name}\n"
-            f"🎯 طريقة اللعب: اكتب {game_name}"
+            f"👤 @{sender}\n"
+            f"💰 مبلغ الفوز: {_fmt_points(prize * 2)} نقطة\n"
+            f"🎯 اكتب {game_name} للمنافسة"
         )
         with self.game_lock:
             # Re-check in case another event created the queue while we prepared.
@@ -6177,6 +6181,10 @@ class TalkinBot:
 
 
     # --------------------- 10 Text-Only Bot Games ---------------------
+    def _bot_win_reward(self):
+        """Random winning reward for normal bot-vs-player games."""
+        return secrets.randbelow(4001) + 1000  # 1,000..5,000
+
     def _table_bot_game(self, room, sender):
         import random
         if not self._game_cooldown_notice(room, sender, 40.0, "طاولة"):
@@ -6184,7 +6192,7 @@ class TalkinBot:
         player = random.randint(1, 6) + random.randint(1, 6)
         bot = random.randint(1, 6) + random.randint(1, 6)
         if player > bot:
-            reward = 200
+            reward = self._bot_win_reward()
             self._game_award(sender, reward)
             result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🏆 فزت بـ {reward} نقطة!"
         elif player < bot:
@@ -6205,7 +6213,7 @@ class TalkinBot:
         p_color, p_num = random.choice(colors), random.randint(0, 9)
         b_color, b_num = random.choice(colors), random.randint(0, 9)
         if p_num > b_num:
-            reward = 200
+            reward = self._bot_win_reward()
             self._game_award(sender, reward)
             result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🏆 فزت بـ {reward} نقطة!"
         elif p_num < b_num:
@@ -6240,7 +6248,7 @@ class TalkinBot:
         if choice in ("وجه", "كتابة"):
             result = secrets.choice(("وجه", "كتابة"))
             won = choice == result
-            reward = 200 if won else 0
+            reward = self._bot_win_reward() if won else 0
             balance = self._game_award(sender, reward)
             _record_game(sender, "coin", reward, 0)
             self.send_room_text(room, f"🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@{sender}\n🎯 اختيارك: {choice}\n🪙 النتيجة: {result}\n{('🏆 فزت!' if won else '❌ لم تفز هذه المرة.')}\n🎁 +{_fmt_points(reward)} نقطة\n💰 رصيدك: {_fmt_points(balance)}")
@@ -6252,8 +6260,7 @@ class TalkinBot:
     def _wheel_bot_game(self, room, sender):
         if not self._game_cooldown_notice(room, sender, 40.0, "عجلة"):
             return True
-        rewards = [0, 20, 40, 60, 80, 100, 150, 200]
-        reward = secrets.choice(rewards)
+        reward = 0 if secrets.randbelow(5) == 0 else self._bot_win_reward()
         balance = self._game_award(sender, reward)
         _record_game(sender, "wheel", reward, 0)
         self.send_room_text(
@@ -6276,12 +6283,12 @@ class TalkinBot:
             self.pending_bot_choices[key] = {
                 "game": "box", "created": time.time(),
                 "prize_box": secrets.randbelow(3) + 1,
-                "reward": secrets.choice([0, 20, 50, 100, 200]),
+                "reward": self._bot_win_reward(),
             }
             self.send_room_text(room, f"📦 لعبة الصناديق\n━━━━━━━━━━━━━━\n@{sender}\n\u20661.\u2069 صندوق 1\n\u20662.\u2069 صندوق 2\n\u20663.\u2069 صندوق 3\n\n📌 أرسل الرقم فقط")
             return True
         prize_box = secrets.randbelow(3) + 1
-        reward = secrets.choice([0, 20, 50, 100, 200]) if chosen == prize_box else 0
+        reward = self._bot_win_reward() if chosen == prize_box else 0
         body = (f"📦 اخترت الصندوق {chosen}\n🏆 الصندوق الرابح: {prize_box}\n✅ ربحت!" if reward else f"📦 اخترت الصندوق {chosen}\n🎲 الصندوق الرابح كان: {prize_box}\n❌ لم تربح.")
         balance = self._game_award(sender, reward)
         _record_game(sender, "box", reward, 0)
@@ -6294,7 +6301,7 @@ class TalkinBot:
             return True
         chosen = int(m.group(1)) if m else None
         hidden = secrets.randbelow(3) + 1
-        reward = secrets.choice([50, 80, 120, 200]) if chosen == hidden else 0
+        reward = self._bot_win_reward() if chosen == hidden else 0
         if chosen is None:
             body = "🥤 اختر الكوب: كوب@1 أو كوب@2 أو كوب@3"
         elif reward:
@@ -6312,7 +6319,7 @@ class TalkinBot:
         player = secrets.randbelow(6) + 1
         monster = secrets.randbelow(6) + 1
         if player > monster:
-            reward = 200
+            reward = self._bot_win_reward()
             result = "⚔️ هزمت الوحش!"
         elif player < monster:
             reward = 0
@@ -6329,8 +6336,7 @@ class TalkinBot:
         if not self._game_cooldown_notice(room, sender, 40.0, "بركان"):
             return True
         result = secrets.randbelow(5)
-        reward_map = {0: 0, 1: 30, 2: 60, 3: 120, 4: 200}
-        reward = reward_map[result]
+        reward = 0 if result == 0 else self._bot_win_reward()
         outcome = "🌋 خرجت الجائزة من البركان!" if reward else "🌋 انفجر البركان ولم تجد جائزة."
         balance = self._game_award(sender, reward)
         _record_game(sender, "volcano", reward, 0)
@@ -6340,7 +6346,7 @@ class TalkinBot:
     def _bird_bot_game(self, room, sender):
         if not self._game_cooldown_notice(room, sender, 40.0, "طائر"):
             return True
-        birds = [("🐦 عصفور", 30), ("🦅 نسر", 100), ("🦉 بومة", 60), ("🦜 ببغاء", 200), ("🌫️ لم يظهر طائر", 0)]
+        birds = [("🐦 عصفور", self._bot_win_reward()), ("🦅 نسر", self._bot_win_reward()), ("🦉 بومة", self._bot_win_reward()), ("🦜 ببغاء", self._bot_win_reward()), ("🌫️ لم يظهر طائر", 0)]
         bird, reward = secrets.choice(birds)
         balance = self._game_award(sender, reward)
         _record_game(sender, "bird", reward, 0)
@@ -6350,7 +6356,7 @@ class TalkinBot:
     def _star_bot_game(self, room, sender):
         if not self._game_cooldown_notice(room, sender, 40.0, "نجم"):
             return True
-        stars = [("⭐ عادية", 20), ("🌟 لامعة", 50), ("💫 نادرة", 100), ("✨ أسطورية", 200), ("🌑 لم تلتقط نجماً", 0)]
+        stars = [("⭐ عادية", self._bot_win_reward()), ("🌟 لامعة", self._bot_win_reward()), ("💫 نادرة", self._bot_win_reward()), ("✨ أسطورية", self._bot_win_reward()), ("🌑 لم تلتقط نجماً", 0)]
         star, reward = secrets.choice(stars)
         balance = self._game_award(sender, reward)
         _record_game(sender, "star", reward, 0)
@@ -6408,7 +6414,7 @@ class TalkinBot:
             result = pending.get("result") or secrets.choice(("وجه", "كتابة"))
             selected = "وجه" if choice == 1 else "كتابة"
             won = selected == result
-            reward = 200 if won else 0
+            reward = self._bot_win_reward() if won else 0
             self.pending_bot_choices.pop(key, None)
             balance = self._game_award(sender_name, reward)
             _record_game(sender_name, "coin", reward, 0)
