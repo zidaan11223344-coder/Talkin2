@@ -272,7 +272,7 @@ def _select_persistent_data_dir():
     if configured:
         candidates.append(Path(configured).expanduser())
     # Railway volume mount /data is the recommended permanent location.
-    candidates.append(Path("/data/talkin1"))
+    candidates.append(Path("/data/chatbuz_bot"))
     candidates.append(BASE_DIR / "data")
     for candidate in candidates:
         try:
@@ -436,7 +436,7 @@ def android_build_info():
 # Android ID or Android system properties for publishing.  Talkin's wire
 # protocol still requires device_id/device_model fields, so keep a stable
 # synthetic profile in the exact APK fingerprint format without probing Android.
-DEVICE_ID = "talkin1-railway"
+DEVICE_ID = "chatbuz-railway"
 _MANUFACTURER = "samsung"
 _MODEL = "SM-G998B"
 SDK = os.getenv("SDK", "35").strip() or "35"
