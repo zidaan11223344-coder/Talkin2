@@ -7014,8 +7014,41 @@ class TalkinBot:
         ][:52]
 
     def _ludo_track(self):
-        # Keep the game logic at 52 positions, while the renderer uses a real Ludo-style board.
+        # Main shared Ludo track: 52 cells. Each player has a different entry
+        # point on this same track, then continues through a 6-cell home lane.
         return self._ludo_path_coords()
+
+    def _ludo_player_color_index(self, game, username):
+        try:
+            return list(game.get("players", [])).index(username) % 4
+        except Exception:
+            return 0
+
+    def _ludo_piece_coord(self, game, username, progress):
+        """Return board coordinate for a player's progress.
+
+        progress 1..52 = player's own 52-cell route, progress 53..58 =
+        the six colored home-lane cells leading to the center.
+        """
+        track=self._ludo_track()
+        color=self._ludo_player_color_index(game, username)
+        progress=max(0,int(progress or 0))
+        if progress <= 0:
+            # Keep an unstarted token in its colored yard.
+            yards=[(2,2),(11,2),(11,11),(2,11)]
+            return yards[color]
+        if progress <= 52:
+            start_offsets=[0,13,26,39]
+            return track[(start_offsets[color] + progress - 1) % 52]
+        # Six final colored cells toward the center.
+        home_lanes=[
+            [(6,5),(6,6),(6,7),(7,7),(7,6),(7,7)],
+            [(9,6),(8,6),(7,6),(7,7),(7,7),(7,7)],
+            [(8,9),(8,8),(8,7),(7,7),(7,7),(7,7)],
+            [(5,8),(6,8),(7,8),(7,7),(7,7),(7,7)],
+        ]
+        lane=home_lanes[color]
+        return lane[min(progress-53,len(lane)-1)]
 
     def _render_ludo_board(self,state,winner_name=""):
         if not PIL_AVAILABLE:return None
@@ -7078,10 +7111,10 @@ class TalkinBot:
             cx=ox+x*cell+cell/2; cy=oy+y*cell+cell/2
             d.text((cx,cy),"★",fill=(105,105,105),font=_gift_font("1",22),anchor="mm")
 
-        # Player pieces: use the profile photo inside the actual board cell.
-        coords=self._ludo_track()
+        # Player pieces follow each player's own route around the 52-cell
+        # track, then enter that player's six-cell colored finish lane.
         for i,(u,pos) in enumerate(state.get("tokens",{}).items()):
-            idx=max(0,min(len(coords)-1,int(pos)-1 if int(pos)>0 else 0)); x,y=coords[idx]
+            x,y=self._ludo_piece_coord(state,u,pos)
             avatar=self._game_square_avatar(u,44)
             cx=ox+x*cell+cell//2; cy=oy+y*cell+cell//2
             if avatar is not None:
@@ -7104,7 +7137,7 @@ class TalkinBot:
             if not self._board_game_cooldown_notice(room, sender):
                 return True
             game={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
-            self.ludo_games[key]=game; self._schedule_board_game_timeout(key, game, "لودو"); self._send_game_cover("ludo",game)
+            self.ludo_games[key]=game; self._schedule_board_game_timeout(key, game, "لودو")
             self.send_room_text(room,"🎲 Ludo: choose players 1-4. Type 1/2/3/4." if low=="ludo" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين"); return True
         if not game:return False
         origin_room = str(game.get("origin_room") or next(iter(game.get("rooms", {room})), room))
@@ -7128,8 +7161,16 @@ class TalkinBot:
                     game["tokens"]["🤖 البوت"]=0
                 game["started"]=True
                 game["turn"]=0
+                self._send_game_cover("ludo", game)
                 self._broadcast_game_start("🤖 بدأت لعبة لودو مع البوت! أنت تبدأ أولاً، اكتب rool للعب.",game)
-            else:self.send_room_text(room,"✅ تم اختيار العدد. اكتب join أو انضمام حتى يكتمل عدد اللاعبين.")
+            else:
+                # The actual Ludo game starts only after the player count is chosen.
+                # Send the cover and the start announcement to every active room.
+                self._send_game_cover("ludo", game)
+                self._broadcast_game_start(
+                    f"🎲 بدأت لعبة لودو! عدد اللاعبين: {count}. اكتب join للانضمام.",
+                    game
+                )
             return True
         if low in ("join","انضمام") and not game.get("started"):
             if sender not in game["players"] and len(game["players"])<int(game.get("max_players",4) or 4):
@@ -7142,12 +7183,12 @@ class TalkinBot:
             now=time.monotonic()
             if now-float(game.get("last_roll_at",0.0) or 0.0)<0.45:return True
             game["last_roll_at"]=now; game["started"]=True; self._schedule_board_game_timeout(key, game, "لودو")
-            roll=secrets.randbelow(6)+1; old=game["tokens"].get(sender,0); new=min(len(self._ludo_track()),old+roll); game["tokens"][sender]=new
+            roll=secrets.randbelow(6)+1; old=game["tokens"].get(sender,0); new=min(58,old+roll); game["tokens"][sender]=new
             img=self._render_ludo_board(game); url=self._game_public_image(img) if img else ""
             for r in self._game_rooms(game):
                 if url:self.send_room_media(r,url,"image")
                 self.send_room_text(r,f"🎲 @{sender} وقف الرول على {roll} وانتقل من المربع {old} إلى {new}.")
-            if new>=len(self._ludo_track()):
+            if new>=58:
                 win_img=self._render_ludo_board(game,winner_name=sender); photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
                 new_points = _add_points(sender, self.LUDO_WIN_REWARD)
                 self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,photo); 
@@ -7158,7 +7199,7 @@ class TalkinBot:
             if game.get("bot") and game["players"][game["turn"]]=="🤖 البوت":
                 br=secrets.randbelow(6)+1
                 bot_old=game["tokens"].get("🤖 البوت",0)
-                bot_new=min(len(self._ludo_track()),bot_old+br)
+                bot_new=min(58,bot_old+br)
                 game["tokens"]["🤖 البوت"]=bot_new
                 # Bot move is followed by the human turn.
                 game["turn"]=0
