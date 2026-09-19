@@ -6822,22 +6822,46 @@ class TalkinBot:
                 t=k/max(3,int(ln//28)); cx=x1+dx*t; cy=y1+dy*t
                 d.line((cx+nx*18,cy+ny*18,cx-nx*18,cy-ny*18),fill=(255,225,100),width=6)
 
+        # Snakes: shaded, scale-textured and dimensional instead of cartoon-green lines.
         snakes={98:40,95:75,92:70,88:48,62:18,48:26,24:5,17:7}
-        for a,b in snakes.items():
+        snake_palettes=[((38,95,48),(12,35,18)),((92,66,32),(35,20,10)),((55,80,115),(18,25,45)),((105,48,48),(45,15,15))]
+        for si,(a,b) in enumerate(snakes.items()):
             x1,y1=cell_center(a); x2,y2=cell_center(b)
             dx=x2-x1; dy=y2-y1; ln=max(1,(dx*dx+dy*dy)**0.5); px=-dy/ln; py=dx/ln
             pts=[]
-            for k in range(25):
-                t=k/24; cx=x1+dx*t; cy=y1+dy*t
-                wave=((k%6)-2.5)*8
+            for k in range(49):
+                t=k/48.0; cx=x1+dx*t; cy=y1+dy*t
+                wave=math.sin(t*math.pi*4 + si*0.7)*11
                 pts.append((cx+px*wave,cy+py*wave))
-            d.line(pts,fill=(35,190,105),width=24,joint="curve")
-            d.line(pts,fill=(20,120,70),width=13,joint="curve")
-            hx,hy=pts[0]
-            d.ellipse((hx-18,hy-18,hx+18,hy+18),fill=(40,205,110),outline=(10,70,40),width=3)
-            d.ellipse((hx-8,hy-5,hx-3,hy),fill=(255,255,255)); d.ellipse((hx+3,hy-5,hx+8,hy),fill=(255,255,255))
-            d.ellipse((hx-6,hy-4,hx-4,hy-2),fill=(0,0,0)); d.ellipse((hx+4,hy-4,hx+6,hy-2),fill=(0,0,0))
-            d.line((hx,hy+12,hx+18,hy+12),fill=(230,60,70),width=3)
+            base,shadow=snake_palettes[si % len(snake_palettes)]
+            # soft shadow under the body
+            shadow_pts=[(x+4,y+5) for x,y in pts]
+            d.line(shadow_pts,fill=(3,8,10),width=27,joint="curve")
+            d.line(pts,fill=shadow,width=25,joint="curve")
+            d.line(pts,fill=base,width=20,joint="curve")
+            # Highlight strip and repeated scale marks give a photographic texture.
+            hi=tuple(min(255,c+42) for c in base)
+            d.line([(x+px*3,y+py*3) for x,y in pts],fill=hi,width=5,joint="curve")
+            for k in range(4,47,3):
+                x,y=pts[k]
+                for side in (-1,1):
+                    sx=x+px*side*5; sy=y+py*side*5
+                    d.arc((sx-4,sy-3,sx+4,sy+3),20,160,fill=tuple(min(255,c+65) for c in base),width=1)
+            # Head at the high-number end, with eye, nostril and forked tongue.
+            hx,hy=pts[0]; tx,ty=pts[2]; ux,uy=(hx-tx,hy-ty); ulen=max(1,(ux*ux+uy*uy)**0.5); ux/=ulen; uy/=ulen
+            vx,vy=-uy,ux
+            head_center=(hx+ux*5,hy+uy*5)
+            d.ellipse((head_center[0]-18,head_center[1]-14,head_center[0]+18,head_center[1]+14),fill=tuple(min(255,c+12) for c in base),outline=(8,12,8),width=2)
+            for side in (-1,1):
+                ex=head_center[0]+ux*7+vx*side*7; ey=head_center[1]+uy*7+vy*side*7
+                d.ellipse((ex-4,ey-4,ex+4,ey+4),fill=(235,220,80),outline=(10,10,10),width=1)
+                d.ellipse((ex-1.5,ey-2,ex+1.5,ey+2),fill=(5,5,5))
+            # forked tongue
+            tongue_start=(head_center[0]+ux*17,head_center[1]+uy*17)
+            tongue_mid=(tongue_start[0]+ux*13,tongue_start[1]+uy*13)
+            d.line((tongue_start[0],tongue_start[1],tongue_mid[0],tongue_mid[1]),fill=(190,35,45),width=2)
+            d.line((tongue_mid[0],tongue_mid[1],tongue_mid[0]+vx*6+ux*8,tongue_mid[1]+vy*6+uy*8),fill=(190,35,45),width=2)
+            d.line((tongue_mid[0],tongue_mid[1],tongue_mid[0]-vx*6+ux*8,tongue_mid[1]-vy*6+uy*8),fill=(190,35,45),width=2)
 
         colors=[(255,210,70),(80,190,255),(220,90,220),(80,225,130)]
         for i,(u,pos) in enumerate(state.get("positions",{}).items()):
@@ -6946,7 +6970,14 @@ class TalkinBot:
         if low in ("1","2","3","4") and len(game["players"])==1 and not game.get("started"):
             count=int(low); game["max_players"]=1 if count==1 else count; game["bot"]=(count==1)
             if count==1:
-                game["started"]=True; self._broadcast_game_start("🤖 بدأت لعبة لودو مع البوت! اكتب rool للعب.",game)
+                # Bot mode is a two-player match: the human is always player 0
+                # and the bot is player 1, so the human can roll immediately.
+                if "🤖 البوت" not in game["players"]:
+                    game["players"].append("🤖 البوت")
+                    game["tokens"]["🤖 البوت"]=0
+                game["started"]=True
+                game["turn"]=0
+                self._broadcast_game_start("🤖 بدأت لعبة لودو مع البوت! أنت تبدأ أولاً، اكتب rool للعب.",game)
             else:self.send_room_text(room,"✅ تم اختيار العدد. اكتب join أو انضمام حتى يكتمل عدد اللاعبين.")
             return True
         if low in ("join","انضمام") and not game.get("started"):
@@ -6970,7 +7001,17 @@ class TalkinBot:
                 self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.",win_img,photo); self.ludo_games.pop(key,None); return True
             game["turn"]=(game.get("turn",0)+1)%len(game["players"])
             if game.get("bot") and game["players"][game["turn"]]=="🤖 البوت":
-                br=secrets.randbelow(6)+1; game["tokens"]["🤖 البوت"]=min(len(self._ludo_track()),game["tokens"].get("🤖 البوت",0)+br); game["turn"]=0
+                br=secrets.randbelow(6)+1
+                bot_old=game["tokens"].get("🤖 البوت",0)
+                bot_new=min(len(self._ludo_track()),bot_old+br)
+                game["tokens"]["🤖 البوت"]=bot_new
+                # Bot move is followed by the human turn.
+                game["turn"]=0
+                game["last_roll_at"]=time.monotonic()
+                bot_img=self._render_ludo_board(game); bot_url=self._game_public_image(bot_img) if bot_img else ""
+                for r in self._game_rooms(game):
+                    if bot_url:self.send_room_media(r,bot_url,"image")
+                    self.send_room_text(r, f"🤖 البوت رمى {br} وانتقل من المربع {bot_old} إلى {bot_new}.\n🎯 الآن دورك، اكتب rool.")
             return True
         return False
 
