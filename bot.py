@@ -5262,11 +5262,11 @@ class TalkinBot:
     LUDO_WIN_REWARD = 50000
     BOARD_GAME_COOLDOWN = 240.0  # 4 minutes between board games for the same player
 
-    def _board_game_ready(self, username, room):
-        """Enforce a 4-minute interval for the same player before starting another board game."""
+    def _board_game_ready(self, username, room, game_type="board"):
+        """Enforce a separate 4-minute interval per game type for the same player."""
         if not username:
             return True, 0
-        key = ("board_games", _norm_user(username))
+        key = ("board_games", str(game_type or "board").casefold(), _norm_user(username))
         now = time.time()
         with self.game_lock:
             last = getattr(self, "board_game_cooldown", {}).get(key, 0.0)
@@ -5275,13 +5275,13 @@ class TalkinBot:
             self.board_game_cooldown[key] = now
         return True, 0
 
-    def _board_game_cooldown_notice(self, room, username):
-        ok, left = self._board_game_ready(username, room)
+    def _board_game_cooldown_notice(self, room, username, game_type="board"):
+        ok, left = self._board_game_ready(username, room, game_type)
         if not ok:
             mins = left // 60
             secs = left % 60
             wait = f"{mins} دقيقة و{secs} ثانية" if mins else f"{secs} ثانية"
-            self.send_room_text(room, f"⏳ @{username} انتظر {wait} قبل بدء لعبة جديدة.\n🎮 الفاصل بين ألعاب السلم والثعبان ولودو لنفس اللاعب هو 4 دقائق.")
+            self.send_room_text(room, f"⏳ @{username} انتظر {wait} قبل بدء لعبة {"السلم والثعبان" if str(game_type).casefold()=="snake" else "لودو"}.\n🎮 الفاصل بين لعبتي {"السلم والثعبان" if str(game_type).casefold()=="snake" else "لودو"} لنفس اللاعب هو 4 دقائق.")
         return ok
 
     def _game_award(self, username, amount):
@@ -6943,7 +6943,7 @@ class TalkinBot:
         key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=low in ("snake","سناكي")
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
-            if not self._board_game_cooldown_notice(room, sender):
+            if not self._board_game_cooldown_notice(room, sender, "ludo"):
                 return True
             game={"players":[sender],"positions":{sender:1},"lang":"en" if english else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"last_roll":None,"last_roll_at":0.0}
             self.snake_games[key]=game; self._schedule_board_game_timeout(key, game, "السلم والثعبان"); self._send_game_cover("snake_ladders",game)
@@ -7118,7 +7118,7 @@ class TalkinBot:
             avatar=self._game_square_avatar(u,44)
             cx=ox+x*cell+cell//2; cy=oy+y*cell+cell//2
             if avatar is not None:
-                img.paste(avatar,(int(cx-22),int(cy-22)),avatar)
+                img.paste(avatar,(int(cx-22),int(cy-22)))
                 d.ellipse((cx-24,cy-24,cx+24,cy+24),outline=(255,255,255),width=3)
             else:
                 d.ellipse((cx-20,cy-20,cx+20,cy+20),fill=colors[i%4],outline=(255,255,255),width=3)
