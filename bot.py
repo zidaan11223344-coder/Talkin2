@@ -5281,7 +5281,8 @@ class TalkinBot:
             mins = left // 60
             secs = left % 60
             wait = f"{mins} دقيقة و{secs} ثانية" if mins else f"{secs} ثانية"
-            self.send_room_text(room, f"⏳ @{username} انتظر {wait} قبل بدء لعبة {"السلم والثعبان" if str(game_type).casefold()=="snake" else "لودو"}.\n🎮 الفاصل بين لعبتي {"السلم والثعبان" if str(game_type).casefold()=="snake" else "لودو"} لنفس اللاعب هو 4 دقائق.")
+            game_label = "السلم والثعبان" if str(game_type).casefold() == "snake" else "لودو"
+        self.send_room_text(room, f"⏳ @{username} انتظر {wait} قبل بدء لعبة {game_label}.\n🎮 الفاصل بين لعبتي {game_label} لنفس اللاعب هو 4 دقائق.")
         return ok
 
     def _game_award(self, username, amount):
