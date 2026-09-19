@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import random
+import math
 import secrets
 import ssl
 import socket
@@ -6783,7 +6784,9 @@ class TalkinBot:
             url = self._game_public_image(path, route="assets")
             if not url:
                 return
-            for r in self._game_rooms(game):
+            # The opening cover is part of the game start, so it is announced
+            # to every active room just like the start message.
+            for r in self._active_rooms():
                 self.send_room_media(r, url, "image")
         except Exception as exc:
             self.log("[GAME] cover send failed:", repr(exc))
@@ -6881,12 +6884,16 @@ class TalkinBot:
         key="__shared_snake__"; low=str(raw or "").strip().casefold(); english=low in ("snake","سناكي")
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
-            game={"players":[sender],"positions":{sender:1},"lang":"en" if english else "ar","turn":0,"created":time.time(),"rooms":{room},"last_roll":None,"last_roll_at":0.0}
+            game={"players":[sender],"positions":{sender:1},"lang":"en" if english else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"last_roll":None,"last_roll_at":0.0}
             self.snake_games[key]=game; self._send_game_cover("snake_ladders",game)
             self._broadcast_game_start("🐍 بدأت لعبة السلم والثعبان! جاري البحث عن خصم. للمشاركة اكتب join" if not english else "🐍 Snake & Ladders started! Waiting for an opponent. Type join to participate.",game)
             return True
         if not game: return False
-        game.setdefault("rooms",set()).add(room)
+        origin_room = str(game.get("origin_room") or next(iter(game.get("rooms", {room})), room))
+        game["origin_room"] = origin_room
+        if room != origin_room:
+            return True
+        game.setdefault("rooms",set()).add(origin_room)
         if low in ("ثعبان","snake","سناكي"):
             self.send_room_text(room,"🐍 توجد لعبة السلم والثعبان شغالة بالفعل. اكتب join للمشاركة." if game.get("lang")!="en" else "🐍 A Snake & Ladders game is already running. Type join to join."); return True
         if low in ("join","انضمام"):
@@ -7024,11 +7031,15 @@ class TalkinBot:
     def _ludo_command(self,room,sender,raw):
         key="__shared_ludo__"; low=str(raw or "").strip().casefold(); game=self.ludo_games.get(key)
         if low in ("لودو","ludo") and not game:
-            game={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time(),"rooms":{room},"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
+            game={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
             self.ludo_games[key]=game; self._send_game_cover("ludo",game)
             self.send_room_text(room,"🎲 Ludo: choose players 1-4. Type 1/2/3/4." if low=="ludo" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين"); return True
         if not game:return False
-        game.setdefault("rooms",set()).add(room)
+        origin_room = str(game.get("origin_room") or next(iter(game.get("rooms", {room})), room))
+        game["origin_room"] = origin_room
+        if room != origin_room:
+            return True
+        game.setdefault("rooms",set()).add(origin_room)
         if low in ("لودو","ludo"):
             self.send_room_text(room,"🎲 توجد لعبة لودو قيد التجهيز. اختر العدد أو اكتب join/انضمام."); return True
         if low in ("1","2","3","4") and len(game["players"])==1 and not game.get("started"):
