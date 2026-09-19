@@ -6918,7 +6918,8 @@ class TalkinBot:
             pass
         game["last_activity_at"] = time.time()
         def expire():
-            current = self.snake_games.get(game_key) if game_key == "__shared_snake__" else self.ludo_games.get(game_key)
+            is_snake = str(game_key).startswith("snake:")
+            current = self.snake_games.get(game_key) if is_snake else self.ludo_games.get(game_key)
             if current is not game:
                 return
             last = float(game.get("last_activity_at", 0) or 0)
@@ -6939,7 +6940,7 @@ class TalkinBot:
         timer.start()
 
     def _snake_command(self,room,sender,raw):
-        key="__shared_snake__"; low=str(raw or "").strip().casefold(); english=low in ("snake","سناكي")
+        key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=low in ("snake","سناكي")
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
             if not self._board_game_cooldown_notice(room, sender):
@@ -6951,11 +6952,16 @@ class TalkinBot:
         if not game: return False
         origin_room = str(game.get("origin_room") or next(iter(game.get("rooms", {room})), room))
         game["origin_room"] = origin_room
+        # The game itself is local to its origin room. However, JOIN is global:
+        # if someone sends join from another room while this game is active,
+        # tell them a game is already running instead of silently ignoring it.
         if room != origin_room:
+            if low in ("join", "انضمام"):
+                self.send_room_text(room, f"🎮 لديك لعبة السلم والثعبان شغالة بالفعل في غرفة: {origin_room}\n✏️ اكتب اسم اللعبة لبدء لعبة جديدة.")
             return True
         game.setdefault("rooms",set()).add(origin_room)
         if low in ("ثعبان","snake","سناكي"):
-            self.send_room_text(room,"🐍 توجد لعبة السلم والثعبان شغالة بالفعل. اكتب join للمشاركة." if game.get("lang")!="en" else "🐍 A Snake & Ladders game is already running. Type join to join."); return True
+            self.send_room_text(room, f"🐍 توجد لعبة السلم والثعبان شغالة بالفعل في غرفة: {origin_room}. اكتب join للمشاركة." if game.get("lang")!="en" else f"🐍 A Snake & Ladders game is already running in room: {origin_room}. Type join to join."); return True
         if low in ("join","انضمام"):
             if sender not in game["players"] and len(game["players"])<2:
                 game["players"].append(sender); game["positions"][sender]=1; game["rooms"].add(room); self._schedule_board_game_timeout(key, game, "السلم والثعبان")
@@ -7093,7 +7099,7 @@ class TalkinBot:
         img.save(out,"JPEG",quality=88,optimize=True); return out
 
     def _ludo_command(self,room,sender,raw):
-        key="__shared_ludo__"; low=str(raw or "").strip().casefold(); game=self.ludo_games.get(key)
+        key=f"ludo:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); game=self.ludo_games.get(key)
         if low in ("لودو","ludo") and not game:
             if not self._board_game_cooldown_notice(room, sender):
                 return True
@@ -7103,11 +7109,15 @@ class TalkinBot:
         if not game:return False
         origin_room = str(game.get("origin_room") or next(iter(game.get("rooms", {room})), room))
         game["origin_room"] = origin_room
+        # JOIN may be typed in any room, but an active Ludo game belongs to
+        # its origin room; do not let another room silently join it.
         if room != origin_room:
+            if low in ("join", "انضمام"):
+                self.send_room_text(room, f"🎮 لديك لعبة لودو شغالة بالفعل في غرفة: {origin_room}\n✏️ اكتب اسم اللعبة لبدء لعبة جديدة.")
             return True
         game.setdefault("rooms",set()).add(origin_room)
         if low in ("لودو","ludo"):
-            self.send_room_text(room,"🎲 توجد لعبة لودو قيد التجهيز. اختر العدد أو اكتب join/انضمام."); return True
+            self.send_room_text(room,f"🎲 توجد لعبة لودو شغالة بالفعل في غرفة: {origin_room}. اختر العدد أو اكتب join/انضمام."); return True
         if low in ("1","2","3","4") and len(game["players"])==1 and not game.get("started"):
             count=int(low); game["max_players"]=1 if count==1 else count; game["bot"]=(count==1)
             if count==1:
