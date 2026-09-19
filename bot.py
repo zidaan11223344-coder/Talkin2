@@ -6729,10 +6729,25 @@ class TalkinBot:
         img=Image.new("RGB",(W,H),(8,15,25)); d=ImageDraw.Draw(img)
         font=_gift_font("1",24); small=_gift_font("1",18); title_font=_gift_font("1",34)
         d.rounded_rectangle((20,18,W-20,110), radius=22, fill=(20,35,52), outline=(245,198,70), width=3)
-        d.text((W//2,38), "السلم والثعبان" if state.get("lang")!="en" else "SNAKE & LADDERS", fill=(255,215,80), font=title_font, anchor="ma")
-        roll=state.get("last_roll")
-        if roll is not None:
-            d.text((W//2,82), f"الرول: {roll}" if state.get("lang")!="en" else f"ROLL: {roll}", fill=(235,245,255), font=small, anchor="ma")
+        if winner_name:
+            # Final result: put the winner's name and avatar INSIDE the final board image.
+            winner_photo = ""
+            try:
+                winner_photo = self.user_photos.get(str(winner_name).casefold(), "") or self._lookup_profile_photo(winner_name)
+            except Exception:
+                pass
+            avatar = _load_sender_avatar(winner_photo, 64) if winner_photo else None
+            if avatar is not None:
+                img.paste(avatar, (36, 41), avatar)
+            d.text((W//2,38), "🏆 الفائز" if state.get("lang")!="en" else "🏆 WINNER",
+                   fill=(255,215,80), font=small, anchor="ma")
+            d.text((W//2,80), f"@{str(winner_name).lstrip('@')}",
+                   fill=(255,255,255), font=title_font, anchor="ma")
+        else:
+            d.text((W//2,38), "السلم والثعبان" if state.get("lang")!="en" else "SNAKE & LADDERS", fill=(255,215,80), font=title_font, anchor="ma")
+            roll=state.get("last_roll")
+            if roll is not None:
+                d.text((W//2,82), f"الرول: {roll}" if state.get("lang")!="en" else f"ROLL: {roll}", fill=(235,245,255), font=small, anchor="ma")
 
         def cell_center(pos):
             pos=max(1,min(100,int(pos)))
@@ -6984,11 +6999,15 @@ class TalkinBot:
             if final>=100:
                 photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender); win_img=self._render_snake_board(game,winner_name=sender)
                 new_points = _add_points(sender, self.SNAKE_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,photo); 
+                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.snake_games.pop(key,None)
-            else: game["turn"]=(game.get("turn",0)+1)%len(game["players"])
+            else:
+                game["turn"]=(game.get("turn",0)+1)%len(game["players"])
+                next_player = game["players"][game["turn"]]
+                for r in self._game_rooms(game):
+                    self.send_room_text(r, f"🎯 الآن دور @{next_player}، اكتب rool.")
             return True
         return False
 
@@ -7125,10 +7144,27 @@ class TalkinBot:
                 d.ellipse((cx-20,cy-20,cx+20,cy+20),fill=colors[i%4],outline=(255,255,255),width=3)
                 d.text((cx,cy),str(i+1),fill=(255,255,255),font=_gift_font("1",18),anchor="mm")
 
-        # Title only; no numbered-square list.
+        # Title and final winner badge. The winner photo is embedded in the final image.
         title="لودو"
         d.rounded_rectangle((ox,18,ox+15*cell,oy-5),radius=16,fill=(16,30,45),outline=(230,190,75),width=3)
         d.text((ox+15*cell//2,42),title,fill=(245,205,80),font=_gift_font("1",30),anchor="mm")
+        if winner_name:
+            panel_y0 = oy + 15*cell + 8
+            panel_y1 = min(H-8, panel_y0 + 100)
+            d.rounded_rectangle((ox, panel_y0, ox+15*cell, panel_y1),
+                                radius=18, fill=(16,30,45), outline=(245,198,70), width=3)
+            winner_photo = ""
+            try:
+                winner_photo = self.user_photos.get(str(winner_name).casefold(), "") or self._lookup_profile_photo(winner_name)
+            except Exception:
+                pass
+            avatar = _load_sender_avatar(winner_photo, 72) if winner_photo else None
+            if avatar is not None:
+                img.paste(avatar, (ox+20, panel_y0+14), avatar)
+            d.text((ox+15*cell//2, panel_y0+31), "🏆 الفائز",
+                   fill=(245,205,80), font=_gift_font("1",22), anchor="ma")
+            d.text((ox+15*cell//2, panel_y0+70), f"@{str(winner_name).lstrip('@')}",
+                   fill=(255,255,255), font=_gift_font("1",26), anchor="ma")
         out=BASE_DIR/"generated_games"/f"ludo_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True)
         img.save(out,"JPEG",quality=88,optimize=True); return out
 
@@ -7192,7 +7228,7 @@ class TalkinBot:
             if new>=58:
                 win_img=self._render_ludo_board(game,winner_name=sender); photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
                 new_points = _add_points(sender, self.LUDO_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,photo); 
+                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.ludo_games.pop(key,None); return True
@@ -7208,7 +7244,12 @@ class TalkinBot:
                 bot_img=self._render_ludo_board(game); bot_url=self._game_public_image(bot_img) if bot_img else ""
                 for r in self._game_rooms(game):
                     if bot_url:self.send_room_media(r,bot_url,"image")
-                    self.send_room_text(r, f"🤖 البوت رمى {br} وانتقل من المربع {bot_old} إلى {bot_new}.\n🎯 الآن دورك، اكتب rool.")
+                    human_player = game["players"][0] if game.get("players") else sender
+                    self.send_room_text(r, f"🤖 البوت رمى {br} وانتقل من المربع {bot_old} إلى {bot_new}.\n🎯 الآن دور @{human_player}، اكتب rool.")
+            else:
+                next_player = game["players"][game["turn"]]
+                for r in self._game_rooms(game):
+                    self.send_room_text(r, f"🎯 الآن دور @{next_player}، اكتب rool.")
             return True
         return False
 
