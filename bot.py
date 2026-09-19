@@ -5282,7 +5282,7 @@ class TalkinBot:
             secs = left % 60
             wait = f"{mins} دقيقة و{secs} ثانية" if mins else f"{secs} ثانية"
             game_label = "السلم والثعبان" if str(game_type).casefold() == "snake" else "لودو"
-        self.send_room_text(room, f"⏳ @{username} انتظر {wait} قبل بدء لعبة {game_label}.\n🎮 الفاصل بين لعبتي {game_label} لنفس اللاعب هو 4 دقائق.")
+            self.send_room_text(room, f"⏳ @{username} انتظر {wait} قبل بدء لعبة {game_label}.\n🎮 الفاصل بين لعبتي {game_label} لنفس اللاعب هو 4 دقائق.")
         return ok
 
     def _game_award(self, username, amount):
@@ -6944,7 +6944,7 @@ class TalkinBot:
         key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=low in ("snake","سناكي")
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
-            if not self._board_game_cooldown_notice(room, sender, "ludo"):
+            if not self._board_game_cooldown_notice(room, sender, "snake"):
                 return True
             game={"players":[sender],"positions":{sender:1},"lang":"en" if english else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"last_roll":None,"last_roll_at":0.0}
             self.snake_games[key]=game; self._schedule_board_game_timeout(key, game, "السلم والثعبان"); self._send_game_cover("snake_ladders",game)
