@@ -1,4 +1,5 @@
 import base64
+import copy
 import json
 import os
 import random
@@ -271,8 +272,6 @@ def _select_persistent_data_dir():
     candidates = []
     if configured:
         candidates.append(Path(configured).expanduser())
-    # Railway volume mount /data is the recommended permanent location.
-    candidates.append(Path("/data/chatbuz_bot"))
     candidates.append(BASE_DIR / "data")
     for candidate in candidates:
         try:
@@ -306,6 +305,11 @@ REPLIES_FILE = DATA_DIR / "replies.json"
 MODERATION_FILE = DATA_DIR / "moderation.json"
 # Dedicated persistent file for filter words added with +mf@...
 MF_FILE = DATA_DIR / "mf.json"
+FILTER_EXCEPTIONS_FILE = DATA_DIR / "filter_exceptions.json"
+FILTER_BANS_FILE = DATA_DIR / "filter_bans.json"
+PROTECTION_FILE = DATA_DIR / "room_protection.json"
+SNAKE_FILE = DATA_DIR / "snake_games.json"
+LUDO_FILE = DATA_DIR / "ludo_games.json"
 # Dedicated persistent file for accounts allowed to manage VIP verification.
 MVIP_MASTERS_FILE = DATA_DIR / "mvip_masters.json"
 
@@ -356,7 +360,7 @@ _migrate_legacy_state_files()
 # Restore state from GitHub after the data directory and legacy migration are ready.
 
 # Giant Chat gift costs/labels; images remain the local Giant assets.
-GIFT_COSTS = {"1":10,"2":20,"3":30,"4":50,"5":80,"6":150,"7":200,"8":500,"9":800,"10":1000,"11":1500,"12":3000,"13":5000,"14":8000}
+GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500}
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://chatp.net/api?").rstrip("?") + "?"
@@ -457,7 +461,14 @@ AUTO_HELP = os.getenv("AUTO_HELP", "1") == "1"
 SAFE_TEXT_PACKET_LIMIT = max(120, int(os.getenv("SAFE_TEXT_PACKET_LIMIT", "260")))
 HELP_LINES_PER_MESSAGE = max(1, int(os.getenv("HELP_LINES_PER_MESSAGE", "10")))
 HELP_PACKET_MAX_CHARS = max(400, int(os.getenv("HELP_PACKET_MAX_CHARS", "900")))
-BANNED_WORDS = {w.strip().lower() for w in os.getenv("BANNED_WORDS", "").split(",") if w.strip()}
+_BUILTIN_OFFENSIVE_WORDS = {
+    # Broad starter list; deployments may extend it with +mf@word.
+    "fuck","fucking","bitch","shit","asshole","dick","pussy","whore","slut","motherfucker",
+    "كس","شرموط","شرموطة","قحبة","قحاب","زانية","زاني","عاهرة","عاهر","خول","خنيث",
+    "كلب","حيوان","سافل","ساقط","حقير","وسخ","نجس","تبن","زب","طيز","نيك","منيوك",
+    "عرص","قواد","ديوث","خرا","خراء","لعنة","ملعون","ياحمار","ياحيوان","ياكلب"
+}
+BANNED_WORDS = {w.strip().lower() for w in os.getenv("BANNED_WORDS", "").split(",") if w.strip()} | _BUILTIN_OFFENSIVE_WORDS
 AUTO_BAN_WORDS = os.getenv("AUTO_BAN_WORDS", "1") == "1"
 
 # ------------------------- protobuf wire helpers -------------------------
@@ -1069,6 +1080,9 @@ def _load_local_json(path, default):
     return default
 
 _LOCAL_JSON_WRITE_LOCK = threading.RLock()
+_LOCAL_BG_CONDITION = threading.Condition()
+_LOCAL_BG_PENDING = {}
+_LOCAL_BG_WORKER_STARTED = False
 
 def _save_local_json(path, data):
     """Atomically save local JSON without sharing one fixed .tmp file.
@@ -1092,14 +1106,15 @@ def _save_local_json(path, data):
                 pass
     _github_sync_after_local_save(path, data)
 
-# GitHub-backed persistent state. Set GITHUB_TOKEN and GITHUB_REPO in the
-# hosting environment to make every JSON state file live in the GitHub repo.
+# GitHub-backed persistent state. Runtime stays in Talkin1; durable state is
+# backed up to Talkin4 asynchronously so message handling is not blocked by
+# GitHub network requests. Set GITHUB_TOKEN in the hosting environment.
 # Never hard-code the token in bot.py. For public repositories, remember that
 # committed member/verification/points data becomes publicly readable.
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 # State backups are intentionally restricted to Talkin4. Do not allow a
 # deployment variable to redirect the bot into the main Talkin1 source repo.
-GITHUB_REPO = "zidaan11223344-coder/Talkin4"
+GITHUB_REPO = "zidaan11223344-coder/Talkin4"  # durable data repository
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
 GITHUB_DATA_DIR = os.getenv("GITHUB_DATA_DIR", "bot_data").strip().strip("/")
 GITHUB_SYNC_ENABLED = bool(GITHUB_TOKEN and GITHUB_REPO and os.getenv("GITHUB_SYNC", "1").strip().lower() not in {"0", "false", "no", "off"})
@@ -1110,6 +1125,39 @@ _GITHUB_PENDING = {}
 _GITHUB_PENDING_CONDITION = threading.Condition()
 _GITHUB_WORKER_STARTED = False
 _GITHUB_BACKUP_REQUESTS = []
+
+def _queue_local_json_save(path, data):
+    """Queue a local JSON snapshot for background persistence.
+
+    Game/message handlers use this instead of waiting for disk I/O.  Repeated
+    updates to the same file are coalesced so a burst of games produces only
+    the newest snapshot.
+    """
+    path = Path(path)
+    try:
+        snapshot = copy.deepcopy(data)
+    except Exception:
+        snapshot = data
+    with _LOCAL_BG_CONDITION:
+        _LOCAL_BG_PENDING[str(path)] = snapshot
+        _LOCAL_BG_CONDITION.notify()
+
+
+def _local_persistence_worker():
+    while True:
+        with _LOCAL_BG_CONDITION:
+            while not _LOCAL_BG_PENDING:
+                _LOCAL_BG_CONDITION.wait()
+            # Coalesce rapid game events before touching disk.
+            _LOCAL_BG_CONDITION.wait(timeout=0.15)
+            pending = dict(_LOCAL_BG_PENDING)
+            _LOCAL_BG_PENDING.clear()
+        for path, data in pending.items():
+            try:
+                _save_local_json(path, data)
+            except Exception as exc:
+                print(f"[LOCAL] background save failed for {Path(path).name}: {exc}", flush=True)
+
 
 def _github_url(path):
     from urllib.parse import quote
@@ -1340,6 +1388,10 @@ def _github_sync_worker():
             except Exception as exc:
                 print(f"[GITHUB] backup completion notice failed: {exc}", flush=True)
 
+
+if not _LOCAL_BG_WORKER_STARTED:
+    threading.Thread(target=_local_persistence_worker, name="local-persistence", daemon=True).start()
+    _LOCAL_BG_WORKER_STARTED = True
 
 if GITHUB_SYNC_ENABLED and not _GITHUB_WORKER_STARTED:
     threading.Thread(target=_github_sync_worker, name="github-sync", daemon=True).start()
@@ -1583,7 +1635,7 @@ def _looks_like_bot_command(text):
         "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
-        "العاب", "ألعاب", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@",
+        "العاب", "ألعاب", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
     )
     prefixes = prefixes + ("bl@",)
@@ -1626,9 +1678,18 @@ def _is_vip_user(name):
     return bool(key and (key in _vip_data() or _is_master_name(name)))
 
 
+_GAME_STATE_LOCK = threading.RLock()
+_GAME_STATS_CACHE = None
+_POINTS_CACHE = None
+
 def _game_stats_data():
-    data = _load_local_json(GAME_STATS_FILE, {})
-    return data if isinstance(data, dict) else {}
+    """Return the in-memory game statistics cache; disk is loaded once."""
+    global _GAME_STATS_CACHE
+    with _GAME_STATE_LOCK:
+        if _GAME_STATS_CACHE is None:
+            data = _load_local_json(GAME_STATS_FILE, {})
+            _GAME_STATS_CACHE = data if isinstance(data, dict) else {}
+        return _GAME_STATS_CACHE
 
 
 # العتبات السابقة محفوظة حتى لا تتغير مستويات اللاعبين الحاليين.
@@ -1645,7 +1706,6 @@ GAME_LEVELS = (
     (20000, "أسطورة الأساطير"),
 )
 
-
 def _game_name_key(name):
     """Compare decorated usernames without changing their displayed form."""
     raw = unicodedata.normalize("NFKC", str(name or "")).strip().lstrip("@")
@@ -1655,7 +1715,6 @@ def _game_name_key(name):
 
 
 def _game_level_info(username):
-    """Return (level number, label, total plays) from all game statistics."""
     data = _game_stats_data()
     item = data.get(_norm_user(username), {})
     if not isinstance(item, dict):
@@ -1674,7 +1733,6 @@ def _game_level_info(username):
 
 
 def _game_star_rank(username):
-    """Top-ten rank: first place has ten gold stars, tenth has one."""
     rows = []
     for key, item in _game_stats_data().items():
         if not isinstance(item, dict):
@@ -1691,7 +1749,6 @@ def _game_star_rank(username):
 
 
 def _game_top10():
-    """Return the ten strongest players ordered by level, then play count."""
     rows = []
     for key, item in _game_stats_data().items():
         if not isinstance(item, dict):
@@ -1705,19 +1762,17 @@ def _game_top10():
 
 
 def _game_top10_message():
-    """Compact top-games message: rank, username, and total plays only."""
     rows = _game_top10()
     if not rows:
         return "🏆 توب الألعاب\nلا توجد نتائج بعد."
     lines = []
     for position, (_level, _label, plays, username) in enumerate(rows, 1):
         rank = {1: "🥇 1", 2: "🥈 2", 3: "🥉 3"}.get(position, str(position))
-        lines.append(f"{rank} {username} لعب {plays}")
+        lines.append(f"{rank} {str(username).strip().lstrip('@')} لعب {plays}")
     return "🏆 توب الألعاب\n" + "\n".join(lines)
 
 
 def _save_game_levels_snapshot():
-    """Persist derived levels/ranks as a separately backed-up JSON record."""
     players = {}
     for key, item in _game_stats_data().items():
         if not isinstance(item, dict):
@@ -1732,14 +1787,11 @@ def _save_game_levels_snapshot():
                 "plays": plays,
                 "star_rank": _game_star_rank(username),
             }
-    _save_local_json(GAME_LEVELS_FILE, {"version": 1, "players": players})
+    _queue_local_json_save(GAME_LEVELS_FILE, {"version": 1, "players": players})
 
 
 def _game_welcome(username, room):
-    """Build the level-aware welcome shown whenever a player enters a room."""
     level, label, plays = _game_level_info(username)
-    # Stars represent the player's game level directly: level 4 = four stars,
-    # while the highest level 10 receives ten stars.
     star_line = f"\n⭐ ترتيب النجوم\n       {'⭐' * level}"
     return (f"🎮 دخل @{username}\n"
             f"{label}\n"
@@ -1752,18 +1804,20 @@ def _record_game(username, game_key, points_delta=0, stake=0):
     key = _norm_user(username)
     if not key or _is_primary_master(username):
         return
-    data = _game_stats_data()
-    item = data.get(key, {"username": str(username).strip().lstrip("@"), "games": {}})
-    item["username"] = str(username).strip().lstrip("@")
-    games = item.get("games") if isinstance(item.get("games"), dict) else {}
-    g = games.get(game_key, {"plays": 0, "points": 0, "staked": 0})
-    g["plays"] = int(g.get("plays", 0) or 0) + 1
-    g["points"] = int(g.get("points", 0) or 0) + int(points_delta or 0)
-    g["staked"] = int(g.get("staked", 0) or 0) + int(stake or 0)
-    games[game_key] = g
-    item["games"] = games
-    data[key] = item
-    _save_local_json(GAME_STATS_FILE, data)
+    with _GAME_STATE_LOCK:
+        data = _game_stats_data()
+        item = data.get(key, {"username": str(username).strip().lstrip("@"), "games": {}})
+        item["username"] = str(username).strip().lstrip("@")
+        games = item.get("games") if isinstance(item.get("games"), dict) else {}
+        g = games.get(game_key, {"plays": 0, "points": 0, "staked": 0})
+        g["plays"] = int(g.get("plays", 0) or 0) + 1
+        g["points"] = int(g.get("points", 0) or 0) + int(points_delta or 0)
+        g["staked"] = int(g.get("staked", 0) or 0) + int(stake or 0)
+        games[game_key] = g
+        item["games"] = games
+        data[key] = item
+        snapshot = copy.deepcopy(data)
+    _queue_local_json_save(GAME_STATS_FILE, snapshot)
     _save_game_levels_snapshot()
 
 
@@ -1793,25 +1847,33 @@ def _game_top(game_key, limit=10):
     return rows[:limit]
 
 def _points_data():
-    data=_load_local_json(POINTS_FILE,{})
-    return data if isinstance(data,dict) else {}
+    global _POINTS_CACHE
+    with _GAME_STATE_LOCK:
+        if _POINTS_CACHE is None:
+            data = _load_local_json(POINTS_FILE, {})
+            _POINTS_CACHE = data if isinstance(data, dict) else {}
+        return _POINTS_CACHE
 
 def _add_points(username, amount):
-    amount=int(amount)
-    data=_points_data(); key=_norm_user(username)
-    item=data.get(key,{"username":str(username).strip().lstrip("@"),"points":0})
-    item["username"]=str(username).strip().lstrip("@")
-    item["points"]=int(item.get("points",0) or 0)+amount
-    data[key]=item; _save_local_json(POINTS_FILE,data)
+    amount = int(amount)
+    key = _norm_user(username)
+    if not key:
+        return 0
+    with _GAME_STATE_LOCK:
+        data = _points_data()
+        item = data.get(key, {"username": str(username).strip().lstrip("@"), "points": 0})
+        item["username"] = str(username).strip().lstrip("@")
+        item["points"] = int(item.get("points", 0) or 0) + amount
+        data[key] = item
+        snapshot = copy.deepcopy(data)
+    _queue_local_json_save(POINTS_FILE, snapshot)
     return item["points"]
 
+
 def _get_points(username):
-    # الماستر لديه صلاحية نقاط غير محدودة داخل الألعاب، لكن رصيد "نقاطي"
-    # يعرض فقط الرصيد المخزن فعلياً مثل بقية المستخدمين. لا نُظهر علامة
-    # اللانهاية للمستخدم، بينما تبقى صلاحية اللعب غير المحدودة مطبقة عبر
-    # _is_primary_master() في عمليات الخصم والتحقق.
-    item=_points_data().get(_norm_user(username),{})
-    return int(item.get("points",0) or 0)
+    item = _points_data().get(_norm_user(username), {})
+    return int(item.get("points", 0) or 0)
+
 
 def _fmt_points(value):
     """Compact point balances for chat: 1k -> 1k and 1k,000,000 -> 1m."""
@@ -1823,6 +1885,14 @@ def _fmt_points(value):
         return str(value)
     sign = "-" if number < 0 else ""
     number = abs(number)
+    if number >= 1_000_000_000:
+        amount = number / 1_000_000_000
+        text = f"{amount:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{text}b"
+    if number >= 1_000_000_000:
+        amount = number / 1_000_000_000
+        text = f"{amount:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{text}b"
     if number >= 1_000_000:
         amount = number / 1_000_000
         text = f"{amount:.1f}".rstrip("0").rstrip(".")
@@ -1840,7 +1910,7 @@ DEFAULT_REPLY_MESSAGES = {
     "game_insufficient": "❌ رصيدك غير كافٍ. رصيدك الحالي: {balance} نقطة.",
     "wager_open": "🎯 {game_label} جديد\n━━━━━━━━━━━━\n👤 {verb}: @{username} 𝃛\n💰 المبلغ: {amount}\n🤝 للمشاركة ارسل: {command}@المبلغ\n━━━━━━━━━━━━",
     "wager_result": "🏆 انتهى {game}\n━━━━━━━━━━━━\n🥊 @{p1} × @{p2}\n\n👑 الفائز: @{winner}\n💰 مبلغ الجولة: {amount} نقطة\n🎁 مكسب الفائز: +{amount} نقطة\n📉 الخاسر: @{loser} (-{amount} نقطة)\n━━━━━━━━━━━━",
-    "luck_result": "🍀✨ حظ\n━━━━━━━━━━━━\n👤 اللاعب: @{username}\n🎯 النتيجة: {result}\n💰 الرهان: {amount} نقطة\n💵 التغير: {delta} نقطة\n💳 الرصيد: {balance} نقطة",
+    "luck_result": "🍀✨ حظ\n━━━━━━━━━━━━\n👤 اللاعب: @{username}\n🎯 النتيجة: {result}\n💰 الرهان: {amount} نقطة\n💸 مبلغ الخسارة: -{amount} نقطة\n💵 التغير: {delta} نقطة\n💳 الرصيد: {balance} نقطة",
 }
 
 
@@ -1930,6 +2000,52 @@ def _save_mf_config(enabled, words):
             clean.append(word)
     _save_local_json(MF_FILE, {"enabled": bool(enabled), "words": clean})
     return clean
+
+
+def _filter_exceptions_data():
+    data = _load_local_json(FILTER_EXCEPTIONS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+def _filter_exception_users():
+    data = _filter_exceptions_data()
+    users = data.get("users", [])
+    return {_norm_user(x) for x in users if _norm_user(x)}
+
+def _save_filter_exception_users(users):
+    clean = sorted({_norm_user(x) for x in users if _norm_user(x)})
+    _save_local_json(FILTER_EXCEPTIONS_FILE, {"users": clean})
+    return set(clean)
+
+def _filter_bans_data():
+    data = _load_local_json(FILTER_BANS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+def _record_filter_ban(username, room, reason, word=""):
+    data = _filter_bans_data()
+    rows = data.get("bans", [])
+    if not isinstance(rows, list): rows=[]
+    rows.append({"username":str(username).strip().lstrip("@"), "room":str(room), "reason":str(reason), "word":str(word), "at":time.strftime("%Y-%m-%d %H:%M:%S")})
+    data["bans"] = rows[-500:]
+    _save_local_json(FILTER_BANS_FILE, data)
+
+def _filter_bans_list():
+    data = _filter_bans_data(); rows=data.get("bans", [])
+    return rows if isinstance(rows,list) else []
+
+def _room_protection_data():
+    data=_load_local_json(PROTECTION_FILE,{})
+    return data if isinstance(data,dict) else {}
+
+def _room_protection_cfg(room):
+    data=_room_protection_data(); rooms=data.get("rooms",{}) if isinstance(data.get("rooms"),dict) else {}
+    cfg=rooms.get(_norm_room(room),{})
+    if not isinstance(cfg,dict): cfg={}
+    return {"swear":bool(cfg.get("swear",False)),"flood":bool(cfg.get("flood",False)),"joinleave":bool(cfg.get("joinleave",False)),"repeat_limit":max(2,min(50,int(cfg.get("repeat_limit",3) or 3)))}
+
+def _save_room_protection(room, **changes):
+    data=_room_protection_data(); rooms=data.get("rooms",{}) if isinstance(data.get("rooms"),dict) else {}
+    cfg=_room_protection_cfg(room); cfg.update(changes); cfg["repeat_limit"]=max(2,min(50,int(cfg.get("repeat_limit",3) or 3)))
+    rooms[_norm_room(room)]=cfg; data["rooms"]=rooms; _save_local_json(PROTECTION_FILE,data); return cfg
 
 def _save_moderation_config(enabled, words):
     clean = []
@@ -2064,7 +2180,7 @@ def _default_help_sections():
     """Complete help catalog. ``ns`` advances only inside the opened category."""
     return {
         1: [
-            '📋 أوامر الإدارة — 1\n━━━━━━━━━━━━\nk@اسم — طرد عضو\nkick اسم — طرد عضو\nb@اسم — حظر عضو\nban اسم — حظر عضو\nbl@اسم — حظر عضو بالقائمة\nub@اسم — فك الحظر\nu@اسم — فك الحظر\nunban اسم — فك الحظر\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك',
+            '📋 أوامر الإدارة — 1\n━━━━━━━━━━━━\nk@اسم — طرد عضو\nkick اسم — طرد عضو\nb@اسم — حظر عضو\nban اسم — حظر عضو\nbl@اسم — حظر عضو بالقائمة\namf@اسم — استثناء من حظر الفلتر\nl@mfb — المحظورون من الفلتر مع السبب\nحماية — إعداد حماية الغرفة\nub@اسم — فك الحظر\nu@اسم — فك الحظر\nunban اسم — فك الحظر\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك',
             '📋 أوامر الإدارة — 2\n━━━━━━━━━━━━\nتشغيل الحماية — تشغيل حماية الغرفة\nإيقاف الحماية — إيقاف حماية الغرفة\nmr@عدد — تحديد حد التكرار\nخاص@النص — إرسال رسالة خاصة لجميع المستخدمين\nرسالة@النص — نفس الأمر\nbroadcast@النص — نفس الأمر\nنسخ احتياطي — إنشاء نسخة احتياطية\nإعادة تشغيل البوت — إعادة تشغيل البوت\nتشغيل الماستر — تشغيل حساب الماستر\nإيقاف الماستر — إيقاف حساب الماستر\nحالة الماستر — حالة حساب الماستر\n\n📌 هذه الأوامر مخصصة للماستر/الإدارة حسب صلاحية الأمر.',
         ],
         2: [
@@ -2075,12 +2191,12 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n\u20661.\u2069 حجر / ورق / مقص\n\u20662.\u2069 استثمار\n\u20663.\u2069 حظ\n\u20664.\u2069 عملة أو عمله@وجه/كتابة\n\u20665.\u2069 عجلة\n\u20666.\u2069 صندوق أو صندوق@1..3\n\u20667.\u2069 كوب أو كأس@1..3\n\u20668.\u2069 وحش\n\u20669.\u2069 بركان\n🔟 طائر\n\u206611.\u2069 نجم\n\u206612.\u2069 طاولة\n\u206613.\u2069 اونو\n\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور',
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n\u206614.\u2069 رهان@المبلغ\n\u206615.\u2069 مضاربة@المبلغ\n\u206616.\u2069 حظي@المبلغ\n\u206617.\u2069 استثمار@المبلغ\n\u206618.\u2069 حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n\u206619.\u2069 بنك أو بنك مليون\n\u206620.\u2069 مليار\n\u206621.\u2069 زرع@رمز\n\u206622.\u2069 فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n\u206623.\u2069 سنارة أو سناره\n\u206624.\u2069 برق\n\u206625.\u2069 ياقوت\n\u206626.\u2069 صدام\n\u206627.\u2069 كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n\u206623.\u2069 ثعبان / snake — السلم والثعبان\n\u206624.\u2069 لودو / ludo — لودو\n\u206625.\u2069 سنارة أو سناره\n\u206626.\u2069 برق\n\u206627.\u2069 ياقوت\n\u206628.\u2069 صدام\n\u206629.\u2069 كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
             '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n\u206628.\u2069 اسرق أو اسرق@اسم\n\u206629.\u2069 شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في A3.\n📌 اكتب Ns للقائمة التالية.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
-            '📢 النشر — 2\n━━━━━━━━━━━━\nانشر — تجهيز ونشر صورة\nانشر@وصف — نشر صورة مع وصف\n\n📌 أرسل الصورة بعد أمر انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
+            '📢 النشر — 2\n━━━━━━━━━━━━\nانشر — تجهيز ونشر صورة\nانشر@وصف — نشر صورة مع وصف\n📌 النشر يخضع لفلتر الكلمات المسيئة\n\n📌 أرسل الصورة بعد أمر انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
         ],
         5: [
             '💰 النقاط — 1\n━━━━━━━━━━━━\nنقاطي — عرض الرصيد والمستوى وإحصاءات اللعب\npoints — عرض النقاط\nتوب — المتصدرين العام\ntop — المتصدرين العام\n\nتوب رهان — متصدروا الرهان\nتوب مضاربة — متصدروا المضاربة\nتوب حظي — متصدروا حظي\nتوب استثمار — متصدروا الاستثمار',
@@ -2088,7 +2204,7 @@ def _default_help_sections():
         ],
         6: [
             '🚪 الغرف — 1\n━━━━━━━━━━━━\nدخول@اسم_الغرفة — دخول غرفة\nمثال: دخول@مشاعر\nخروج — الخروج من الغرفة الحالية\nخروج اسم_الغرفة — الخروج من غرفة محددة\nغرفي — عرض الغرف التي يتواجد بها البوت\nmyrooms — نفس الأمر\n\ninv — دعوة أعضاء الغرفة الحالية\ninv اسم_الغرفة — دعوة أعضاء غرفة محددة\nدعوات — نفس أمر inv\ninvite — نفس أمر inv\ninvmsg نص — تغيير رسالة الدعوة\ni@اسم — دعوة مستخدم واحد',
-            '🏠 الغرف والترحيب — 2\n━━━━━━━━━━━━\nsay نص — إرسال نص داخل الغرفة\nقل نص — إرسال نص داخل الغرفة\n\n+sr@اسم_المستخدم@النص — إضافة رد/ترحيب مخصص (ماستر)\nsr@on — تشغيل الردود المخصصة\nsr@off — إيقاف الردود المخصصة\nswc+@اسم_الحساب@النص — إضافة ترحيب مخصص (ماستر)\nswc@on — تشغيل الترحيبات\nswc@off — إيقاف الترحيبات\n\n🛡️ حماية وتكرار الغرفة تُدار من صلاحيات الإدارة.',
+            '🏠 الغرف والترحيب — 2\n━━━━━━━━━━━━\nsay نص — إرسال نص داخل الغرفة\nقل نص — إرسال نص داخل الغرفة\n\n+sr@اسم_المستخدم@النص — إضافة رد/ترحيب مخصص (ماستر)\nsr@on — تشغيل الردود المخصصة\nsr@off — إيقاف الردود المخصصة\nswc+@اسم_الحساب@النص — إضافة ترحيب مخصص (ماستر)\nswc@on — تشغيل الترحيبات\nswc@off — إيقاف الترحيبات\n\n🛡️ حماية — قائمة الحماية\ninv — يجلب أعضاء إعدادات الغرفة حتى غير المتصلين\nدخول@الغرفة — اختيار لغة البوت ثم الدخول.',
         ],
     }
 
@@ -3177,6 +3293,11 @@ class TalkinBot:
         self.moderation_enabled, moderation_words = _load_moderation_config()
         self.banned_words = set(moderation_words)
         self.bot_blocked_users = _bot_blocked_users()
+        self.filter_exceptions = _filter_exception_users()
+        self._joinleave_state = defaultdict(lambda: defaultdict(lambda: {"events":[], "last_type":"", "banned_until":0.0}))
+        self._pending_protection_number = {}
+        self.snake_games = {}
+        self.ludo_games = {}
         self.bot_protection_enabled = _bot_protection_enabled()
         self._bot_protection_menu_state = None
         self._bot_block_notice_at = {}
@@ -4886,10 +5007,11 @@ class TalkinBot:
         return self.send_query(encode_query("gifts", type_=GIFT_PROTOCOL, **kwargs))
 
     def gift_help(self, room):
-        lines = ["🎁 الهدايا المتاحة:"]
+        lines = ["🎁 الهدايا | الأسعار"]
         for k, (emoji, name) in GIFT_CATALOG.items():
-            lines.append(f"{k} {emoji} {name}")
-        lines.append("📌 الإرسال: sa@رقم_الهدية@اسم_المستخدم")
+            cost = GIFT_COSTS.get(str(k), 0)
+            lines.append(f"{k} {emoji} {name} — 💰 {cost}")
+        lines.append("📌 للإرسال: sa@رقم_الهدية@اسم_المستخدم")
         self.send_room_text(room, "\n".join(lines))
 
     def _verify_public_media_url(self, url: str, media_kind: str = "image"):
@@ -5082,9 +5204,9 @@ class TalkinBot:
             )
             if private_to:
                 self.send_private_media(private_to, gift_url, "image")
-                self.send_private_text(private_to, f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة")
+                self.send_private_text(private_to, f"🎁 {item[0]} {item[1]}\n📤 {sender_name} ➜ 📥 {target}\n💰 {cost} نقطة")
             else:
-                gift_text = f"🎁 {item[0]} {item[1]} | 📤 {sender_name} ➜ 📥 {target} | 💰 {cost} نقطة"
+                gift_text = f"🎁 {item[0]} {item[1]}\n📤 {sender_name} ➜ 📥 {target}\n💰 {cost} نقطة"
                 self._broadcast_gift_to_all_rooms(gift_url, gift_text, room)
         except Exception as e:
             self.report_master_error("إرسال صورة الهدية", e, room)
@@ -5125,12 +5247,14 @@ class TalkinBot:
         return _add_points(username, int(amount))
 
     def _game_ready(self, username, room, cooldown=40.0, game_name=""):
-        # 40 ثانية لنفس اللعبة فقط ولكل مستخدم.
-        # مثال: حظ ثم حظ = ينتظر 40 ثانية، بينما حظ ثم استثمار
-        # أو حظ ثم صندوق = مسموح فوراً. الفاصل مستقل عن الغرفة.
-        # كل الألعاب تستخدم نفس مدة الفاصل، لكن لكل لعبة مفتاح مستقل.
+        # الفاصل مستقل لكل لعبة ولكل مستخدم. لا نفرض 40 ثانية هنا،
+        # بل نستخدم المدة التي يحددها مستدعي اللعبة.
+        # المليون = 60 ثانية، المليار = 600 ثانية (10 دقائق).
         game_key = _norm_user(str(game_name or "general").replace("ة", "ه")) or "general"
-        cooldown = 40.0
+        try:
+            cooldown = max(0.0, float(cooldown))
+        except (TypeError, ValueError):
+            cooldown = 40.0
         # الماستر الأساسي مستثنى من فاصل الـ40 ثانية في جميع الألعاب.
         if _is_primary_master(username):
             return True, 0
@@ -5144,13 +5268,23 @@ class TalkinBot:
         return True, 0
 
     def _game_cooldown_notice(self, room, username, cooldown=40.0, game_name=""):
-        ok, left = self._game_ready(username, room, 40.0, game_name)
+        # مرر مدة اللعبة كما هي؛ لا تستبدلها افتراضياً بـ40 ثانية.
+        try:
+            cooldown = max(0.0, float(cooldown))
+        except (TypeError, ValueError):
+            cooldown = 40.0
+        ok, left = self._game_ready(username, room, cooldown, game_name)
         if not ok:
             label = str(game_name or "اللعبة").strip() or "اللعبة"
+            if cooldown >= 60 and cooldown % 60 == 0:
+                minutes = int(cooldown // 60)
+                interval = f"{minutes} دقائق" if minutes != 1 else "دقيقة واحدة"
+            else:
+                interval = f"{int(cooldown)} ثانية"
             self.send_room_text(
                 room,
                 f"⏳ @{username} انتظر {left} ثانية قبل إعادة لعبة {label}.\n"
-                f"🎮 الفاصل 40 ثانية لنفس اللعبة فقط، ويمكنك لعب لعبة أخرى الآن."
+                f"🎮 الفاصل {interval} لنفس اللعبة فقط، ويمكنك لعب لعبة أخرى الآن."
             )
         return ok
 
@@ -5284,7 +5418,17 @@ class TalkinBot:
         _record_game(loser.get("user"), game_key, -loser_stake, loser_stake)
         _record_game(winner.get("user"), game_key, loser_stake, loser_stake)
 
-        text = f"🏆 انتهت لعبة {game_name}\n👑 الفائز: @{winner.get('user', '')}"
+        winner_name = str(winner.get("user", ""))
+        loser_name = str(loser.get("user", ""))
+        winner_profit = loser_stake
+        loser_loss = loser_stake
+        text = (
+            f"🏆 انتهت لعبة {game_name}\n"
+            f"👑 الفائز: @{winner_name}\n"
+            f"💰 مبلغ الفوز: +{_fmt_points(winner_profit)} نقطة\n"
+            f"❌ الخاسر: @{loser_name}\n"
+            f"💸 مبلغ الخسارة: -{_fmt_points(loser_loss)} نقطة"
+        )
 
         # IMPORTANT: the queue is global across rooms, but the result is local
         # to exactly the two rooms where the two players entered the game.
@@ -5430,7 +5574,15 @@ class TalkinBot:
         _record_game(loser.get("user"), game_key, -prize, prize)
         _record_game(winner.get("user"), game_key, prize, prize)
 
-        text=f"🏆 انتهت لعبة {game_name}\n👑 الفائز: @{winner.get('user', '')}"
+        winner_name = str(winner.get("user", ""))
+        loser_name = str(loser.get("user", ""))
+        text=(
+            f"🏆 انتهت لعبة {game_name}\n"
+            f"👑 الفائز: @{winner_name}\n"
+            f"💰 مبلغ الفوز: +{_fmt_points(prize * 2)} نقطة\n"
+            f"❌ الخاسر: @{loser_name}\n"
+            f"💸 مبلغ الخسارة: -{_fmt_points(prize)} نقطة"
+        )
 
         result_rooms=[]
         seen=set()
@@ -5501,11 +5653,11 @@ class TalkinBot:
             self.send_room_text(room, "❌ اختر فاكهة من القائمة: " + " ".join(fruits)); return True
         bot_fruit=random.choice(fruits)
         if emoji == bot_fruit:
-            self._send_game_result(room, f"🍉 فيس @{sender}\n✅ تمت المطابقة! البوت أرسل {bot_fruit}\n🏆 فزت بـ 20 نقطة.", "")
+            self._send_game_result(room, f"🍉 فيس @{sender}\n✅ تمت المطابقة! البوت أرسل {bot_fruit}\n🏆 فزت بـ 20 نقطة.\n💰 مبلغ الفوز: +20 نقطة\n💸 مبلغ الخسارة: 0 نقطة", "")
             self._game_award(sender,20)
             _record_game(sender, "fruit", 20, 0)
         else:
-            self.send_room_text(room, f"🍉 فيس @{sender}\n🤖 البوت أرسل {bot_fruit}\n❌ لم تتم المطابقة، حظاً موفقاً.")
+            self.send_room_text(room, f"🍉 فيس @{sender}\n🤖 البوت أرسل {bot_fruit}\n❌ لم تتم المطابقة، حظاً موفقاً.\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة")
         return True
 
     def _save_crop_plots(self):
@@ -5537,15 +5689,20 @@ class TalkinBot:
                 for key, username, crop, minutes, reward in ready:
                     balance=self._game_award(username, reward)
                     _record_game(username, "farm", reward, 0)
-                    self.send_private_text(
-                        username,
+                    result_text = (
                         f"🌾✨ حصادك جاهز!\n━━━━━━━━━━━━\n"
+                        f"👤 اللاعب: @{username}\n"
                         f"🌱 المحصول: {crop}\n"
                         f"⏱️ مدة الزراعة: {minutes} دقيقة\n"
-                        f"🎁 المكافأة: +{_fmt_points(reward)} نقطة\n"
-                        f"💰 رصيدك الآن: {_fmt_points(balance)}\n"
+                        f"💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n"
+                        f"💸 مبلغ الخسارة: 0 نقطة\n"
+                        f"💳 رصيدك الآن: {_fmt_points(balance)}\n"
                         f"🌟 زرع جديد عندما تريد!"
                     )
+                    origin_room = str(plot.get("room") or "").strip() if isinstance(plot, dict) else ""
+                    if origin_room:
+                        self.send_room_text(origin_room, result_text)
+                    self.send_private_text(username, result_text)
             self.stop_event.wait(2.0)
 
     def _crop_command(self, room, sender, raw):
@@ -5678,10 +5835,10 @@ class TalkinBot:
                 reward = secrets.choice((10, 20, 30, 50, 100))
             if reward:
                 balance = self._game_award(sender, reward)
-                result = f"🎉 ربحت: +{_fmt_points(reward)} نقطة"
+                result = f"🎉 ربحت: +{_fmt_points(reward)} نقطة\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة"
             else:
                 balance = _get_points(sender)
-                result = "🍀 هذه الجولة لم تكن رابحة."
+                result = "🍀 هذه الجولة لم تكن رابحة.\n💰 مبلغ الفوز: 0 نقطة"
             delta = reward - amount if amount else reward
             _record_game(sender, "luck_free" if not amount else "luck", delta, amount)
         text = _reply_template(
@@ -6136,7 +6293,7 @@ class TalkinBot:
             self.send_room_text(
                 room,
                 f"🐎🛡️ @{victim} محصّن حالياً.\n"
-                f"❌ فشلت السرقة، الحصانة تحميه من السرقة لمدة دقيقة."
+                f"❌ فشلت السرقة، الحصانة تحميه من السرقة لمدة دقيقة.\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
             )
             _record_game(sender, "steal", 0, 500)
             self._send_game_winner_card("اسرق_فشل", sender, [room])
@@ -6146,7 +6303,7 @@ class TalkinBot:
                 room,
                 f"🕵️ @{sender} حاول سرقة @{victim}...\n"
                 f"❌ فشلت السرقة، المسروق @{victim} مفلس.\n"
-                f"💰 رصيده: {_fmt_points(victim_balance)}"
+                f"💰 رصيده: {_fmt_points(victim_balance)}\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
             )
             _record_game(sender, "steal", 0, 500)
             self._send_game_winner_card("اسرق_فشل", sender, [room])
@@ -6158,7 +6315,7 @@ class TalkinBot:
                 room,
                 f"🚨 @{sender} حاول سرقة @{victim}...\n"
                 f"🚔 السرقة حرام، تم إبلاغ الشرطة! 😁\n"
-                f"❌ لم تتم السرقة."
+                f"❌ لم تتم السرقة.\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
             )
             _record_game(sender, "steal", 0, 500)
             return True
@@ -6194,13 +6351,13 @@ class TalkinBot:
         if player > bot:
             reward = self._bot_win_reward()
             self._game_award(sender, reward)
-            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🏆 فزت بـ {reward} نقطة!"
+            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🏆 فزت بـ {reward} نقطة!\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n💸 مبلغ الخسارة: 0 نقطة"
         elif player < bot:
             reward = 0
-            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🤖 البوت فاز!"
+            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🤖 البوت فاز!\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
         else:
             reward = 0
-            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🤝 تعادل!"
+            result = f"🎲 طاولة\n👤 أنت: {player}\n🤖 البوت: {bot}\n🤝 تعادل!\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
         _record_game(sender, "طاولة", reward, reward)
         self.send_room_text(room, result)
         return True
@@ -6215,13 +6372,13 @@ class TalkinBot:
         if p_num > b_num:
             reward = self._bot_win_reward()
             self._game_award(sender, reward)
-            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🏆 فزت بـ {reward} نقطة!"
+            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🏆 فزت بـ {reward} نقطة!\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n💸 مبلغ الخسارة: 0 نقطة"
         elif p_num < b_num:
             reward = 0
-            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🤖 البوت فاز!"
+            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🤖 البوت فاز!\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
         else:
             reward = 0
-            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🤝 تعادل!"
+            result = f"🃏 أونو\n👤 أنت: {p_color} {p_num}\n🤖 البوت: {b_color} {b_num}\n🤝 تعادل!\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
         _record_game(sender, "اونو", reward, reward)
         self.send_room_text(room, result)
         return True
@@ -6235,8 +6392,9 @@ class TalkinBot:
         self.send_room_text(
             room,
             f"{title}\n━━━━━━━━━━━━━━\n{body}\n"
-            f"🎁 المكافأة: +{_fmt_points(reward)} نقطة\n"
-            f"💰 رصيدك: {_fmt_points(balance)}\n━━━━━━━━━━━━━━"
+            f"💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n"
+            f"💸 مبلغ الخسارة: 0 نقطة\n"
+            f"💳 رصيدك: {_fmt_points(balance)}\n━━━━━━━━━━━━━━"
         )
         return True
 
@@ -6267,8 +6425,9 @@ class TalkinBot:
             room,
             f"🎡 عجلة الحظ\n━━━━━━━━━━━━━━\n@{sender}\n"
             f"🎯 دارت العجلة وتوقفت على: {_fmt_points(reward)} نقطة\n"
-            f"🎁 المكافأة: +{_fmt_points(reward)} نقطة\n"
-            f"💰 رصيدك: {_fmt_points(balance)}\n━━━━━━━━━━━━━━"
+            f"💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n"
+            f"💸 مبلغ الخسارة: 0 نقطة\n"
+            f"💳 رصيدك: {_fmt_points(balance)}\n━━━━━━━━━━━━━━"
         )
         return True
 
@@ -6364,7 +6523,7 @@ class TalkinBot:
         return True
 
     def _million_bank_game(self, room, sender_name):
-        if not self._game_cooldown_notice(room, sender_name, 40.0, "بنك مليون"):
+        if not self._game_cooldown_notice(room, sender_name, 120.0, "بنك مليون"):
             return True
         self.send_room_text(room, f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n✅ @{sender_name}\n🔎 جاري البحث عن الجائزة...\n━━━━━━━━━━━━━━")
         time.sleep(1.0)
@@ -6372,11 +6531,18 @@ class TalkinBot:
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
         if not won:
-            self.send_room_text(room, "🏦 بنك مليون\n❌ لم يحالفك الحظ هذه المرة. حاول لاحقاً.")
+            loss_text = (
+                "🏦 بنك مليون\n━━━━━━━━━━━━━━\n"
+                f"❌ @{sender_name} لم يحالفه الحظ هذه المرة.\n"
+                "🍀 حظاً أوفر في المحاولة القادمة!\n"
+                "━━━━━━━━━━━━━━"
+            )
+            for target_room in (self._active_rooms() or [room]):
+                self.send_room_text(target_room, loss_text)
             return True
         self._game_award(sender_name, reward)
         winner_photo = self.user_photos.get(_norm_user(sender_name), "") or self._lookup_profile_photo(sender_name)
-        winner_text = f"🏆✨ مبروك! فاز بنك مليون ✨🏆\n━━━━━━━━━━━━━━━━\n👑 الفائز: @{sender_name}\n💰 الجائزة: {_fmt_points(reward)} نقطة\n━━━━━━━━━━━━━━━━"
+        winner_text = f"🏆✨ مبروك! فاز بنك مليون ✨🏆\n━━━━━━━━━━━━━━━━\n👑 الفائز: @{sender_name}\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n💸 مبلغ الخسارة: 0 نقطة\n━━━━━━━━━━━━━━━━"
         target_rooms = self._active_rooms() or [room]
         for target_room in target_rooms:
             self.send_room_text(target_room, winner_text)
@@ -6459,6 +6625,111 @@ class TalkinBot:
         return True
 
 
+    def _game_public_image(self, path, route="games"):
+        base=_public_base_url()
+        if not base: return ""
+        path.parent.mkdir(parents=True,exist_ok=True)
+        try: self._verify_public_media_url(f"{base}/{route}/{path.name}","image")
+        except Exception: pass
+        return f"{base}/{route}/{path.name}"
+
+    def _render_snake_board(self, state):
+        if not PIL_AVAILABLE: return None
+        from PIL import Image, ImageDraw, ImageFont
+        W=900; H=900; cell=80
+        img=Image.new("RGB",(W,H),(10,18,28)); d=ImageDraw.Draw(img)
+        font=_gift_font("1",22)
+        for n in range(1,101):
+            idx=n-1; row=idx//10; col=idx%10
+            if row%2: col=9-col
+            x=col*cell; y=(9-row)*cell
+            d.rectangle((x,y,x+cell,y+cell),outline=(50,130,180),width=2)
+            d.text((x+6,y+5),str(n),fill=(230,240,255),font=font)
+        ladders={3:22,8:30,28:55,36:44,51:72,71:92,80:99}; snakes={98:40,95:75,92:70,88:48,62:18,48:26,24:5,17:7}
+        for a,b in ladders.items():
+            def c(pos):
+                i=pos-1; r=i//10; cc=i%10; cc=9-cc if r%2 else cc; return (cc*cell+40,(9-r)*cell+40)
+            d.line((*c(a),*c(b)),fill=(40,220,100),width=10)
+        for a,b in snakes.items():
+            def c(pos):
+                i=pos-1; r=i//10; cc=i%10; cc=9-cc if r%2 else cc; return (cc*cell+40,(9-r)*cell+40)
+            d.line((*c(a),*c(b)),fill=(240,80,90),width=10)
+        colors=[(255,210,60),(80,190,255),(220,90,220),(80,230,130)]
+        for i,(u,pos) in enumerate(state.get("positions",{}).items()):
+            i2=pos-1; r=i2//10; cc=i2%10; cc=9-cc if r%2 else cc; x=cc*cell+40; y=(9-r)*cell+40
+            d.ellipse((x-18,y-18,x+18,y+18),fill=colors[i%4],outline=(255,255,255),width=2); d.text((x-12,y-8),str(i+1),fill=(0,0,0),font=font)
+        out=BASE_DIR/"generated_games"/f"snake_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True); img.save(out,"JPEG",quality=82,optimize=True); return out
+
+    def _snake_command(self,room,sender,raw):
+        key=_norm_room(room); low=raw.casefold(); english=low in ("snake","سناكي")
+        game=self.snake_games.get(key)
+        if low in ("ثعبان","snake","سناكي") and not game:
+            self.snake_games[key]={"players":[sender],"positions":{sender:1},"lang":"en" if english else "ar","turn":0,"created":time.time()}
+            self.send_room_text(room,"🎲 Snake game started! Waiting for an opponent. Type join to participate." if english else "🎲 بدأت لعبة السلم والثعبان! جاري البحث عن خصم. للمشاركة اكتب join")
+            for r in self._active_rooms():
+                if _norm_room(r)!=key: self.send_room_text(r,"🐍 بدأت لعبة السلم والثعبان في غرفة أخرى. للمشاركة اكتب join")
+            return True
+        if low in ("join","انضمام") and game:
+            if sender not in game["players"] and len(game["players"])<2: game["players"].append(sender); game["positions"][sender]=1; self.send_room_text(room,"🐍 تم انضمام اللاعب. اكتب rool للعب."); return True
+            return True
+        if low in ("rool","roll","رول") and game and sender in game["players"]:
+            idx=game["players"].index(sender)
+            if idx != game.get("turn",0): self.send_room_text(room,"⏳ انتظر دورك." if game.get("lang")=="ar" else "⏳ Wait for your turn."); return True
+            roll=secrets.randbelow(6)+1; pos=min(100,game["positions"].get(sender,1)+roll); ladders={3:22,8:30,28:55,36:44,51:72,71:92,80:99}; snakes={98:40,95:75,92:70,88:48,62:18,48:26,24:5,17:7}; final=ladders.get(pos,snakes.get(pos,pos)); game["positions"][sender]=final
+            img=self._render_snake_board(game); url=self._game_public_image(img) if img else ""
+            if url:self.send_room_media(room,url,"image")
+            self.send_room_text(room,f"🎲 @{sender} rolled {roll} and stopped at {final}." if game.get("lang")=="en" else f"🎲 @{sender} وقف الرول على رقم {roll} وانتقل إلى الخانة {final}.")
+            if final>=100:
+                self.send_room_text(room,f"🏆 @{sender} won the Snake and Ladder game!" if game.get("lang")=="en" else f"🏆 مبروك @{sender} فاز بلعبة السلم والثعبان!"); self.snake_games.pop(key,None)
+            else: game["turn"]=(game.get("turn",0)+1)%len(game["players"])
+            return True
+        return False
+
+    def _render_ludo_board(self,state):
+        if not PIL_AVAILABLE:return None
+        from PIL import Image,ImageDraw
+        img=Image.new("RGB",(900,900),(18,22,30));d=ImageDraw.Draw(img); cell=60
+        for r in range(15):
+            for c in range(15):
+                d.rectangle((c*cell,r*cell,c*cell+cell,r*cell+cell),outline=(70,90,110),width=2)
+        path=[]
+        for c in range(1,14): path.append((c,7))
+        for r in range(1,14): path.append((7,r))
+        for i,p in enumerate(state.get("tokens",{}).items()):
+            user,pos=p; x,y=path[min(max(int(pos),0),len(path)-1)]; d.ellipse((x*cell+12,y*cell+12,x*cell+48,y*cell+48),fill=[(230,70,70),(70,180,255),(90,220,120),(220,190,50)][i%4])
+        out=BASE_DIR/"generated_games"/f"ludo_{uuid.uuid4().hex}.jpg";out.parent.mkdir(parents=True,exist_ok=True);img.save(out,"JPEG",quality=80,optimize=True);return out
+
+    def _ludo_command(self,room,sender,raw):
+        key=_norm_room(room); low=raw.casefold(); game=self.ludo_games.get(key)
+        if low in ("لودو","ludo") and not game:
+            self.ludo_games[key]={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time()}
+            self.send_room_text(room,"🎲 Ludo: choose players 1-4. Type join to join." if low=="ludo" else "🎲 لودو: اختر عدد اللاعبين 1-4\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين\nللانضمام اكتب join أو انضمام")
+            return True
+        if low in ("1","2","3","4") and game and len(game["players"])==1:
+            count=int(low)
+            if count==1:
+                game["max_players"]=2; game["bot"]=True; game["players"].append("🤖 البوت"); game["tokens"]["🤖 البوت"]=0
+                self.send_room_text(room,"🤖 تم اختيار اللعب مع البوت. اكتب rool لبدء دورك.")
+            else:
+                game["max_players"]=count; game["bot"]=False; self.send_room_text(room,"✅ تم اختيار عدد اللاعبين. اكتب join أو انضمام.")
+            return True
+        if low in ("join","انضمام") and game:
+            if sender not in game["players"] and len(game["players"])<int(game.get("max_players",4)): game["players"].append(sender); game["tokens"][sender]=0; self.send_room_text(room,"✅ انضم اللاعب. عند اكتمال العدد تبدأ اللعبة، ثم اكتب rool.")
+            if len(game["players"])>=int(game.get("max_players",4)) or (game.get("bot") and len(game["players"])>=1): self.send_room_text(room,"🎲 بدأت لعبة لودو! اكتب rool لتحريك الرول.")
+            return True
+        if low in ("rool","roll","رول") and game and sender in game["players"]:
+            if game["players"].index(sender)!=game.get("turn",0): self.send_room_text(room,"⏳ انتظر دورك."); return True
+            roll=secrets.randbelow(6)+1; game["tokens"][sender]=min(40,game["tokens"].get(sender,0)+roll); img=self._render_ludo_board(game); url=self._game_public_image(img) if img else ""; 
+            if url:self.send_room_media(room,url,"image")
+            self.send_room_text(room,f"🎲 @{sender} وقف الرول على {roll} وانتقل إلى المربع {game['tokens'][sender]}.")
+            if game["tokens"][sender]>=40:self.send_room_text(room,f"🏆 مبروك @{sender} فاز بلعبة لودو!"); self.ludo_games.pop(key,None)
+            else:
+                game["turn"]=(game.get("turn",0)+1)%len(game["players"])
+                if game.get("bot") and game["players"][game["turn"]]=="🤖 البوت":
+                    br=secrets.randbelow(6)+1; game["tokens"]["🤖 البوت"]=min(40,game["tokens"].get("🤖 البوت",0)+br); self.send_room_text(room,f"🤖 البوت رمى {br} وانتقل إلى المربع {game['tokens']['🤖 البوت']}."); game["turn"]=0
+            return True
+        return False
+
     def handle_game_command(self, room, text, sender_name):
         raw=str(text or "").strip()
         if not raw or not sender_name: return False
@@ -6529,6 +6800,8 @@ class TalkinBot:
         if not _is_verified_user(sender_name):
             self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
             return True
+        if self._snake_command(room,sender_name,raw): return True
+        if self._ludo_command(room,sender_name,raw): return True
         if low in ("العاب","ألعاب","لعب","games","game"):
             self.game_help(room); return True
         if not _games_enabled_for_room(room):
@@ -6597,7 +6870,7 @@ class TalkinBot:
         if game_low in ("بنك مليون", "بنك"):
             return self._million_bank_game(room, sender_name)
         if low in ("مليار","billion"):
-            if not self._game_cooldown_notice(room, sender_name, 40.0, "مليار"):
+            if not self._game_cooldown_notice(room, sender_name, 600.0, "مليار"):
                 return True
 
             self.send_room_text(
@@ -6622,17 +6895,20 @@ class TalkinBot:
                     winner_photo = self._lookup_profile_photo(sender_name)
 
                 zeros = "⭐" * 9  # 1k,000,000 contains nine zeros.
-                self.send_room_text(
-                    room,
+                winner_text = (
                     f"🏆✨ مبروك! تم الحصول على المليار ✨🏆\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"✅ @{sender_name}\n"
-                    f"💰 لقد حصلت علي مليار\n"
-                    f"🔢 رقم المليار: 1k,000,000\n"
+                    f"💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n"
+                    f"💸 مبلغ الخسارة: 0 نقطة\n"
+                    f"🔢 قيمة المليار: 1b\n"
                     f"🎉 مبروك يا بطل!\n"
                     f"{zeros}\n"
                     f"━━━━━━━━━━━━━━━━"
                 )
+                target_rooms = self._active_rooms() or [room]
+                for target_room in target_rooms:
+                    self.send_room_text(target_room, winner_text)
 
                 try:
                     base = _public_base_url()
@@ -6642,20 +6918,19 @@ class TalkinBot:
                     url = f"{base}/billion/{card.name}"
                     self._verify_public_media_url(url, "image")
                     # Publish the same generated winner card to every active room.
-                    target_rooms = self._active_rooms() or [room]
                     for target_room in target_rooms:
                         self.send_room_media(target_room, url, "image")
                     self.log("[GAME] billion winner card sent", sender_name, len(target_rooms))
                 except Exception as exc:
                     self.log("[GAME] billion winner card failed:", repr(exc))
             else:
-                self.send_room_text(
-                    room,
+                loss_text = (
                     f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n"
                     f"❌ @{sender_name} لم يحصل على المليار هذه المرة.\n"
                     f"🍀 حظاً أوفر في المحاولة القادمة!\n"
                     f"━━━━━━━━━━━━━━"
                 )
+                self.send_room_text(room, loss_text)
             return True
         if game_low in ("حظ","الحظ","luck"):
             return self._lottery_game(room, sender_name, 0)
@@ -6669,7 +6944,7 @@ class TalkinBot:
             else: result="❌ خسرت"; reward=0
             balance=self._game_award(sender_name,reward)
             _record_game(sender_name,"rps",reward,0)
-            self.send_room_text(room, f"✂️ @{sender_name}: {low} | 🤖 البوت: {bot_choice}\n{result}\n🎁 +{reward} نقطة\n💰 {_fmt_points(balance)}")
+            self.send_room_text(room, f"✂️ @{sender_name}: {low} | 🤖 البوت: {bot_choice}\n{result}\n🎁 +{reward} نقطة\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n💸 مبلغ الخسارة: 0 نقطة\n💳 الرصيد: {_fmt_points(balance)}")
             return True
         # Steal: random victim with `اسرق`, or a named room member with `اسرق@username` / `اسرق username`.
         m=re.fullmatch(r"اسرق(?:@|\s+@?)([^@\s]+)", raw, re.I)
@@ -6685,7 +6960,7 @@ class TalkinBot:
             reward = secrets.randbelow(101) + 100 if won else 0
             balance = self._game_award(sender_name, reward)
             _record_game(sender_name, "misc", reward, 0)
-            self.send_room_text(room, f"{label} @{sender_name}\n" + (f"🏆 نجحت وربحت {reward} نقطة." if won else "❌ لم تنجح هذه المرة.") + f"\n💰 {_fmt_points(balance)}")
+            self.send_room_text(room, f"{label} @{sender_name}\n" + (f"🏆 نجحت وربحت {reward} نقطة." if won else "❌ لم تنجح هذه المرة.") + f"\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n💸 مبلغ الخسارة: 0 نقطة\n💳 الرصيد: {_fmt_points(balance)}")
             return True
         return False
 
@@ -6809,11 +7084,20 @@ class TalkinBot:
             return True
 
         is_publish = str(body or "").strip().casefold() == "انشر" or str(body or "").strip().casefold().startswith("انشر@")
-        security_command = bool(re.match(r"^(?:تشغيل|إيقاف) الحماية$", str(body or "").strip(), re.I) or re.match(r"^mr@\d+$", str(body or "").strip(), re.I))
+        security_command = bool(
+            re.match(r"^(?:تشغيل|إيقاف) الحماية$", str(body or "").strip(), re.I)
+            or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
+            or str(body or "").strip().casefold() in {"حماية", "l@mfb"}
+            or re.match(r"^amf@.+$", str(body or "").strip(), re.I)
+        )
         join_command = bool(re.match(r"^دخول@.+$", str(body or "").strip(), re.I))
         verification_manager_command = _is_verification_manager_command(body)
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
+        public_top_command = str(body or "").strip().casefold() in {
+            "توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"
+        }
         if (not _is_master_name(sender)
+                and not public_top_command
                 and not (verification_manager_command and _is_mvip_master(sender))
                 and not (points_transfer_command and _is_verified_user(sender))
                 and not (is_publish and _is_verified_user(sender))
@@ -6968,16 +7252,79 @@ class TalkinBot:
             ).start()
             return True
 
+        # New master protection menu.
+        if low == "حماية":
+            if not _is_master_name(sender): return True
+            self._pending_protection_number[_norm_user(sender)] = {"room":room,"created":time.time()}
+            self.send_private_text(sender,
+                "🛡️ حماية الغرفة\n"
+                "1️⃣ تشغيل حماية الغرفة من السب\n"
+                "2️⃣ إيقاف حماية الغرفة من السب\n"
+                "3️⃣ تشغيل حماية الغرفة من الفلود\n"
+                "4️⃣ إيقاف حماية الغرفة من الفلود\n"
+                "5️⃣ تشغيل حماية الغرفة من الدخول والخروج\n"
+                "6️⃣ إيقاف حماية الغرفة من الدخول والخروج\n"
+                "7️⃣ تعيين عدد الرسائل للحماية من الفلود\n\n"
+                "أرسل رقم الخيار الآن.")
+            return True
+        if _norm_user(sender) in self._pending_protection_number and low.isdigit():
+            st=self._pending_protection_number.get(_norm_user(sender),{})
+            if time.time()-float(st.get("created",0))>180:
+                self._pending_protection_number.pop(_norm_user(sender),None)
+            else:
+                n=int(low); target_room=str(st.get("room") or room or "").strip()
+                if n in range(1,7):
+                    cfg=_room_protection_cfg(target_room)
+                    names={1:("swear",True,"🛡️ تم تشغيل حماية الغرفة من السب."),2:("swear",False,"⛔ تم إيقاف حماية الغرفة من السب."),3:("flood",True,"🛡️ تم تشغيل حماية الغرفة من الفلود."),4:("flood",False,"⛔ تم إيقاف حماية الغرفة من الفلود."),5:("joinleave",True,"🛡️ تم تشغيل حماية الدخول والخروج."),6:("joinleave",False,"⛔ تم إيقاف حماية الدخول والخروج.")}[n]
+                    _save_room_protection(target_room, **{names[0]:names[1]})
+                    self._pending_protection_number.pop(_norm_user(sender),None)
+                    self.send_private_text(sender,names[2]+f"\n🏠 الغرفة: {target_room}")
+                    return True
+                if n==7:
+                    self._pending_protection_number[_norm_user(sender)]={"room":target_room,"created":time.time(),"awaiting_number":True}
+                    self.send_private_text(sender,"🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر (من 2 إلى 50).")
+                    return True
+        st=self._pending_protection_number.get(_norm_user(sender),{})
+        if st.get("awaiting_number") and re.fullmatch(r"\d+",low):
+            limit=max(2,min(50,int(low))); target_room=str(st.get("room") or room or "")
+            _save_room_protection(target_room,repeat_limit=limit)
+            _save_room_moderation(target_room,repeat_limit=limit)
+            self._pending_protection_number.pop(_norm_user(sender),None)
+            self.send_private_text(sender,f"✅ تم اعتماد حد الفلود: {limit} رسائل متكررة في الغرفة {target_room}.")
+            return True
+        # Filter exception: amf@username
+        m_amf=re.fullmatch(r"amf@(.+)",text,re.I)
+        if m_amf:
+            if not _is_master_name(sender): return True
+            target=m_amf.group(1).strip().lstrip("@")
+            if target:
+                self.filter_exceptions=_save_filter_exception_users(self.filter_exceptions|{target})
+                self.send_private_text(sender,f"✅ تمت إضافة @{target} إلى استثناءات حظر الفلتر.")
+            return True
+        if low == "l@mfb":
+            if not _is_master_name(sender): return True
+            rows=_filter_bans_list()
+            if not rows:
+                self.send_private_text(sender,"📭 لا يوجد محظورون من الفلتر.")
+            else:
+                lines=["🚫 المحظورون من الفلتر:"]
+                for i,r in enumerate(rows[-100:],1):
+                    lines.append(f"{i}. @{r.get('username','')} | السبب: {r.get('reason','كلمة مسيئة')} | الغرفة: {r.get('room','')}")
+                self.send_private_text(sender,"\n".join(lines))
+            return True
+
         if low in ("تشغيل الحماية", "تشغيل الحمايه", "الحماية تشغيل", "الحمايه تشغيل"):
             if not room or not _room_manager(self, room, sender):
                 return True
             cfg = _save_room_moderation(room, enabled=True)
+            _save_room_protection(room, swear=True, flood=True)
             self.send_room_text(room, f"🛡️ حماية الغرفة شغالة. حد التكرار: {cfg['repeat_limit']} رسائل.")
             return True
         if low in ("إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "الحماية إيقاف", "الحمايه ايقاف"):
             if not room or not _room_manager(self, room, sender):
                 return True
             _save_room_moderation(room, enabled=False)
+            _save_room_protection(room, swear=False, flood=False)
             self.send_room_text(room, "⛔ حماية الغرفة متوقفة.")
             return True
         m_repeat = re.fullmatch(r"mr@(\d+)", text, re.I)
@@ -7117,7 +7464,7 @@ class TalkinBot:
                 rows=_game_top(game_map[game_label])
                 def _top_medal(i):
                     return {1:"🥇",2:"🥈",3:"🥉"}.get(i, f"{i}️⃣")
-                msg=f"🏆 توب {game_label}\n━━━━━━━━━━━━\n" + ("\n".join(f"{_top_medal(i)} @{u} — {_fmt_points(p)} نقطة | {pl} لعب" for i,(p,st,pl,u) in enumerate(rows,1)) if rows else "لا توجد نتائج بعد.")
+                msg=f"🏆 توب {game_label}\n━━━━━━━━━━━━\n" + ("\n".join(f"{_top_medal(i)} {str(u).strip().lstrip('@')} — {_fmt_points(p)} نقطة | {pl} لعب" for i,(p,st,pl,u) in enumerate(rows,1)) if rows else "لا توجد نتائج بعد.")
             else:
                 data=_points_data(); rows=[]
                 for v in data.values():
@@ -7126,7 +7473,7 @@ class TalkinBot:
                 rows.sort(reverse=True)
                 def _top_medal(i):
                     return {1:"🥇",2:"🥈",3:"🥉"}.get(i, f"{i}️⃣")
-                msg="🏆 توب النقاط\n━━━━━━━━━━━━\n"+"\n".join(f"{_top_medal(i)} @{u} — {_fmt_points(p)}" for i,(p,u) in enumerate(rows[:10],1)) if rows else "🏆 لا توجد نقاط بعد."
+                msg="🏆 توب النقاط\n━━━━━━━━━━━━\n"+"\n".join(f"{_top_medal(i)} {str(u).strip().lstrip('@')} — {_fmt_points(p)}" for i,(p,u) in enumerate(rows[:10],1)) if rows else "🏆 لا توجد نقاط بعد."
             if is_private: self.send_private_text(sender,msg)
             else: self.send_room_text(room,msg)
             return True
@@ -7246,6 +7593,16 @@ class TalkinBot:
                     self.send_private_text(sender, "🚫 قائمة الفلتر فارغة حالياً.")
                 return True
 
+        # Joining a room: ask the master for bot language first.
+        pending_lang=getattr(self,"_pending_room_language",{}).get(_norm_user(sender))
+        if pending_lang and low in ("1","2"):
+            target=pending_lang.get("room",""); lang="ar" if low=="1" else "en"
+            self._pending_room_language.pop(_norm_user(sender),None)
+            if not hasattr(self,"room_languages"): self.room_languages={}
+            self.room_languages[_norm_room(target)]=lang
+            joined=self.join_room(target,force=True,requested_by=sender)
+            self.send_private_text(sender,("⏳ تم اختيار العربية، جاري دخول الغرفة: " if lang=="ar" else "⏳ English selected, joining room: ")+target)
+            return True
         # Joining a room: ONLY the master command دخول@اسم_الغرفة is accepted.
         m_join = re.fullmatch(r"دخول@(.+)", text, re.I)
         if m_join:
@@ -7264,13 +7621,9 @@ class TalkinBot:
                 self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(target)}
                 self._save_blocked_rooms()
                 _save_persistent_rooms(self.known_rooms)
-            joined = self.join_room(target, force=True, requested_by=sender)
-            reply = (
-                f"⏳ تمت إعادة محاولة دخول الغرفة: {target}. انتظر تأكيد الخادم."
-                if joined else
-                f"⚠️ تعذر إرسال طلب دخول الغرفة: {target}."
-            )
-            self.send_private_text(sender, reply)
+            if not hasattr(self,"_pending_room_language"): self._pending_room_language={}
+            self._pending_room_language[_norm_user(sender)]={"room":target,"created":time.time()}
+            self.send_private_text(sender,"🌐 اختر لغة البوت للغرفة\n1️⃣ عربي\n2️⃣ English\n\nأرسل 1 أو 2.")
             return True
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
         if m_transfer and _is_verified_user(sender):
@@ -7755,6 +8108,13 @@ class TalkinBot:
         if time.time()-pending.get("created_at",0)>120:
             self.publish_pending.pop(key,None); self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد."); return True
         desc=pending.get("description",description or "")
+        publish_check=_norm_filter_text(desc)
+        publish_hit=next((w for w in sorted(self.banned_words) if _norm_filter_text(w) and _norm_filter_text(w) in publish_check),None)
+        if publish_hit:
+            self.send_private_text(sender,f"🚫 تم منع النشر: الوصف يحتوي كلمة محظورة في الفلتر.")
+            self.publish_pending.pop(key,None)
+            _record_filter_ban(sender,room,"محاولة نشر كلمة مسيئة",publish_hit)
+            return True
         source_room=str(pending.get("source_room") or room or "")
         silent_publish=bool(pending.get("silent"))
         self.publish_pending.pop(key,None)
@@ -7846,6 +8206,13 @@ class TalkinBot:
                 self._incoming_seen = {k: ts for k, ts in self._incoming_seen.items() if ts >= cutoff}
         return bool(previous and now - previous < ttl)
 
+    def _auto_unban(self, room, username):
+        try:
+            self.send_admin(room, username, "member")
+            self.log("[JOINLEAVE] auto-unban", room, username)
+        except Exception as exc:
+            self.log("[JOINLEAVE] auto-unban failed", repr(exc))
+
     def handle_room_event(self, result):
         event = result.get("room_event") or {}
         if not hasattr(self, "blocked_rooms"):
@@ -7880,6 +8247,22 @@ class TalkinBot:
 
         # Keep the live membership state in sync.  The APK itself uses these
         # exact event names and RoomEvent fields.
+        if event_type in ("user_joined", "user_left") and username:
+            pcfg=_room_protection_cfg(room)
+            if pcfg.get("joinleave") and _norm_user(username)!=_norm_user(BOT_ID):
+                st=self._joinleave_state[_norm_room(room)][_norm_user(username)]
+                now=time.time(); evs=st.setdefault("events",[])
+                evs[:]=[x for x in evs if now-float(x[0])<=600]
+                evs.append((now,event_type))
+                if len(evs)>=4 and now>=float(st.get("banned_until",0) or 0):
+                    try:
+                        self.send_admin(room,username,"ban")
+                        st["banned_until"]=now+120
+                        _record_filter_ban(username,room,"حماية الدخول والخروج", "دخول/خروج متكرر")
+                        self.send_room_text(room,f"🚫 تم حظر @{username} لمدة دقيقتين بسبب تكرار الدخول والخروج.")
+                        threading.Timer(120.0, lambda r=room,u=username: self._auto_unban(r,u)).start()
+                    except Exception as exc: self.log("[JOINLEAVE] ban failed",repr(exc))
+        
         if event_type == "user_joined" and username:
             self.room_users[room][username] = role or "none"
             _remember_roster(room, [{"username": username, "role": role or "none"}])
@@ -8064,7 +8447,7 @@ class TalkinBot:
                 and not (_is_mvip_master(frm) and _is_verification_manager_command(body))
                 and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and _is_verified_user(frm))
                 and not (is_publish_command and _is_verified_user(frm))
-                and body.strip().casefold() not in {"توب الألعاب", "توب الالعاب", "top games", "games top"}):
+                and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}):
             if not _is_verified_user(frm):
                 self.send_room_text(room, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
             return
@@ -8072,7 +8455,8 @@ class TalkinBot:
         # Word filter runs before games/normal commands. It uses the same native
         # room ban operation as b@, with Arabic normalization and no public reply.
         room_cfg = _room_moderation_config(room)
-        if getattr(self, "bot_protection_enabled", _bot_protection_enabled()) and not _is_master_name(frm):
+        protection_cfg = _room_protection_cfg(room)
+        if protection_cfg["flood"] and not _is_master_name(frm):
             now = time.time()
             state = self._room_repeat_state[room]
             last_sender = str(state.get("sender", ""))
@@ -8093,9 +8477,12 @@ class TalkinBot:
             text_count = int(state.get("text_count", 0) or 0)
             limit = room_cfg["repeat_limit"]
             if sender_count >= limit or text_count >= limit:
-                self.bot_blocked_users.add(_norm_user(frm))
-                _save_bot_blocked_users(self.bot_blocked_users)
-                self.send_room_text(room, f"🚫 @{frm} تم حظرك اشتباه فلود")
+                try:
+                    self.send_admin(room, frm, "ban")
+                except Exception as exc:
+                    self.log("[FLOOD] native ban failed", repr(exc))
+                _record_filter_ban(frm, room, "حماية الفلود", "تكرار الرسائل")
+                self.send_room_text(room, f"🚫 @{frm} تم حظره بسبب الفلود وتكرار الرسائل.")
                 state.clear()
                 return
             if sender_count == limit - 1 or text_count == limit - 1:
@@ -8103,10 +8490,21 @@ class TalkinBot:
                 return
         filter_words = room_cfg["words"] or (sorted(self.banned_words) if self.moderation_enabled else [])
         normalized_body = _norm_filter_text(body)
-        hit = next((w for w in filter_words if _norm_filter_text(w) and _norm_filter_text(w) in normalized_body), None)
+        hit = next((w for w in filter_words if _norm_filter_text(w) and _norm_filter_text(w) in normalized_body), None) if protection_cfg["swear"] or self.moderation_enabled else None
         if hit and not _is_master_name(frm):
             try:
+                exempt = _norm_user(frm) in getattr(self,"filter_exceptions",set())
+                if exempt:
+                    # The exception account may report a target after @; ban only that named target.
+                    mentions=re.findall(r"@([^\s@]+)", body)
+                    target=mentions[-1].strip() if mentions else ""
+                    if target and _norm_user(target)!=_norm_user(frm):
+                        self.send_admin(room,target,"ban")
+                        _record_filter_ban(target,room,f"إبلاغ من @{frm}: كلمة الفلتر",hit)
+                        self.send_room_text(room,f"🚫 تم حظر @{target}\nالسبب: بلاغ فلتر من @{frm}")
+                    return
                 self.send_admin(room, frm, "ban")
+                _record_filter_ban(frm,room,"كلمة مسيئة",hit)
                 self.send_room_text(room, f"🚫 تم حظر @{frm}\nالسبب: كلمة مسيئة")
                 self.log("[WORD-FILTER] native room ban", frm, "word=", hit, "room=", room)
             except Exception as exc:
@@ -8154,7 +8552,7 @@ class TalkinBot:
         if (not is_verified
                 and _looks_like_bot_command(body)
                 and not re.match(r"^دخول@.+$", body.strip(), re.I)
-                and body.strip().casefold() not in {"توب الألعاب", "توب الالعاب", "top games", "games top"}):
+                and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}):
             self.send_room_text(room, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
             return
         # Music/gifts require verification; masters are always allowed.
@@ -8314,7 +8712,7 @@ class TalkinBot:
                             and not (_is_mvip_master(frm) and _is_verification_manager_command(body))
                             and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and _is_verified_user(frm))
                             and not (is_publish_command and _is_verified_user(frm))
-                            and body.strip().casefold() not in {"توب الألعاب", "توب الالعاب", "top games", "games top"}
+                            and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}
                             and not re.match(r"^دخول@.+$", body, re.I)):
                         if not _is_verified_user(frm):
                             self.send_private_text(frm, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
@@ -8323,7 +8721,7 @@ class TalkinBot:
                             and not _is_verified_user(frm)
                             and _looks_like_bot_command(body)
                             and not re.match(r"^دخول@.+$", body.strip(), re.I)
-                            and body.strip().casefold() not in {"توب الألعاب", "توب الالعاب", "top games", "games top"}):
+                            and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}):
                         self.send_room_text(self.room, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
                         return
                     if body and body.casefold() in ("نقاطي", "points"):
