@@ -3334,6 +3334,7 @@ class TalkinBot:
         # Mini-games: free-to-play, no points are deducted.
         self.game_lock = threading.Lock()
         self.game_cooldown = defaultdict(float)
+        self.board_game_cooldown = {}
         self.guess_games = {}
         self.help_pages = {}
         self.help_game_part = {}  # legacy alias used by older code
@@ -5256,6 +5257,33 @@ class TalkinBot:
         return sent
 
     # ----------------------------- Mini Games -----------------------------
+    # Board-game rewards and player-to-player game interval.
+    SNAKE_WIN_REWARD = 100000
+    LUDO_WIN_REWARD = 50000
+    BOARD_GAME_COOLDOWN = 240.0  # 4 minutes between board games for the same player
+
+    def _board_game_ready(self, username, room):
+        """Enforce a 4-minute interval for the same player before starting another board game."""
+        if not username:
+            return True, 0
+        key = ("board_games", _norm_user(username))
+        now = time.time()
+        with self.game_lock:
+            last = getattr(self, "board_game_cooldown", {}).get(key, 0.0)
+            if now - last < self.BOARD_GAME_COOLDOWN:
+                return False, int(self.BOARD_GAME_COOLDOWN - (now - last)) + 1
+            self.board_game_cooldown[key] = now
+        return True, 0
+
+    def _board_game_cooldown_notice(self, room, username):
+        ok, left = self._board_game_ready(username, room)
+        if not ok:
+            mins = left // 60
+            secs = left % 60
+            wait = f"{mins} دقيقة و{secs} ثانية" if mins else f"{secs} ثانية"
+            self.send_room_text(room, f"⏳ @{username} انتظر {wait} قبل بدء لعبة جديدة.\n🎮 الفاصل بين ألعاب السلم والثعبان ولودو لنفس اللاعب هو 4 دقائق.")
+        return ok
+
     def _game_award(self, username, amount):
         if not username or _is_primary_master(username):
             return _get_points(username)
@@ -6880,12 +6908,44 @@ class TalkinBot:
         out=BASE_DIR/"generated_games"/f"snake_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True)
         img.save(out,"JPEG",quality=86,optimize=True); return out
 
+    def _schedule_board_game_timeout(self, game_key, game, label):
+        """Cancel Ludo/Snake after 2 minutes without any player interaction."""
+        old_timer = game.get("timeout_timer")
+        try:
+            if old_timer:
+                old_timer.cancel()
+        except Exception:
+            pass
+        game["last_activity_at"] = time.time()
+        def expire():
+            current = self.snake_games.get(game_key) if game_key == "__shared_snake__" else self.ludo_games.get(game_key)
+            if current is not game:
+                return
+            last = float(game.get("last_activity_at", 0) or 0)
+            if time.time() - last < 120:
+                self._schedule_board_game_timeout(game_key, game, label)
+                return
+            rooms = self._game_rooms(game) or [str(game.get("origin_room") or "")]
+            for r in rooms:
+                if r:
+                    self.send_room_text(r, f"⌛ انتهت لعبة {label} تلقائيًا لعدم وجود تفاعل لمدة دقيقتين.")
+            if game_key == "__shared_snake__":
+                self.snake_games.pop(game_key, None)
+            else:
+                self.ludo_games.pop(game_key, None)
+        timer = threading.Timer(120.0, expire)
+        timer.daemon = True
+        game["timeout_timer"] = timer
+        timer.start()
+
     def _snake_command(self,room,sender,raw):
         key="__shared_snake__"; low=str(raw or "").strip().casefold(); english=low in ("snake","سناكي")
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
+            if not self._board_game_cooldown_notice(room, sender):
+                return True
             game={"players":[sender],"positions":{sender:1},"lang":"en" if english else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"last_roll":None,"last_roll_at":0.0}
-            self.snake_games[key]=game; self._send_game_cover("snake_ladders",game)
+            self.snake_games[key]=game; self._schedule_board_game_timeout(key, game, "السلم والثعبان"); self._send_game_cover("snake_ladders",game)
             self._broadcast_game_start("🐍 بدأت لعبة السلم والثعبان! جاري البحث عن خصم. للمشاركة اكتب join" if not english else "🐍 Snake & Ladders started! Waiting for an opponent. Type join to participate.",game)
             return True
         if not game: return False
@@ -6898,7 +6958,7 @@ class TalkinBot:
             self.send_room_text(room,"🐍 توجد لعبة السلم والثعبان شغالة بالفعل. اكتب join للمشاركة." if game.get("lang")!="en" else "🐍 A Snake & Ladders game is already running. Type join to join."); return True
         if low in ("join","انضمام"):
             if sender not in game["players"] and len(game["players"])<2:
-                game["players"].append(sender); game["positions"][sender]=1; game["rooms"].add(room)
+                game["players"].append(sender); game["positions"][sender]=1; game["rooms"].add(room); self._schedule_board_game_timeout(key, game, "السلم والثعبان")
                 self.send_room_text(room,"🐍 تم انضمام اللاعب. اكتب rool للعب.")
             return True
         if self._game_roll_command(raw) and sender in game["players"]:
@@ -6906,7 +6966,7 @@ class TalkinBot:
             if idx != game.get("turn",0): self.send_room_text(room,"⏳ انتظر دورك."); return True
             now=time.monotonic()
             if now-float(game.get("last_roll_at",0.0) or 0.0)<0.45: return True
-            game["last_roll_at"]=now; game["rooms"].add(room)
+            game["last_roll_at"]=now; game["rooms"].add(room); self._schedule_board_game_timeout(key, game, "السلم والثعبان")
             roll=secrets.randbelow(6)+1; old_pos=game["positions"].get(sender,1); raw_pos=min(100,old_pos+roll)
             ladders={3:22,8:30,28:55,36:44,51:72,71:92,80:99}; snakes={98:40,95:75,92:70,88:48,62:18,48:26,24:5,17:7}
             final=ladders.get(raw_pos,snakes.get(raw_pos,raw_pos)); game["positions"][sender]=final; game["last_roll"]=roll
@@ -6916,7 +6976,11 @@ class TalkinBot:
                 self.send_room_text(r,f"🎲 @{sender} وقف الرول على {roll} وانتقل من {old_pos} إلى {final}.")
             if final>=100:
                 photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender); win_img=self._render_snake_board(game,winner_name=sender)
-                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.",win_img,photo); self.snake_games.pop(key,None)
+                new_points = _add_points(sender, self.SNAKE_WIN_REWARD)
+                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,photo); 
+                try: game.get("timeout_timer").cancel()
+                except Exception: pass
+                self.snake_games.pop(key,None)
             else: game["turn"]=(game.get("turn",0)+1)%len(game["players"])
             return True
         return False
@@ -7031,8 +7095,10 @@ class TalkinBot:
     def _ludo_command(self,room,sender,raw):
         key="__shared_ludo__"; low=str(raw or "").strip().casefold(); game=self.ludo_games.get(key)
         if low in ("لودو","ludo") and not game:
+            if not self._board_game_cooldown_notice(room, sender):
+                return True
             game={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
-            self.ludo_games[key]=game; self._send_game_cover("ludo",game)
+            self.ludo_games[key]=game; self._schedule_board_game_timeout(key, game, "لودو"); self._send_game_cover("ludo",game)
             self.send_room_text(room,"🎲 Ludo: choose players 1-4. Type 1/2/3/4." if low=="ludo" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين"); return True
         if not game:return False
         origin_room = str(game.get("origin_room") or next(iter(game.get("rooms", {room})), room))
@@ -7057,7 +7123,7 @@ class TalkinBot:
             return True
         if low in ("join","انضمام") and not game.get("started"):
             if sender not in game["players"] and len(game["players"])<int(game.get("max_players",4) or 4):
-                game["players"].append(sender); game["tokens"][sender]=0; game["rooms"].add(room); self.send_room_text(room,"✅ انضم اللاعب. عند اكتمال العدد تبدأ اللعبة عند أول rool.")
+                game["players"].append(sender); game["tokens"][sender]=0; game["rooms"].add(room); self._schedule_board_game_timeout(key, game, "لودو"); self.send_room_text(room,"✅ انضم اللاعب. عند اكتمال العدد تبدأ اللعبة عند أول rool.")
             return True
         if self._game_roll_command(raw) and sender in game["players"]:
             if game.get("max_players",0)==0:self.send_room_text(room,"❌ اختر عدد اللاعبين أولاً: 1 أو 2 أو 3 أو 4."); return True
@@ -7065,7 +7131,7 @@ class TalkinBot:
             if game["players"].index(sender)!=game.get("turn",0):self.send_room_text(room,"⏳ انتظر دورك."); return True
             now=time.monotonic()
             if now-float(game.get("last_roll_at",0.0) or 0.0)<0.45:return True
-            game["last_roll_at"]=now; game["started"]=True
+            game["last_roll_at"]=now; game["started"]=True; self._schedule_board_game_timeout(key, game, "لودو")
             roll=secrets.randbelow(6)+1; old=game["tokens"].get(sender,0); new=min(len(self._ludo_track()),old+roll); game["tokens"][sender]=new
             img=self._render_ludo_board(game); url=self._game_public_image(img) if img else ""
             for r in self._game_rooms(game):
@@ -7073,7 +7139,11 @@ class TalkinBot:
                 self.send_room_text(r,f"🎲 @{sender} وقف الرول على {roll} وانتقل من المربع {old} إلى {new}.")
             if new>=len(self._ludo_track()):
                 win_img=self._render_ludo_board(game,winner_name=sender); photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
-                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.",win_img,photo); self.ludo_games.pop(key,None); return True
+                new_points = _add_points(sender, self.LUDO_WIN_REWARD)
+                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,photo); 
+                try: game.get("timeout_timer").cancel()
+                except Exception: pass
+                self.ludo_games.pop(key,None); return True
             game["turn"]=(game.get("turn",0)+1)%len(game["players"])
             if game.get("bot") and game["players"][game["turn"]]=="🤖 البوت":
                 br=secrets.randbelow(6)+1
