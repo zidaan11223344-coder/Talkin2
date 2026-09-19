@@ -6924,38 +6924,102 @@ class TalkinBot:
         for r in range(12,0,-1): coords.append((0,r))
         return coords
 
+    def _ludo_path_coords(self):
+        """Authentic-looking 15x15 Ludo main track (52 cells, no numbers drawn)."""
+        return [
+            (6,0),(6,1),(6,2),(6,3),(6,4),(5,4),(4,4),(3,4),(2,4),(1,4),(0,4),
+            (0,5),(0,6),(1,6),(2,6),(3,6),(4,6),(4,7),(4,8),(3,8),(2,8),(1,8),(0,8),
+            (0,9),(0,10),(1,10),(2,10),(3,10),(4,10),(5,10),(6,10),(6,11),(6,12),(6,13),(6,14),
+            (7,14),(8,14),(8,13),(8,12),(8,11),(8,10),(9,10),(10,10),(11,10),(12,10),(13,10),(14,10),
+            (14,9),(14,8),(13,8),(12,8),(11,8),(10,8),(10,7),(10,6),(11,6),(12,6),(13,6),(14,6),
+            (14,5),(14,4),(13,4),(12,4),(11,4),(10,4),(10,3),(10,2),(10,1),(10,0),(9,0),(8,0),
+            (8,1),(8,2),(8,3),(8,4),(7,4)
+        ][:52]
+
+    def _ludo_track(self):
+        # Keep the game logic at 52 positions, while the renderer uses a real Ludo-style board.
+        return self._ludo_path_coords()
+
     def _render_ludo_board(self,state,winner_name=""):
         if not PIL_AVAILABLE:return None
         from PIL import Image,ImageDraw
-        img=Image.new("RGB",(960,960),(16,20,28)); d=ImageDraw.Draw(img); cell=58; ox=45; oy=45
-        home_colors=[(225,65,65),(75,165,235),(80,195,105),(245,190,55)]
-        homes=[(0,0),(10,0),(0,10),(10,10)]
-        for idx,(hx,hy) in enumerate(homes):
-            d.rounded_rectangle((ox+hx*cell,oy+hy*cell,ox+(hx+5)*cell,oy+(hy+5)*cell),radius=20,fill=home_colors[idx],outline=(255,255,255),width=3)
-            d.rounded_rectangle((ox+(hx+1)*cell,oy+(hy+1)*cell,ox+(hx+4)*cell,oy+(hy+4)*cell),radius=18,fill=(245,245,245),outline=(255,255,255),width=2)
-            for px,py in ((1.7,1.7),(3.3,1.7),(1.7,3.3),(3.3,3.3)):
-                d.ellipse((ox+(hx+px)*cell-14,oy+(hy+py)*cell-14,ox+(hx+px)*cell+14,oy+(hy+py)*cell+14),fill=home_colors[idx],outline=(255,255,255),width=2)
-        # Full square cells, with a visible 52-cell loop.
-        for r in range(1,13):
-            for c in range(1,13):
-                d.rectangle((ox+c*cell,oy+r*cell,ox+(c+1)*cell,oy+(r+1)*cell),fill=(242,245,248),outline=(90,100,110),width=2)
-        track=set(self._ludo_track())
-        for i,(c,r) in enumerate(self._ludo_track(),1):
-            d.rectangle((ox+c*cell,oy+r*cell,ox+(c+1)*cell,oy+(r+1)*cell),fill=(255,255,255),outline=(55,65,75),width=2)
-            d.text((ox+c*cell+cell//2,oy+r*cell+cell//2),str(i),fill=(40,45,50),font=_gift_font("1",16),anchor="mm")
-        # Center finish: four colored triangles, purely decorative.
-        cx=ox+7*cell; cy=oy+7*cell
-        d.polygon([(cx,cy),(ox+6*cell,oy+6*cell),(ox+8*cell,oy+6*cell)],fill=home_colors[0])
-        d.polygon([(cx,cy),(ox+8*cell,oy+6*cell),(ox+8*cell,oy+8*cell)],fill=home_colors[1])
-        d.polygon([(cx,cy),(ox+8*cell,oy+8*cell),(ox+6*cell,oy+8*cell)],fill=home_colors[2])
-        d.polygon([(cx,cy),(ox+6*cell,oy+8*cell),(ox+6*cell,oy+6*cell)],fill=home_colors[3])
+        W=1050; H=1050; cell=58; ox=60; oy=60
+        img=Image.new("RGB",(W,H),(20,24,31)); d=ImageDraw.Draw(img)
+        colors=[(225,55,65),(75,145,235),(72,185,95),(245,185,45)]
+        light=[(255,225,225),(220,238,255),(222,248,226),(255,244,205)]
+
+        # Wooden-style frame and clean 15x15 Ludo board.
+        d.rounded_rectangle((ox-16,oy-16,ox+15*cell+16,oy+15*cell+16),radius=28,fill=(92,58,32),outline=(235,195,110),width=5)
+        d.rounded_rectangle((ox,oy,ox+15*cell,oy+15*cell),radius=10,fill=(245,245,245),outline=(35,45,55),width=3)
+
+        # Four colored home yards: 6x6 corners with four player slots each.
+        homes=[(0,0,colors[0]),(9,0,colors[1]),(0,9,colors[2]),(9,9,colors[3])]
+        for hx,hy,col in homes:
+            d.rectangle((ox+hx*cell,oy+hy*cell,ox+(hx+6)*cell,oy+(hy+6)*cell),fill=col,outline=(255,255,255),width=3)
+            d.rounded_rectangle((ox+(hx+1)*cell,oy+(hy+1)*cell,ox+(hx+5)*cell,oy+(hy+5)*cell),radius=20,fill=(250,250,250),outline=(255,255,255),width=3)
+            for px,py in ((2,2),(4,2),(2,4),(4,4)):
+                cx=ox+(hx+px)*cell; cy=oy+(hy+py)*cell
+                d.ellipse((cx-17,cy-17,cx+17,cy+17),fill=col,outline=(255,255,255),width=3)
+
+        # Main 3-cell-wide cross lanes. No cell numbers: the board should look like real Ludo.
+        for r in range(6,9):
+            for c in range(15):
+                # Leave colored home blocks intact.
+                if c < 6 or c > 8:
+                    d.rectangle((ox+c*cell,oy+r*cell,ox+(c+1)*cell,oy+(r+1)*cell),fill=(250,250,250),outline=(100,105,110),width=2)
+        for c in range(6,9):
+            for r in range(15):
+                if r < 6 or r > 8:
+                    d.rectangle((ox+c*cell,oy+r*cell,ox+(c+1)*cell,oy+(r+1)*cell),fill=(250,250,250),outline=(100,105,110),width=2)
+
+        # Player-colored entry lanes toward the center.
+        lane_defs=[
+            ((6,1),(6,5),colors[0]), ((9,6),(13,6),colors[1]),
+            ((8,9),(8,13),colors[3]), ((1,8),(5,8),colors[2])
+        ]
+        for (x1,y1),(x2,y2),col in lane_defs:
+            if x1==x2:
+                for y in range(y1,y2+1): d.rectangle((ox+x1*cell,oy+y*cell,ox+(x1+1)*cell,oy+(y+1)*cell),fill=light[colors.index(col)],outline=col,width=2)
+            else:
+                for x in range(x1,x2+1): d.rectangle((ox+x*cell,oy+y1*cell,ox+(x+1)*cell,oy+(y1+1)*cell),fill=light[colors.index(col)],outline=col,width=2)
+
+        # Start cells with subtle arrows/markers.
+        starts=[(6,0,colors[0]),(14,6,colors[1]),(8,14,colors[3]),(0,8,colors[2])]
+        for x,y,col in starts:
+            d.rectangle((ox+x*cell,oy+y*cell,ox+(x+1)*cell,oy+(y+1)*cell),fill=col,outline=(255,255,255),width=3)
+            d.ellipse((ox+x*cell+17,oy+y*cell+17,ox+(x+1)*cell-17,oy+(y+1)*cell-17),outline=(255,255,255),width=3)
+
+        # Center home triangle: the four colors meet in the classic Ludo finish.
+        x0=ox+6*cell; y0=oy+6*cell; x1=ox+9*cell; y1=oy+9*cell; cx=(x0+x1)//2; cy=(y0+y1)//2
+        d.polygon([(x0,y0),(x1,y0),(cx,cy)],fill=colors[0],outline=(255,255,255))
+        d.polygon([(x1,y0),(x1,y1),(cx,cy)],fill=colors[1],outline=(255,255,255))
+        d.polygon([(x1,y1),(x0,y1),(cx,cy)],fill=colors[3],outline=(255,255,255))
+        d.polygon([(x0,y1),(x0,y0),(cx,cy)],fill=colors[2],outline=(255,255,255))
+
+        # Safe/star markers on selected path cells.
+        for x,y in [(2,6),(8,2),(12,8),(6,12),(8,6),(6,8)]:
+            cx=ox+x*cell+cell/2; cy=oy+y*cell+cell/2
+            d.text((cx,cy),"★",fill=(105,105,105),font=_gift_font("1",22),anchor="mm")
+
+        # Player pieces: use the profile photo inside the actual board cell.
         coords=self._ludo_track()
         for i,(u,pos) in enumerate(state.get("tokens",{}).items()):
-            idx=max(1,min(len(coords),int(pos) if int(pos)>0 else 1))-1; x,y=coords[idx]
-            avatar=self._game_square_avatar(u,48)
-            if avatar is not None: img.paste(avatar,(ox+x*cell+5,oy+y*cell+5))
-            else: d.rounded_rectangle((ox+x*cell+8,oy+y*cell+8,ox+(x+1)*cell-8,oy+(y+1)*cell-8),radius=10,fill=home_colors[i%4],outline=(255,255,255),width=2)
-        out=BASE_DIR/"generated_games"/f"ludo_{uuid.uuid4().hex}.jpg";out.parent.mkdir(parents=True,exist_ok=True);img.save(out,"JPEG",quality=84,optimize=True);return out
+            idx=max(0,min(len(coords)-1,int(pos)-1 if int(pos)>0 else 0)); x,y=coords[idx]
+            avatar=self._game_square_avatar(u,44)
+            cx=ox+x*cell+cell//2; cy=oy+y*cell+cell//2
+            if avatar is not None:
+                img.paste(avatar,(int(cx-22),int(cy-22)),avatar)
+                d.ellipse((cx-24,cy-24,cx+24,cy+24),outline=(255,255,255),width=3)
+            else:
+                d.ellipse((cx-20,cy-20,cx+20,cy+20),fill=colors[i%4],outline=(255,255,255),width=3)
+                d.text((cx,cy),str(i+1),fill=(255,255,255),font=_gift_font("1",18),anchor="mm")
+
+        # Title only; no numbered-square list.
+        title="لودو"
+        d.rounded_rectangle((ox,18,ox+15*cell,oy-5),radius=16,fill=(16,30,45),outline=(230,190,75),width=3)
+        d.text((ox+15*cell//2,42),title,fill=(245,205,80),font=_gift_font("1",30),anchor="mm")
+        out=BASE_DIR/"generated_games"/f"ludo_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True)
+        img.save(out,"JPEG",quality=88,optimize=True); return out
 
     def _ludo_command(self,room,sender,raw):
         key="__shared_ludo__"; low=str(raw or "").strip().casefold(); game=self.ludo_games.get(key)
