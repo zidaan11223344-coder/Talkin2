@@ -6633,100 +6633,266 @@ class TalkinBot:
         except Exception: pass
         return f"{base}/{route}/{path.name}"
 
-    def _render_snake_board(self, state):
+    def _game_rooms(self, game):
+        rooms = game.get("rooms", set()) if isinstance(game, dict) else set()
+        if not isinstance(rooms, set):
+            rooms = set(rooms or [])
+        return set(rooms)
+
+    def _broadcast_game_start(self, title, game):
+        for r in self._active_rooms():
+            try:
+                self.send_room_text(r, title)
+            except Exception:
+                pass
+
+    def _broadcast_game_result_all_rooms(self, text, image_path=None, winner_photo_url=""):
+        url = self._game_public_image(image_path) if image_path else ""
+        for r in self._active_rooms():
+            try:
+                if winner_photo_url:
+                    self.send_room_media(r, winner_photo_url, "image")
+                if url:
+                    self.send_room_media(r, url, "image")
+                self.send_room_text(r, text)
+            except Exception:
+                pass
+
+    def _game_square_avatar(self, username, size=58):
+        """Fetch a profile image as a true square board piece, not a circle."""
+        if not PIL_AVAILABLE:
+            return None
+        username = str(username or "").strip().lstrip("@")
+        if not username or username == "🤖 البوت":
+            return None
+        try:
+            photo = self.user_photos.get(username.casefold(), "") or self._lookup_profile_photo(username)
+            if not photo or not photo.startswith(("http://", "https://")):
+                return None
+            r = requests.get(photo, headers={"User-Agent":"TalkinBot/23"}, timeout=3)
+            if r.status_code != 200 or not r.content:
+                return None
+            from io import BytesIO
+            av = Image.open(BytesIO(r.content)).convert("RGB")
+            return _fit_crop(av, (size, size)).convert("RGB")
+        except Exception:
+            return None
+
+    def _render_snake_board(self, state, winner_name=""):
         if not PIL_AVAILABLE: return None
         from PIL import Image, ImageDraw, ImageFont
-        W=900; H=900; cell=80
-        img=Image.new("RGB",(W,H),(10,18,28)); d=ImageDraw.Draw(img)
-        font=_gift_font("1",22)
-        for n in range(1,101):
-            idx=n-1; row=idx//10; col=idx%10
+        W=1000; H=1080; cell=92; left=40; top=130
+        img=Image.new("RGB",(W,H),(8,15,25)); d=ImageDraw.Draw(img)
+        font=_gift_font("1",24); small=_gift_font("1",18); title_font=_gift_font("1",34)
+        d.rounded_rectangle((20,18,W-20,110), radius=22, fill=(20,35,52), outline=(245,198,70), width=3)
+        d.text((W//2,38), "السلم والثعبان" if state.get("lang")!="en" else "SNAKE & LADDERS", fill=(255,215,80), font=title_font, anchor="ma")
+        roll=state.get("last_roll")
+        if roll is not None:
+            d.text((W//2,82), f"الرول: {roll}" if state.get("lang")!="en" else f"ROLL: {roll}", fill=(235,245,255), font=small, anchor="ma")
+
+        def cell_center(pos):
+            pos=max(1,min(100,int(pos)))
+            idx=pos-1; row=idx//10; col=idx%10
             if row%2: col=9-col
-            x=col*cell; y=(9-row)*cell
-            d.rectangle((x,y,x+cell,y+cell),outline=(50,130,180),width=2)
-            d.text((x+6,y+5),str(n),fill=(230,240,255),font=font)
-        ladders={3:22,8:30,28:55,36:44,51:72,71:92,80:99}; snakes={98:40,95:75,92:70,88:48,62:18,48:26,24:5,17:7}
+            return (left+col*cell+cell//2, top+(9-row)*cell+cell//2)
+
+        # board cells
+        for n in range(1,101):
+            x,y=cell_center(n)
+            x0=x-cell//2; y0=y-cell//2
+            fill=(20,34,48) if n%2 else (24,43,59)
+            d.rectangle((x0,y0,x0+cell,y0+cell), fill=fill, outline=(75,125,155), width=2)
+            d.text((x0+8,y0+6),str(n),fill=(235,240,245),font=font)
+
+        # Realistic-looking ladders: rails + rungs
+        ladders={3:22,8:30,28:55,36:44,51:72,71:92,80:99}
         for a,b in ladders.items():
-            def c(pos):
-                i=pos-1; r=i//10; cc=i%10; cc=9-cc if r%2 else cc; return (cc*cell+40,(9-r)*cell+40)
-            d.line((*c(a),*c(b)),fill=(40,220,100),width=10)
+            x1,y1=cell_center(a); x2,y2=cell_center(b)
+            dx=x2-x1; dy=y2-y1; ln=max(1,(dx*dx+dy*dy)**0.5); nx=-dy/ln; ny=dx/ln
+            rail=12
+            for off in (-12,12):
+                d.line((x1+nx*off,y1+ny*off,x2+nx*off,y2+ny*off),fill=(242,190,45),width=7)
+            steps=max(3,int(ln//28))
+            for k in range(1,steps):
+                t=k/steps; cx=x1+dx*t; cy=y1+dy*t
+                d.line((cx+nx*18,cy+ny*18,cx-nx*18,cy-ny*18),fill=(255,225,100),width=6)
+
+        # Realistic-looking snakes: curved segmented body, head and eyes
+        snakes={98:40,95:75,92:70,88:48,62:18,48:26,24:5,17:7}
         for a,b in snakes.items():
-            def c(pos):
-                i=pos-1; r=i//10; cc=i%10; cc=9-cc if r%2 else cc; return (cc*cell+40,(9-r)*cell+40)
-            d.line((*c(a),*c(b)),fill=(240,80,90),width=10)
-        colors=[(255,210,60),(80,190,255),(220,90,220),(80,230,130)]
+            x1,y1=cell_center(a); x2,y2=cell_center(b)
+            dx=x2-x1; dy=y2-y1; ln=max(1,(dx*dx+dy*dy)**0.5); px=-dy/ln; py=dx/ln
+            pts=[]
+            for k in range(17):
+                t=k/16; cx=x1+dx*t; cy=y1+dy*t; wave=((k%4)-1.5)*9
+                pts.append((cx+px*wave,cy+py*wave))
+            d.line(pts,fill=(35,190,105),width=20,joint="curve")
+            d.line(pts,fill=(20,120,70),width=11,joint="curve")
+            hx,hy=pts[0]; d.ellipse((hx-17,hy-17,hx+17,hy+17),fill=(40,205,110),outline=(10,70,40),width=3)
+            d.ellipse((hx-8,hy-5,hx-3,hy),fill=(255,255,255)); d.ellipse((hx+3,hy-5,hx+8,hy),fill=(255,255,255))
+            d.ellipse((hx-6,hy-4,hx-4,hy-2),fill=(0,0,0)); d.ellipse((hx+4,hy-4,hx+6,hy-2),fill=(0,0,0))
+            d.line((hx,hy+12,hx+18,hy+12),fill=(230,60,70),width=3)
+
+        # Player profile photos are the pieces; no red circles.
+        colors=[(255,210,70),(80,190,255),(220,90,220),(80,225,130)]
         for i,(u,pos) in enumerate(state.get("positions",{}).items()):
-            i2=pos-1; r=i2//10; cc=i2%10; cc=9-cc if r%2 else cc; x=cc*cell+40; y=(9-r)*cell+40
-            d.ellipse((x-18,y-18,x+18,y+18),fill=colors[i%4],outline=(255,255,255),width=2); d.text((x-12,y-8),str(i+1),fill=(0,0,0),font=font)
-        out=BASE_DIR/"generated_games"/f"snake_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True); img.save(out,"JPEG",quality=82,optimize=True); return out
+            cx,cy=cell_center(pos); photo=""
+            try:
+                photo=self.user_photos.get(str(u).casefold(), "") or self._lookup_profile_photo(u)
+            except Exception:
+                photo=""
+            avatar=_load_sender_avatar(photo, 58) if photo else None
+            if avatar is not None:
+                img.paste(avatar,(cx-29,cy-29),avatar)
+            else:
+                d.rounded_rectangle((cx-27,cy-27,cx+27,cy+27),radius=12,fill=colors[i%len(colors)],outline=(255,255,255),width=2)
+                d.text((cx,cy),str(i+1),fill=(10,10,10),font=small,anchor="mm")
+            # player name below the piece when space allows
+            short=str(u)[:12]
+            d.text((cx,cy+31),short,fill=(255,255,255),font=_gift_font("1",14),anchor="ma")
+
+        out=BASE_DIR/"generated_games"/f"snake_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True)
+        img.save(out,"JPEG",quality=84,optimize=True); return out
 
     def _snake_command(self,room,sender,raw):
-        key=_norm_room(room); low=raw.casefold(); english=low in ("snake","سناكي")
+        key="__shared_snake__"; low=raw.casefold(); english=low in ("snake","سناكي")
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
-            self.snake_games[key]={"players":[sender],"positions":{sender:1},"lang":"en" if english else "ar","turn":0,"created":time.time()}
-            self.send_room_text(room,"🎲 Snake game started! Waiting for an opponent. Type join to participate." if english else "🎲 بدأت لعبة السلم والثعبان! جاري البحث عن خصم. للمشاركة اكتب join")
-            for r in self._active_rooms():
-                if _norm_room(r)!=key: self.send_room_text(r,"🐍 بدأت لعبة السلم والثعبان في غرفة أخرى. للمشاركة اكتب join")
+            game={"players":[sender],"positions":{sender:1},"lang":"en" if english else "ar","turn":0,"created":time.time(),"rooms":{room},"last_roll":None}
+            self.snake_games[key]=game
+            self._broadcast_game_start("🐍 بدأت لعبة السلم والثعبان! جاري البحث عن خصم. للمشاركة اكتب join" if not english else "🐍 Snake & Ladders started! Waiting for an opponent. Type join to participate.",game)
             return True
-        if low in ("join","انضمام") and game:
-            if sender not in game["players"] and len(game["players"])<2: game["players"].append(sender); game["positions"][sender]=1; self.send_room_text(room,"🐍 تم انضمام اللاعب. اكتب rool للعب."); return True
+        if not game: return False
+        game.setdefault("rooms",set()).add(room)
+        if low in ("ثعبان","snake","سناكي"):
+            self.send_room_text(room,"🐍 توجد لعبة السلم والثعبان شغالة بالفعل. اكتب join للمشاركة." if game.get("lang")!="en" else "🐍 A Snake & Ladders game is already running. Type join to join.")
             return True
-        if low in ("rool","roll","رول") and game and sender in game["players"]:
+        if low in ("join","انضمام"):
+            if sender not in game["players"] and len(game["players"])<2:
+                game["players"].append(sender); game["positions"][sender]=1
+                game["rooms"].add(room)
+                self.send_room_text(room,"🐍 تم انضمام اللاعب. اكتب rool للعب.")
+            return True
+        if low in ("rool","roll","رول") and sender in game["players"]:
             idx=game["players"].index(sender)
-            if idx != game.get("turn",0): self.send_room_text(room,"⏳ انتظر دورك." if game.get("lang")=="ar" else "⏳ Wait for your turn."); return True
-            roll=secrets.randbelow(6)+1; pos=min(100,game["positions"].get(sender,1)+roll); ladders={3:22,8:30,28:55,36:44,51:72,71:92,80:99}; snakes={98:40,95:75,92:70,88:48,62:18,48:26,24:5,17:7}; final=ladders.get(pos,snakes.get(pos,pos)); game["positions"][sender]=final
+            if idx != game.get("turn",0): self.send_room_text(room,"⏳ انتظر دورك." if game.get("lang")!="en" else "⏳ Wait for your turn."); return True
+            game["rooms"].add(room)
+            roll=secrets.randbelow(6)+1; old_pos=game["positions"].get(sender,1); raw_pos=min(100,old_pos+roll)
+            ladders={3:22,8:30,28:55,36:44,51:72,71:92,80:99}; snakes={98:40,95:75,92:70,88:48,62:18,48:26,24:5,17:7}
+            final=ladders.get(raw_pos,snakes.get(raw_pos,raw_pos)); game["positions"][sender]=final; game["last_roll"]=roll
             img=self._render_snake_board(game); url=self._game_public_image(img) if img else ""
-            if url:self.send_room_media(room,url,"image")
-            self.send_room_text(room,f"🎲 @{sender} rolled {roll} and stopped at {final}." if game.get("lang")=="en" else f"🎲 @{sender} وقف الرول على رقم {roll} وانتقل إلى الخانة {final}.")
+            # Gameplay result only goes to rooms where the game has actually been played.
+            for r in self._game_rooms(game):
+                if url:self.send_room_media(r,url,"image")
+                self.send_room_text(r,f"🎲 @{sender} وقف الرول على {roll} وانتقل من {old_pos} إلى {final}." if game.get("lang")!="en" else f"🎲 @{sender} rolled {roll}: {old_pos} → {final}.")
             if final>=100:
-                self.send_room_text(room,f"🏆 @{sender} won the Snake and Ladder game!" if game.get("lang")=="en" else f"🏆 مبروك @{sender} فاز بلعبة السلم والثعبان!"); self.snake_games.pop(key,None)
+                photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
+                win_img=self._render_snake_board(game,winner_name=sender)
+                text=f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100."
+                self._broadcast_game_result_all_rooms(text,win_img,photo)
+                self.snake_games.pop(key,None)
             else: game["turn"]=(game.get("turn",0)+1)%len(game["players"])
             return True
         return False
 
-    def _render_ludo_board(self,state):
+    def _render_ludo_board(self,state,winner_name=""):
         if not PIL_AVAILABLE:return None
         from PIL import Image,ImageDraw
-        img=Image.new("RGB",(900,900),(18,22,30));d=ImageDraw.Draw(img); cell=60
+        img=Image.new("RGB",(960,960),(16,20,28));d=ImageDraw.Draw(img); cell=58; ox=45; oy=45
+        # Classic Ludo 15x15 home areas and center.
+        home_colors=[(225,65,65),(75,165,235),(80,195,105),(245,190,55)]
+        homes=[(0,0),(10,0),(0,10),(10,10)]
+        for idx,(hx,hy) in enumerate(homes):
+            d.rounded_rectangle((ox+hx*cell,oy+hy*cell,ox+(hx+5)*cell,oy+(hy+5)*cell),radius=20,fill=home_colors[idx],outline=(255,255,255),width=3)
+            d.rounded_rectangle((ox+(hx+1)*cell,oy+(hy+1)*cell,ox+(hx+4)*cell,oy+(hy+4)*cell),radius=18,fill=(245,245,245),outline=(255,255,255),width=2)
+            for px,py in ((1.7,1.7),(3.3,1.7),(1.7,3.3),(3.3,3.3)):
+                d.ellipse((ox+(hx+px)*cell-14,oy+(hy+py)*cell-14,ox+(hx+px)*cell+14,oy+(hy+py)*cell+14),fill=home_colors[idx],outline=(255,255,255),width=2)
+        # Cross/path
         for r in range(15):
             for c in range(15):
-                d.rectangle((c*cell,r*cell,c*cell+cell,r*cell+cell),outline=(70,90,110),width=2)
+                in_home=((c<5 or c>=10) and (r<5 or r>=10))
+                if in_home: continue
+                fill=(245,245,245)
+                if c in range(6,9) or r in range(6,9): fill=(230,235,240)
+                d.rectangle((ox+c*cell,oy+r*cell,ox+(c+1)*cell,oy+(r+1)*cell),fill=fill,outline=(90,100,110),width=2)
+        # colored entry lanes
+        for c in range(6,9):
+            d.rectangle((ox+c*cell,oy+6*cell,ox+(c+1)*cell,oy+9*cell),fill=home_colors[0],outline=(255,255,255),width=1)
+            d.rectangle((ox+c*cell,oy+6*cell,ox+(c+1)*cell,oy+9*cell),fill=home_colors[1] if c==7 else home_colors[0],outline=(255,255,255),width=1)
+        for r in range(6,9):
+            d.rectangle((ox+6*cell,oy+r*cell,ox+9*cell,oy+(r+1)*cell),fill=home_colors[2] if r==7 else home_colors[3],outline=(255,255,255),width=1)
+        # center triangles
+        cx=ox+7.5*cell; cy=oy+7.5*cell
+        d.polygon([(cx,cy),(ox+5*cell,oy+5*cell),(ox+10*cell,oy+5*cell)],fill=home_colors[0])
+        d.polygon([(cx,cy),(ox+10*cell,oy+5*cell),(ox+10*cell,oy+10*cell)],fill=home_colors[1])
+        d.polygon([(cx,cy),(ox+10*cell,oy+10*cell),(ox+5*cell,oy+10*cell)],fill=home_colors[2])
+        d.polygon([(cx,cy),(ox+5*cell,oy+10*cell),(ox+5*cell,oy+5*cell)],fill=home_colors[3])
+        # Simple circular track positions around the cross, 40 spaces.
         path=[]
-        for c in range(1,14): path.append((c,7))
-        for r in range(1,14): path.append((7,r))
-        for i,p in enumerate(state.get("tokens",{}).items()):
-            user,pos=p; x,y=path[min(max(int(pos),0),len(path)-1)]; d.ellipse((x*cell+12,y*cell+12,x*cell+48,y*cell+48),fill=[(230,70,70),(70,180,255),(90,220,120),(220,190,50)][i%4])
-        out=BASE_DIR/"generated_games"/f"ludo_{uuid.uuid4().hex}.jpg";out.parent.mkdir(parents=True,exist_ok=True);img.save(out,"JPEG",quality=80,optimize=True);return out
+        for c in range(1,14): path.append((c,6))
+        for r in range(7,14): path.append((13,r))
+        for c in range(12,0,-1): path.append((c,13))
+        for r in range(12,6,-1): path.append((1,r))
+        for i,(u,pos) in enumerate(state.get("tokens",{}).items()):
+            if not path: break
+            x,y=path[min(max(int(pos),0),len(path)-1)]
+            photo=self.user_photos.get(str(u).casefold(), "") or self._lookup_profile_photo(u)
+            avatar=self._game_square_avatar(u,48)
+            if avatar is not None: img.paste(avatar,(ox+x*cell+5,oy+y*cell+5))
+            else:
+                d.rounded_rectangle((ox+x*cell+8,oy+y*cell+8,ox+(x+1)*cell-8,oy+(y+1)*cell-8),radius=10,fill=home_colors[i%4],outline=(255,255,255),width=2)
+        out=BASE_DIR/"generated_games"/f"ludo_{uuid.uuid4().hex}.jpg";out.parent.mkdir(parents=True,exist_ok=True);img.save(out,"JPEG",quality=82,optimize=True);return out
 
     def _ludo_command(self,room,sender,raw):
-        key=_norm_room(room); low=raw.casefold(); game=self.ludo_games.get(key)
+        key="__shared_ludo__"; low=raw.casefold(); game=self.ludo_games.get(key)
         if low in ("لودو","ludo") and not game:
-            self.ludo_games[key]={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time()}
-            self.send_room_text(room,"🎲 Ludo: choose players 1-4. Type join to join." if low=="ludo" else "🎲 لودو: اختر عدد اللاعبين 1-4\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين\nللانضمام اكتب join أو انضمام")
+            game={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time(),"rooms":{room},"max_players":0,"bot":False,"started":False}
+            self.ludo_games[key]=game
+            self.send_room_text(room,"🎲 Ludo: choose players 1-4. Type 1/2/3/4." if low=="ludo" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين")
             return True
-        if low in ("1","2","3","4") and game and len(game["players"])==1:
-            count=int(low)
+        if not game: return False
+        game.setdefault("rooms",set()).add(room)
+        if low in ("لودو","ludo"):
+            self.send_room_text(room,"🎲 توجد لعبة لودو قيد التجهيز. اختر العدد أو اكتب join/انضمام." if game.get("lang")!="en" else "🎲 A Ludo game is being prepared. Choose the player count or type join.")
+            return True
+        if low in ("1","2","3","4") and len(game["players"])==1 and not game.get("started"):
+            count=int(low); game["max_players"]=1 if count==1 else count; game["bot"]=(count==1)
             if count==1:
-                game["max_players"]=2; game["bot"]=True; game["players"].append("🤖 البوت"); game["tokens"]["🤖 البوت"]=0
-                self.send_room_text(room,"🤖 تم اختيار اللعب مع البوت. اكتب rool لبدء دورك.")
+                game["started"]=True
+                game["rooms"].add(room)
+                self._broadcast_game_start("🤖 بدأت لعبة لودو مع البوت! اكتب rool للعب." if game.get("lang")!="en" else "🤖 Ludo vs Bot started! Type rool to play.", game)
             else:
-                game["max_players"]=count; game["bot"]=False; self.send_room_text(room,"✅ تم اختيار عدد اللاعبين. اكتب join أو انضمام.")
+                self.send_room_text(room,"✅ تم اختيار العدد. اكتب join أو انضمام حتى يكتمل عدد اللاعبين.")
             return True
-        if low in ("join","انضمام") and game:
-            if sender not in game["players"] and len(game["players"])<int(game.get("max_players",4)): game["players"].append(sender); game["tokens"][sender]=0; self.send_room_text(room,"✅ انضم اللاعب. عند اكتمال العدد تبدأ اللعبة، ثم اكتب rool.")
-            if len(game["players"])>=int(game.get("max_players",4)) or (game.get("bot") and len(game["players"])>=1): self.send_room_text(room,"🎲 بدأت لعبة لودو! اكتب rool لتحريك الرول.")
+        if low in ("join","انضمام") and not game.get("started"):
+            if sender not in game["players"] and len(game["players"])<int(game.get("max_players",4)):
+                game["players"].append(sender); game["tokens"][sender]=0; game["rooms"].add(room)
+                self.send_room_text(room,"✅ انضم اللاعب. عند اكتمال العدد تبدأ اللعبة عند أول rool.")
             return True
-        if low in ("rool","roll","رول") and game and sender in game["players"]:
+        if low in ("rool","roll","رول") and sender in game["players"]:
+            if game.get("max_players",0)==0:
+                self.send_room_text(room,"❌ اختر عدد اللاعبين أولاً: 1 أو 2 أو 3 أو 4."); return True
+            if len(game["players"])<int(game["max_players"]):
+                self.send_room_text(room,"⏳ ما زلنا ننتظر اكتمال عدد اللاعبين."); return True
             if game["players"].index(sender)!=game.get("turn",0): self.send_room_text(room,"⏳ انتظر دورك."); return True
-            roll=secrets.randbelow(6)+1; game["tokens"][sender]=min(40,game["tokens"].get(sender,0)+roll); img=self._render_ludo_board(game); url=self._game_public_image(img) if img else ""; 
-            if url:self.send_room_media(room,url,"image")
-            self.send_room_text(room,f"🎲 @{sender} وقف الرول على {roll} وانتقل إلى المربع {game['tokens'][sender]}.")
-            if game["tokens"][sender]>=40:self.send_room_text(room,f"🏆 مبروك @{sender} فاز بلعبة لودو!"); self.ludo_games.pop(key,None)
+            if not game.get("started"):
+                game["started"]=True; game["rooms"].add(room)
+                self._broadcast_game_start("🎲 بدأت لعبة لودو! للمشاركة واللعب اكتب rool عند دورك." if game.get("lang")!="en" else "🎲 Ludo game started! Type rool when it is your turn.", game)
             else:
-                game["turn"]=(game.get("turn",0)+1)%len(game["players"])
-                if game.get("bot") and game["players"][game["turn"]]=="🤖 البوت":
-                    br=secrets.randbelow(6)+1; game["tokens"]["🤖 البوت"]=min(40,game["tokens"].get("🤖 البوت",0)+br); self.send_room_text(room,f"🤖 البوت رمى {br} وانتقل إلى المربع {game['tokens']['🤖 البوت']}."); game["turn"]=0
+                game["rooms"].add(room)
+            roll=secrets.randbelow(6)+1; old=game["tokens"].get(sender,0); new=min(40,old+roll); game["tokens"][sender]=new
+            img=self._render_ludo_board(game); url=self._game_public_image(img) if img else ""
+            for r in self._game_rooms(game):
+                if url:self.send_room_media(r,url,"image")
+                self.send_room_text(r,f"🎲 @{sender} وقف الرول على {roll} وانتقل من المربع {old} إلى {new}.")
+            if new>=40:
+                win_img=self._render_ludo_board(game,winner_name=sender)
+                photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
+                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.",win_img,photo)
+                self.ludo_games.pop(key,None); return True
+            game["turn"]=(game.get("turn",0)+1)%len(game["players"])
+            if game.get("bot") and game["players"][game["turn"]]=="🤖 البوت":
+                br=secrets.randbelow(6)+1; game["tokens"]["🤖 البوت"]=min(40,game["tokens"].get("🤖 البوت",0)+br); game["turn"]=0
             return True
         return False
 
@@ -6744,12 +6910,14 @@ class TalkinBot:
                 return self._stock_exchange_game(room,sender_name,int(raw))
         if self._handle_pending_bot_choice(room, raw, sender_name):
             return True
-        # Do not run the verification gate for ordinary conversation.  The
-        # caller may pass every room message here, so first require a known
-        # bot/game command; unrelated text must be ignored silently.
+        # Game state inputs such as Ludo 1-4, join and rool must be handled
+        # before the generic bot-command gate.
+        low=raw.casefold()
+        if self._snake_command(room,sender_name,raw): return True
+        if self._ludo_command(room,sender_name,raw): return True
+        # Do not run the verification gate for ordinary conversation.
         if not _looks_like_bot_command(raw):
             return False
-        low=raw.casefold()
         normalized_raw = raw.replace("ة", "ه")
         # Game-name normalization: Arabic ه/ة variants are treated as the same
         # command (e.g. سناره/سنارة, حصانه/حصانة), while preserving raw text
@@ -6800,8 +6968,6 @@ class TalkinBot:
         if not _is_verified_user(sender_name):
             self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
             return True
-        if self._snake_command(room,sender_name,raw): return True
-        if self._ludo_command(room,sender_name,raw): return True
         if low in ("العاب","ألعاب","لعب","games","game"):
             self.game_help(room); return True
         if not _games_enabled_for_room(room):
