@@ -1672,7 +1672,7 @@ def _looks_like_admin_command(text):
         "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "mas@", "umas@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "انشر", "+sr@", "sr@",
-        "swc", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify",
+        "swc", "mf@", "+mf@", "-mf@", "l@mf", "clear@mf", "amf@", "l@mfb", "mr@", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify",
     )
     return low.startswith(prefixes)
 
@@ -3554,8 +3554,9 @@ class TalkinBot:
         if requester:
             self.send_private_text(
                 requester,
-                f"⚠️ لم يؤكد الخادم دخول البوت إلى الغرفة: {room}. "
-                "قد تكون الغرفة محظورة أو للأعضاء فقط؛ تحقق من صلاحية البوت ثم أعد المحاولة.",
+                f"⚠️ تعذر تأكيد دخول البوت إلى الغرفة: {room}. "
+                "قد يكون البوت محظوراً من الغرفة أو تحتاج الغرفة إلى صلاحية مشرف/أونر. "
+                "تحقق من صلاحية البوت ثم أعد المحاولة.",
             )
 
     def join_room(self, room: str, force: bool = False, requested_by: str = ""):
@@ -6581,8 +6582,8 @@ class TalkinBot:
                 "🍀 حظاً أوفر في المحاولة القادمة!\n"
                 "━━━━━━━━━━━━━━"
             )
-            for target_room in (self._active_rooms() or [room]):
-                self.send_room_text(target_room, loss_text)
+            # محاولة الحصول على المليون تبقى داخل الغرفة التي أُرسلت منها.
+            self.send_room_text(room, loss_text)
             return True
         self._game_award(sender_name, reward)
         winner_photo = self.user_photos.get(_norm_user(sender_name), "") or self._lookup_profile_photo(sender_name)
@@ -6725,7 +6726,7 @@ class TalkinBot:
     def _render_snake_board(self, state, winner_name=""):
         if not PIL_AVAILABLE: return None
         from PIL import Image, ImageDraw, ImageFont
-        W=1000; H=1080; cell=92; left=40; top=130
+        W=1000; H=1160; cell=92; left=40; top=130
         img=Image.new("RGB",(W,H),(8,15,25)); d=ImageDraw.Draw(img)
         font=_gift_font("1",24); small=_gift_font("1",18); title_font=_gift_font("1",34)
         d.rounded_rectangle((20,18,W-20,110), radius=22, fill=(20,35,52), outline=(245,198,70), width=3)
@@ -6806,9 +6807,44 @@ class TalkinBot:
             else:
                 d.rounded_rectangle((cx-27,cy-27,cx+27,cy+27),radius=12,fill=colors[i%len(colors)],outline=(255,255,255),width=2)
                 d.text((cx,cy),str(i+1),fill=(10,10,10),font=small,anchor="mm")
-            # player name below the piece when space allows
-            short=str(u)[:12]
-            d.text((cx,cy+31),short,fill=(255,255,255),font=_gift_font("1",14),anchor="ma")
+            # Keep the piece clean; player names are rendered in the
+            # dedicated legend below the board so long Arabic/Latin names
+            # remain readable and are never clipped by a board cell.
+
+        # Clear player-name panel below the board.  The old 14px text was
+        # too small and was often hidden/overlapped by pieces.
+        panel_y0 = top + 10*cell + 10
+        panel_y1 = H - 12
+        d.rounded_rectangle((20, panel_y0, W-20, panel_y1), radius=18,
+                            fill=(16,30,45), outline=(245,198,70), width=3)
+        players = list(state.get("positions", {}).items())
+        if players:
+            d.text((W//2, panel_y0 + 18), "👤 اللاعبون",
+                   fill=(245,205,80), font=_gift_font("1",22), anchor="ma")
+            col_w = (W-50) / max(1, len(players))
+            for i,(u,_pos) in enumerate(players[:4]):
+                center_x = int(25 + col_w*i + col_w/2)
+                avatar = None
+                try:
+                    photo = self.user_photos.get(str(u).casefold(), "") or self._lookup_profile_photo(u)
+                    avatar = _load_sender_avatar(photo, 42) if photo else None
+                except Exception:
+                    avatar = None
+                if avatar is not None:
+                    img.paste(avatar, (center_x-21, panel_y0+42), avatar)
+                else:
+                    d.ellipse((center_x-21, panel_y0+42, center_x+21, panel_y0+84),
+                              fill=colors[i%len(colors)], outline=(255,255,255), width=2)
+                    d.text((center_x, panel_y0+63), str(i+1), fill=(10,10,10),
+                           font=_gift_font("1",16), anchor="mm")
+                # Actual mixed-font measurement keeps Arabic names centered and
+                # automatically reduces the font size for long usernames.
+                max_name_w = max(70, int(col_w-16))
+                _draw_name_centered(
+                    d, (center_x, panel_y0+91),
+                    "@" + str(u).lstrip("@"),
+                    22, (255,255,255), max_name_w
+                )
 
         out=BASE_DIR/"generated_games"/f"snake_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True)
         img.save(out,"JPEG",quality=84,optimize=True); return out
@@ -7610,8 +7646,10 @@ class TalkinBot:
         security_command = bool(
             re.match(r"^(?:تشغيل|إيقاف) الحماية$", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
-            or str(body or "").strip().casefold() in {"حماية", "l@mfb"}
+            or str(body or "").strip().casefold() in {"حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "l@mfb"}
             or re.match(r"^amf@.+$", str(body or "").strip(), re.I)
+            or re.match(r"^l@mfb$", str(body or "").strip(), re.I)
+            or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
         )
         join_command = bool(re.match(r"^دخول@.+$", str(body or "").strip(), re.I))
         verification_manager_command = _is_verification_manager_command(body)
@@ -7776,9 +7814,15 @@ class TalkinBot:
             return True
 
         # New master protection menu.
-        if low == "حماية":
-            if not _is_master_name(sender): return True
-            self._pending_protection_number[_norm_user(sender)] = {"room":room,"created":time.time()}
+        if low in ("حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه"):
+            if not _is_master_name(sender):
+                self.send_private_text(sender, "🚫 أمر الحماية مخصص للماستر.")
+                return True
+            target_room = str(room or self.room or "").strip()
+            if not target_room:
+                self.send_private_text(sender, "⚠️ أرسل أمر حماية داخل الغرفة التي تريد حمايتها.")
+                return True
+            self._pending_protection_number[_norm_user(sender)] = {"room":target_room,"created":time.time()}
             self.send_private_text(sender,
                 "🛡️ حماية الغرفة\n"
                 "1️⃣ تشغيل حماية الغرفة من السب\n"
@@ -7788,33 +7832,46 @@ class TalkinBot:
                 "5️⃣ تشغيل حماية الغرفة من الدخول والخروج\n"
                 "6️⃣ إيقاف حماية الغرفة من الدخول والخروج\n"
                 "7️⃣ تعيين عدد الرسائل للحماية من الفلود\n\n"
-                "أرسل رقم الخيار الآن.")
+                "📌 أرسل رقم الخيار الآن.")
             return True
-        if _norm_user(sender) in self._pending_protection_number and low.isdigit():
-            st=self._pending_protection_number.get(_norm_user(sender),{})
+
+        # Option 7 has priority over numeric menu choices: otherwise a limit
+        # such as 3 would accidentally be interpreted as option 3.
+        protection_key = _norm_user(sender)
+        st=self._pending_protection_number.get(protection_key,{})
+        if st.get("awaiting_number") and re.fullmatch(r"\d+",low):
+            try:
+                limit=int(low)
+            except Exception:
+                limit=0
+            if not 2 <= limit <= 50:
+                self.send_private_text(sender,"⚠️ أرسل رقماً من 2 إلى 50 فقط.")
+                return True
+            target_room=str(st.get("room") or room or self.room or "").strip()
+            _save_room_protection(target_room,repeat_limit=limit)
+            _save_room_moderation(target_room,repeat_limit=limit)
+            self._pending_protection_number.pop(protection_key,None)
+            self.send_private_text(sender,f"✅ تم اعتماد حد الفلود: {limit} رسائل متكررة في الغرفة: {target_room}")
+            return True
+
+        if protection_key in self._pending_protection_number and low.isdigit():
+            st=self._pending_protection_number.get(protection_key,{})
             if time.time()-float(st.get("created",0))>180:
-                self._pending_protection_number.pop(_norm_user(sender),None)
+                self._pending_protection_number.pop(protection_key,None)
             else:
-                n=int(low); target_room=str(st.get("room") or room or "").strip()
+                n=int(low); target_room=str(st.get("room") or room or self.room or "").strip()
                 if n in range(1,7):
-                    cfg=_room_protection_cfg(target_room)
-                    names={1:("swear",True,"🛡️ تم تشغيل حماية الغرفة من السب."),2:("swear",False,"⛔ تم إيقاف حماية الغرفة من السب."),3:("flood",True,"🛡️ تم تشغيل حماية الغرفة من الفلود."),4:("flood",False,"⛔ تم إيقاف حماية الغرفة من الفلود."),5:("joinleave",True,"🛡️ تم تشغيل حماية الدخول والخروج."),6:("joinleave",False,"⛔ تم إيقاف حماية الدخول والخروج.")}[n]
+                    names={1:("swear",True,"🛡️ تم تشغيل حماية الغرفة من السب."),2:("swear",False,"⛔ تم إيقاف حماية الغرفة من السب."),3:("flood",True,"🛡️ تم تشغيل حماية الغرفة من الفلود."),4:("flood",False,"⛔ تم إيقاف حماية الغرفة من الفلود."),5:("joinleave",True,"🛡️ تم تشغيل حماية الغرفة من الدخول والخروج."),6:("joinleave",False,"⛔ تم إيقاف حماية الغرفة من الدخول والخروج.")}[n]
                     _save_room_protection(target_room, **{names[0]:names[1]})
-                    self._pending_protection_number.pop(_norm_user(sender),None)
+                    self._pending_protection_number.pop(protection_key,None)
                     self.send_private_text(sender,names[2]+f"\n🏠 الغرفة: {target_room}")
                     return True
                 if n==7:
-                    self._pending_protection_number[_norm_user(sender)]={"room":target_room,"created":time.time(),"awaiting_number":True}
+                    self._pending_protection_number[protection_key]={"room":target_room,"created":time.time(),"awaiting_number":True}
                     self.send_private_text(sender,"🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر (من 2 إلى 50).")
                     return True
-        st=self._pending_protection_number.get(_norm_user(sender),{})
-        if st.get("awaiting_number") and re.fullmatch(r"\d+",low):
-            limit=max(2,min(50,int(low))); target_room=str(st.get("room") or room or "")
-            _save_room_protection(target_room,repeat_limit=limit)
-            _save_room_moderation(target_room,repeat_limit=limit)
-            self._pending_protection_number.pop(_norm_user(sender),None)
-            self.send_private_text(sender,f"✅ تم اعتماد حد الفلود: {limit} رسائل متكررة في الغرفة {target_room}.")
-            return True
+                self.send_private_text(sender,"⚠️ اختر رقماً من 1 إلى 7.")
+                return True
         # Filter exception: amf@username
         m_amf=re.fullmatch(r"amf@(.+)",text,re.I)
         if m_amf:
@@ -8715,20 +8772,13 @@ class TalkinBot:
         if not hasattr(self, "_incoming_seen_lock"):
             self._incoming_seen_lock = threading.Lock()
         event_id = str(event_id or "").strip()
-        # Some Talkin builds reuse field 41 for more than one incoming
-        # message. Never deduplicate by that field alone: a new command with
-        # the same transport id must still reach the command handler. Pair the
-        # id with the actual message signature. A content-only replay is kept
-        # for a very short window so a server retransmission is ignored without
-        # making a user repeat a command several times.
-        raw = "\x1f".join(str(v or "") for v in values)
-        signature = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
         if event_id:
-            key = (str(kind), "id+sig", event_id, signature)
-            ttl = 3.0
+            key = (str(kind), "id", event_id)
+            ttl = 300.0
         else:
-            key = (str(kind), "sig", signature)
-            ttl = 0.75
+            raw = "\x1f".join(str(v or "") for v in values)
+            key = (str(kind), "sig", hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest())
+            ttl = 8.0
         with self._incoming_seen_lock:
             previous = self._incoming_seen.get(key, 0.0)
             self._incoming_seen[key] = now
@@ -8914,11 +8964,12 @@ class TalkinBot:
                 notice=f"{reason_text}: {room}\n💡 {advice}"
                 requested_by = str((pending_join or {}).get("requested_by", "") or "").strip()
                 recipient = requested_by or (username if username and _norm_user(username) != _norm_user(BOT_ID) else BOT_MASTER)
+                # The blocked-room notice belongs to the person who sent
+                # دخول@اسم_الغرفة. Do not send this notification privately
+                # to BOT_MASTER as an extra message.
                 if recipient and blocked_room not in self._blocked_room_notices:
                     self.send_private_text(recipient, notice)
                     self._blocked_room_notices.add(blocked_room)
-                if BOT_MASTER and _norm_user(recipient) != _norm_user(BOT_MASTER):
-                    self.send_private_text(BOT_MASTER, f"⚠️ رد الخادم برفض دخول البوت إلى الغرفة: {room}\n{reason_text}\nلم تُحفظ الغرفة في قائمة الاستثناءات؛ أعد المحاولة بعد تعديل صلاحيات البوت.")
 
         if ACK_ROOM_EVENTS and result.get("uid"):
             try:
@@ -9176,6 +9227,21 @@ class TalkinBot:
             }
             result_type = str(result.get("type") or "").strip()
             result_room = str(result.get("value") or "").strip()
+
+            # Some TalkinChat server versions return a join failure without
+            # putting the room name in ResultMessage.value.  In that case the
+            # room is still known from _pending_room_joins, and that pending
+            # record also contains the exact user who sent دخول@اسم_الغرفة.
+            # Use it so the failure notification is delivered to the requester
+            # instead of falling back to BOT_MASTER.
+            if result_type in join_result_types and not result_room:
+                pending_rooms = list(getattr(self, "_pending_room_joins", {}).keys())
+                if len(pending_rooms) == 1:
+                    result_room = str(
+                        getattr(self, "_pending_room_joins", {}).get(pending_rooms[0], {}).get("room", "")
+                        or ""
+                    ).strip()
+
             if (
                 result_type in join_result_types
                 and result_room
@@ -9186,22 +9252,7 @@ class TalkinBot:
                     "uid": result.get("uid", ""),
                 })
             if "room_event" in result:
-                room_event = result.get("room_event") or {}
-                # Keep the raw WebSocket receive loop free. Music downloads,
-                # image work, database calls and management commands can take
-                # seconds; running them inline makes the socket stop reading
-                # newer commands, which is why users sometimes need to send
-                # the same command 3-4 times.
-                event_type = str(room_event.get(1, "") or "").strip()
-                if event_type == "text":
-                    threading.Thread(
-                        target=self.handle_room_event,
-                        args=(result,),
-                        name="room-event-handler",
-                        daemon=True,
-                    ).start()
-                else:
-                    self.handle_room_event(result)
+                self.handle_room_event(result)
             if result.get("rooms"):
                 self._process_room_list(result.get("rooms"))
             if result.get("users") or result.get("room_admin"):
