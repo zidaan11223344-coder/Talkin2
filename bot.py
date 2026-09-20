@@ -3255,6 +3255,7 @@ class TalkinBot:
         # was accepted by the room server.
         self.pending_admin_actions = {}
         self.pending_admin_lock = threading.Lock()
+        self.last_admin_actions = {}
         # Reaction/publish state must exist before any background music or
         # image-publish worker can write to it.
         self.reaction_targets = {}
@@ -3691,11 +3692,69 @@ class TalkinBot:
         return [text] if text else [""]
 
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
-        # Normal replies remain one complete message. Only help menus use the
-        # explicit line-based batching in _send_help_chunks below.
+        """Send every textual result in safe ordered chunks, like A3.
+
+        Talkin can close the WebSocket when a large result is sent as one
+        protobuf packet.  All text responses therefore use the same line-based
+        batching rule as the A3 command: short packets, preserved order, and
+        no loss of lines.
+        """
+        text = str(text or "")
+        if not text:
+            return True
+        limit = 185
+        max_lines = 10
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if not lines:
+            lines = [text[:limit]]
+        chunks = []
+        current = ""
+        count = 0
+        for line in lines:
+            # A single unusually long line is split too, so no result can
+            # produce an oversized packet.
+            while len(line) > limit:
+                piece = line[:limit]
+                if current:
+                    chunks.append(current)
+                    current = ""
+                    count = 0
+                chunks.append(piece)
+                line = line[limit:]
+            if not line:
+                continue
+            candidate = line if not current else current + "\n" + line
+            if current and (len(candidate) > limit or count >= max_lines):
+                chunks.append(current)
+                current = line
+                count = 1
+            else:
+                current = candidate
+                count += 1
+        if current:
+            chunks.append(current)
+        # Long results are paginated.  Only the first page is sent now; the
+        # user can type Ns to receive the next page.  This prevents a large
+        # result from flooding the room or closing the websocket.
+        if len(chunks) > 1:
+            if not hasattr(self, "_result_pages"):
+                self._result_pages = {}
+            room_key = str(kwargs.get("room") or "")
+            user_key = str(kwargs.get("to") or "")
+            key = (str(packet_type), room_key, user_key)
+            self._result_pages[key] = {
+                "pages": chunks,
+                "part": 1,
+                "created": time.time(),
+                "kwargs": dict(kwargs),
+            }
+            chunk = chunks[0] + "\n\n📌 للقائمة التالية اكتب Ns"
+        else:
+            chunk = chunks[0]
+
         payload = dict(kwargs)
         payload["type_"] = "text"
-        payload["body"] = str(text or "")
+        payload["body"] = chunk
         self.send_query(encode_query(packet_type, **payload))
         return True
 
@@ -3836,6 +3895,7 @@ class TalkinBot:
                 "room": room, "target": target, "role": expected_role,
                 "requester": requester, "created_at": time.time(), "announced": False,
                 "announce_room": bool(announce_room),
+                "previous_role": self.room_users.get(room, {}).get(target),
             }
         labels = {
             "kicked": "طرد",
@@ -5687,7 +5747,9 @@ class TalkinBot:
                 self.fixed_game_waiting[game_name]={"user":sender,"room":room,"created":time.time(),"reserved":True,"prize":prize}
             else:
                 return True
-        self.broadcast_all_rooms(challenge)
+        # إعلان بداية الألعاب الخمس يكون في الغرفة التي بدأت منها اللعبة فقط.
+        # لا نرسل رسالة البحث عن منافس إلى جميع الغرف.
+        self.send_room_text(room, challenge)
         return True
 
     def _fruit_match(self, room, sender, emoji):
@@ -7665,6 +7727,38 @@ class TalkinBot:
                     elif room:
                         self.send_room_text(room, "✅ انتهت قوائم كلمات الفلتر.\n📌 أرسل l@mf لعرضها من البداية.")
                 return True
+
+            # Generic long-result navigation. Any command that produced more
+            # than one safe text page is continued with Ns.
+            result_pages = getattr(self, "_result_pages", {})
+            result_key_room = str(room or "")
+            result_key_user = str(sender or "") if is_private else ""
+            result_key = ("chat_message" if is_private else "room_message", result_key_room, result_key_user)
+            result_state = result_pages.get(result_key)
+            if result_state:
+                pages = result_state.get("pages") or []
+                part = int(result_state.get("part", 1) or 1)
+                if part < len(pages):
+                    part += 1
+                    result_state["part"] = part
+                    chunk = pages[part - 1]
+                    if part < len(pages):
+                        chunk += "\n\n📌 للقائمة التالية اكتب Ns"
+                    else:
+                        chunk += "\n\n✅ انتهت القوائم."
+                    payload = dict(result_state.get("kwargs") or {})
+                    payload["type_"] = "text"
+                    payload["body"] = chunk
+                    self.send_query(encode_query("chat_message" if is_private else "room_message", **payload))
+                else:
+                    result_pages.pop(result_key, None)
+                    msg = "✅ انتهت القوائم.\n📌 أرسل الأمر من جديد لعرض النتائج من البداية."
+                    if is_private:
+                        self.send_private_text(sender, msg)
+                    elif room:
+                        self.send_room_text(room, msg)
+                return True
+
             # ns only works after the user explicitly opened a category with a1..a6.
             # Never default to a1, otherwise a bare ns in a room would expose admin help.
             if key not in self.help_pages:
@@ -8581,6 +8675,23 @@ class TalkinBot:
                 self.send_room_text(active_room, f"🚫 @{target} تم حظره بسبب الإساءة.")
                 self.request_admin_action(active_room, target, "ban", sender)
             return True
+        if low == ".u":
+            if not _is_master_name(sender):
+                return True
+            undo = self.last_admin_actions.get(_norm_user(sender))
+            if not undo:
+                self.send_private_text(sender, "📭 لا يوجد إجراء إداري مؤكد يمكن التراجع عنه.")
+                return True
+            target_room = str(undo.get("room") or room or "").strip()
+            target_user = str(undo.get("target") or "").strip().lstrip("@")
+            inverse = str(undo.get("inverse") or "member").strip().lower()
+            if not target_room or not target_user:
+                self.send_private_text(sender, "❌ تعذر تحديد آخر إجراء للتراجع عنه.")
+                return True
+            if self.request_admin_action(target_room, target_user, inverse, sender):
+                self.send_private_text(sender, f"↩️ جاري التراجع عن آخر إجراء: @{target_user}")
+            return True
+
         m=re.match(r"^(u@|ub@|unban\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
@@ -8962,6 +9073,23 @@ class TalkinBot:
                 with self.pending_admin_lock:
                     pending = self.pending_admin_actions.pop(key, None)
                 if pending:
+                    requester = str(pending.get("requester") or "").strip()
+                    inverse = {
+                        "kicked": "member",
+                        "outcast": "member",
+                        "member": pending.get("previous_role") or "outcast",
+                        "admin": pending.get("previous_role") or "member",
+                        "owner": pending.get("previous_role") or "member",
+                    }.get(changed_role, "member")
+                    if requester and _is_master_name(requester):
+                        self.last_admin_actions[_norm_user(requester)] = {
+                            "room": pending.get("room") or room,
+                            "target": pending.get("target") or changed_user,
+                            "operation": pending.get("role"),
+                            "confirmed_role": changed_role,
+                            "inverse": inverse,
+                            "created_at": time.time(),
+                        }
                     labels = {
                         "kicked": f"✅ أكد الخادم طرد @{changed_user} من الغرفة {room}.",
                         "outcast": f"✅ أكد الخادم حظر @{changed_user} في الغرفة {room}.",
