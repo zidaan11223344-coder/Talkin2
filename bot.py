@@ -7523,6 +7523,55 @@ class TalkinBot:
             return True
         return False
 
+    def _filter_list_key(self, room, sender):
+        return (str(room or ""), _norm_user(sender))
+
+    def _build_filter_list_pages(self, words):
+        """Build short filter-word pages like A3, keeping every packet under 200 chars."""
+        clean=[]
+        seen=set()
+        for word in words or []:
+            w=str(word or "").strip()
+            k=_norm_filter_text(w)
+            if w and k and k not in seen:
+                seen.add(k); clean.append(w)
+        pages=[]; current=[]
+        for w in clean:
+            # Keep the visible list compact enough for Talkin's room/private packet limit.
+            if len(current) >= 7:
+                pages.append(current); current=[]
+            candidate=current + [w]
+            body="\n".join(f"{i}. {x}" for i,x in enumerate(candidate,1))
+            header="🚫 كلمات الفلتر\n━━━━━━━━━━━━\n"
+            if len(header)+len(body)+len("\n\n📌 للقائمة التالية اكتب Ns") > 185 and current:
+                pages.append(current); current=[w]
+            else:
+                current=candidate
+        if current: pages.append(current)
+        return pages
+
+    def _send_filter_list_page(self, room, sender, is_private, part=1):
+        state=getattr(self, "_filter_list_state", {}).get(self._filter_list_key(room,sender))
+        if not state:
+            return False
+        pages=state.get("pages") or []
+        if not pages:
+            text="🚫 كلمات الفلتر\n━━━━━━━━━━━━\n📭 قائمة الفلتر فارغة حالياً."
+        else:
+            idx=max(1,min(int(part),len(pages)))-1
+            lines=["🚫 كلمات الفلتر", "━━━━━━━━━━━━"]
+            lines.extend(f"{i}. {w}" for i,w in enumerate(pages[idx],1))
+            if idx < len(pages)-1:
+                lines.append("\n📌 للقائمة التالية اكتب Ns")
+            else:
+                lines.append("\n✅ انتهت قوائم كلمات الفلتر.")
+            text="\n".join(lines)
+        if is_private:
+            return self._send_text_packets("chat_message", text, to=sender)
+        if room:
+            return self._send_text_packets("room_message", text, room=room)
+        return False
+
     def _send_help_section(self, room=None, private_to=None, page=1, part=1):
         sections = _help_sections_from_messages()
         page_sections = sections.get(int(page), [])
@@ -7601,6 +7650,21 @@ class TalkinBot:
             return True
         if _body_low in ("ns", "n", "التالي", "القائمة التالية", "next"):
             key = (str(room), _norm_user(sender))
+            # Filter-word navigation has priority over A1..A6 navigation.
+            filter_state = getattr(self, "_filter_list_state", {}).get(self._filter_list_key(room, sender))
+            if filter_state:
+                pages = filter_state.get("pages") or []
+                part = int(filter_state.get("part", 1) or 1)
+                if part < len(pages):
+                    part += 1
+                    filter_state["part"] = part
+                    self._send_filter_list_page(room, sender, is_private, part)
+                else:
+                    if is_private:
+                        self.send_private_text(sender, "✅ انتهت قوائم كلمات الفلتر.\n📌 أرسل l@mf لعرضها من البداية.")
+                    elif room:
+                        self.send_room_text(room, "✅ انتهت قوائم كلمات الفلتر.\n📌 أرسل l@mf لعرضها من البداية.")
+                return True
             # ns only works after the user explicitly opened a category with a1..a6.
             # Never default to a1, otherwise a bare ns in a room would expose admin help.
             if key not in self.help_pages:
@@ -8167,10 +8231,12 @@ class TalkinBot:
                 return True
             if low == "l@mf":
                 words = sorted(self.banned_words, key=lambda x: _norm_filter_text(x))
-                if words:
-                    self.send_private_text(sender, "🚫 كلمات الفلتر:\n" + "\n".join(f"• {w}" for w in words))
-                else:
-                    self.send_private_text(sender, "🚫 قائمة الفلتر فارغة حالياً.")
+                if not hasattr(self, "_filter_list_state"):
+                    self._filter_list_state = {}
+                key = self._filter_list_key(room, sender)
+                pages = self._build_filter_list_pages(words)
+                self._filter_list_state[key] = {"pages": pages, "part": 1, "created": time.time()}
+                self._send_filter_list_page(room, sender, is_private, 1)
                 return True
 
         # Joining a room: ask the master for bot language first.
