@@ -3453,9 +3453,15 @@ class TalkinBot:
         return []
 
     def _render_auto_reply(self, template, username, room):
-        return (str(template or "")
-                .replace("{username}", str(username or "").strip().lstrip("@"))
-                .replace("{room}", str(room or "")))
+        # Automatic replies always show the username as plain text, never as
+        # a mention. This also handles templates that were saved previously
+        # as "@{username}".
+        clean_name = str(username or "").strip().lstrip("@")
+        text = str(template or "")
+        text = text.replace("@{username}", "{username}")
+        text = text.replace("{username}", clean_name)
+        text = text.replace("{room}", str(room or ""))
+        return text.replace("@@", "@")
 
     def _choose_auto_reply(self, trigger, username, room):
         variants = self._auto_reply_variants(trigger)
@@ -9013,6 +9019,45 @@ class TalkinBot:
             return True
         return False
 
+    def _ocr_publish_image(self, media_url):
+        """Extract visible text from a publish image for the same word filter.
+
+        OCR is best-effort: if OCR is unavailable or the image has no readable
+        text, publication continues normally. Arabic and English are both
+        scanned.
+        """
+        if not TESSERACT_AVAILABLE or not PIL_AVAILABLE or not media_url:
+            return ""
+        try:
+            from io import BytesIO
+            r = requests.get(media_url, headers={"User-Agent":"Mozilla/5.0", "Accept":"image/*"}, timeout=(6,20))
+            r.raise_for_status()
+            if len(r.content) > 12 * 1024 * 1024:
+                return ""
+            img = Image.open(BytesIO(r.content)).convert("RGB")
+            # Keep OCR responsive on Railway while retaining enough detail for
+            # Arabic text in normal phone screenshots/photos.
+            max_side = 2200
+            if max(img.size) > max_side:
+                ratio = max_side / float(max(img.size))
+                img = img.resize((max(1,int(img.width*ratio)), max(1,int(img.height*ratio))))
+            try:
+                return str(pytesseract.image_to_string(img, lang="ara+eng", config="--psm 6") or "").strip()
+            except Exception:
+                return str(pytesseract.image_to_string(img, lang="eng", config="--psm 6") or "").strip()
+        except Exception as exc:
+            self.log("[PUBLISH-OCR] skipped:", repr(exc))
+            return ""
+
+    def _find_publish_filter_hit(self, text):
+        if not getattr(self, "moderation_enabled", True):
+            return None
+        normalized = _norm_filter_text(text)
+        if not normalized:
+            return None
+        return next((w for w in sorted(self.banned_words, key=lambda x: _norm_filter_text(x))
+                     if _norm_filter_text(w) and _norm_filter_text(w) in normalized), None)
+
     def _handle_publish_media(self, room, sender, media_url, description=""):
         if not media_url: return False
         # Accept the pending image from ANY room (or private chat).
@@ -9025,14 +9070,15 @@ class TalkinBot:
             self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
             self.publish_pending.pop(key,None)
             return True
-        publish_check=_norm_filter_text(desc)
-        publish_hit=(
-            next((w for w in sorted(self.banned_words,key=lambda x:_norm_filter_text(x))
-                  if _norm_filter_text(w) and _norm_filter_text(w) in publish_check),None)
-            if bool(getattr(self,"moderation_enabled",True)) else None
-        )
+        # Check both the written description and text visible inside the image.
+        publish_hit = self._find_publish_filter_hit(desc)
+        ocr_text = ""
+        if not publish_hit:
+            ocr_text = self._ocr_publish_image(media_url)
+            publish_hit = self._find_publish_filter_hit(ocr_text)
         if publish_hit:
-            self.send_private_text(sender,"🚫 تم منع النشر: الوصف يحتوي كلمة محظورة في الفلتر.\n⛔ تم منع حسابك من النشر حتى فك المنع.")
+            source = "الوصف" if self._find_publish_filter_hit(desc) else "الصورة"
+            self.send_private_text(sender, f"🚫 تم منع النشر: تم اكتشاف كلمة محظورة في {source}.\n⛔ تم منع حسابك من النشر حتى فك المنع.")
             self.publish_pending.pop(key,None)
             _record_filter_ban(sender,room,"محاولة نشر كلمة مسيئة",publish_hit)
             _record_publish_ban(sender,room,publish_hit)

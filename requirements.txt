@@ -4,5 +4,7 @@ yt-dlp>=2026.08.19
 Pillow>=10.0
 arabic-reshaper>=3.0.0
 python-bidi>=0.6.0
+fonttools>=4.50
+supabase>=2.0
 
-fonttools>=4.55.0
+pytesseract>=0.3.13
