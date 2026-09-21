@@ -3540,7 +3540,7 @@ class TalkinBot:
         self.banned_words = set(moderation_words)
         self.bot_blocked_users = _bot_blocked_users()
         self.filter_exceptions = _filter_exception_users()
-        self._joinleave_state = defaultdict(lambda: {"events":[], "active_until":0.0, "wave_users":set(), "banned":set()})
+        self._joinleave_state = defaultdict(lambda: defaultdict(lambda: {"events":[], "last_type":"", "banned_until":0.0}))
         self._pending_protection_number = {}
         self.snake_games = {}
         self.ludo_games = {}
@@ -4511,7 +4511,7 @@ class TalkinBot:
             return False
 
     def request_live_room(self, room: str):
-        """Send a real live-seat invitation for this exact room."""
+        """Join the live seat immediately, with callback support as a fallback."""
         room = str(room or "").strip()
         if not STREAM_EXPERIMENTAL_ENABLED:
             self.send_room_text(room, "❌ البث الحي غير مفعّل في إعدادات البوت.")
@@ -4520,15 +4520,36 @@ class TalkinBot:
             return False
         try:
             self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
-            self.log("[STREAM] real live invite", room, STREAM_INVITE_ACTION)
+            self._live_ready_rooms.discard(room)
+            self.log("[STREAM] request live seat", room, STREAM_INVITE_ACTION)
+
+            # Some Talkin builds accept a self seat request directly using the
+            # room name. Newer builds answer with a live-invite callback; the
+            # callback handler below remains enabled for those builds.
             self.send_query(encode_query(
                 STREAM_INVITE_ACTION, room=room, to=BOT_ID,
             ))
-            self.send_room_text(room, "📡 تم إرسال دعوة صعود فعلية للبوت في هذه الغرفة. بانتظار تأكيد الخادم...")
+            time.sleep(float(os.getenv("STREAM_ACCEPT_DELAY", "0.8")))
+
+            # Legacy/current fallback: accept the seat without waiting for a
+            # you_invited event. This is important for builds that silently
+            # accept the invite but never emit a callback to the bot.
+            accept_result = self.send_query(encode_query(
+                STREAM_ACCEPT_ACTION, room=room, to=BOT_ID,
+                value=BOT_ID, state=STREAM_ACCEPT_STATE,
+            ))
+            if accept_result is False:
+                raise RuntimeError("خادم Talkin رفض طلب قبول مقعد البث")
+            self._live_ready_rooms.add(room)
+            self.send_room_text(
+                room,
+                "🎙️✅ تم إرسال طلب صعود البوت للبث الحي. "
+                "إذا قبل الخادم المقعد يمكنك الآن استخدام: بث اسم الأغنية"
+            )
         except Exception as exc:
             self._live_ready_rooms.discard(room)
-            self.log("[STREAM] manual invite failed:", repr(exc))
-            self.send_room_text(room, f"❌ تعذر إرسال دعوة الصعود للبث: {str(exc)[:180]}")
+            self.log("[STREAM] manual live join failed:", repr(exc))
+            self.send_room_text(room, f"❌ تعذر صعود البوت للبث: {str(exc)[:180]}")
         return True
 
     def _master_is_online(self):
@@ -4552,7 +4573,13 @@ class TalkinBot:
                                 if str(item.get("room_id", "")) == room_id), None)
             pending = pending_tracks.get(pending_key) if pending_key else None
             room_name = pending_key or room_name
-        self.log("[STREAM] you_invited", room_name, "room_id=", room_id, "invite_id=", invite_id)
+        self.log(
+            "[STREAM] you_invited",
+            room_name,
+            "room_id=", room_id,
+            "invite_id=", invite_id,
+            "token=", str(event.get(5, "") or event.get("token", "") or "").strip(),
+        )
         if not room_id or not invite_id:
             self.log("[STREAM] no queued track for invitation", room_name)
             return False
@@ -5131,15 +5158,9 @@ class TalkinBot:
         with self.invite_lock:
             self.invite_sent.add(username)
         self.log("[INV] normal private invite sent:", username, "room=", room)
-        # Talkin renders the font tag as the same green system-style notice
-        # used for role changes such as promotion/ban confirmations.
-        try:
-            self.send_room_text(
-                room,
-                f'<font color="#00C853">📨 تمت دعوة @{username} من الغرفة.</font>',
-            )
-        except Exception as exc:
-            self.log("[INV] room notice failed:", repr(exc))
+        # Do NOT announce each invitation inside the room. Invitations are a
+        # background action: only the invited user receives the private invite,
+        # while progress/result is reported privately to the command sender.
         return True
 
     def _users_from_room_admin(self, room_admin):
@@ -5299,6 +5320,117 @@ class TalkinBot:
             self.log("[GIFT] receiver photo lookup failed:", repr(exc))
         return ""
 
+    def _process_pending_room_role_list(self, result):
+        """Finish l@o/l@a/l@m from a fresh native occupants_list response."""
+        pending_map = getattr(self, "_pending_room_role_lists", {})
+        if not pending_map:
+            return False
+
+        # Prefer the room carried by the request state. The response may omit
+        # the room name on some Talkin builds.
+        candidates = []
+        for key, item in list(pending_map.items()):
+            room_name = str(item.get("room") or "").strip()
+            if room_name:
+                candidates.append((key, item, room_name))
+
+        if not candidates:
+            return False
+
+        # If the response itself identifies a room, use that exact pending
+        # request; otherwise a single pending request is unambiguous.
+        response_room = str(result.get("_occupants_room") or "").strip()
+        chosen = None
+        if response_room:
+            chosen = next(
+                (x for x in candidates if _norm_room(x[2]) == _norm_room(response_room)),
+                None,
+            )
+        if chosen is None and len(candidates) == 1:
+            chosen = candidates[0]
+        if chosen is None:
+            return False
+
+        key, pending, room_name = chosen
+        room_admin = result.get("room_admin") or {}
+        users = self._users_from_room_admin(room_admin) if room_admin else []
+
+        # Some builds expose the same UserItem records through ResultMessage.users.
+        if not users:
+            for user in result.get("users") or []:
+                if not isinstance(user, dict):
+                    continue
+                username = str(user.get(1, "") or "").strip()
+                if not username:
+                    continue
+                users.append({
+                    "username": username,
+                    "role": str(user.get(6, "none") or "none").strip().lower() or "none",
+                    "user_id": str(user.get(2, "") or "").strip(),
+                })
+
+        # A malformed/empty response is not a valid role list. Keep the
+        # pending request briefly so a follow-up frame can complete it.
+        if not users:
+            self.log("[ROOM-ROLES] occupants response contained no UserItem records", room_name)
+            return False
+
+        pending_map.pop(key, None)
+
+        owner_roles = {"owner", "creator", "room_owner", "room_creator"}
+        admin_roles = {"admin", "moderator", "mod"}
+
+        owners = []
+        admins = []
+        members = []
+        for user in users:
+            username = str(user.get("username") or "").strip().lstrip("@")
+            if not username or _norm_user(username) == _norm_user(BOT_ID):
+                continue
+            role = str(user.get("role") or "none").strip().casefold()
+            if role in owner_roles:
+                owners.append(username)
+            elif role in admin_roles:
+                admins.append(username)
+            else:
+                # The server's settings list uses member/user/none on ordinary
+                # accounts. Unknown non-privileged role values are also kept
+                # here rather than silently dropping a configured account.
+                members.append(username)
+
+        role_kind = str(pending.get("kind") or "members")
+        rows = {
+            "owners": owners,
+            "admins": admins,
+            "members": members,
+        }[role_kind]
+        labels = {
+            "owners": "👑 أونرات الغرفة",
+            "admins": "🛡️ مشرفين الغرفة",
+            "members": "👤 أعضاء الغرفة",
+        }
+
+        lines = [
+            f"{labels[role_kind]}: {room_name}",
+            "━━━━━━━━━━━━",
+            f"📊 العدد: {len(rows)}",
+        ]
+        if rows:
+            lines.extend(f"{i}. @{name}" for i, name in enumerate(rows, 1))
+        else:
+            lines.append("📭 لا توجد حسابات في هذه الفئة.")
+
+        sender = str(pending.get("sender") or BOT_MASTER or "").strip()
+        if sender:
+            self._send_text_packets("chat_message", "\n".join(lines), to=sender)
+
+        self.log(
+            f"[ROOM-ROLES] room={room_name} kind={role_kind} "
+            f"owners={len(owners)} admins={len(admins)} members={len(members)}"
+        )
+        return True
+
+
     def process_occupants_for_invite(self, result):
         room = (self.invite_room or result.get("_occupants_room") or
                 self.last_joined_room or self.room)
@@ -5308,6 +5440,11 @@ class TalkinBot:
         # history logic: connected_rooms is intentionally session-only.
         if room:
             self.connected_rooms.add(room)
+
+        # l@o/l@a/l@m consume the same native room-settings response but never
+        # enter the invitation worker.
+        if self._process_pending_room_role_list(result):
+            return
 
         # Fallback live responses are tagged by the room they came from.
         # Accumulate all room responses before sending the final invitation batch.
@@ -9451,6 +9588,51 @@ class TalkinBot:
             msg = _format_saved_accounts("👑 ماسترات التوثيق", { _norm_user(x): {"username": x} for x in _mvip_master_list() }, "📭 لا توجد ماسترات توثيق.")
             self.send_private_text(sender, msg)
             return True
+        # Live room-settings role lists:
+        # l@o = owners, l@a = moderators/admins, l@m = ordinary members.
+        # These are NOT read from the saved roster. A fresh native
+        # room_admin/occupants_list request is made for the exact room where
+        # the command was issued, so offline users in the room settings are
+        # included when the server returns them.
+        if low in ("l@o", "l@a", "l@m"):
+            if not _is_master_name(sender):
+                return True
+            target_room = str(room or "").strip()
+            if not target_room:
+                self.send_private_text(sender, "⚠️ نفّذ l@o أو l@a أو l@m داخل الغرفة المطلوبة.")
+                return True
+            if not hasattr(self, "_pending_room_role_lists"):
+                self._pending_room_role_lists = {}
+            role_kind = {"l@o": "owners", "l@a": "admins", "l@m": "members"}[low]
+            self._pending_room_role_lists[_norm_room(target_room)] = {
+                "kind": role_kind,
+                "sender": sender,
+                "room": target_room,
+                "created_at": time.time(),
+            }
+            try:
+                self.send_query(encode_query(
+                    "room_admin",
+                    type_="occupants_list",
+                    room=target_room,
+                    to=BOT_ID,
+                    value="none",
+                ))
+                labels = {
+                    "owners": "الأونرات",
+                    "admins": "المشرفين",
+                    "members": "الأعضاء",
+                }
+                self.send_private_text(
+                    sender,
+                    f"⏳ جاري جلب {labels[role_kind]} من إعدادات الغرفة: {target_room}"
+                )
+            except Exception as exc:
+                self._pending_room_role_lists.pop(_norm_room(target_room), None)
+                self.log("[ROOM-ROLES] occupants request failed:", repr(exc))
+                self.send_private_text(sender, f"❌ تعذر جلب إعدادات الغرفة: {str(exc)[:180]}")
+            return True
+
         if low == "l@mas":
             if not _is_master_name(sender):
                 return True
@@ -9697,11 +9879,14 @@ class TalkinBot:
                 }
                 self.send_room_text(target_room, "⏳ جاري التحقق من رتبة البوت...\n👑 يجب أن يكون البوت أونر لإكمال الدعوات.")
                 return True
+            # Run the invitation job in the background. Do not spam the room
+            # with per-user notices or HTML <font> tags; send the final result
+            # privately to the user who issued `inv`.
             self.request_occupants(
                 target_room,
                 silent_master=False,
-                response_room=target_room,
-                response_to="",
+                response_room="",
+                response_to=sender,
             )
             return True
         m_single_invite = re.fullmatch(r"i@(.+)", text.strip(), re.I)
@@ -9920,6 +10105,12 @@ class TalkinBot:
         # A room that rejected/banned the bot must not abort or receive this
         # publication; all other active rooms continue normally.
         rooms=self._active_rooms()
+        # If the publication arrived from a room that is temporarily missing
+        # from connected_rooms during a reconnect, still publish to that
+        # authenticated source room. The normal active-room broadcast remains
+        # unchanged when connected_rooms is populated.
+        if not rooms and source_room:
+            rooms = [source_room]
         # In rooms, the successful publish message contains ONLY the reaction
         # controls. The publish status/result is sent privately to the master.
         base_code=uuid.uuid4().hex[:4]
@@ -9983,7 +10174,8 @@ class TalkinBot:
             return False
         tried = set()
         ordered = list(candidates or [])
-        ordered.extend(list(getattr(self, "publish_pending", {}).keys()))
+        pending_keys = list(getattr(self, "publish_pending", {}).keys())
+        ordered.extend(pending_keys)
         for sender in ordered:
             sender = str(sender or "").strip()
             key = _norm_user(sender)
@@ -9992,6 +10184,22 @@ class TalkinBot:
             tried.add(key)
             if self._handle_publish_media(room, sender, media_url):
                 return True
+
+        # Talkin image frames on some server builds expose the uploader as
+        # the bot, an internal numeric id, or no username at all. If there is
+        # exactly one fresh pending publish request, that request itself is
+        # the authorization; consume it rather than silently dropping the
+        # image because the media wrapper changed its sender field.
+        pending = getattr(self, "publish_pending", {})
+        if len(pending) == 1:
+            sender_key, item = next(iter(pending.items()))
+            try:
+                if time.time() - float(item.get("created_at", 0) or 0) <= 120:
+                    if self._handle_publish_media(room, sender_key, media_url):
+                        self.log("[PUBLISH] consumed image using the single pending request fallback")
+                        return True
+            except Exception as exc:
+                self.log("[PUBLISH] pending fallback failed:", repr(exc))
         return False
 
     def _is_duplicate_incoming(self, kind, values, event_id=""):
@@ -10077,52 +10285,23 @@ class TalkinBot:
             self.log("[DEDUP] ignored repeated room event")
             return
 
-        # Fast join/leave flood protection: four different users inside ONE
-        # second trigger an immediate ban for the whole wave.  The active wave
-        # stays open for one second so additional accounts arriving immediately
-        # after the trigger are banned too.
-        # Some Talkin server builds put the affected account in field 17 or 2
-        # instead of field 22.  Use all native user fields so rapid join events
-        # are not missed.
-        flood_username = str(
-            event.get(22, "") or event.get(17, "") or event.get(2, "") or ""
-        ).strip()
-        if event_type in ("user_joined", "user_left") and flood_username:
-            pcfg = _room_protection_cfg(room)
-            uname = _norm_user(flood_username)
-            if pcfg.get("joinleave") and uname and uname != _norm_user(BOT_ID):
-                # Masters and explicit filter exceptions are never touched.
-                if not _is_master_name(flood_username) and uname not in getattr(self, "filter_exceptions", set()):
-                    key = _norm_room(room)
-                    state = self._joinleave_state[key]
-                    now = time.time()
-                    events = state.setdefault("events", [])
-                    # Detection window is deliberately only 1 second.
-                    events[:] = [(ts, user, typ) for ts, user, typ in events if now - float(ts) <= 1.0]
-                    events.append((now, uname, event_type))
-                    active_until = float(state.get("active_until", 0.0) or 0.0)
-                    unique_users = {u for _ts, u, _typ in events if u}
-
-                    if active_until <= now and len(unique_users) >= 4:
-                        state["active_until"] = now + 1.0
-                        state["wave_users"] = set(unique_users)
-                        state["banned"] = set()
-                        active_until = now + 1.0
-
-                    if active_until > now:
-                        state.setdefault("wave_users", set()).update(unique_users)
-                        wave = set(state.get("wave_users", set()))
-                        already = state.setdefault("banned", set())
-                        for victim in wave:
-                            if not victim or victim in already:
-                                continue
-                            try:
-                                self.send_admin(room, victim, "ban")
-                                already.add(victim)
-                                _record_filter_ban(victim, room, "حماية فلود الدخول والخروج", "4 نكات خلال ثانية واحدة")
-                                self.log(f"[JOINLEAVE] permanent b@ ban room={room} target=@{victim}")
-                            except Exception as exc:
-                                self.log(f"[JOINLEAVE] ban failed room={room} target=@{victim}: {exc!r}")
+        # Keep the live membership state in sync.  The APK itself uses these
+        # exact event names and RoomEvent fields.
+        if event_type in ("user_joined", "user_left") and username:
+            pcfg=_room_protection_cfg(room)
+            if pcfg.get("joinleave") and _norm_user(username)!=_norm_user(BOT_ID):
+                st=self._joinleave_state[_norm_room(room)][_norm_user(username)]
+                now=time.time(); evs=st.setdefault("events",[])
+                evs[:]=[x for x in evs if now-float(x[0])<=600]
+                evs.append((now,event_type))
+                if len(evs)>=4 and now>=float(st.get("banned_until",0) or 0):
+                    try:
+                        self.send_admin(room,username,"ban")
+                        st["banned_until"]=now+120
+                        _record_filter_ban(username,room,"حماية الدخول والخروج", "دخول/خروج متكرر")
+                        self.send_room_text(room,f"🚫 تم حظر @{username} لمدة دقيقتين بسبب تكرار الدخول والخروج.")
+                        threading.Timer(120.0, lambda r=room,u=username: self._auto_unban(r,u)).start()
+                    except Exception as exc: self.log("[JOINLEAVE] ban failed",repr(exc))
         
         if event_type == "user_joined" and username:
             self.room_users[room][username] = role or "none"
@@ -10289,40 +10468,6 @@ class TalkinBot:
                 "",
         ) or first_http_url(event)
         if event_type in {"image", "photo", "picture", "media", "file"} or (media_url and event_type not in {"text", "user_joined", "user_left"}):
-            # Ultra-fast repeated-image protection: if the same image is posted
-            # by the same account again within 1 second, ban the sender with
-            # the native permanent room ban (b@ / outcast).  URL equality is
-            # checked first because it is instantaneous; content hashing is
-            # also attempted for different URLs when possible.
-            try:
-                img_sender = next((x for x in (frm, event.get(22, ""), event.get(17, ""), event.get(2, ""), event.get("sender", ""), event.get("username", ""), event.get("from", "")) if str(x or "").strip()), "")
-                img_sender = str(img_sender or "").strip()
-                img_key = _norm_user(img_sender)
-                cfg = _room_protection_cfg(room)
-                if media_url and img_key and img_key != _norm_user(BOT_ID) and cfg.get("joinleave") and not _is_master_name(img_sender):
-                    now_img = time.time()
-                    if not hasattr(self, "_repeat_image_seen"):
-                        self._repeat_image_seen = {}
-                    # The URL is the fastest stable fingerprint.
-                    url_key = re.sub(r"[?#].*$", "", str(media_url).strip()).casefold()
-                    previous = self._repeat_image_seen.get((img_key, url_key))
-                    # Drop stale entries cheaply.
-                    if previous and now_img - float(previous) < 1.0:
-                        try:
-                            self.send_admin(room, img_sender, "ban")
-                            self.log(f"[IMAGE-FLOOD] permanent b@ ban room={room} target=@{img_sender}")
-                            _record_filter_ban(img_sender, room, "حماية تكرار الصورة خلال ثانية", "same image < 1s")
-                        except Exception as exc:
-                            self.log(f"[IMAGE-FLOOD] ban failed room={room} target=@{img_sender}: {exc!r}")
-                        self._repeat_image_seen[(img_key, url_key)] = now_img
-                    else:
-                        self._repeat_image_seen[(img_key, url_key)] = now_img
-                    if len(self._repeat_image_seen) > 2000:
-                        cutoff_img = now_img - 5.0
-                        self._repeat_image_seen = {k:v for k,v in self._repeat_image_seen.items() if now_img-float(v) <= 5.0}
-            except Exception as exc:
-                self.log("[IMAGE-FLOOD] detector failed:", repr(exc))
-
             # Different Talkin server versions put the image author in field
             # 2 or field 22 (or expose it by name). Try all candidates so a
             # valid انشر followed by a photo is never silently discarded.
@@ -10767,7 +10912,12 @@ class TalkinBot:
                     if body.strip().startswith((".تشغيل ", "بث ")):
                         is_room_broadcast = body.strip().startswith("بث ")
                         command = body.replace(".تشغيل ", ".sa ", 1) if not is_room_broadcast else body.replace("بث ", ".sa ", 1)
-                        if self.handle_music_command(self.room, command, frm, broadcast_all=is_room_broadcast, with_reactions=False):
+                        if self.handle_music_command(
+                                self.room, command, frm,
+                                broadcast_all=not is_room_broadcast,
+                                with_reactions=False,
+                                room_output=not is_room_broadcast,
+                                live_stream=is_room_broadcast):
                             return
                     if body.strip().lower().startswith(".sa "):
                         if self.handle_music_command(self.room, body, frm):
