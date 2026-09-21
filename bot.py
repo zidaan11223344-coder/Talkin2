@@ -156,6 +156,18 @@ MASTER_SUPPORT_USERNAME = os.getenv(
     "∫♚∫اݪـــۛــ⃮ـاۿــ𓏺𓏺ـيّـــّٰـبــۃ∫♚∫",
 ).strip()
 MASTER_SERVICE_ENABLED = os.getenv("MASTER_SERVICE_ENABLED", "0") == "1"
+# Experimental Talkin live-room actions.  These names are configurable because
+# older APK/server builds use different Query action strings.  The defaults
+# match the action family observed by the current bot transport.
+STREAM_EXPERIMENTAL_ENABLED = os.getenv("STREAM_EXPERIMENTAL_ENABLED", "1") == "1"
+STREAM_INVITE_ACTION = os.getenv("STREAM_INVITE_ACTION", "stream_invite").strip()
+STREAM_ACCEPT_ACTION = os.getenv("STREAM_ACCEPT_ACTION", "stream_accept").strip()
+STREAM_AUDIO_ACTION = os.getenv("STREAM_AUDIO_ACTION", "stream_audio").strip()
+STREAM_ACCEPT_STATE = os.getenv("STREAM_ACCEPT_STATE", "accept").strip() or "accept"
+STREAM_AUTO_ACCEPT = os.getenv("STREAM_AUTO_ACCEPT", "1").strip() == "1"
+# The current Talkin private-chat gateway displays type=audio as a text-only
+# message.  type=file delivers the actual downloadable MP3 to the recipient.
+PRIVATE_AUDIO_TYPE = os.getenv("PRIVATE_AUDIO_TYPE", "file").strip().lower() or "file"
 # TalkinChat's APK uses Query action ``profile_update`` with type ``status``
 # and value field 11. Normalize the old incorrect alias so a stale Railway
 # variable cannot keep sending the unsupported ``update_profile`` action.
@@ -213,7 +225,7 @@ def _start_master_process():
         return False, "❌ ملف master_bot.py غير موجود بجانب البوت."
     with MASTER_PROCESS_LOCK:
         if MASTER_PROCESS is not None and MASTER_PROCESS.poll() is None:
-            return True, "ℹ️ الماستر يعمل بالفعل."
+            return True, "ℹ️ الخدمة مشغلة مسبقاً."
         env = os.environ.copy()
         env["MASTER_ID"] = master_id
         env["MASTER_PWD"] = master_pwd
@@ -244,7 +256,7 @@ def _start_master_process():
         code = MASTER_PROCESS.returncode
         MASTER_PROCESS = None
         return False, f"❌ توقفت خدمة الماستر مباشرة (رمز الخروج: {code}). راجع سجل الاستضافة."
-    return True, "✅ تم تشغيل الماستر."
+    return True, "✅ تم تشغيل الخدمة."
 
 def _stop_master_process():
     """Stop only the master_bot.py process started by this primary bot."""
@@ -253,7 +265,7 @@ def _stop_master_process():
         proc = MASTER_PROCESS
         MASTER_PROCESS = None
     if proc is None or proc.poll() is not None:
-        return True, "ℹ️ الماستر متوقف بالفعل."
+        return True, "ℹ️ الخدمة متوقفة مسبقاً."
     try:
         proc.terminate()
         try:
@@ -261,7 +273,7 @@ def _stop_master_process():
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=3)
-        return True, "✅ تم إيقاف الماستر."
+        return True, "✅ تم إيقاف الخدمة."
     except Exception as exc:
         return False, f"❌ تعذر إيقاف الماستر: {exc}"
 
@@ -324,7 +336,7 @@ _STATE_FILE_NAMES = (
     "messages.json", "published_posts.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
     "moderation.json", "mf.json", "filter_bans.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
-    "custom_commands.json", "repair_state.json", "wager_state.json", "backup_manifest.json",
+    "custom_commands.json", "repair_state.json", "wager_state.json", "last_action.json", "backup_manifest.json",
 )
 
 def _json_has_real_data(path):
@@ -627,6 +639,27 @@ def as_text(v):
         except UnicodeDecodeError:
             return ""
     return str(v)
+
+
+def first_http_url(value):
+    """Find the first public HTTP(S) URL in a decoded Talkin payload."""
+    if isinstance(value, str):
+        for token in value.replace("\n", " ").split():
+            token = token.strip("<>[](){}\"'")
+            if token.startswith(("http://", "https://")):
+                return token.rstrip(",.;")
+        return ""
+    if isinstance(value, dict):
+        for item in value.values():
+            found = first_http_url(item)
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = first_http_url(item)
+            if found:
+                return found
+    return ""
 
 
 def first_text(fields, num, default=""):
@@ -1226,6 +1259,62 @@ def _github_list_state_files():
         print(f"[GITHUB] state listing failed: {exc}", flush=True)
         return []
 
+def _github_find_json_paths(filename):
+    """Find a JSON file anywhere in the backup repo (legacy-layout fallback)."""
+    if not GITHUB_SYNC_ENABLED:
+        return []
+    wanted = str(filename or "").strip().casefold()
+    if not wanted:
+        return []
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/git/trees/{GITHUB_BRANCH}"
+        response = requests.get(url, headers=_github_headers(), params={"recursive": "1"}, timeout=20)
+        if response.status_code == 404:
+            return []
+        response.raise_for_status()
+        tree = response.json().get("tree", [])
+        paths = []
+        for item in tree:
+            path = str(item.get("path") or "").strip()
+            if str(item.get("type") or "") == "blob" and path.casefold().rsplit("/", 1)[-1] == wanted:
+                paths.append(path)
+        configured = f"{GITHUB_DATA_DIR}/{wanted}".strip("/").casefold()
+        return sorted(set(paths), key=lambda x: (0 if x.casefold() == configured else 1 if x.casefold() == wanted else 2, x.casefold()))
+    except Exception as exc:
+        print(f"[GITHUB] json path discovery failed for {filename}: {exc}", flush=True)
+        return []
+
+def _github_get_arbitrary_file(path):
+    """Read one JSON file from an arbitrary path in the backup repository."""
+    if not GITHUB_SYNC_ENABLED:
+        return None
+    try:
+        response = requests.get(_github_url(str(path).lstrip("/")), headers=_github_headers(),
+                                params={"ref": GITHUB_BRANCH}, timeout=15)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        content = base64.b64decode(payload.get("content", "").replace("\n", "")).decode("utf-8")
+        return json.loads(content)
+    except Exception as exc:
+        print(f"[GITHUB] read failed for {path}: {exc}", flush=True)
+        return None
+
+def _has_auto_reply_entries(data):
+    """Return True only when a replies record contains actual reply entries."""
+    if not isinstance(data, dict):
+        return False
+    raw = data.get("auto_replies")
+    if not isinstance(raw, (dict, list)) or not raw:
+        raw = data.get("replies")
+    if isinstance(raw, dict):
+        return any(bool(value) for value in raw.values())
+    if isinstance(raw, list):
+        return bool(raw)
+    reserved = {"messages", "auto_replies", "auto_replies_enabled", "enabled", "version"}
+    return any(key not in reserved and bool(value) for key, value in data.items())
+
 def _github_put_file(local_path, data, sha=None):
     """Create or update a JSON file in GitHub reliably.
 
@@ -1297,6 +1386,16 @@ def _github_restore_or_seed_state():
             local = DATA_DIR / name
             try:
                 remote = _github_get_file(local)
+                if name == "replies.json":
+                    # Replies may live at bot_data/replies.json, replies.json,
+                    # or another legacy folder in Talkin4. Prefer the exact
+                    # configured/canonical path and fall back to any match.
+                    for candidate_path in _github_find_json_paths("replies.json"):
+                        candidate = _github_get_arbitrary_file(candidate_path)
+                        if _has_auto_reply_entries(candidate):
+                            remote = candidate
+                            print(f"[GITHUB] replies source: {candidate_path}", flush=True)
+                            break
                 if remote is not None:
                     # GitHub is the durable source. Always restore a non-empty
                     # remote record when the local copy is empty or differs;
@@ -1423,6 +1522,20 @@ def _is_ns_command(text):
     return str(text or "").strip().casefold() in {
         "ns", "n", "التالي", "القائمة التالية", "next"
     }
+
+
+def _is_publish_command(text):
+    """Recognize both publish spellings: نشر / نشر@الوصف / انشر / انشر@الوصف."""
+    value = str(text or "").strip()
+    return bool(re.fullmatch(r"(?:انشر|نشر)(?:@.*)?", value, re.I | re.S))
+
+
+def _publish_description(text):
+    """Return the description part of a publish command without losing @/newlines."""
+    value = str(text or "").strip()
+    if "@" not in value:
+        return ""
+    return value.split("@", 1)[1].strip()
 
 
 def _norm_user(name):
@@ -1648,11 +1761,11 @@ def _looks_like_bot_command(text):
         return False
     prefixes = (
         "sa@", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@",
-        "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
+        ".u", "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
-        "العاب", "ألعاب", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
-        "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "mbp@", "clear@mf", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
+        "say ", "قل ", "دخول@", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "نشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
+        "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
     )
     prefixes = prefixes + ("bl@",)
     normalized_low = low.replace("ة", "ه")
@@ -1667,13 +1780,20 @@ def _looks_like_bot_command(text):
         or normalized_low in normalized_games
     )
 
+def _auto_reply_key(value):
+    """Normalize an automatic-reply trigger for natural Arabic input."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    text = text.translate(str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي"}))
+    text = re.sub(r"[؟?!.,،؛:]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 def _looks_like_admin_command(text):
     low = str(text or "").strip().casefold()
     prefixes = (
-        "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "mas@", "umas@", "sb@",
+        ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "mas@", "umas@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
-        "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "انشر", "+sr@", "sr@",
-        "swc", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify",
+        "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "انشر", "نشر", "+sr@", "sr@",
+        "swc", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify",
     )
     return low.startswith(prefixes)
 
@@ -1948,20 +2068,67 @@ def _ensure_replies_file():
         data = {}
     messages = data.get("messages") if isinstance(data.get("messages"), dict) else {}
     changed = False
+    if not _has_auto_reply_entries(data):
+        candidates = (
+            BASE_DIR / "bot_data" / "replies.json",
+            BASE_DIR / "data" / "replies.json",
+            BASE_DIR / "replies.json",
+            BASE_DIR / "auto_replies.json",
+        )
+        for candidate_path in candidates:
+            if candidate_path.resolve() == REPLIES_FILE.resolve():
+                continue
+            candidate = _load_local_json(candidate_path, {})
+            if _has_auto_reply_entries(candidate):
+                data = candidate
+                messages = data.get("messages") if isinstance(data.get("messages"), dict) else {}
+                changed = True
+                break
     for key, value in DEFAULT_REPLY_MESSAGES.items():
         if key not in messages:
             messages[key] = value
             changed = True
     data["messages"] = messages
-    if not isinstance(data.get("auto_replies"), dict):
-        # Migrate the older auto_replies.json format once.
+
+    auto_replies = data.get("auto_replies")
+    if not isinstance(auto_replies, dict) or not auto_replies:
+        candidate = data.get("replies")
+        if isinstance(candidate, dict):
+            auto_replies = candidate
+            changed = True
+        elif isinstance(candidate, list):
+            converted = {}
+            for item in candidate:
+                if not isinstance(item, dict):
+                    continue
+                trigger = str(item.get("trigger") or item.get("word") or item.get("name") or "").strip()
+                replies = item.get("replies")
+                reply = str(item.get("reply") or "").strip()
+                if trigger and isinstance(replies, list):
+                    converted[trigger.casefold()] = {"trigger": trigger, "replies": replies}
+                elif trigger and reply:
+                    converted[trigger.casefold()] = {"trigger": trigger, "replies": [reply]}
+            if converted:
+                auto_replies = converted
+                changed = True
+        else:
+            reserved = {"messages", "auto_replies", "auto_replies_enabled", "enabled", "version"}
+            direct = {k: v for k, v in data.items() if k not in reserved and isinstance(v, (str, list, dict))}
+            if direct:
+                auto_replies = direct
+                changed = True
+
+    if not isinstance(auto_replies, dict):
+        # Migrate the older local auto_replies.json format once.
         legacy = _load_local_json(BASE_DIR / "auto_replies.json", {})
         legacy_replies = legacy.get("replies", {}) if isinstance(legacy, dict) else {}
-        data["auto_replies"] = legacy_replies if isinstance(legacy_replies, dict) else {}
-        data["auto_replies_enabled"] = bool(legacy.get("enabled", True)) if isinstance(legacy, dict) else True
+        auto_replies = legacy_replies if isinstance(legacy_replies, dict) else {}
+        if "auto_replies_enabled" not in data:
+            data["auto_replies_enabled"] = bool(legacy.get("enabled", True)) if isinstance(legacy, dict) else True
         changed = True
+    data["auto_replies"] = auto_replies
     if "auto_replies_enabled" not in data:
-        data["auto_replies_enabled"] = True
+        data["auto_replies_enabled"] = bool(data.get("enabled", True))
         changed = True
     if changed or not REPLIES_FILE.is_file():
         _save_local_json(REPLIES_FILE, data)
@@ -3307,10 +3474,22 @@ class TalkinBot:
         self.pending_admin_actions = {}
         self.pending_admin_lock = threading.Lock()
         self.last_admin_actions = {}
+        # Last successfully dispatched bot command. Used by `.u` to repeat
+        # the exact command (room, sender, privacy and arguments).
+        self.last_bot_action = _load_local_json(DATA_DIR / "last_action.json", {})
+        if not isinstance(self.last_bot_action, dict):
+            self.last_bot_action = {}
+        self._replaying_bot_action = False
         # Reaction/publish state must exist before any background music or
         # image-publish worker can write to it.
         self.reaction_targets = {}
         self.publish_pending = {}
+        monitored = _load_local_json(DATA_DIR / "monitored_users.json", [])
+        self.monitored_users = {
+            _norm_user(item) for item in (monitored if isinstance(monitored, list) else [])
+            if _norm_user(item)
+        }
+        self._monitor_invited = set()
         self.invite_pending = False
         self.invites_enabled = True
         self.invite_silent_master = False
@@ -3361,7 +3540,7 @@ class TalkinBot:
         self.banned_words = set(moderation_words)
         self.bot_blocked_users = _bot_blocked_users()
         self.filter_exceptions = _filter_exception_users()
-        self._joinleave_state = defaultdict(lambda: defaultdict(lambda: {"events":[], "last_type":"", "banned_until":0.0}))
+        self._joinleave_state = defaultdict(lambda: {"events":[], "active_until":0.0, "wave_users":set(), "banned":set()})
         self._pending_protection_number = {}
         self.snake_games = {}
         self.ludo_games = {}
@@ -3418,7 +3597,22 @@ class TalkinBot:
             data = _ensure_replies_file()
             self.auto_replies_enabled = bool(data.get("auto_replies_enabled", True))
             raw = data.get("auto_replies", {})
-            self.auto_replies = raw if isinstance(raw, dict) else {}
+            fixed = {}
+            if isinstance(raw, dict):
+                for k,v in raw.items():
+                    key=_auto_reply_key(k)
+                    if isinstance(v, dict):
+                        replies=v.get("replies")
+                        if replies is None and "reply" in v:
+                            replies=v.get("reply")
+                        if isinstance(replies, str):
+                            replies=[replies]
+                        fixed[key]={"trigger":str(v.get("trigger") or k),"replies":[str(x).strip() for x in (replies or []) if str(x).strip()]}
+                    elif isinstance(v, str):
+                        fixed[key]={"trigger":str(k),"replies":[v]}
+                self.auto_replies = fixed
+            else:
+                self.auto_replies = {}
         except Exception:
             self.auto_replies_enabled, self.auto_replies = True, {}
         try:
@@ -3437,7 +3631,7 @@ class TalkinBot:
         _save_local_json(self.custom_welcomes_file, {"enabled": self.custom_welcome_enabled, "welcomes": self.custom_welcomes})
 
     def _auto_reply_variants(self, trigger):
-        item = self.auto_replies.get(str(trigger or "").strip().casefold())
+        item = self.auto_replies.get(_auto_reply_key(trigger))
         if isinstance(item, dict):
             raw = item.get("replies")
             if isinstance(raw, list):
@@ -3458,22 +3652,48 @@ class TalkinBot:
         # as "@{username}".
         clean_name = str(username or "").strip().lstrip("@")
         text = str(template or "")
+        has_username_placeholder = "{username}" in text
         text = text.replace("@{username}", "{username}")
         text = text.replace("{username}", clean_name)
         text = text.replace("{room}", str(room or ""))
-        return text.replace("@@", "@")
+        text = text.replace("@@", "@").strip()
+        if clean_name and text and not has_username_placeholder:
+            text = f"{clean_name} {text}"
+        return text
 
     def _choose_auto_reply(self, trigger, username, room):
+        """Return exactly ONE saved reply per trigger event.
+
+        Replies are consumed from a shuffled cycle so the bot does not dump the
+        whole reply list and does not immediately repeat one response. A new
+        cycle is generated only after every saved response has been used.
+        """
         variants = self._auto_reply_variants(trigger)
         if not variants:
             return ""
-        state = getattr(self, "_auto_reply_last", {})
-        key = str(trigger or "").strip().casefold()
-        last = state.get(key)
-        choices = [v for v in variants if v != last] or variants
-        reply = random.choice(choices)
-        state[key] = reply
-        self._auto_reply_last = state
+        key = _auto_reply_key(trigger)
+        state = getattr(self, "_auto_reply_cycle", {})
+        signature = tuple(variants)
+        entry = state.get(key) if isinstance(state, dict) else None
+
+        if not isinstance(entry, dict) or tuple(entry.get("signature", ())) != signature:
+            order = list(range(len(variants)))
+            random.shuffle(order)
+            entry = {"signature": signature, "order": order, "index": 0}
+
+        order = entry.get("order") or []
+        index = int(entry.get("index", 0) or 0)
+        if len(order) != len(variants) or index >= len(order):
+            order = list(range(len(variants)))
+            random.shuffle(order)
+            index = 0
+
+        reply = variants[order[index]]
+        entry["signature"] = signature
+        entry["order"] = order
+        entry["index"] = index + 1
+        state[key] = entry
+        self._auto_reply_cycle = state
         return self._render_auto_reply(reply, username, room)
 
     def log(self, *args):
@@ -3494,6 +3714,60 @@ class TalkinBot:
                 self.send_private_text(BOT_MASTER, message)
             except Exception as notify_error:
                 self.log("[MASTER-ERROR] failed:", repr(notify_error))
+
+    def _monitor_command(self, sender, text):
+        """Handle master-only private monitoring commands."""
+        if not _is_primary_master(sender):
+            return False
+        raw = str(text or "").strip()
+        match = re.fullmatch(r"(?:مراقبه|مراقبة|راقب)\s*@?([^\s@]+)", raw, re.I)
+        if match:
+            username = match.group(1).strip().lstrip("@")
+            key = _norm_user(username)
+            if not key:
+                self.send_private_text(sender, "❌ الصيغة: مراقبه اسم_المستخدم")
+                return True
+            self.monitored_users.add(key)
+            _save_local_json(DATA_DIR / "monitored_users.json", sorted(self.monitored_users))
+            self.send_private_text(sender, f"👁️ تمت إضافة @{username} للمراقبة.")
+            return True
+        match = re.fullmatch(r"(?:إلغاء\s+مراقبه|الغاء\s+مراقبه|إيقاف\s+مراقبه|ايقاف\s+مراقبه)\s*@?([^\s@]+)", raw, re.I)
+        if match:
+            username = match.group(1).strip().lstrip("@")
+            self.monitored_users.discard(_norm_user(username))
+            self._monitor_invited = {x for x in self._monitor_invited if x[1] != _norm_user(username)}
+            _save_local_json(DATA_DIR / "monitored_users.json", sorted(self.monitored_users))
+            self.send_private_text(sender, f"✅ تم إيقاف مراقبة @{username}.")
+            return True
+        if raw.casefold() in {"المراقبين", "المراقبة", "قائمة المراقبة"}:
+            names = "، ".join(sorted(self.monitored_users)) or "لا يوجد"
+            self.send_private_text(sender, f"👁️ المستخدمون المراقبون:\n{names}")
+            return True
+        return False
+
+    def _report_monitored_event(self, room, event_type, username, detail=""):
+        key = _norm_user(username)
+        if not key or key not in getattr(self, "monitored_users", set()):
+            return
+        room = str(room or self.room or "").strip()
+        summary = f"👁️ مراقبة @{username}\n📌 الحدث: {event_type}\n🏠 الغرفة: {room}"
+        if detail:
+            summary += f"\n📝 {str(detail)[:240]}"
+        try:
+            self.send_private_text(BOT_MASTER, summary)
+        except Exception as exc:
+            self.log("[MONITOR] report failed:", repr(exc))
+        # Invite once per user/room, using the same native invite path used by
+        # the normal invite command. Never spam the user on every event.
+        invite_key = (_norm_room(room), key)
+        if room and invite_key not in self._monitor_invited:
+            self._monitor_invited.add(invite_key)
+            try:
+                self.send_private_invite(username, room)
+                self.send_private_text(BOT_MASTER, f"📨 أرسلت دعوة إلى @{username} من غرفة {room}.")
+            except Exception as exc:
+                self.log("[MONITOR] invite failed:", repr(exc))
+                self.send_private_text(BOT_MASTER, f"❌ تعذر دعوة @{username} من غرفة {room}: {str(exc)[:180]}")
 
     def authenticate(self):
         body = encode_auth_request(BOT_ID, BOT_PWD)
@@ -3642,6 +3916,9 @@ class TalkinBot:
             return
         room = str(pending.get("room") or room_norm).strip()
         requester = str(pending.get("requested_by") or "").strip()
+        self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
+        self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
+        _save_persistent_rooms(self.known_rooms)
         self.log("[ROOM] join confirmation timeout:", room)
         if requester:
             self.send_private_text(
@@ -3661,9 +3938,20 @@ class TalkinBot:
         room = str(room or "").strip()
         if not room:
             return False
-        if _norm_room(room) in getattr(self, "blocked_rooms", set()) and not force:
-            self.log("[ROOM] join suppressed (bot is blocked):", room)
-            return False
+        room_norm = _norm_room(room)
+        # An explicit/forced join is always a fresh TalkinChat request. Clear
+        # only runtime failure markers so lifting a room ban or changing the
+        # bot role allows a new join packet to be sent immediately.
+        if force or requested_by:
+            stale = self._pending_room_joins.pop(room_norm, None)
+            if stale and stale.get("timer"):
+                try:
+                    stale["timer"].cancel()
+                except Exception:
+                    pass
+            self.blocked_rooms.discard(room_norm)
+            self._blocked_room_reasons.pop(room_norm, None)
+            self._blocked_room_notices.discard(room_norm)
         known_norm = {_norm_room(r) for r in getattr(self, "known_rooms", set())}
         connected_norm = {_norm_room(r) for r in getattr(self, "connected_rooms", set())}
         already_known = _norm_room(room) in known_norm
@@ -3680,11 +3968,16 @@ class TalkinBot:
                 return False
             self._last_join_sent[room] = now
         self.log("[ROOM] joining", room)
-        self._pending_room_joins[_norm_room(room)] = {
+        self._pending_room_joins[room_norm] = {
             "room": room,
             "started": time.time(),
             "requested_by": str(requested_by or "").strip(),
+            "fresh": bool(force or requested_by),
         }
+        # Send the join packet first and wait for TalkinChat's result. Never
+        # query occupants before confirmation; that can surface a stale
+        # unauthorized state and make the bot say "محظور" after permissions
+        # have already been fixed.
         self.send_query(encode_query("room_join", room=room, int_value=0, force_int_value=True))
         timer = threading.Timer(
             max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20"))),
@@ -3694,9 +3987,9 @@ class TalkinBot:
         timer.daemon = True
         self._pending_room_joins[_norm_room(room)]["timer"] = timer
         timer.start()
-        self.known_rooms.add(room)
-        _save_persistent_rooms(self.known_rooms)
-        self.request_room_occupants(room)
+        # A room is persisted only after TalkinChat confirms you_joined or
+        # you_rejoined. A failed/blocked join therefore never becomes a saved
+        # exception or an automatic rejoin target.
         return True
 
     def request_room_occupants(self, room: str):
@@ -3885,6 +4178,95 @@ class TalkinBot:
                 self.send_room_text(room, str(line))
         return True
 
+    def _remember_bot_action(self, room, body, sender, is_private=False):
+        """Remember the last command the bot actually dispatched.
+
+        `.u` replays this command verbatim. We deliberately store the original
+        sender and room so permission checks and room-scoped commands behave
+        exactly as they did the first time. Replay itself is never recorded as
+        a new action.
+        """
+        if getattr(self, "_replaying_bot_action", False):
+            return
+        text = str(body or "").strip()
+        if not text or text.casefold() == ".u":
+            return
+        # Navigation/help is not a meaningful bot action to repeat.
+        if _is_ns_command(text) or re.fullmatch(r"a[1-6]", text, re.I) or text.casefold() in {"اوامر", "الاوامر", "help", "مساعدة"}:
+            return
+        action = {
+            "command": text,
+            "room": str(room or ""),
+            "sender": str(sender or ""),
+            "is_private": bool(is_private),
+            "created_at": int(time.time()),
+        }
+        self.last_bot_action = action
+        try:
+            _save_local_json(DATA_DIR / "last_action.json", action)
+        except Exception as exc:
+            self.log("[UNDO] save last action failed:", repr(exc))
+        self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
+
+    def _replay_last_bot_action(self, requester):
+        """Replay the last stored bot command once, without replacing it."""
+        action = getattr(self, "last_bot_action", None)
+        if not isinstance(action, dict) or not str(action.get("command") or "").strip():
+            action = _load_local_json(DATA_DIR / "last_action.json", {})
+        if not isinstance(action, dict) or not str(action.get("command") or "").strip():
+            self.send_private_text(requester, "📭 لا يوجد أمر سابق نفذه البوت لإعادته.")
+            return True
+
+        command = str(action.get("command") or "").strip()
+        if command.casefold() == ".u":
+            self.send_private_text(requester, "📭 لا يوجد أمر سابق صالح لإعادته.")
+            return True
+        target_room = str(action.get("room") or "").strip()
+        original_sender = str(action.get("sender") or "").strip() or str(requester or "").strip()
+        is_private = bool(action.get("is_private", False))
+
+        self.send_private_text(
+            requester,
+            f"↻ إعادة تنفيذ آخر أمر للبوت:\n"
+            f"📌 الأمر: {command}\n"
+            f"🏠 الغرفة: {target_room or 'غير محددة'}"
+        )
+
+        old_flag = getattr(self, "_replaying_bot_action", False)
+        self._replaying_bot_action = True
+        try:
+            # Use the same TalkinChat command pipelines used by normal incoming
+            # messages. Service on/off lives one layer above management, so it
+            # must also be replayable by .u.
+            if self._handle_master_process_command(original_sender, command, is_private=is_private):
+                return True
+            if self._handle_management_command(target_room, command, original_sender, is_private=is_private):
+                return True
+            low = command.casefold()
+            if re.match(r"^sa@[^@]+@.+$", command, re.I):
+                return bool(self.handle_gift_command(target_room, command, original_sender))
+            if low in ("هدايا", "gifts", "gv"):
+                self.gift_help(target_room)
+                return True
+            if re.fullmatch(r"sher@(.+)", command, re.I):
+                self.share_last_music(original_sender, command.split("@",1)[1], target_room)
+                return True
+            if low.startswith(".sa "):
+                return bool(self.handle_music_command(target_room, command, original_sender))
+            if low in ("نقاطي", "points"):
+                self.send_room_text(target_room, _points_summary_text(original_sender))
+                return True
+            if self._run_game_command_async(target_room, command, original_sender):
+                return True
+            self.send_private_text(requester, "⚠️ لم يعد الأمر السابق معروفاً في النسخة الحالية من البوت.")
+            return True
+        except Exception as exc:
+            self.log("[UNDO] replay failed:", repr(exc))
+            self.send_private_text(requester, f"❌ تعذر إعادة تنفيذ الأمر: {exc}")
+            return True
+        finally:
+            self._replaying_bot_action = old_flag
+
     def send_admin(self, room: str, target: str, operation: str):
         """Execute room moderation directly over TalkinChat's native room_admin query.
 
@@ -4047,16 +4429,28 @@ class TalkinBot:
             return False
         if media_type not in {"audio", "image", "video", "file"}:
             raise ValueError(f"unsupported private media type: {media_type}")
-        if media_type == "audio":
+        requested_audio = media_type == "audio"
+        if requested_audio:
             self._verify_public_media_url(media_url, "audio")
+            # This Talkin gateway renders type=audio as a text-only message.
+            # Keep the semantic audio validation, but send the MP3 as a file
+            # packet so the recipient gets the actual downloadable sound.
+            media_type = PRIVATE_AUDIO_TYPE
+        if requested_audio and media_type not in {"file", "audio"}:
+            raise ValueError(f"unsupported private audio packet type: {media_type}")
+        if requested_audio and not media_url.lower().split("?", 1)[0].endswith((".mp3", ".m4a", ".ogg", ".wav", ".webm")):
+            self.log("[MEDIA] audio URL has no audio extension; explicit audio type is used")
         payload = encode_query(
             "chat_message", type_=media_type, to=username, url=media_url,
+            body="",
             length=str(max(0, int(duration or 0))) if media_type == "audio" else None
         )
         last_error = None
         for attempt in range(2):
             try:
                 result = self.send_query(payload)
+                if result is False:
+                    raise RuntimeError("خادم Talkin رفض حزمة الوسائط الخاصة")
                 if attempt:
                     self.log("[MEDIA] private media delivered after retry:", username, media_type)
                 return result
@@ -4067,9 +4461,133 @@ class TalkinBot:
                     time.sleep(0.8)
         raise last_error
 
+    def _play_music_in_live_room(self, room: str, media_url: str, duration: int = 0):
+        """Experimental flow: invite self, accept, then publish audio live."""
+        if not STREAM_EXPERIMENTAL_ENABLED:
+            return False
+        room = str(room or "").strip()
+        if not room or not media_url:
+            return False
+        if not all((STREAM_INVITE_ACTION, STREAM_ACCEPT_ACTION, STREAM_AUDIO_ACTION)):
+            self.log("[STREAM] experimental actions are not fully configured")
+            return False
+        try:
+            self._pending_live_tracks = getattr(self, "_pending_live_tracks", {})
+            pending = {
+                "url": media_url, "duration": int(duration or 0),
+                "room_id": "", "created_at": time.time()
+            }
+            self._pending_live_tracks[room] = pending
+            ready_rooms = getattr(self, "_live_ready_rooms", set())
+            if room in ready_rooms:
+                ready_rooms.discard(room)
+            else:
+                self.log("[STREAM] invite self", room, STREAM_INVITE_ACTION)
+                self.send_query(encode_query(STREAM_INVITE_ACTION, room=room, to=BOT_ID))
+            # Older servers do not emit a you_invited callback for a self
+            # invitation. Keep the legacy room-based accept/audio fallback;
+            # newer servers will consume the callback path below instead.
+            if STREAM_AUTO_ACCEPT:
+                time.sleep(float(os.getenv("STREAM_ACCEPT_DELAY", "0.8")))
+                if room in self._pending_live_tracks:
+                    self.log("[STREAM] legacy accept self", room, STREAM_ACCEPT_ACTION)
+                    self.send_query(encode_query(
+                        STREAM_ACCEPT_ACTION, room=room, to=BOT_ID,
+                        value=BOT_ID, state=STREAM_ACCEPT_STATE,
+                    ))
+                    time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.8")))
+                pending = self._pending_live_tracks.get(room)
+                if pending:
+                    self.log("[STREAM] legacy publish audio", room, STREAM_AUDIO_ACTION)
+                    self.send_query(encode_query(
+                        STREAM_AUDIO_ACTION, type_="audio", room=room,
+                        url=str(pending["url"]),
+                        length=str(max(0, int(pending.get("duration") or 0))),
+                    ))
+                    self._pending_live_tracks.pop(room, None)
+            return True
+        except Exception as exc:
+            self.log("[STREAM] experimental live flow failed:", repr(exc))
+            return False
+
+    def request_live_room(self, room: str):
+        """Send a real live-seat invitation for this exact room."""
+        room = str(room or "").strip()
+        if not STREAM_EXPERIMENTAL_ENABLED:
+            self.send_room_text(room, "❌ البث الحي غير مفعّل في إعدادات البوت.")
+            return True
+        if not room:
+            return False
+        try:
+            self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
+            self.log("[STREAM] real live invite", room, STREAM_INVITE_ACTION)
+            self.send_query(encode_query(
+                STREAM_INVITE_ACTION, room=room, to=BOT_ID,
+            ))
+            self.send_room_text(room, "📡 تم إرسال دعوة صعود فعلية للبوت في هذه الغرفة. بانتظار تأكيد الخادم...")
+        except Exception as exc:
+            self._live_ready_rooms.discard(room)
+            self.log("[STREAM] manual invite failed:", repr(exc))
+            self.send_room_text(room, f"❌ تعذر إرسال دعوة الصعود للبث: {str(exc)[:180]}")
+        return True
+
     def _master_is_online(self):
         """Return the latest presence state known by this bot connection."""
         return bool(getattr(self, "master_online", False))
+
+    def _handle_stream_event(self, event):
+        """Accept a real you_invited event, then publish the queued track."""
+        if not STREAM_EXPERIMENTAL_ENABLED or not isinstance(event, dict):
+            return False
+        event_type = str(event.get(1, "") or event.get("type", "") or "").strip().casefold()
+        if event_type not in {"you_invited", "invited", "stream_invite", "live_invite"}:
+            return False
+        room_name = str(event.get(8, "") or event.get(2, "") or event.get("room", "") or "").strip()
+        room_id = str(event.get(6, "") or event.get(3, "") or event.get("room_id", "") or "").strip()
+        invite_id = str(event.get(5, "") or event.get(4, "") or event.get("invite_id", "") or event.get("id", "") or "").strip()
+        pending_tracks = getattr(self, "_pending_live_tracks", {})
+        pending = pending_tracks.get(room_name)
+        if not pending and room_id:
+            pending_key = next((key for key, item in pending_tracks.items()
+                                if str(item.get("room_id", "")) == room_id), None)
+            pending = pending_tracks.get(pending_key) if pending_key else None
+            room_name = pending_key or room_name
+        self.log("[STREAM] you_invited", room_name, "room_id=", room_id, "invite_id=", invite_id)
+        if not room_id or not invite_id:
+            self.log("[STREAM] no queued track for invitation", room_name)
+            return False
+        if not pending:
+            try:
+                self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
+                self._live_ready_rooms.add(room_name)
+                self.send_query(encode_query(
+                    STREAM_ACCEPT_ACTION, room=room_id, id_=invite_id, to=BOT_ID,
+                    value=STREAM_ACCEPT_STATE, state=STREAM_ACCEPT_STATE,
+                ))
+                self.log("[STREAM] accepted seat invitation; waiting for بث command", room_name)
+                return True
+            except Exception as exc:
+                self.log("[STREAM] seat invitation accept failed:", repr(exc))
+                return False
+        try:
+            getattr(self, "_live_ready_rooms", set()).add(room_name)
+            self.log("[STREAM] accept invitation", STREAM_ACCEPT_ACTION)
+            self.send_query(encode_query(
+                STREAM_ACCEPT_ACTION, room=room_id, id_=invite_id, to=BOT_ID,
+                value=STREAM_ACCEPT_STATE, state=STREAM_ACCEPT_STATE,
+            ))
+            time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.8")))
+            self.log("[STREAM] publish queued audio", STREAM_AUDIO_ACTION, room_id)
+            self.send_query(encode_query(
+                STREAM_AUDIO_ACTION, type_="audio", room=room_id, id_=invite_id,
+                url=str(pending["url"]),
+                length=str(max(0, int(pending.get("duration") or 0))),
+            ))
+            self._pending_live_tracks.pop(room_name, None)
+            return True
+        except Exception as exc:
+            self.log("[STREAM] invitation accept/audio failed:", repr(exc))
+            return False
 
     def _master_service_menu(self, username: str):
         """Greeting/menu shown once per private conversation with the master."""
@@ -4093,16 +4611,24 @@ class TalkinBot:
         if not is_private or not _is_master_name(sender):
             return False
         low = str(body or "").strip().casefold()
-        if low in ("تشغيل الماستر", "تشغيل الماستر@", "start master", "master on"):
+        if low in ("تشغيل الماستر", "تشغيل الماستر@", "تشغيل الخدمة", "تشغيل الخدمه", "تشغيل", "start master", "master on"):
+            before = _master_process_running()
             ok, msg = _start_master_process()
             self.send_private_text(sender, msg)
+            # Record only a real state change. A repeated تشغيل while already
+            # running is reported as already running and does not replace .u.
+            if ok and not before and not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(self.room, body, sender, is_private=True)
             return True
-        if low in ("ايقاف الماستر", "إيقاف الماستر", "ايقاف الماستر@", "إيقاف الماستر@", "stop master", "master off"):
+        if low in ("ايقاف الماستر", "إيقاف الماستر", "ايقاف الماستر@", "إيقاف الماستر@", "إيقاف الخدمة", "ايقاف الخدمة", "إيقاف الخدمه", "ايقاف الخدمه", "إيقاف", "ايقاف", "stop master", "master off"):
+            before = _master_process_running()
             ok, msg = _stop_master_process()
             self.send_private_text(sender, msg)
+            if ok and before and not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(self.room, body, sender, is_private=True)
             return True
-        if low in ("حالة الماستر", "حاله الماستر", "master status"):
-            self.send_private_text(sender, "🟢 الماستر يعمل." if _master_process_running() else "🔴 الماستر متوقف.")
+        if low in ("حالة الماستر", "حاله الماستر", "حالة الخدمة", "حاله الخدمة", "حالة الخدمه", "حاله الخدمه", "master status"):
+            self.send_private_text(sender, "🟢 الخدمة مشغلة." if _master_process_running() else "🔴 الخدمة متوقفة.")
             return True
         return False
 
@@ -4605,6 +5131,15 @@ class TalkinBot:
         with self.invite_lock:
             self.invite_sent.add(username)
         self.log("[INV] normal private invite sent:", username, "room=", room)
+        # Talkin renders the font tag as the same green system-style notice
+        # used for role changes such as promotion/ban confirmations.
+        try:
+            self.send_room_text(
+                room,
+                f'<font color="#00C853">📨 تمت دعوة @{username} من الغرفة.</font>',
+            )
+        except Exception as exc:
+            self.log("[INV] room notice failed:", repr(exc))
         return True
 
     def _users_from_room_admin(self, room_admin):
@@ -5078,7 +5613,7 @@ class TalkinBot:
         detail=" | ".join(errors[-10:])
         raise RuntimeError("تعذر تنزيل ملف صوت من SoundCloud أو YouTube."+(f" تفاصيل: {detail[:1200]}" if detail else ""))
 
-    def handle_music_command(self,room,text,requester,private_to=""):
+    def handle_music_command(self,room,text,requester,private_to="",broadcast_all=True,with_reactions=True,room_output=True,live_stream=False):
         raw=text.strip()
         if not raw.lower().startswith(".sa "): return False
         query=raw[4:].strip()
@@ -5099,26 +5634,41 @@ class TalkinBot:
                     "requester": requester, "title": title, "artist": artist,
                     "url": url, "duration": duration, "created_at": time.time(),
                 }
-                # Music posts use the user's messages.json template.  The
-                # reaction code is intentionally limited to 4 characters.
-                code=uuid.uuid4().hex[:4]
-                caption=_message_template(
-                    "music", "broadcast",
-                    "🎶✨ تم تشغيل الأغنية بنجاح ✨🎶\n━━━━━━━━━━━━\n🎵 العنوان: {title}\n🎤 الطلب: @{requester_name}\n📡 المصدر: {source_label}\n🏠 الغرفة: {room}\n━━━━━━━━━━━━\n👍 lk@{code}   ❤️ lv@{code}\n💬 cm@{code} msg   🚨 report@{code} msg",
-                    requester_name=requester, title=title, artist=artist,
-                    source_label=artist or "Music", room=room, code=code,
-                    url=url, duration=duration
-                )
-                # Music is broadcast to every room currently joined by the bot.
-                # Do not send a duplicate private song message to the requester.
-                self.reaction_targets[code] = {"publisher": requester, "kind": "music", "title": title, "description": title, "created_at": time.time()}
-                target_rooms=self._active_rooms()
-                for target_room in target_rooms:
-                    self.send_room_text(target_room,caption)
-                    self.send_room_media(target_room,url,"audio",duration)
+                if with_reactions:
+                    code=uuid.uuid4().hex[:4]
+                    caption=_message_template(
+                        "music", "broadcast",
+                        "🎶✨ تم تشغيل الأغنية بنجاح ✨🎶\n━━━━━━━━━━━━\n🎵 العنوان: {title}\n🎤 الطلب: @{requester_name}\n📡 المصدر: {source_label}\n🏠 الغرفة: {room}\n━━━━━━━━━━━━\n👍 lk@{code}   ❤️ lv@{code}\n💬 cm@{code} msg   🚨 report@{code} msg",
+                        requester_name=requester, title=title, artist=artist,
+                        source_label=artist or "Music", room=room, code=code,
+                        url=url, duration=duration
+                    )
+                    self.reaction_targets[code] = {"publisher": requester, "kind": "music", "title": title, "description": title, "created_at": time.time()}
+                else:
+                    caption=(f"🎶 تم تشغيل الأغنية\n━━━━━━━━━━━━\n"
+                             f"🎵 العنوان: {title}\n🎤 الطلب: @{requester}\n"
+                             f"📡 المصدر: {artist or 'Music'}")
+                # `.sa` publishes the audio file to the connected rooms.
+                # `بث` is the separate live-room mode and must not duplicate
+                # the track as a normal room attachment.
+                live_started = self._play_music_in_live_room(room, url, duration) if live_stream else False
+                if room_output:
+                    target_rooms=self._active_rooms() if broadcast_all else [room]
+                    for target_room in target_rooms:
+                        self.send_room_text(target_room,caption)
+                        # If the live actions are unavailable, retain the
+                        # proven room-audio fallback for visible commands.
+                        if not live_started:
+                            self.send_room_media(target_room,url,"audio",duration)
+                elif live_stream:
+                    if live_started:
+                        self.send_room_text(room, f"✅ تم تشغيل {title} في البث الحي.")
+                    else:
+                        self.send_room_text(room, "❌ لم يصعد البوت للبث؛ استخدم أمر صعود ثم أعد أمر بث.")
             except Exception as e:
                 self.report_master_error("تشغيل الأغنية", e, room)
-                self.send_room_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.")
+                if room_output:
+                    self.send_room_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.")
         threading.Thread(target=worker,name="music-request",daemon=True).start(); self.send_room_text(room,"⏳ جاري البحث عن الأغنية وتحضير الصوت..."); return True
 
     def share_last_music(self, sender: str, target: str, room: str = ""):
@@ -5129,21 +5679,23 @@ class TalkinBot:
             self.send_room_text(room, "⚠️ لا توجد أغنية شغّلها المستخدم بعد لمشاركتها.") if room else self.send_private_text(sender, "⚠️ لا توجد أغنية شغّلتها بعد لمشاركتها.")
             return True
         title = str(info.get("title") or "أغنية")
-        self.send_private_text(target, f"🎵 مشاركة أغنية من @{sender}\n🎶 {title}")
-        # Talkin can drop a private media packet when it immediately follows
-        # the text packet on the same socket. Give the text frame a short
-        # head start so the recipient receives both messages.
-        time.sleep(0.25)
+        # Send the media packet first. Some Talkin gateway versions accept the
+        # caption but drop an audio packet that immediately follows it.
         try:
             self.send_private_media(target, str(info["url"]), "audio", int(info.get("duration") or 0))
         except Exception as exc:
             self.log("[MUSIC] private share audio failed:", repr(exc))
-            notice = f"⚠️ تعذر إرسال ملف الأغنية إلى @{target}. الرابط العام للصوت غير متاح حالياً."
+            reason = str(exc).strip().replace("\n", " ")[:300] or "سبب غير معروف"
+            notice = f"⚠️ تعذر إرسال ملف الأغنية إلى @{target}.\n🧾 سبب الفشل: {reason}"
             if room:
                 self.send_room_text(room, notice)
             else:
                 self.send_private_text(sender, notice)
             return True
+        # Do not send a caption to the recipient: on this gateway the caption
+        # is often the only visible private message while the media card is
+        # hidden. The recipient must receive the audio/file packet alone.
+        time.sleep(0.45)
         if room:
             self.send_room_text(room, f"✅ تمت مشاركة أغنية {title} مع @{target} في الخاص.")
         else:
@@ -6704,9 +7256,18 @@ class TalkinBot:
         return True
 
     def _million_bank_game(self, room, sender_name):
+        # The cooldown check itself emits the exact remaining wait time.
+        # For a fresh play, send the acknowledgement immediately from the
+        # worker thread before doing any reveal delay.
         if not self._game_cooldown_notice(room, sender_name, 120.0, "بنك مليون"):
             return True
-        self.send_room_text(room, f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n✅ @{sender_name}\n🔎 جاري البحث عن الجائزة...\n━━━━━━━━━━━━━━")
+        self.send_room_text(
+            room,
+            f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n"
+            f"✅ @{sender_name}\n"
+            "🔎 جاري البحث عن الجائزة...\n"
+            "━━━━━━━━━━━━━━"
+        )
         time.sleep(1.0)
         won = secrets.randbelow(100) == 0
         reward = 1_000_000 if won else 0
@@ -6789,6 +7350,20 @@ class TalkinBot:
         command is received and handled immediately instead of waiting for the
         game to finish sleeping.
         """
+        # handle_game_command() is intentionally permissive for callers that
+        # already routed a command, but this receive-path helper must not
+        # claim ordinary conversation.  Returning True for every message
+        # used to prevent automatic replies such as "أنا" and "بوت" from
+        # ever reaching the reply router.
+        if not _looks_like_bot_command(text):
+            raw = str(text or "").strip()
+            pending_key = (_norm_room(room), _norm_user(sender_name))
+            ludo_game = getattr(self, "ludo_games", {}).get(f"ludo:{_norm_room(room)}")
+            has_pending_choice = pending_key in getattr(self, "pending_bot_choices", {})
+            has_pending_stock = pending_key in getattr(self, "stock_pending", {})
+            is_ludo_choice = raw in {"1", "2", "3", "4", "١", "٢", "٣", "٤"} and bool(ludo_game)
+            if not (has_pending_choice or has_pending_stock or is_ludo_choice):
+                return False
         def worker():
             try:
                 self.handle_game_command(room, text, sender_name)
@@ -6798,6 +7373,8 @@ class TalkinBot:
                     self.report_master_error("الألعاب", exc, room)
                 except Exception:
                     pass
+        if not getattr(self, "_replaying_bot_action", False):
+            self._remember_bot_action(room, text, sender_name, is_private=False)
         threading.Thread(
             target=worker,
             name="game-command",
@@ -7364,7 +7941,9 @@ class TalkinBot:
         img.save(out,"JPEG",quality=88,optimize=True); return out
 
     def _ludo_command(self,room,sender,raw):
-        key=f"ludo:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); game=self.ludo_games.get(key)
+        key=f"ludo:{_norm_room(room)}"; low=str(raw or "").strip().casefold()
+        low=low.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        game=self.ludo_games.get(key)
         if low in ("لودو","ludo") and not game:
             if not self._board_game_cooldown_notice(room, sender):
                 return True
@@ -7457,6 +8036,47 @@ class TalkinBot:
             return True
         return False
 
+    def _fun_room_members(self, room, sender):
+        """Return live room members suitable for light social games."""
+        users = getattr(self, "room_users", {}).get(room, {}) or {}
+        names = list(users.keys()) if isinstance(users, dict) else list(users or [])
+        out=[]
+        for name in names:
+            clean=str(name or "").strip().lstrip("@")
+            if (clean and _norm_user(clean) not in {_norm_user(sender), _norm_user(BOT_ID)}
+                    and _norm_user(clean) not in {_norm_user("🤖 البوت")}):
+                out.append(clean)
+        return out
+
+    def _marriage_game(self, room, sender):
+        candidates=self._fun_room_members(room, sender)
+        if not candidates:
+            self.send_room_text(room, f"💍 @{sender} لم أجد عضواً آخر متاحاً للزواج حالياً.")
+            return True
+        partner=secrets.choice(candidates)
+        sentence=(f"زوجتك هي @{partner}" if secrets.randbelow(2) == 0
+                  else f"زوجك هو @{partner}")
+        self.send_room_text(room, f"💍 مبروك @{sender}! {sentence} ❤️\n"
+                                 "نتمنى لكما حياة سعيدة مليئة بالفرح.")
+        return True
+
+    def _fun_game(self, room, sender, command):
+        options={
+            "تحدي": ["أرسل كلمة طيبة لعضو في الغرفة.", "اكتب أول شيء تحبه اليوم.", "امدح شخصاً لم تتحدث معه كثيراً.", "اكتب نكتة قصيرة للجميع."],
+            "لغز": [("شيء له أسنان ولا يعض، ما هو؟", "المشط"), ("ما الشيء الذي يمشي بلا أرجل؟", "الوقت"), ("ما الذي كلما أخذت منه كبر؟", "الحفرة")],
+            "حظي": ["حظك اليوم ممتاز، جرّب شيئاً جديداً!", "الحظ يبتسم لك، لا تتردد.", "يوم هادئ وجميل بانتظارك.", "مفاجأة لطيفة قد تصلك قريباً."],
+            "مزاج": ["مزاجك اليوم: فرح وطاقة إيجابية 😄", "مزاجك اليوم: هدوء وراحة 🌿", "مزاجك اليوم: مغامرة وحماس 🔥", "مزاجك اليوم: ضحك وسوالف 😂"],
+        }
+        value=secrets.choice(options[command])
+        if command == "لغز":
+            question, answer=value
+            self.send_room_text(room, f"🧩 لغز @{sender}\n{question}\n✅ الإجابة: {answer}")
+        elif command == "تحدي":
+            self.send_room_text(room, f"🎯 تحدي @{sender}: {value}")
+        else:
+            self.send_room_text(room, f"✨ {command} @{sender}: {value}")
+        return True
+
     def handle_game_command(self, room, text, sender_name):
         raw=str(text or "").strip()
         if not raw or not sender_name: return False
@@ -7534,6 +8154,13 @@ class TalkinBot:
             self.game_help(room); return True
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
+            return True
+        if game_low in ("زواج", "زوجه"):
+            return self._marriage_game(room, sender_name)
+        if game_low in ("تحدي", "لغز", "حظي", "مزاج"):
+            return self._fun_game(room, sender_name, game_low)
+        if game_low == "تسليه":
+            self.send_room_text(room, "🎉 ألعاب التسلية: زواج، تحدي، لغز، حظي، مزاج")
             return True
         if game_low in ("حصانه", "حصانه!"):
             return self._horse_game(room, sender_name)
@@ -7844,6 +8471,15 @@ class TalkinBot:
             result_key_user = str(sender or "") if is_private else ""
             result_key = ("chat_message" if is_private else "room_message", result_key_room, result_key_user)
             result_state = result_pages.get(result_key)
+            if not result_state:
+                # l@sr is often issued from a room but replies privately to
+                # the master.  Accept Ns from that private chat as well as
+                # from the original command context.
+                for candidate_key, candidate_state in reversed(list(result_pages.items())):
+                    if (candidate_key[0] == "chat_message"
+                            and candidate_key[2] == str(sender or "")):
+                        result_key, result_state = candidate_key, candidate_state
+                        break
             if result_state:
                 pages = result_state.get("pages") or []
                 part = int(result_state.get("part", 1) or 1)
@@ -7909,7 +8545,8 @@ class TalkinBot:
                     self.send_room_text(room, msg)
             return True
 
-        is_publish = str(body or "").strip().casefold() == "انشر" or str(body or "").strip().casefold().startswith("انشر@")
+        is_publish = _is_publish_command(body)
+        repeat_last_command = str(body or "").strip().casefold() == ".u"
         security_command = bool(
             re.match(r"^(?:تشغيل|إيقاف) الحماية$", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
@@ -7919,6 +8556,7 @@ class TalkinBot:
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
         )
         join_command = bool(re.match(r"^دخول@.+$", str(body or "").strip(), re.I))
+        join_all_command = str(body or "").strip().casefold() in {"دخول الكل", "دخولكل", "join all"}
         verification_manager_command = _is_verification_manager_command(body)
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
         public_top_command = str(body or "").strip().casefold() in {
@@ -7930,6 +8568,8 @@ class TalkinBot:
                 and not (points_transfer_command and _is_verified_user(sender))
                 and not (is_publish and _is_verified_user(sender))
                 and not join_command
+                and not join_all_command
+                and not repeat_last_command
                 and not (security_command and room and _room_manager(self, room, sender))):
             return False
         # A private command can be replayed by the Talkin transport with a new
@@ -7962,6 +8602,8 @@ class TalkinBot:
             help_command = bool(re.fullmatch(r"a[1-6]", str(body or '').strip(), re.I)
                                 or str(body or '').strip().casefold() in
                                 {"اوامر", "الاوامر", "help", "مساعدة", "ns", "n", "التالي", "القائمة التالية", "next"})
+            if handled and not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(room, body, sender, is_private=is_private)
             if handled and _is_master_name(sender) and not help_command:
                 if is_private and not self._master_reply_local.private_replied:
                     self.send_private_text(sender, f"✅ تم تنفيذ الأمر: {str(body or '').strip()}")
@@ -7975,6 +8617,115 @@ class TalkinBot:
             self._master_reply_local.command_private = old_command_private
             self._master_reply_local.command_sender = old_command_sender
             self._master_reply_local.command_room = old_command_room
+
+    def _room_language_pending_key(self, sender):
+        return _norm_user(sender)
+
+    def _begin_join_rooms_language(self, sender, rooms):
+        """Ask once for language, then join all requested rooms."""
+        cleaned=[]
+        seen=set()
+        for value in rooms or []:
+            room_name=str(value or "").strip()
+            if not room_name:
+                continue
+            key=_norm_room(room_name).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(room_name)
+        if not cleaned:
+            return False
+        if not hasattr(self,"_pending_room_language"):
+            self._pending_room_language={}
+        self._pending_room_language[self._room_language_pending_key(sender)]={
+            "rooms": cleaned,
+            "created": time.time(),
+        }
+        preview=" ".join(cleaned[:20])
+        extra=" ..." if len(cleaned)>20 else ""
+        self.send_private_text(
+            sender,
+            "🌐 اختر لغة البوت للغرف المحددة\n"
+            f"🏠 الغرف: {preview}{extra}\n\n"
+            "1️⃣ العربية\n2️⃣ English\n\n"
+            "أرسل 1 أو 2."
+        )
+        return True
+
+    def _complete_join_rooms_language(self, sender, choice):
+        pending=getattr(self,"_pending_room_language",{}).get(self._room_language_pending_key(sender))
+        if not isinstance(pending,dict):
+            return False
+        created=float(pending.get("created",0) or 0)
+        if created and time.time()-created > 180:
+            self._pending_room_language.pop(self._room_language_pending_key(sender),None)
+            self.send_private_text(sender,"⌛ انتهت مهلة اختيار اللغة. أرسل أمر دخول الغرف من جديد.")
+            return True
+        choice=str(choice or "").strip().casefold()
+        if choice not in ("1","2"):
+            return False
+        lang="ar" if choice=="1" else "en"
+        rooms=list(pending.get("rooms") or [])
+        self._pending_room_language.pop(self._room_language_pending_key(sender),None)
+        if not hasattr(self,"room_languages"):
+            self.room_languages={}
+        sent=0
+        skipped=0
+        for target in rooms:
+            self.room_languages[_norm_room(target)]=lang
+            try:
+                if self.join_room(target,force=True,requested_by=sender):
+                    sent+=1
+                else:
+                    skipped+=1
+            except Exception as exc:
+                skipped+=1
+                self.log("[ROOM] multi join failed:", target, repr(exc))
+        label="العربية" if lang=="ar" else "English"
+        self.send_private_text(
+            sender,
+            f"✅ تم اختيار اللغة: {label}\n"
+            f"🏠 عدد الغرف: {len(rooms)}\n"
+            f"📨 أُرسلت طلبات الدخول: {sent}\n"
+            f"⚠️ تخطّي/فشل: {skipped}\n"
+            "⏳ انتظر تأكيد الخادم لكل غرفة."
+        )
+        return True
+
+    def _add_rooms_to_saved_file(self, sender, raw_rooms):
+        rooms=[]
+        seen=set()
+        for value in str(raw_rooms or "").split():
+            room_name=value.strip()
+            if not room_name:
+                continue
+            key=_norm_room(room_name).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            rooms.append(room_name)
+        if not rooms:
+            self.send_private_text(sender,"❌ أرسل أسماء الغرف مفصولة بمسافة.\nمثال: مشاعر ادم نبض قلوب سوالف")
+            return True
+        existing=_persistent_rooms()
+        existing_keys={_norm_room(x).casefold() for x in existing}
+        added=[]
+        for room_name in rooms:
+            if _norm_room(room_name).casefold() not in existing_keys:
+                existing.append(room_name)
+                existing_keys.add(_norm_room(room_name).casefold())
+                added.append(room_name)
+        _save_persistent_rooms(existing)
+        self.known_rooms.update(existing)
+        self.send_private_text(
+            sender,
+            "✅ تم تحديث ملف الغرف المحفوظة.\n"
+            f"➕ تمت إضافة: {len(added)}\n"
+            f"📋 الجديد: {' '.join(added) if added else 'لا توجد غرف جديدة'}\n"
+            f"🏠 إجمالي الغرف المحفوظة: {len(_persistent_rooms())}"
+        )
+        return True
 
     def _handle_management_command_impl(self, room, body, sender, is_private=False):
         """Giant-style persistent management commands. Returns True if consumed."""
@@ -8442,38 +9193,85 @@ class TalkinBot:
                 self._send_filter_list_page(room, sender, is_private, 1)
                 return True
 
-        # Joining a room: ask the master for bot language first.
-        pending_lang=getattr(self,"_pending_room_language",{}).get(_norm_user(sender))
-        if pending_lang and low in ("1","2"):
-            target=pending_lang.get("room",""); lang="ar" if low=="1" else "en"
-            self._pending_room_language.pop(_norm_user(sender),None)
-            if not hasattr(self,"room_languages"): self.room_languages={}
-            self.room_languages[_norm_room(target)]=lang
-            joined=self.join_room(target,force=True,requested_by=sender)
-            self.send_private_text(sender,("⏳ تم اختيار العربية، جاري دخول الغرفة: " if lang=="ar" else "⏳ English selected, joining room: ")+target)
+        # Pending multi-room language choice: one choice applies to all requested rooms.
+        if low in ("1","2") and self._complete_join_rooms_language(sender, low):
             return True
-        # Joining a room: ONLY the master command دخول@اسم_الغرفة is accepted.
-        m_join = re.fullmatch(r"دخول@(.+)", text, re.I)
+
+        # Add one or more room names to tracked_rooms.json without joining them yet.
+        if low in ("اضف لملف الغرف", "أضف لملف الغرف", "اضف للملف الغرف", "أضف للملف الغرف"):
+            if not _is_primary_master(sender):
+                return True
+            if not hasattr(self,"_pending_add_rooms"):
+                self._pending_add_rooms={}
+            self._pending_add_rooms[_norm_user(sender)]={"created":time.time()}
+            self.send_private_text(
+                sender,
+                "📁 أضف الغرف إلى ملف الغرف\n"
+                "📨 أرسل أسماء الغرف مفصولة بمسافة.\n"
+                "مثال: مشاعر ادم نبض قلوب سوالف"
+            )
+            return True
+
+        # Consume the next plain message after "اضف لملف الغرف" as room names.
+        pending_add=getattr(self,"_pending_add_rooms",{}).get(_norm_user(sender))
+        if isinstance(pending_add,dict) and low not in ("1","2"):
+            if time.time()-float(pending_add.get("created",0) or 0) <= 180:
+                # Do not steal another explicit bot command.
+                if not _looks_like_bot_command(text):
+                    self._pending_add_rooms.pop(_norm_user(sender),None)
+                    return self._add_rooms_to_saved_file(sender, text)
+            else:
+                self._pending_add_rooms.pop(_norm_user(sender),None)
+
+        # Bulk room join: enter every room currently saved in tracked_rooms.json.
+        if low in ("دخول الكل", "دخولكل", "join all"):
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 أمر دخول الكل مخصص للماستر الأساسي فقط.")
+                return True
+            saved_rooms = _persistent_rooms()
+            if not saved_rooms:
+                self.send_private_text(sender, "📭 ملف الغرف المحفوظة فارغ حالياً.\n📌 أضف غرفة أولاً عبر دخول@اسم_الغرفة.")
+                return True
+            sent = 0
+            skipped = 0
+            for target_room in saved_rooms:
+                try:
+                    if self.join_room(target_room, force=True, requested_by=sender):
+                        sent += 1
+                    else:
+                        skipped += 1
+                except Exception as exc:
+                    skipped += 1
+                    self.log("[ROOM] دخول الكل failed:", target_room, repr(exc))
+            self.send_private_text(
+                sender,
+                f"🏠 دخول الكل\n━━━━━━━━━━━━\n📋 الغرف المحفوظة: {len(saved_rooms)}\n"
+                f"📨 أُرسلت طلبات الدخول: {sent}\n⚠️ تخطّي/فشل: {skipped}\n"
+                "⏳ انتظر تأكيد الخادم للغرف التي تم إرسال طلبها."
+            )
+            return True
+
+        # Joining one or multiple rooms: دخول@مشاعر ادم نبض ...
+        m_join = re.fullmatch(r"دخول@(.+)", text, re.I | re.S)
         if m_join:
-            target = m_join.group(1).strip()
-            if not target:
-                self.send_private_text(sender, "❌ الصيغة: دخول@اسم_الغرفة"); return True
-            blocked = _norm_room(target) in getattr(self, "blocked_rooms", set())
-            if blocked:
-                # A blocked marker is only the last server response. An
-                # explicit دخول@ command is a request to retry after the
-                # owner grants moderator/owner permission.
-                self.blocked_rooms.discard(_norm_room(target))
-                self._blocked_room_reasons.pop(_norm_room(target), None)
-                self._blocked_room_notices.discard(_norm_room(target))
-                self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(target)}
-                self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(target)}
-                self._save_blocked_rooms()
-                _save_persistent_rooms(self.known_rooms)
-            if not hasattr(self,"_pending_room_language"): self._pending_room_language={}
-            self._pending_room_language[_norm_user(sender)]={"room":target,"created":time.time()}
-            self.send_private_text(sender,"🌐 اختر لغة البوت للغرفة\n1️⃣ عربي\n2️⃣ English\n\nأرسل 1 أو 2.")
-            return True
+            raw_rooms=m_join.group(1).strip()
+            rooms=[x.strip() for x in raw_rooms.split() if x.strip()]
+            if not rooms:
+                self.send_private_text(sender, "❌ الصيغة: دخول@اسم_الغرفة أو دخول@غرفة1 غرفة2 غرفة3")
+                return True
+            # Explicit join retries are allowed even for rooms the server
+            # previously marked as blocked.
+            for target in rooms:
+                blocked = _norm_room(target) in getattr(self, "blocked_rooms", set())
+                if blocked:
+                    self.blocked_rooms.discard(_norm_room(target))
+                    self._blocked_room_reasons.pop(_norm_room(target), None)
+                    self._blocked_room_notices.discard(_norm_room(target))
+                    self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(target)}
+                    self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(target)}
+            self._save_blocked_rooms()
+            _save_persistent_rooms(self.known_rooms)
+            return self._begin_join_rooms_language(sender, rooms)
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
         if m_transfer and _is_verified_user(sender):
             target, amount = m_transfer.group(1).strip().lstrip("@"), int(m_transfer.group(2))
@@ -8493,8 +9291,16 @@ class TalkinBot:
             return True
 
         # VIP users may publish images; the actual image is handled by _handle_publish_media.
-        if (low == "انشر" or low.startswith("انشر@")) and _is_vip_user(sender):
-            desc=text[5:].strip() if low.startswith("انشر@") else ""
+        if _is_publish_command(text) and _is_vip_user(sender):
+            desc = _publish_description(text)
+            hit = self._find_publish_filter_hit(desc)
+            if hit:
+                self.send_private_text(sender,
+                    f"🚫 تم منع أمر النشر: الوصف يحتوي كلمة محظورة ({hit}).\n"
+                    "⛔ تم منع حسابك من النشر حتى فك المنع.")
+                _record_filter_ban(sender, room, "محاولة نشر كلمة مسيئة في الوصف", hit)
+                _record_publish_ban(sender, room, hit)
+                return True
             self.publish_pending[_norm_user(sender)]={"description":desc,"source_room":str(room or ""),"created_at":time.time(),"silent":_is_master_name(sender)}
             self.send_private_text(sender,"🖼️ تم استلام أمر النشر. أرسل الصورة الآن خلال دقيقتين في الروم أو الخاص، وسيتم نشرها في جميع الغرف." + (f"\n📝 الوصف: {desc}" if desc else ""))
             return True
@@ -8787,19 +9593,10 @@ class TalkinBot:
         if low == ".u":
             if not _is_master_name(sender):
                 return True
-            undo = self.last_admin_actions.get(_norm_user(sender))
-            if not undo:
-                self.send_private_text(sender, "📭 لا يوجد إجراء إداري مؤكد يمكن التراجع عنه.")
-                return True
-            target_room = str(undo.get("room") or room or "").strip()
-            target_user = str(undo.get("target") or "").strip().lstrip("@")
-            inverse = str(undo.get("inverse") or "member").strip().lower()
-            if not target_room or not target_user:
-                self.send_private_text(sender, "❌ تعذر تحديد آخر إجراء للتراجع عنه.")
-                return True
-            if self.request_admin_action(target_room, target_user, inverse, sender):
-                self.send_private_text(sender, f"↩️ جاري التراجع عن آخر إجراء: @{target_user}")
-            return True
+            # `.u` means repeat the last bot action, not undo it. This covers
+            # moderation, owner/admin changes, games, music, publishing and
+            # other commands that reached the normal dispatcher.
+            return self._replay_last_bot_action(sender)
 
         m=re.match(r"^(u@|ub@|unban\s+)(@?[^\s]+)$", text, re.I)
         if m:
@@ -8822,6 +9619,33 @@ class TalkinBot:
                 self.send_private_text(sender,"❌ لا توجد غرفة لتعيين المالك فيها."); return True
             self.request_admin_action(room,target,"owner",sender)
             return True
+        if low in ("دخول الكل", "دخولكل", "join all"):
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 أمر دخول الكل مخصص للماستر الأساسي فقط.")
+                return True
+            saved_rooms = _persistent_rooms()
+            if not saved_rooms:
+                self.send_private_text(sender, "📭 ملف الغرف المحفوظة فارغ حالياً.\n📌 أضف غرفة أولاً عبر دخول@اسم_الغرفة.")
+                return True
+            sent = 0
+            skipped = 0
+            for target_room in saved_rooms:
+                try:
+                    if self.join_room(target_room, force=True, requested_by=sender):
+                        sent += 1
+                    else:
+                        skipped += 1
+                except Exception as exc:
+                    skipped += 1
+                    self.log("[ROOM] دخول الكل failed:", target_room, repr(exc))
+            self.send_private_text(
+                sender,
+                f"🏠 دخول الكل\n━━━━━━━━━━━━\n📋 الغرف المحفوظة: {len(saved_rooms)}\n"
+                f"📨 أُرسلت طلبات الدخول: {sent}\n⚠️ تخطّي/فشل: {skipped}\n"
+                "⏳ انتظر تأكيد الخادم للغرف التي تم إرسال طلبها."
+            )
+            return True
+
         m_join = re.fullmatch(r"دخول@(.+)", text, re.I)
         if m_join:
             target=m_join.group(1).strip()
@@ -8930,7 +9754,7 @@ class TalkinBot:
         if m_sr and _is_master_name(sender):
             trigger, reply = m_sr.group(1).strip(), m_sr.group(2).strip()
             if trigger and reply:
-                key_sr=trigger.casefold()
+                key_sr=_auto_reply_key(trigger)
                 variants=self._auto_reply_variants(key_sr)
                 if reply not in variants:
                     variants.append(reply)
@@ -9005,11 +9829,20 @@ class TalkinBot:
             self.send_private_text(sender, f"✅ تم فك منع النشر عن {target}." if was else "ℹ️ المستخدم غير موجود في قائمة منع النشر.")
             return True
 
-        # Publishing: master or verified user says `انشر` or `انشر@description`, then sends an image.
-        if low == "انشر" or low.startswith("انشر@"):
-            desc=text[5:].strip() if low.startswith("انشر@") else ""
+        # Publishing: master or verified user says نشر / انشر (optionally @description), then sends an image.
+        if _is_publish_command(text):
+            desc = _publish_description(text)
             if _is_publish_banned(sender):
                 self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
+                return True
+            hit = self._find_publish_filter_hit(desc)
+            if hit:
+                self.send_private_text(sender,
+                    f"🚫 تم منع أمر النشر: الوصف يحتوي كلمة محظورة ({hit}).\n"
+                    "⛔ تم منع حسابك من النشر حتى فك المنع.")
+                self.publish_pending.pop(_norm_user(sender), None)
+                _record_filter_ban(sender, room, "محاولة نشر كلمة مسيئة في الوصف", hit)
+                _record_publish_ban(sender, room, hit)
                 return True
             # The image may be sent later in a room or in private chat.
             # Key the pending publish by sender, not by the command room, so
@@ -9050,8 +9883,6 @@ class TalkinBot:
             return ""
 
     def _find_publish_filter_hit(self, text):
-        if not getattr(self, "moderation_enabled", True):
-            return None
         normalized = _norm_filter_text(text)
         if not normalized:
             return None
@@ -9145,6 +9976,24 @@ class TalkinBot:
                 self.send_private_text(sender, "❌ أخطاء النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors))
         return True
 
+    def _try_publish_pending_media(self, room, media_url, candidates=()):
+        """Consume a pending publish request from any Talkin media wrapper."""
+        media_url = str(media_url or "").strip()
+        if not media_url:
+            return False
+        tried = set()
+        ordered = list(candidates or [])
+        ordered.extend(list(getattr(self, "publish_pending", {}).keys()))
+        for sender in ordered:
+            sender = str(sender or "").strip()
+            key = _norm_user(sender)
+            if not key or key in tried:
+                continue
+            tried.add(key)
+            if self._handle_publish_media(room, sender, media_url):
+                return True
+        return False
+
     def _is_duplicate_incoming(self, kind, values, event_id=""):
         """Return True when the server has replayed an inbound event.
 
@@ -9160,12 +10009,20 @@ class TalkinBot:
             self._incoming_seen_lock = threading.Lock()
         event_id = str(event_id or "").strip()
         if event_id:
-            key = (str(kind), "id", event_id)
-            ttl = 300.0
+            # Some server versions recycle event ids for separate messages.
+            # Bind the id to the message content so a later بنك/roll is not
+            # suppressed as a replay of an earlier command.
+            raw = "\x1f".join(str(v or "") for v in values)
+            signature = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+            key = (str(kind), "id", event_id, signature)
+            ttl = 3.0
         else:
             raw = "\x1f".join(str(v or "") for v in values)
             key = (str(kind), "sig", hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest())
-            ttl = 8.0
+            # Without a server event id, the signature can only protect against
+            # the same frame being replayed immediately. A long content TTL
+            # incorrectly swallowed legitimate repeated commands such as roll/بنك.
+            ttl = 0.45
         with self._incoming_seen_lock:
             previous = self._incoming_seen.get(key, 0.0)
             self._incoming_seen[key] = now
@@ -9197,6 +10054,8 @@ class TalkinBot:
             _save_persistent_rooms(self.known_rooms)
         event_id = str(event.get(41, ""))
         username = str(event.get(22, "") or "").strip()
+        monitored_username = username or frm or str(event.get(17, "") or "").strip()
+        self._report_monitored_event(room, event_type, monitored_username, body)
         # NS is a navigation command. Every newly received NS must be accepted
         # immediately; do not let the transport replay/duplicate cache suppress
         # rapid NS presses.
@@ -9205,31 +10064,59 @@ class TalkinBot:
         count = str(event.get(23, "") or "").strip()
         reconnected = str(event.get(24, "") or "").strip()
         # Do not log room message contents, usernames, room names, or media events.
-        if (not is_ns_navigation) and self._is_duplicate_incoming(
-            "room",
-            (event_type, room, frm, to, body, str(event.get(7, "") or "")),
-            event_id,
+        _skip_room_text_signature_dedup = (not event_id and event_type == "text")
+        if (
+            not is_ns_navigation
+            and not _skip_room_text_signature_dedup
+            and self._is_duplicate_incoming(
+                "room",
+                (event_type, room, frm, to, body, str(event.get(7, "") or "")),
+                event_id,
+            )
         ):
             self.log("[DEDUP] ignored repeated room event")
             return
 
-        # Keep the live membership state in sync.  The APK itself uses these
-        # exact event names and RoomEvent fields.
+        # Fast join/leave flood protection: four different users inside ONE
+        # second trigger an immediate ban for the whole wave.  The active wave
+        # stays open for one second so additional accounts arriving immediately
+        # after the trigger are banned too.
         if event_type in ("user_joined", "user_left") and username:
-            pcfg=_room_protection_cfg(room)
-            if pcfg.get("joinleave") and _norm_user(username)!=_norm_user(BOT_ID):
-                st=self._joinleave_state[_norm_room(room)][_norm_user(username)]
-                now=time.time(); evs=st.setdefault("events",[])
-                evs[:]=[x for x in evs if now-float(x[0])<=600]
-                evs.append((now,event_type))
-                if len(evs)>=4 and now>=float(st.get("banned_until",0) or 0):
-                    try:
-                        self.send_admin(room,username,"ban")
-                        st["banned_until"]=now+120
-                        _record_filter_ban(username,room,"حماية الدخول والخروج", "دخول/خروج متكرر")
-                        self.send_room_text(room,f"🚫 تم حظر @{username} لمدة دقيقتين بسبب تكرار الدخول والخروج.")
-                        threading.Timer(120.0, lambda r=room,u=username: self._auto_unban(r,u)).start()
-                    except Exception as exc: self.log("[JOINLEAVE] ban failed",repr(exc))
+            pcfg = _room_protection_cfg(room)
+            uname = _norm_user(username)
+            if pcfg.get("joinleave") and uname and uname != _norm_user(BOT_ID):
+                # Masters and explicit filter exceptions are never touched.
+                if not _is_master_name(username) and uname not in getattr(self, "filter_exceptions", set()):
+                    key = _norm_room(room)
+                    state = self._joinleave_state[key]
+                    now = time.time()
+                    events = state.setdefault("events", [])
+                    # Detection window is deliberately only 1 second.
+                    events[:] = [(ts, user, typ) for ts, user, typ in events if now - float(ts) <= 1.0]
+                    events.append((now, uname, event_type))
+                    active_until = float(state.get("active_until", 0.0) or 0.0)
+                    unique_users = {u for _ts, u, _typ in events if u}
+
+                    if active_until <= now and len(unique_users) >= 4:
+                        state["active_until"] = now + 1.0
+                        state["wave_users"] = set(unique_users)
+                        state["banned"] = set()
+                        active_until = now + 1.0
+
+                    if active_until > now:
+                        state.setdefault("wave_users", set()).update(unique_users)
+                        wave = set(state.get("wave_users", set()))
+                        already = state.setdefault("banned", set())
+                        for victim in wave:
+                            if not victim or victim in already:
+                                continue
+                            try:
+                                self.send_admin(room, victim, "ban")
+                                already.add(victim)
+                                _record_filter_ban(victim, room, "حماية فلود الدخول والخروج", "4 نكات خلال ثانية واحدة")
+                                self.log(f"[JOINLEAVE] permanent b@ ban room={room} target=@{victim}")
+                            except Exception as exc:
+                                self.log(f"[JOINLEAVE] ban failed room={room} target=@{victim}: {exc!r}")
         
         if event_type == "user_joined" and username:
             self.room_users[room][username] = role or "none"
@@ -9323,6 +10210,13 @@ class TalkinBot:
                 pending_join["timer"].cancel()
             self._blocked_room_reasons.pop(rnorm, None)
             self._blocked_room_notices.discard(rnorm)
+            if room:
+                self.known_rooms.add(room)
+                _save_persistent_rooms(self.known_rooms)
+                try:
+                    self.request_room_occupants(room)
+                except Exception as exc:
+                    self.log("[ROOM] occupants refresh after join failed:", repr(exc))
             requester = str((pending_join or {}).get("requested_by", "") or "").strip()
             if requester:
                 self.send_private_text(requester, f"✅ أكد الخادم دخول البوت إلى الغرفة: {room}")
@@ -9383,12 +10277,27 @@ class TalkinBot:
         # A photo sent in a room arrives as RoomEvent type=image with its
         # public URL in field 7 (url). If a master previously used `انشر`,
         # publish that image even when it was sent from a different room.
-        if event_type == "image":
-            media_url = str(event.get(7, "") or "").strip()
-            if frm and frm != BOT_ID and media_url:
-                # Ignore ordinary room images silently. Only a pending publish
-                # request may consume an image, avoiding verification notices.
-                if _is_verified_user(frm) and self._handle_publish_media(room, frm, media_url):
+        media_url = next(
+                (str(event.get(key, "") or "").strip() for key in (7, 6, 9, 10, 11, "url", "media_url", "image_url")
+                 if str(event.get(key, "") or "").strip().startswith(("http://", "https://"))),
+                "",
+        ) or first_http_url(event)
+        if event_type in {"image", "photo", "picture", "media", "file"} or (media_url and event_type not in {"text", "user_joined", "user_left"}):
+            # Different Talkin server versions put the image author in field
+            # 2 or field 22 (or expose it by name). Try all candidates so a
+            # valid انشر followed by a photo is never silently discarded.
+            media_senders = []
+            for candidate in (frm, event.get(22, ""), event.get(17, ""), event.get(2, ""),
+                              event.get("sender", ""), event.get("username", ""), event.get("from", "")):
+                candidate = str(candidate or "").strip()
+                if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
+                    media_senders.append(candidate)
+            if media_url:
+                # The pending publish record is the authorization. Do not add
+                # a second verification gate here: some servers identify the
+                # sender differently on media events, which used to make the
+                # image silently disappear after a valid انشر command.
+                if self._try_publish_pending_media(room, media_url, media_senders):
                     return
             return
 
@@ -9426,7 +10335,7 @@ class TalkinBot:
         # Administrative commands are private to the configured master. Do
         # not send an authorization message to other users and do not allow
         # verified/VIP users to reach the management handlers accidentally.
-        is_publish_command = body.strip().casefold() == "انشر" or body.strip().casefold().startswith("انشر@")
+        is_publish_command = _is_publish_command(body)
         if (_looks_like_admin_command(body)
                 and not _is_master_name(frm)
                 and not (_is_mvip_master(frm) and _is_verification_manager_command(body))
@@ -9537,6 +10446,8 @@ class TalkinBot:
         # نقاطي متاح للجميع ولا يحتاج توثيقاً.
         if body.strip().casefold() in ("نقاطي", "points"):
             self.send_room_text(room, _points_summary_text(frm))
+            if not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(room, body, frm, is_private=False)
             return
 
         # Verified users may use normal bot commands; administration remains
@@ -9555,37 +10466,80 @@ class TalkinBot:
                 self.send_room_text(room, f"🔒 @{frm} يحتاج توثيقاً لاستخدام الهدايا.\n{_verification_notice()}")
                 return
             if self.handle_gift_command(room, body, frm):
+                if not getattr(self, "_replaying_bot_action", False):
+                    self._remember_bot_action(room, body, frm, is_private=False)
                 return
         if body.strip().casefold() in ("هدايا", "gifts", "gv"):
             self.gift_help(room)
+            if not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(room, body, frm, is_private=False)
+            return
+        if body.strip().casefold() in ("صعود", "اصعد", "إصعد", ".صعود", "live", "join live"):
+            if not is_verified:
+                self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام البث.\n{_verification_notice()}")
+                return
+            self.request_live_room(room)
+            return
+        m_share_ar = re.fullmatch(r"(?:مشاركه|مشاركة)\s+@?([^\s@]+)", body.strip(), re.I)
+        if m_share_ar:
+            self.share_last_music(frm, m_share_ar.group(1), room)
+            if not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(room, body, frm, is_private=False)
             return
         m_share = re.fullmatch(r"sher@(.+)", body.strip(), re.I)
         if m_share:
             self.share_last_music(frm, m_share.group(1), room)
+            if not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(room, body, frm, is_private=False)
             return
+        if body.strip().startswith((".تشغيل ", "بث ")):
+            if not is_verified:
+                self.send_room_text(room, f"🔒 @{frm} غير موثّق لتشغيل الأغاني.\n{_verification_notice()}")
+                return
+            is_room_broadcast = body.strip().startswith("بث ")
+            command = body.replace(".تشغيل ", ".sa ", 1) if not is_room_broadcast else body.replace("بث ", ".sa ", 1)
+            # بث means broadcast to every room connected to this bot;
+            # .تشغيل remains local to the room where it was requested.
+            if self.handle_music_command(
+                    room, command, frm,
+                    broadcast_all=not is_room_broadcast,
+                    with_reactions=False,
+                    room_output=not is_room_broadcast,
+                    live_stream=is_room_broadcast):
+                if not getattr(self, "_replaying_bot_action", False):
+                    self._remember_bot_action(room, body, frm, is_private=False)
+                return
         if body.strip().lower().startswith(".sa "):
             if not is_verified:
                 self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام الأغاني.\n{_verification_notice()}")
                 return
             if self.handle_music_command(room, body, frm):
+                if not getattr(self, "_replaying_bot_action", False):
+                    self._remember_bot_action(room, body, frm, is_private=False)
                 return
 
         # Keep a small per-room message history for diagnostics.
         self.last_messages[room].append((frm, body, event_id))
         self.last_messages[room] = self.last_messages[room][-50:]
 
-        # Exact-match automatic replies.
-        if self.auto_replies_enabled:
-            reply=self._choose_auto_reply(body.strip().casefold(),frm,room)
-            if reply:
-                self.send_room_text(room,reply)
-                return
-
         if self._handle_management_command(room, body, frm):
             return
 
         if self._run_game_command_async(room, body, frm):
+            if not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(room, body, frm, is_private=False)
             return
+
+        # Exact-match automatic replies are intentionally evaluated LAST so
+        # they never steal a real bot command such as بنك/roll/نشر. One normal
+        # text message produces one response from the saved reply cycle.
+        if (self.auto_replies_enabled
+                and not _looks_like_bot_command(body)
+                and not _looks_like_admin_command(body)):
+            reply=self._choose_auto_reply(body.strip().casefold(),frm,room)
+            if reply:
+                self.send_room_text(room,reply)
+                return
 
         if body.lower().strip() in ("!help", "مساعدة") and AUTO_HELP:
             self.send_room_text(room, "أوامر البوت: k@ اسم، b@ اسم، a@ اسم، o@ اسم، دخول@اسم_الغرفة، خروج [اسم_الغرفة]، inv، invmsg نص الدعوة لدعوة مستخدمي الغرفة")
@@ -9659,8 +10613,13 @@ class TalkinBot:
                 self._process_room_list(result.get("rooms"))
             if result.get("users") or result.get("room_admin"):
                 self.process_occupants_for_invite(result)
-            if result.get("stream_event"):
-                self.log("[STREAM]", result["stream_event"])
+            # Different Talkin builds wrap the live invitation as StreamEvent,
+            # CallInfo, or (less commonly) a RoomEvent. Try all wrappers.
+            for stream_event in tuple(
+                    x for x in (result.get("stream_event"), result.get("call_info"), result.get("room_event"))
+                    if isinstance(x, dict)):
+                self.log("[STREAM]", stream_event)
+                self._handle_stream_event(stream_event)
             if result.get("room_admin"):
                 self.log("[ROOM_ADMIN]", result["room_admin"])
             if result.get("chat_message"):
@@ -9669,7 +10628,11 @@ class TalkinBot:
                 try:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
-                    media_url = str(cm.get(6, "") or "").strip()
+                    media_url = next(
+                        (str(cm.get(key, "") or "").strip() for key in (6, 7, 9, 10)
+                         if str(cm.get(key, "") or "").strip().startswith(("http://", "https://"))),
+                        "",
+                    ) or first_http_url(cm)
                     # Every NS is a fresh navigation request. Do not suppress
                     # rapid NS commands with the normal transport de-dup cache.
                     # Direct private message is a user command, not an admin
@@ -9686,10 +10649,19 @@ class TalkinBot:
                                 self.log("[DIRECT-MESSAGE] failed", target, repr(exc))
                             return
 
-                    if (not _is_ns_command(body)) and self._is_duplicate_incoming(
-                        "private",
-                        (frm, body, media_url),
-                        str(cm.get(41, "") or result.get("uid", "") or ""),
+                    _private_event_id = str(cm.get(41, "") or result.get("uid", "") or "")
+                    # A missing ChatMessage event id means content-signature
+                    # de-duplication is not safe for legitimate repeated text.
+                    # Keep signature de-duplication only for media messages.
+                    _skip_text_signature_dedup = (not _private_event_id and not media_url)
+                    if (
+                        not _is_ns_command(body)
+                        and not _skip_text_signature_dedup
+                        and self._is_duplicate_incoming(
+                            "private",
+                            (frm, body, media_url),
+                            _private_event_id,
+                        )
                     ):
                         self.log("[DEDUP] ignored repeated private message")
                         return
@@ -9700,6 +10672,8 @@ class TalkinBot:
                         self.master_last_seen = time.time()
                     if body and self._handle_master_process_command(frm, body, is_private=True):
                         return
+                    if body and self._monitor_command(frm, body):
+                        return
                     # When this process is the master account, it owns the
                     # private service flow and performs verification itself.
                     if MASTER_SERVICE_ENABLED and self._handle_master_account_service(frm, body):
@@ -9707,14 +10681,18 @@ class TalkinBot:
                     # The primary bot does not show the master-service menu.
                     # That menu belongs exclusively to the standalone master
                     # account when MASTER_SERVICE_ENABLED is active.
-                    if body and media_url:
-                        if not _is_verified_user(frm):
-                            self.send_room_text(self.room, f"🔒 @{frm} يحتاج توثيقاً لاستخدام النشر.\n{_verification_notice()}")
-                            return
-                        if self._handle_publish_media(self.room, frm, media_url):
+                    if media_url:
+                        # A pending publish request is the authorization for
+                        # the image; let the media handler validate it rather
+                        # than rejecting it on a second private-message role
+                        # check.
+                        private_media_senders = [
+                            frm, cm.get(22, ""), cm.get("sender", ""), cm.get("username", "")
+                        ]
+                        if self._try_publish_pending_media(self.room, media_url, private_media_senders):
                             return
                     # Silently ignore master-only commands from everyone else.
-                    is_publish_command = body.strip().casefold() == "انشر" or body.strip().casefold().startswith("انشر@")
+                    is_publish_command = _is_publish_command(body)
                     if (body and _looks_like_admin_command(body)
                             and not _is_master_name(frm)
                             and not (_is_mvip_master(frm) and _is_verification_manager_command(body))
@@ -9738,10 +10716,19 @@ class TalkinBot:
                     if body:
                         if self._handle_management_command(self.room, body, frm, is_private=True):
                             return
+                    m_share_ar = re.fullmatch(r"(?:مشاركه|مشاركة)\s+@?([^\s@]+)", body.strip(), re.I)
+                    if m_share_ar:
+                        self.share_last_music(frm, m_share_ar.group(1))
+                        return
                     m_share = re.fullmatch(r"sher@(.+)", body.strip(), re.I)
                     if m_share:
                         self.share_last_music(frm, m_share.group(1))
                         return
+                    if body.strip().startswith((".تشغيل ", "بث ")):
+                        is_room_broadcast = body.strip().startswith("بث ")
+                        command = body.replace(".تشغيل ", ".sa ", 1) if not is_room_broadcast else body.replace("بث ", ".sa ", 1)
+                        if self.handle_music_command(self.room, command, frm, broadcast_all=is_room_broadcast, with_reactions=False):
+                            return
                     if body.strip().lower().startswith(".sa "):
                         if self.handle_music_command(self.room, body, frm):
                             return
@@ -9760,7 +10747,21 @@ class TalkinBot:
                         parts = body.split(None, 1)
                         cmd = parts[0].lower() if parts else ""
                         arg = parts[1].strip() if len(parts) == 2 else ""
-                        if body.strip().casefold() in ("تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات") and _is_primary_master(frm):
+                        pending_add = getattr(self, "_pending_add_rooms", {}).get(_norm_user(frm))
+                        if isinstance(pending_add, dict) and body.strip().casefold() not in ("1", "2") and not _looks_like_bot_command(body.strip()):
+                            if time.time() - float(pending_add.get("created", 0) or 0) <= 180:
+                                self._pending_add_rooms.pop(_norm_user(frm), None)
+                                self._add_rooms_to_saved_file(frm, body.strip())
+                                return
+                            self._pending_add_rooms.pop(_norm_user(frm), None)
+                        if body.strip().casefold() in ("اضف لملف الغرف", "أضف لملف الغرف", "اضف للملف الغرف", "أضف للملف الغرف") and _is_primary_master(frm):
+                            if not hasattr(self, "_pending_add_rooms"):
+                                self._pending_add_rooms = {}
+                            self._pending_add_rooms[_norm_user(frm)] = {"created": time.time()}
+                            self.send_private_text(frm, "📁 أضف الغرف إلى ملف الغرف\n📨 أرسل أسماء الغرف مفصولة بمسافة.\nمثال: مشاعر ادم نبض قلوب سوالف")
+                        elif body.strip().casefold() in ("1", "2") and self._complete_join_rooms_language(frm, body.strip()):
+                            return
+                        elif body.strip().casefold() in ("تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات") and _is_primary_master(frm):
                             if body.strip().casefold() == "تشغيل الدعوات":
                                 self.invites_enabled = True
                                 self.send_private_text(frm, "✅ تم تشغيل الدعوات.")
@@ -9797,21 +10798,20 @@ class TalkinBot:
                                     self.send_private_text(frm, "⏳ جاري التحقق من رتبة البوت...")
                                 else:
                                     self.request_occupants(ctx_room, silent_master=False, response_room=ctx_room)
-                        elif re.fullmatch(r"دخول@(.+)", body.strip(), re.I):
-                            target_room = re.fullmatch(r"دخول@(.+)", body.strip(), re.I).group(1).strip()
-                            blocked_room = _norm_room(target_room)
-                            if blocked_room in self.blocked_rooms:
-                                self.blocked_rooms.discard(blocked_room)
-                                self._blocked_room_reasons.pop(blocked_room, None)
-                                self._blocked_room_notices.discard(blocked_room)
+                        elif re.fullmatch(r"دخول@(.+)", body.strip(), re.I | re.S):
+                            raw_rooms = re.fullmatch(r"دخول@(.+)", body.strip(), re.I | re.S).group(1).strip()
+                            rooms = [x.strip() for x in raw_rooms.split() if x.strip()]
+                            if rooms:
+                                for target_room in rooms:
+                                    blocked_room = _norm_room(target_room)
+                                    if blocked_room in self.blocked_rooms:
+                                        self.blocked_rooms.discard(blocked_room)
+                                        self._blocked_room_reasons.pop(blocked_room, None)
+                                        self._blocked_room_notices.discard(blocked_room)
                                 self._save_blocked_rooms()
-                            joined = self.join_room(target_room, force=True, requested_by=frm)
-                            self.send_private_text(
-                                frm,
-                                f"⏳ تمت إعادة محاولة دخول الغرفة: {target_room}. انتظر تأكيد الخادم."
-                                if joined else
-                                f"⚠️ تعذر إرسال طلب دخول الغرفة: {target_room}. تحقق من الاسم والصلاحية.",
-                            )
+                                self._begin_join_rooms_language(frm, rooms)
+                            else:
+                                self.send_private_text(frm, "❌ الصيغة: دخول@اسم_الغرفة أو دخول@غرفة1 غرفة2 غرفة3")
                         elif cmd in ("خروج", "leave", "exit"):
                             if arg:
                                 ok = self.leave_room(arg)
