@@ -10081,12 +10081,18 @@ class TalkinBot:
         # second trigger an immediate ban for the whole wave.  The active wave
         # stays open for one second so additional accounts arriving immediately
         # after the trigger are banned too.
-        if event_type in ("user_joined", "user_left") and username:
+        # Some Talkin server builds put the affected account in field 17 or 2
+        # instead of field 22.  Use all native user fields so rapid join events
+        # are not missed.
+        flood_username = str(
+            event.get(22, "") or event.get(17, "") or event.get(2, "") or ""
+        ).strip()
+        if event_type in ("user_joined", "user_left") and flood_username:
             pcfg = _room_protection_cfg(room)
-            uname = _norm_user(username)
+            uname = _norm_user(flood_username)
             if pcfg.get("joinleave") and uname and uname != _norm_user(BOT_ID):
                 # Masters and explicit filter exceptions are never touched.
-                if not _is_master_name(username) and uname not in getattr(self, "filter_exceptions", set()):
+                if not _is_master_name(flood_username) and uname not in getattr(self, "filter_exceptions", set()):
                     key = _norm_room(room)
                     state = self._joinleave_state[key]
                     now = time.time()
@@ -10283,6 +10289,40 @@ class TalkinBot:
                 "",
         ) or first_http_url(event)
         if event_type in {"image", "photo", "picture", "media", "file"} or (media_url and event_type not in {"text", "user_joined", "user_left"}):
+            # Ultra-fast repeated-image protection: if the same image is posted
+            # by the same account again within 1 second, ban the sender with
+            # the native permanent room ban (b@ / outcast).  URL equality is
+            # checked first because it is instantaneous; content hashing is
+            # also attempted for different URLs when possible.
+            try:
+                img_sender = next((x for x in (frm, event.get(22, ""), event.get(17, ""), event.get(2, ""), event.get("sender", ""), event.get("username", ""), event.get("from", "")) if str(x or "").strip()), "")
+                img_sender = str(img_sender or "").strip()
+                img_key = _norm_user(img_sender)
+                cfg = _room_protection_cfg(room)
+                if media_url and img_key and img_key != _norm_user(BOT_ID) and cfg.get("joinleave") and not _is_master_name(img_sender):
+                    now_img = time.time()
+                    if not hasattr(self, "_repeat_image_seen"):
+                        self._repeat_image_seen = {}
+                    # The URL is the fastest stable fingerprint.
+                    url_key = re.sub(r"[?#].*$", "", str(media_url).strip()).casefold()
+                    previous = self._repeat_image_seen.get((img_key, url_key))
+                    # Drop stale entries cheaply.
+                    if previous and now_img - float(previous) < 1.0:
+                        try:
+                            self.send_admin(room, img_sender, "ban")
+                            self.log(f"[IMAGE-FLOOD] permanent b@ ban room={room} target=@{img_sender}")
+                            _record_filter_ban(img_sender, room, "حماية تكرار الصورة خلال ثانية", "same image < 1s")
+                        except Exception as exc:
+                            self.log(f"[IMAGE-FLOOD] ban failed room={room} target=@{img_sender}: {exc!r}")
+                        self._repeat_image_seen[(img_key, url_key)] = now_img
+                    else:
+                        self._repeat_image_seen[(img_key, url_key)] = now_img
+                    if len(self._repeat_image_seen) > 2000:
+                        cutoff_img = now_img - 5.0
+                        self._repeat_image_seen = {k:v for k,v in self._repeat_image_seen.items() if now_img-float(v) <= 5.0}
+            except Exception as exc:
+                self.log("[IMAGE-FLOOD] detector failed:", repr(exc))
+
             # Different Talkin server versions put the image author in field
             # 2 or field 22 (or expose it by name). Try all candidates so a
             # valid انشر followed by a photo is never silently discarded.
