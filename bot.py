@@ -4640,12 +4640,8 @@ class TalkinBot:
                 except Exception as exc:
                     self.log("[STREAM] فشل إرسال room_stream audio:", repr(exc))
 
-                # 3. إرسال الصوت عبر قناة صوت الغرفة لضمان سماع جميع الحاضرين
-                try:
-                    self.send_room_media(room, str(media_url), "audio", int(duration or 0))
-                    self.log("[STREAM] أُرسلت وسائط الصوت للغرفة بنجاح:", room)
-                except Exception as exc:
-                    self.log("[STREAM] فشل send_room_media في البث:", repr(exc))
+                # تم إلغاء إرسال رسالة صوتية للشات لأن الأمر مخصص للبث الصوتي الحي فقط
+                pass
 
                 return True
 
@@ -5113,7 +5109,36 @@ class TalkinBot:
                     lk_url = f"ws://chatp.net:7880/rtc?access_token={token_jwt}&protocol=8&auto_subscribe=1"
                     lk_ws = RawWebSocket(lk_url, [], timeout=20)
                     lk_ws.connect()
-                    self.log("[LIVEKIT] تم الاتصال بنجاح بخادم الصوت LiveKit! البوت الآن موجود فعلياً على المايك.")
+                    self.log("[LIVEKIT] تم الاتصال بنجاح بخادم الصوت LiveKit!")
+
+                    # إرسال طلب نشر مسار الصوت (AddTrackRequest / MICROPHONE)
+                    # لنقل البوت فوراً من قائمة المستمعين (Listeners) إلى مقاعد المتحدثين (Mic Seats)
+                    try:
+                        def _varint(n):
+                            res = bytearray()
+                            while n > 0x7f:
+                                res.append((n & 0x7f) | 0x80)
+                                n >>= 7
+                            res.append(n & 0x7f)
+                            return bytes(res)
+                        def _field_str(fn, s):
+                            d = s.encode('utf-8')
+                            return _varint((fn << 3) | 2) + _varint(len(d)) + d
+                        def _field_var(fn, v):
+                            return _varint((fn << 3) | 0) + _varint(v)
+
+                        add_tr = bytearray()
+                        add_tr += _field_str(1, 'TR_audio')
+                        add_tr += _field_str(2, 'microphone')
+                        add_tr += _field_var(3, 0) # AUDIO
+                        add_tr += _field_var(8, 1) # MICROPHONE
+                        sig_req = bytearray()
+                        sig_req += _varint((4 << 3) | 2) + _varint(len(add_tr)) + add_tr
+                        
+                        lk_ws.send_binary(bytes(sig_req))
+                        self.log("[LIVEKIT] أُرسلت حزمة نشر المايك (AddTrackRequest) لنقل البوت لمقعد المتحدث الفعلي.")
+                    except Exception as tr_err:
+                        self.log("[LIVEKIT] تنبيه أثناء إرسال AddTrackRequest:", repr(tr_err))
 
                     stop_evt = threading.Event()
                     setattr(self, "_livekit_stop_" + r_name, stop_evt)
