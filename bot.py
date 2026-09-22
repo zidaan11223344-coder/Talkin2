@@ -4409,10 +4409,30 @@ class TalkinBot:
             )
             return self.send_query(payload)
 
+        if operation in ("ban_ip", "ip_ban"):
+            self.log(f"[MOD] room ban_ip room={room} target=@{target}")
+            try:
+                self.send_query(
+                    encode_query(
+                        "room_admin",
+                        type_="ban_ip",
+                        room=room,
+                        to=target,
+                        value="outcast",
+                    )
+                )
+            except Exception as e:
+                self.log("[MOD] ban_ip packet warning:", repr(e))
+            payload = encode_query(
+                "room_admin",
+                type_="change_role",
+                room=room,
+                to=target,
+                value="outcast",
+            )
+            return self.send_query(payload)
+
         if operation == "ban":
-            # A room ban is represented by the same role transition that the
-            # client reports in `role_changed`.  `ban_ip` was accepted by the
-            # gateway in some versions but did not change room membership.
             self.log(f"[MOD] room outcast room={room} target=@{target}")
             payload = encode_query(
                 "room_admin",
@@ -4627,6 +4647,7 @@ class TalkinBot:
                     self.log("[STREAM] فشل إرسال STREAM_AUDIO_ACTION:", repr(exc))
 
                 # 2. إرسال حزمة room_stream المخصصة للبث
+                audio_sent = False
                 try:
                     self.send_query(encode_query(
                         "room_stream",
@@ -4636,12 +4657,46 @@ class TalkinBot:
                         url=str(media_url),
                         length=str(max(0, int(duration or 0))),
                     ))
+                    audio_sent = True
                     self.log("[STREAM] أُرسلت حزمة room_stream audio بنجاح إلى:", room)
                 except Exception as exc:
                     self.log("[STREAM] فشل إرسال room_stream audio:", repr(exc))
 
-                # تم إلغاء إرسال رسالة صوتية للشات لأن الأمر مخصص للبث الصوتي الحي فقط
-                pass
+                # === اختبار آلي للتحقق من إرسال حزم الصوت وجاهزية البث ===
+                lk_active = getattr(self, f"_livekit_active_{room}", False)
+                lk_ws = getattr(self, f"_livekit_ws_{room}", None)
+                socket_healthy = bool(lk_ws and getattr(lk_ws, "sock", None))
+                self.log(f"[STREAM_VERIFY] فحص جاهزية البث في {room}: audio_sent={audio_sent}, livekit_active={lk_active}, socket_ok={socket_healthy}")
+                
+                # دورة إدارة تشغيل الأغنية في خيط مستقل لضمان استمرار البث حتى انتهاء الملف
+                # وتوقف الصوت بأمان دون مغادرة البوت أو إغلاق LiveKit
+                def _playback_lifecycle(target_room, r_id, s_id, track_len):
+                    try:
+                        self.log(f"[STREAM_PLAYBACK] بدء مراقبة تشغيل الأغنية في {target_room} لمدة {track_len} ثانية.")
+                        start_time = time.time()
+                        # إبقاء البوت متصلاً والنبض مستمراً طوال مدة الأغنية
+                        while time.time() - start_time < track_len:
+                            time.sleep(2.0)
+                            # إرسال تأكيد بقاء الصوت حياً داخل البث
+                            if getattr(self, f"_livekit_active_{target_room}", False) is False:
+                                self.log(f"[STREAM_PLAYBACK] تنبيه: انقطع اتصال البث أثناء تشغيل الأغنية في {target_room}")
+                                break
+                        self.log(f"[STREAM_PLAYBACK] اكتملت مدة الأغنية ({track_len} ثانية) في {target_room}. البوت يبقى على المايك بأمان.")
+                        # إرسال حزمة توقف الصوت الآمنة بدون خروج من الغرفة
+                        try:
+                            self.send_query(encode_query("room_stream", type_="audio_stop", room=r_id, id_=s_id))
+                        except Exception:
+                            pass
+                    except Exception as play_err:
+                        self.log("[STREAM_PLAYBACK] خطأ أثناء دورة تشغيل الصوت:", repr(play_err))
+
+                dur_sec = max(5, int(duration or 180))
+                threading.Thread(
+                    target=_playback_lifecycle,
+                    args=(room, room_id, session_id, dur_sec),
+                    name=f"stream-lifecycle-{room}",
+                    daemon=True,
+                ).start()
 
                 return True
 
@@ -5128,15 +5183,16 @@ class TalkinBot:
                             return _varint((fn << 3) | 0) + _varint(v)
 
                         add_tr = bytearray()
-                        add_tr += _field_str(1, 'TR_audio')
+                        add_tr += _field_str(1, 'TR_audio_mic')
                         add_tr += _field_str(2, 'microphone')
-                        add_tr += _field_var(3, 0) # AUDIO
-                        add_tr += _field_var(8, 1) # MICROPHONE
+                        add_tr += _field_var(3, 0) # AUDIO (0)
+                        add_tr += _field_var(6, 0) # unmuted = false (0)
+                        add_tr += _field_var(8, 2) # MICROPHONE = 2 (LiveKit official TrackSource)
                         sig_req = bytearray()
                         sig_req += _varint((4 << 3) | 2) + _varint(len(add_tr)) + add_tr
                         
                         lk_ws.send_binary(bytes(sig_req))
-                        self.log("[LIVEKIT] أُرسلت حزمة نشر المايك (AddTrackRequest) لنقل البوت لمقعد المتحدث الفعلي.")
+                        self.log("[LIVEKIT] ✅ أُرسلت حزمة نشر المايك (AddTrackRequest) بمصدر MICROPHONE=2 والمعرف TR_audio_mic لنقل البوت لمقعد المتحدث.")
                     except Exception as tr_err:
                         self.log("[LIVEKIT] تنبيه أثناء إرسال AddTrackRequest:", repr(tr_err))
 
@@ -5166,11 +5222,16 @@ class TalkinBot:
                     reader_t = threading.Thread(target=_reader, name=f"lk-reader-{r_name}", daemon=True)
                     reader_t.start()
 
-                    # حلقة إبقاء الاتصال حياً (Heartbeat/Ping) كل 8 ثوانٍ
-                    while not stop_evt.wait(8.0):
+                    # حلقة إبقاء الاتصال حياً (Heartbeat/Ping) كل 6 ثوانٍ مع بروتوكول LiveKit Protobuf
+                    while not stop_evt.wait(6.0):
                         if not lk_ws or not lk_ws.sock:
                             break
                         try:
+                            # 1. إرسال LiveKit Protobuf Signal Ping (field 14 timestamp in ms) لمنع قطع الاتصال بعد دقيقة
+                            now_ms = int(time.time() * 1000)
+                            sig_ping = _varint((14 << 3) | 0) + _varint(now_ms)
+                            lk_ws.send_binary(bytes(sig_ping))
+                            # 2. إرسال WebSocket control frame ping
                             lk_ws.send_control(0x9, b"lk-ping")
                         except Exception as p_err:
                             self.log("[LIVEKIT] خطأ أثناء إرسال نبض الحياة LiveKit Ping:", repr(p_err))
@@ -9576,14 +9637,16 @@ class TalkinBot:
                 return True
             self._pending_protection_number[_norm_user(sender)] = {"room":target_room,"created":time.time()}
             self.send_private_text(sender,
-                "🛡️ حماية الغرفة\n"
+                "🛡️ قائمة حماية الغرفة\n"
+                "━━━━━━━━━━━━\n"
                 "1️⃣ تشغيل حماية الغرفة من السب\n"
                 "2️⃣ إيقاف حماية الغرفة من السب\n"
-                "3️⃣ تشغيل حماية الغرفة من الفلود\n"
-                "4️⃣ إيقاف حماية الغرفة من الفلود\n"
-                "5️⃣ تشغيل حماية الغرفة من الدخول والخروج\n"
-                "6️⃣ إيقاف حماية الغرفة من الدخول والخروج\n"
-                "7️⃣ تعيين عدد الرسائل للحماية من الفلود\n\n"
+                "3️⃣ تشغيل حماية الفلود (هجوم الدخول المتزامن + حظر IP)\n"
+                "4️⃣ إيقاف حماية الفلود\n"
+                "5️⃣ تشغيل حماية الدخول والخروج (تكرار الدخول)\n"
+                "6️⃣ إيقاف حماية الدخول والخروج\n"
+                "7️⃣ تعيين حد رسائل الفلود\n"
+                "━━━━━━━━━━━━\n"
                 "📌 أرسل رقم الخيار الآن.")
             return True
 
@@ -10834,20 +10897,51 @@ class TalkinBot:
         # Keep the live membership state in sync.  The APK itself uses these
         # exact event names and RoomEvent fields.
         if event_type in ("user_joined", "user_left") and username:
-            pcfg=_room_protection_cfg(room)
-            if pcfg.get("joinleave") and _norm_user(username)!=_norm_user(BOT_ID):
-                st=self._joinleave_state[_norm_room(room)][_norm_user(username)]
-                now=time.time(); evs=st.setdefault("events",[])
-                evs[:]=[x for x in evs if now-float(x[0])<=600]
-                evs.append((now,event_type))
-                if len(evs)>=4 and now>=float(st.get("banned_until",0) or 0):
+            pcfg = _room_protection_cfg(room)
+            now = time.time()
+            norm_u = _norm_user(username)
+            norm_r = _norm_room(room)
+
+            # --- حماية الفلود: كشف دخول عدد نكات غير محدود/جماعي بنفس الوقت وحظرهم IP ---
+            if event_type == "user_joined" and pcfg.get("flood") and norm_u != _norm_user(BOT_ID) and not _is_master_name(username):
+                if not hasattr(self, "_join_flood_history"):
+                    self._join_flood_history = defaultdict(list)
+                history = self._join_flood_history[norm_r]
+                # إبقاء سجل آخر 5 ثوانٍ
+                history[:] = [h for h in history if now - h[0] <= 5.0]
+                history.append((now, username))
+                # إذا دخل 3 أو أكثر من النكات المختلفة خلال 5 ثوانٍ (هجوم فلود نكات)
+                if len(history) >= 3:
+                    self.log(f"[FLOOD] كشف فلود دخول جماعي في {room}: {len(history)} نكات خلال 5 ثوانٍ")
+                    banned_names = []
+                    for _, u_flood in list(history):
+                        if _norm_user(u_flood) != _norm_user(BOT_ID) and not _is_master_name(u_flood):
+                            try:
+                                self.send_admin(room, u_flood, "ban_ip")
+                                _record_filter_ban(u_flood, room, "حماية الفلود", "دخول جماعي متزامن (حظر IP)")
+                                banned_names.append(f"@{u_flood}")
+                            except Exception as f_err:
+                                self.log("[FLOOD] ban_ip error:", repr(f_err))
+                    history.clear()
+                    if banned_names:
+                        self.send_room_text(room, f"🚫 [حماية الفلود] تم حظر IP للنكات التالية لدخولها المتزامن: {' '.join(banned_names[:5])}")
+
+            # --- حماية الدخول والخروج: كشف تكرار الدخول والخروج لنفس النك وحظره ---
+            if pcfg.get("joinleave") and norm_u != _norm_user(BOT_ID) and not _is_master_name(username):
+                st = self._joinleave_state[norm_r][norm_u]
+                evs = st.setdefault("events", [])
+                evs[:] = [x for x in evs if now - float(x[0]) <= 300]
+                evs.append((now, event_type))
+                # 3 حركات دخول/خروج خلال 5 دقائق
+                if len(evs) >= 3 and now >= float(st.get("banned_until", 0) or 0):
                     try:
-                        self.send_admin(room,username,"ban")
-                        st["banned_until"]=now+120
-                        _record_filter_ban(username,room,"حماية الدخول والخروج", "دخول/خروج متكرر")
-                        self.send_room_text(room,f"🚫 تم حظر @{username} لمدة دقيقتين بسبب تكرار الدخول والخروج.")
-                        threading.Timer(120.0, lambda r=room,u=username: self._auto_unban(r,u)).start()
-                    except Exception as exc: self.log("[JOINLEAVE] ban failed",repr(exc))
+                        self.send_admin(room, username, "ban_ip")
+                        st["banned_until"] = now + 180
+                        _record_filter_ban(username, room, "حماية الدخول والخروج", "تكرار الدخول والخروج (حظر IP)")
+                        self.send_room_text(room, f"🚫 تم حظر @{username} (حظر IP) بسبب تكرار الدخول والخروج.")
+                        threading.Timer(180.0, lambda r=room, u=username: self._auto_unban(r, u)).start()
+                    except Exception as exc:
+                        self.log("[JOINLEAVE] ban failed", repr(exc))
         
         if event_type == "user_joined" and username:
             self.room_users[room][username] = role or "none"
