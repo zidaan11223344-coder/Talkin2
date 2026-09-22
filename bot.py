@@ -160,9 +160,11 @@ MASTER_SERVICE_ENABLED = os.getenv("MASTER_SERVICE_ENABLED", "0") == "1"
 # older APK/server builds use different Query action strings.  The defaults
 # match the action family observed by the current bot transport.
 STREAM_EXPERIMENTAL_ENABLED = os.getenv("STREAM_EXPERIMENTAL_ENABLED", "1") == "1"
-STREAM_INVITE_ACTION = os.getenv("STREAM_INVITE_ACTION", "stream_invite").strip()
-STREAM_ACCEPT_ACTION = os.getenv("STREAM_ACCEPT_ACTION", "stream_accept").strip()
+STREAM_INVITE_ACTION = os.getenv("STREAM_INVITE_ACTION", "sent_invitation").strip()
+STREAM_ACCEPT_ACTION = os.getenv("STREAM_ACCEPT_ACTION", "check_streaming").strip()
 STREAM_AUDIO_ACTION = os.getenv("STREAM_AUDIO_ACTION", "stream_audio").strip()
+STREAM_CHECK_ACTION = os.getenv("STREAM_CHECK_ACTION", "check_streaming").strip()
+STREAM_INVITE_TOKEN = os.getenv("STREAM_INVITE_TOKEN", "Token").strip() or "Token"
 STREAM_ACCEPT_STATE = os.getenv("STREAM_ACCEPT_STATE", "accept").strip() or "accept"
 STREAM_AUTO_ACCEPT = os.getenv("STREAM_AUTO_ACCEPT", "1").strip() == "1"
 # The current Talkin private-chat gateway displays type=audio as a text-only
@@ -587,6 +589,24 @@ def encode_query(action: str, *, type_: str = None, length: str = None,
         out += _varint(14 << 3) + _varint(int(long_value))
     if use_bin is not None:
         out += _field_int32(15, use_bin, True)
+    return bytes(out)
+
+
+def encode_live_invitation(inviter: str, target: str, token: str,
+                           room_id: str, room_name: str, invitation_id: str) -> bytes:
+    """Encode the manual Talkin live invitation packet captured from the app.
+
+    Unlike the generic Query schema used by chat messages, this action was
+    observed with username fields 2 and 3 followed by token/room/session
+    fields 5/6/8/9.
+    """
+    values = {
+        1: "sent_invitation", 2: inviter, 3: target, 5: token,
+        6: room_id, 8: room_name, 9: invitation_id,
+    }
+    out = bytearray()
+    for field in (1, 2, 3, 5, 6, 8, 9):
+        out += _field_string(field, str(values.get(field, "")), True)
     return bytes(out)
 
 
@@ -2265,11 +2285,6 @@ def _publish_ban_rows():
     data=_publish_bans_data(); rows=data.get("users",[])
     return rows if isinstance(rows,list) else []
 
-def _has_english_id(name):
-    """Return True when the username contains Latin/English letters."""
-    return bool(re.search(r"[A-Za-z]", str(name or "")))
-
-
 def _room_protection_data():
     data=_load_local_json(PROTECTION_FILE,{})
     return data if isinstance(data,dict) else {}
@@ -2278,14 +2293,7 @@ def _room_protection_cfg(room):
     data=_room_protection_data(); rooms=data.get("rooms",{}) if isinstance(data.get("rooms"),dict) else {}
     cfg=rooms.get(_norm_room(room),{})
     if not isinstance(cfg,dict): cfg={}
-    return {
-        "swear": bool(cfg.get("swear", False)),
-        "flood": bool(cfg.get("flood", False)),
-        "joinleave": bool(cfg.get("joinleave", False)),
-        "english_ids": bool(cfg.get("english_ids", False)),
-        "no_photo": bool(cfg.get("no_photo", False)),
-        "repeat_limit": max(2, min(50, int(cfg.get("repeat_limit", 3) or 3))),
-    }
+    return {"swear":bool(cfg.get("swear",False)),"flood":bool(cfg.get("flood",False)),"joinleave":bool(cfg.get("joinleave",False)),"repeat_limit":max(2,min(50,int(cfg.get("repeat_limit",3) or 3)))}
 
 def _save_room_protection(room, **changes):
     data=_room_protection_data(); rooms=data.get("rooms",{}) if isinstance(data.get("rooms"),dict) else {}
@@ -3502,6 +3510,8 @@ class TalkinBot:
             if _norm_user(item)
         }
         self._monitor_invited = set()
+        self._pending_live_accepts = {}
+        self._live_room_ids = {}
         self.invite_pending = False
         self.invites_enabled = True
         self.invite_silent_master = False
@@ -3553,10 +3563,7 @@ class TalkinBot:
         self.bot_blocked_users = _bot_blocked_users()
         self.filter_exceptions = _filter_exception_users()
         self._joinleave_state = defaultdict(lambda: defaultdict(lambda: {"events":[], "last_type":"", "banned_until":0.0}))
-        self._joinleave_wave_state = defaultdict(lambda: {"events": [], "active_until": 0.0, "wave_users": set(), "banned": set()})
         self._pending_protection_number = {}
-        # New joins awaiting a roster/photo confirmation when no-photo protection is enabled.
-        self._pending_no_photo_checks = defaultdict(dict)
         self.snake_games = {}
         self.ludo_games = {}
         self.bot_protection_enabled = _bot_protection_enabled()
@@ -3735,6 +3742,13 @@ class TalkinBot:
         if not _is_primary_master(sender):
             return False
         raw = str(text or "").strip()
+        match = re.fullmatch(r"(?:دعوة|دعوه)\s+(?:بث|للبث)\s*@?([^\s@]+)(?:\s+في\s+(.+))?", raw, re.I)
+        if match:
+            target = match.group(1).strip().lstrip("@")
+            room = str(match.group(2) or self.last_joined_room or self.room or "").strip()
+            if self.send_live_invitation_to_user(target, room):
+                self.send_private_text(sender, f"✅ تم إرسال دعوة البث اليدوية إلى @{target} في {room}.")
+            return True
         match = re.fullmatch(r"(?:مراقبه|مراقبة|راقب)\s*@?([^\s@]+)", raw, re.I)
         if match:
             username = match.group(1).strip().lstrip("@")
@@ -3783,6 +3797,38 @@ class TalkinBot:
             except Exception as exc:
                 self.log("[MONITOR] invite failed:", repr(exc))
                 self.send_private_text(BOT_MASTER, f"❌ تعذر دعوة @{username} من غرفة {room}: {str(exc)[:180]}")
+        if str(detail or "").strip().casefold() in {"صعدني", "ارفعني", "ارفعني للبث", "صعدني للبث"}:
+            self.send_live_invitation_to_user(username, room)
+
+    def send_live_invitation_to_user(self, target, room):
+        """Send the captured manual live invitation packet to a target."""
+        target = str(target or "").strip().lstrip("@")
+        room = str(room or "").strip()
+        if not target or not room:
+            return False
+        room_id = str(getattr(self, "_live_room_ids", {}).get(room, "") or "").strip()
+        try:
+            if not room_id:
+                room_id = str(self.db.room_id(room) or "").strip() if getattr(self, "db", None) else ""
+        except Exception as exc:
+            self.log("[STREAM] room id lookup failed:", repr(exc))
+        if not room_id or not room_id.isdigit():
+            self.send_private_text(BOT_MASTER, f"❌ لم أرسل دعوة البث إلى @{target}: لا يوجد room_id رقمي للغرفة {room}. أرسل دعوة يدوية للبوت أولاً أو فعّل Supabase.")
+            return False
+        inviter = str(BOT_ID or "").strip()
+        # The captured manual packet uses the literal protocol token marker
+        # in field 5. Allow a deployment-specific value without hard-coding a
+        # credential into the repository.
+        token = STREAM_INVITE_TOKEN
+        invitation_id = str(secrets.randbelow(90000000000000000) + 10000000000000000)
+        try:
+            self.send_query(encode_live_invitation(inviter, target, token, room_id, room, invitation_id))
+            self.send_private_text(BOT_MASTER, f"📨 أرسلت دعوة بث يدوية إلى @{target} في {room}\n📌 room_id={room_id}")
+            return True
+        except Exception as exc:
+            self.log("[STREAM] manual invitation failed:", repr(exc))
+            self.send_private_text(BOT_MASTER, f"❌ فشل إرسال دعوة البث إلى @{target}: {str(exc)[:180]}")
+            return False
 
     def authenticate(self):
         body = encode_auth_request(BOT_ID, BOT_PWD)
@@ -3861,6 +3907,21 @@ class TalkinBot:
     def send_query(self, payload: bytes):
         if not self.ws:
             raise RuntimeError("WebSocket is not connected")
+        # Keep a compact trace of the live protocol. This is intentionally
+        # limited to stream actions and never logs credentials or media URLs.
+        try:
+            fields = decode_message(payload)
+            action = str((fields.get(1) or [b""])[0], "utf-8", "ignore")
+            if action in {STREAM_INVITE_ACTION, STREAM_ACCEPT_ACTION, STREAM_AUDIO_ACTION, "sent_invitation", "check_streaming"}:
+                safe = {key: (str(values[0], "utf-8", "ignore")[:120] if isinstance(values[0], bytes) else str(values[0])[:120])
+                        for key, values in fields.items() if key in {1, 2, 4, 6, 8, 9, 10, 11, 13, 18}}
+                if 5 in fields:
+                    safe[5] = f"<token:{len(fields[5][0]) if isinstance(fields[5][0], bytes) else len(str(fields[5][0]))}>"
+                self.log("[STREAM_OUT_FULL_FIELDS]", safe)
+                self.log("[STREAM_OUT_RAW_HEX]", payload.hex()[:4000])
+                self.log("[STREAM_OUT]", safe)
+        except Exception as exc:
+            self.log("[STREAM_OUT] decode failed:", repr(exc))
         self.ws.send_binary(payload)
 
     def _start_heartbeat(self):
@@ -4499,27 +4560,8 @@ class TalkinBot:
             else:
                 self.log("[STREAM] invite self", room, STREAM_INVITE_ACTION)
                 self.send_query(encode_query(STREAM_INVITE_ACTION, room=room, to=BOT_ID))
-            # Older servers do not emit a you_invited callback for a self
-            # invitation. Keep the legacy room-based accept/audio fallback;
-            # newer servers will consume the callback path below instead.
-            if STREAM_AUTO_ACCEPT:
-                time.sleep(float(os.getenv("STREAM_ACCEPT_DELAY", "0.8")))
-                if room in self._pending_live_tracks:
-                    self.log("[STREAM] legacy accept self", room, STREAM_ACCEPT_ACTION)
-                    self.send_query(encode_query(
-                        STREAM_ACCEPT_ACTION, room=room, to=BOT_ID,
-                        value=BOT_ID, state=STREAM_ACCEPT_STATE,
-                    ))
-                    time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.8")))
-                pending = self._pending_live_tracks.get(room)
-                if pending:
-                    self.log("[STREAM] legacy publish audio", room, STREAM_AUDIO_ACTION)
-                    self.send_query(encode_query(
-                        STREAM_AUDIO_ACTION, type_="audio", room=room,
-                        url=str(pending["url"]),
-                        length=str(max(0, int(pending.get("duration") or 0))),
-                    ))
-                    self._pending_live_tracks.pop(room, None)
+            # Never publish audio before the server sends `you_invited` and
+            # the exact check_streaming acceptance has been sent.
             return True
         except Exception as exc:
             self.log("[STREAM] experimental live flow failed:", repr(exc))
@@ -4544,17 +4586,11 @@ class TalkinBot:
             self.send_query(encode_query(
                 STREAM_INVITE_ACTION, room=room, to=BOT_ID,
             ))
-            time.sleep(float(os.getenv("STREAM_ACCEPT_DELAY", "0.8")))
-
-            # Legacy/current fallback: accept the seat without waiting for a
-            # you_invited event. This is important for builds that silently
-            # accept the invite but never emit a callback to the bot.
-            self.send_query(encode_query(
-                STREAM_ACCEPT_ACTION, room=room, to=BOT_ID,
-                value=BOT_ID, state=STREAM_ACCEPT_STATE,
-            ))
-            self._live_ready_rooms.add(room)
-            self.send_room_text(room, "🎙️✅ تم طلب صعود البوت للبث الحي. يمكنك الآن استخدام: بث اسم الأغنية")
+            # Do not send a guessed accept packet here. The real acceptance
+            # requires token/room_id/room_name/session_id from `you_invited`.
+            # Sending the old room-name fallback made the server ignore the
+            # request while the bot falsely reported that it had joined.
+            self.send_room_text(room, "📡 تم إرسال طلب الدعوة. لن يعلن البوت الصعود حتى يصل حدث you_invited ويقبل الحزمة الصحيحة.")
         except Exception as exc:
             self._live_ready_rooms.discard(room)
             self.log("[STREAM] manual live join failed:", repr(exc))
@@ -4570,54 +4606,31 @@ class TalkinBot:
         if not STREAM_EXPERIMENTAL_ENABLED or not isinstance(event, dict):
             return False
         event_type = str(event.get(1, "") or event.get("type", "") or "").strip().casefold()
-        if event_type not in {
-            "you_invited", "invited", "stream_invite", "live_invite",
-            "sent_invitation",
-        }:
+        if event_type not in {"you_invited", "invited", "stream_invite", "live_invite"} and not any(token in event_type for token in ("invite", "invitation", "دعوه", "دعوة")):
             return False
-
-        # The live invitation packet used by the current Talkin build is not
-        # shaped like the self-request packet.  In the observed manual invite
-        # event:
-        #   field 1 = sent_invitation
-        #   field 5 = invitation token
-        #   field 8 = room name
-        #   field 9 = room id
-        # while field 6 is the invited user's numeric id.  Do not mistake
-        # field 6 for the room id.
-        room_name = str(
-            event.get(8, "") or event.get(2, "") or event.get("room", "") or ""
-        ).strip()
-        if event_type == "sent_invitation":
-            room_id = str(
-                event.get(9, "") or event.get("room_id", "") or event.get(8, "") or ""
-            ).strip()
-        else:
-            room_id = str(
-                event.get(6, "") or event.get(9, "") or
-                event.get(3, "") or event.get("room_id", "") or ""
-            ).strip()
-
-        invite_id = str(
-            event.get(5, "") or event.get(4, "") or
-            event.get("invite_id", "") or event.get("id", "") or ""
-        ).strip()
-
-        # For sent_invitation, field 3 is the account receiving the invite.
-        # Only treat it as an incoming invitation when it is addressed to this
-        # bot. This prevents an outgoing invitation to another user from being
-        # accidentally accepted by the bot itself.
-        if event_type == "sent_invitation":
-            invited_user = str(
-                event.get(3, "") or event.get("to", "") or
-                event.get("username", "") or ""
-            ).strip()
-            if invited_user and _norm_user(invited_user) != _norm_user(BOT_ID):
-                self.log(
-                    "[STREAM] sent_invitation is for another user; ignored:",
-                    invited_user,
+        room_name = str(event.get(8, "") or event.get(2, "") or event.get("room", "") or getattr(self, "room", "") or "").strip()
+        room_id = str(event.get(6, "") or event.get(3, "") or event.get("room_id", "") or room_name).strip()
+        if room_name and room_id.isdigit():
+            getattr(self, "_live_room_ids", {}).update({room_name: room_id})
+        stream_token = str(event.get(5, "") or event.get("token", "") or "").strip()
+        invitation_stream_id = str(event.get(9, "") or event.get("stream_id", "") or event.get("id", "") or "").strip()
+        invite_id = invitation_stream_id
+        if event_type in {"sent_invitation", "invitation_sent", "sent_invite", "دعوة_مرسلة", "دعوه_مرسله"}:
+            try:
+                self.send_private_text(
+                    BOT_MASTER,
+                    f"📨 تم إرسال دعوة بث فقط في الغرفة: {room_name}\n"
+                    "⚠️ هذا ليس حدث دعوة واردة للبوت؛ لم يتم قبول البث بعد.",
                 )
-                return False
+            except Exception as exc:
+                self.log("[STREAM] sent-invitation report failed:", repr(exc))
+            self.log("[STREAM] sent_invitation is not an incoming seat invitation", room_name)
+            return False
+        try:
+            if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
+                self.send_private_text(BOT_MASTER, f"📡 وصل حدث دعوة بث: {event_type} | الغرفة: {room_name}")
+        except Exception as exc:
+            self.log("[STREAM] invite event report failed:", repr(exc))
         pending_tracks = getattr(self, "_pending_live_tracks", {})
         pending = pending_tracks.get(room_name)
         if not pending and room_id:
@@ -4625,49 +4638,45 @@ class TalkinBot:
                                 if str(item.get("room_id", "")) == room_id), None)
             pending = pending_tracks.get(pending_key) if pending_key else None
             room_name = pending_key or room_name
-        self.log(
-            "[STREAM] incoming live invitation",
-            "type=", event_type,
-            "room=", room_name,
-            "room_id=", room_id,
-            "invite_id/token=", invite_id,
-            "target=", str(event.get(3, "") or event.get("to", "") or "").strip(),
-        )
-        if not room_id or not invite_id:
+        self.log("[STREAM] you_invited", room_name, "room_id=", room_id, "invite_id=", invite_id)
+        if not room_id:
             self.log("[STREAM] no queued track for invitation", room_name)
             return False
-        if not pending:
-            try:
-                self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
-                self._live_ready_rooms.add(room_name)
-                accept_result = self.send_query(encode_query(
-                    STREAM_ACCEPT_ACTION, room=room_id, id_=invite_id, to=BOT_ID,
-                    value=STREAM_ACCEPT_STATE, state=STREAM_ACCEPT_STATE,
-                ))
-                if accept_result is False:
-                    self.log("[STREAM] server rejected incoming live invitation", room_name)
-                    return False
-                self.log(
-                    "[STREAM] accepted incoming live invitation; waiting for بث command",
-                    room_name,
-                )
-                return True
-            except Exception as exc:
-                self.log("[STREAM] seat invitation accept failed:", repr(exc))
-                return False
         try:
-            getattr(self, "_live_ready_rooms", set()).add(room_name)
-            self.log("[STREAM] accept invitation", STREAM_ACCEPT_ACTION)
-            accept_result = self.send_query(encode_query(
-                STREAM_ACCEPT_ACTION, room=room_id, id_=invite_id, to=BOT_ID,
-                value=STREAM_ACCEPT_STATE, state=STREAM_ACCEPT_STATE,
+            # Manual capture proved the accept packet is:
+            # 1=check_streaming, 5=token, 6=room_id, 8=room_name, 9=stream_id.
+            # The captured field 9 changes between the invitation and the
+            # acceptance packet, so it is a fresh client-side session id.
+            stream_id = str(secrets.randbelow(90000000000000000) + 10000000000000000)
+            self.log("[STREAM] accept invitation", STREAM_CHECK_ACTION)
+            self.send_query(encode_query(
+                STREAM_CHECK_ACTION, body=stream_token, room=room_id,
+                uid=room_name, password=stream_id,
             ))
-            if accept_result is False:
-                raise RuntimeError("خادم Talkin رفض قبول دعوة البث")
+            pending_accepts = getattr(self, "_pending_live_accepts", None)
+            if not isinstance(pending_accepts, dict):
+                pending_accepts = {}
+                self._pending_live_accepts = pending_accepts
+            pending_accepts[room_name] = {
+                "room_id": room_id, "session_id": stream_id,
+                "sent_at": time.time(),
+            }
+            try:
+                self.send_private_text(
+                    BOT_MASTER,
+                    f"📤 أرسلت حزمة check_streaming، بانتظار قبول الخادم في {room_name}\n"
+                    f"📌 room_id={room_id} | session_id={stream_id}\n"
+                    "⚠️ هذا إرسال للحزمة وليس تأكيد صعود نهائي.",
+                )
+            except Exception as exc:
+                self.log("[STREAM] acceptance report failed:", repr(exc))
+            if not pending:
+                self.log("[STREAM] accepted seat invitation; waiting for بث command", room_name)
+                return True
             time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.8")))
             self.log("[STREAM] publish queued audio", STREAM_AUDIO_ACTION, room_id)
             self.send_query(encode_query(
-                STREAM_AUDIO_ACTION, type_="audio", room=room_id, id_=invite_id,
+                STREAM_AUDIO_ACTION, type_="audio", room=room_id, id_=stream_id,
                 url=str(pending["url"]),
                 length=str(max(0, int(pending.get("duration") or 0))),
             ))
@@ -4676,6 +4685,34 @@ class TalkinBot:
         except Exception as exc:
             self.log("[STREAM] invitation accept/audio failed:", repr(exc))
             return False
+
+    def _handle_stream_result_ack(self, result):
+        """Report the server's acceptance/failure after check_streaming."""
+        if not isinstance(result, dict):
+            return False
+        kind = str(result.get("type", "") or result.get("value", "") or "").strip().casefold()
+        if not any(word in kind for word in ("stream", "live", "check", "accept", "رفض", "فشل")):
+            return False
+        pending = getattr(self, "_pending_live_accepts", {})
+        room = str(result.get("room", "") or result.get(8, "") or "").strip()
+        if not room and len(pending) == 1:
+            room = next(iter(pending))
+        if not room or room not in pending:
+            return False
+        positive = any(word in kind for word in ("started", "accepted", "accept", "streaming", "live_ok", "success", "ok", "تم"))
+        negative = any(word in kind for word in ("reject", "رفض", "failed", "فشل", "denied", "error"))
+        if positive and not negative:
+            pending.pop(room, None)
+            self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
+            self._live_ready_rooms.add(room)
+            self.send_private_text(BOT_MASTER, f"✅ أكد الخادم صعود البوت للبث في الغرفة: {room}")
+            return True
+        if negative:
+            detail = str(result.get("value", "") or result.get("type", "") or "غير معروف")[:180]
+            pending.pop(room, None)
+            self.send_private_text(BOT_MASTER, f"❌ رفض الخادم صعود البوت في {room}: {detail}")
+            return True
+        return False
 
     def _master_service_menu(self, username: str):
         """Greeting/menu shown once per private conversation with the master."""
@@ -5380,54 +5417,6 @@ class TalkinBot:
         except Exception as exc:
             self.log("[GIFT] receiver photo lookup failed:", repr(exc))
         return ""
-
-    def _process_pending_no_photo_checks(self, result):
-        """Ban newly joined accounts whose RoomAdmin UserItem has no photo."""
-        room_admin = result.get("room_admin") or {}
-        if not room_admin:
-            return
-        try:
-            users = self._users_from_room_admin(room_admin)
-        except Exception:
-            users = []
-        if not users:
-            return
-        # RoomAdmin responses are room-scoped on current builds; when the
-        # wrapper does not expose the room, only process a single pending room.
-        candidate_rooms = list(getattr(self, "_pending_no_photo_checks", {}).keys())
-        if not candidate_rooms:
-            return
-        result_room = str(result.get("_occupants_room") or result.get("room") or "").strip()
-        if result_room and _norm_room(result_room) in self._pending_no_photo_checks:
-            rooms = [ _norm_room(result_room) ]
-        elif len(candidate_rooms) == 1:
-            rooms = candidate_rooms
-        else:
-            rooms = candidate_rooms
-        for rkey in rooms:
-            pending = self._pending_no_photo_checks.get(rkey, {})
-            if not pending:
-                continue
-            for user in users:
-                username = str(user.get("username") or "").strip()
-                key = _norm_user(username)
-                if not key or key not in pending:
-                    continue
-                photo = str(user.get("photo") or "").strip()
-                if not photo:
-                    room_name = result_room or next((str(x) for x in self.known_rooms if _norm_room(x)==rkey), "") or self.last_joined_room or self.room
-                    if (key not in {_norm_user(BOT_ID), _norm_user(BOT_MASTER)}
-                            and not _is_master_name(username)
-                            and key not in getattr(self, "filter_exceptions", set())):
-                        try:
-                            self.send_admin(room_name, username, "ban")
-                            _record_filter_ban(username, room_name, "حماية الحسابات بدون صورة", "No profile photo")
-                            self.log(f"[NO-PHOTO] permanent b@ ban room={room_name} target=@{username}")
-                        except Exception as exc:
-                            self.log(f"[NO-PHOTO] ban failed room={room_name} target=@{username}: {exc!r}")
-                pending.pop(key, None)
-            if not pending:
-                self._pending_no_photo_checks.pop(rkey, None)
 
     def process_occupants_for_invite(self, result):
         room = (self.invite_room or result.get("_occupants_room") or
@@ -8961,39 +8950,14 @@ class TalkinBot:
             ).start()
             return True
 
-        # Master-only room protection menu.
-        # `حمايه اسم الغرفه` may be sent from the master's private chat; all
-        # subsequent numeric choices operate on that saved target room.
-        m_protection_room = re.fullmatch(r"(?:حماية|حمايه)(?:\s+(?:الغرفة|الغرفه))?\s+(.+)", text.strip(), re.I)
-        if m_protection_room and _is_master_name(sender):
-            target_room = m_protection_room.group(1).strip()
-            if target_room:
-                self._pending_protection_number[_norm_user(sender)] = {
-                    "room": target_room, "created": time.time()
-                }
-                self.send_private_text(sender,
-                    f"🛡️ تم تحديد غرفة الحماية: {target_room}\n\n"
-                    "1️⃣ تشغيل حماية الغرفة من السب\n"
-                    "2️⃣ إيقاف حماية الغرفة من السب\n"
-                    "3️⃣ تشغيل حماية الغرفة من الفلود\n"
-                    "4️⃣ إيقاف حماية الغرفة من الفلود\n"
-                    "5️⃣ تشغيل حظر الدخول والخروج المتتابع\n"
-                    "6️⃣ إيقاف حظر الدخول والخروج المتتابع\n"
-                    "7️⃣ تعيين عدد الرسائل للحماية من الفلود\n"
-                    "8️⃣ تشغيل حظر المعرفات الإنجليزية\n"
-                    "9️⃣ إيقاف حظر المعرفات الإنجليزية\n"
-                    "🔟 تشغيل حظر الحسابات بدون صورة\n"
-                    "1️⃣1️⃣ إيقاف حظر الحسابات بدون صورة\n\n"
-                    "📌 أرسل رقم الخيار في الخاص.")
-            return True
-
+        # New master protection menu.
         if low in ("حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه"):
             if not _is_master_name(sender):
                 self.send_private_text(sender, "🚫 أمر الحماية مخصص للماستر.")
                 return True
-            target_room = str(room or "").strip()
+            target_room = str(room or self.room or "").strip()
             if not target_room:
-                self.send_private_text(sender, "⚠️ من الخاص استخدم: حمايه اسم الغرفه")
+                self.send_private_text(sender, "⚠️ أرسل أمر حماية داخل الغرفة التي تريد حمايتها.")
                 return True
             self._pending_protection_number[_norm_user(sender)] = {"room":target_room,"created":time.time()}
             self.send_private_text(sender,
@@ -9002,13 +8966,9 @@ class TalkinBot:
                 "2️⃣ إيقاف حماية الغرفة من السب\n"
                 "3️⃣ تشغيل حماية الغرفة من الفلود\n"
                 "4️⃣ إيقاف حماية الغرفة من الفلود\n"
-                "5️⃣ تشغيل حظر الدخول والخروج المتتابع\n"
-                "6️⃣ إيقاف حظر الدخول والخروج المتتابع\n"
-                "7️⃣ تعيين عدد الرسائل للحماية من الفلود\n"
-                "8️⃣ تشغيل حظر المعرفات الإنجليزية\n"
-                "9️⃣ إيقاف حظر المعرفات الإنجليزية\n"
-                "🔟 تشغيل حظر الحسابات بدون صورة\n"
-                "1️⃣1️⃣ إيقاف حظر الحسابات بدون صورة\n\n"
+                "5️⃣ تشغيل حماية الغرفة من الدخول والخروج\n"
+                "6️⃣ إيقاف حماية الغرفة من الدخول والخروج\n"
+                "7️⃣ تعيين عدد الرسائل للحماية من الفلود\n\n"
                 "📌 أرسل رقم الخيار الآن.")
             return True
 
@@ -9024,7 +8984,7 @@ class TalkinBot:
             if not 2 <= limit <= 50:
                 self.send_private_text(sender,"⚠️ أرسل رقماً من 2 إلى 50 فقط.")
                 return True
-            target_room=str(st.get("room") or room or "").strip()
+            target_room=str(st.get("room") or room or self.room or "").strip()
             _save_room_protection(target_room,repeat_limit=limit)
             _save_room_moderation(target_room,repeat_limit=limit)
             self._pending_protection_number.pop(protection_key,None)
@@ -9036,30 +8996,18 @@ class TalkinBot:
             if time.time()-float(st.get("created",0))>180:
                 self._pending_protection_number.pop(protection_key,None)
             else:
-                n=int(low); target_room=str(st.get("room") or room or "").strip()
-                names={
-                    1:("swear",True,"🛡️ تم تشغيل حماية الغرفة من السب."),
-                    2:("swear",False,"⛔ تم إيقاف حماية الغرفة من السب."),
-                    3:("flood",True,"🛡️ تم تشغيل حماية الغرفة من الفلود."),
-                    4:("flood",False,"⛔ تم إيقاف حماية الغرفة من الفلود."),
-                    5:("joinleave",True,"🛡️ تم تشغيل حظر الدخول والخروج المتتابع في 100ms."),
-                    6:("joinleave",False,"⛔ تم إيقاف حظر الدخول والخروج المتتابع."),
-                    8:("english_ids",True,"🛡️ تم تشغيل حظر المعرفات الإنجليزية."),
-                    9:("english_ids",False,"⛔ تم إيقاف حظر المعرفات الإنجليزية."),
-                    10:("no_photo",True,"🛡️ تم تشغيل حظر الحسابات بدون صورة."),
-                    11:("no_photo",False,"⛔ تم إيقاف حظر الحسابات بدون صورة."),
-                }
-                if n in names:
-                    field, value, msg = names[n]
-                    _save_room_protection(target_room, **{field:value})
+                n=int(low); target_room=str(st.get("room") or room or self.room or "").strip()
+                if n in range(1,7):
+                    names={1:("swear",True,"🛡️ تم تشغيل حماية الغرفة من السب."),2:("swear",False,"⛔ تم إيقاف حماية الغرفة من السب."),3:("flood",True,"🛡️ تم تشغيل حماية الغرفة من الفلود."),4:("flood",False,"⛔ تم إيقاف حماية الغرفة من الفلود."),5:("joinleave",True,"🛡️ تم تشغيل حماية الغرفة من الدخول والخروج."),6:("joinleave",False,"⛔ تم إيقاف حماية الغرفة من الدخول والخروج.")}[n]
+                    _save_room_protection(target_room, **{names[0]:names[1]})
                     self._pending_protection_number.pop(protection_key,None)
-                    self.send_private_text(sender,msg+f"\n🏠 الغرفة: {target_room}")
+                    self.send_private_text(sender,names[2]+f"\n🏠 الغرفة: {target_room}")
                     return True
                 if n==7:
                     self._pending_protection_number[protection_key]={"room":target_room,"created":time.time(),"awaiting_number":True}
                     self.send_private_text(sender,"🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر (من 2 إلى 50).")
                     return True
-                self.send_private_text(sender,"⚠️ اختر رقماً من 1 إلى 11.")
+                self.send_private_text(sender,"⚠️ اختر رقماً من 1 إلى 7.")
                 return True
         # Filter exception: amf@username
         m_amf=re.fullmatch(r"amf@(.+)",text,re.I)
@@ -10261,88 +10209,31 @@ class TalkinBot:
             and not _skip_room_text_signature_dedup
             and self._is_duplicate_incoming(
                 "room",
-                (event_type, room, frm, to, body, str(event.get(7, "") or ""), username or frm or str(event.get(17, "") or "").strip()),
+                (event_type, room, frm, to, body, str(event.get(7, "") or "")),
                 event_id,
             )
         ):
             self.log("[DEDUP] ignored repeated room event")
             return
 
-        # Keep the live membership state in sync. The APK/logs use user_joined
-        # and user_left RoomEvent names, with username in field 22.
-        flood_username = str(event.get(22, "") or event.get(17, "") or event.get(2, "") or "").strip()
-        joinleave_event = (
-            event_type in ("user_joined", "user_left", "user_join", "join", "entered",
-                           "enter", "user_entered", "user_left_room", "leave")
-            or "join" in event_type or "enter" in event_type
-            or "دخول" in event_type or "خروج" in event_type
-        )
-        if joinleave_event and flood_username:
-            pcfg = _room_protection_cfg(room)
-            uname = _norm_user(flood_username)
-
-            # Optional permanent ban for usernames containing Latin letters.
-            if event_type == "user_joined" and pcfg.get("english_ids"):
-                if (_has_english_id(flood_username)
-                        and uname not in {_norm_user(BOT_ID), _norm_user(BOT_MASTER)}
-                        and not _is_master_name(flood_username)
-                        and uname not in getattr(self, "filter_exceptions", set())):
+        # Keep the live membership state in sync.  The APK itself uses these
+        # exact event names and RoomEvent fields.
+        if event_type in ("user_joined", "user_left") and username:
+            pcfg=_room_protection_cfg(room)
+            if pcfg.get("joinleave") and _norm_user(username)!=_norm_user(BOT_ID):
+                st=self._joinleave_state[_norm_room(room)][_norm_user(username)]
+                now=time.time(); evs=st.setdefault("events",[])
+                evs[:]=[x for x in evs if now-float(x[0])<=600]
+                evs.append((now,event_type))
+                if len(evs)>=4 and now>=float(st.get("banned_until",0) or 0):
                     try:
-                        self.send_admin(room, flood_username, "ban")
-                        _record_filter_ban(flood_username, room, "حماية المعرفات الإنجليزية", "English/Latin ID")
-                        self.log(f"[ENGLISH-ID] permanent b@ ban room={room} target=@{flood_username}")
-                    except Exception as exc:
-                        self.log(f"[ENGLISH-ID] ban failed room={room} target=@{flood_username}: {exc!r}")
-
-            # Join/leave flood: two different accounts inside 100ms start a
-            # permanent ban wave. Any additional account arriving while the
-            # 100ms wave is active is banned as well. Option 7 never changes
-            # this detector.
-            if pcfg.get("joinleave") and uname and uname != _norm_user(BOT_ID):
-                if not _is_master_name(flood_username) and uname not in getattr(self, "filter_exceptions", set()):
-                    key = _norm_room(room)
-                    state = self._joinleave_wave_state[key]
-                    now = time.time()
-                    events = state.setdefault("events", [])
-                    window = 0.10
-                    events[:] = [(ts, user, typ) for ts, user, typ in events if now-float(ts) <= window]
-                    events.append((now, uname, event_type))
-                    active_until = float(state.get("active_until", 0.0) or 0.0)
-                    unique_users = {u for ts, u, typ in events if u}
-                    if active_until <= now and len(unique_users) >= 2:
-                        state["active_until"] = now + window
-                        state["wave_users"] = set(unique_users)
-                        state["banned"] = set()
-                        active_until = now + window
-                    if active_until > now:
-                        state.setdefault("wave_users", set()).update(unique_users)
-                        wave = set(state.get("wave_users", set()))
-                        already = state.setdefault("banned", set())
-                        for victim in wave:
-                            if not victim or victim in already:
-                                continue
-                            try:
-                                self.send_admin(room, victim, "ban")
-                                already.add(victim)
-                                _record_filter_ban(victim, room, "حماية فلود الدخول والخروج", "حسابات متتابعة خلال 100ms")
-                                self.log(f"[JOINLEAVE] permanent b@ ban room={room} target=@{victim}")
-                            except Exception as exc:
-                                self.log(f"[JOINLEAVE] ban failed room={room} target=@{victim}: {exc!r}")
-
-            # No-photo protection is confirmed from the native RoomAdmin/UserItem
-            # roster, where UserItem field 3 is the profile photo URL. Queue only
-            # newly joined accounts so ordinary roster refreshes do not ban all
-            # old no-photo members.
-            if event_type == "user_joined" and pcfg.get("no_photo") and uname:
-                if (uname not in {_norm_user(BOT_ID), _norm_user(BOT_MASTER)}
-                        and not _is_master_name(flood_username)
-                        and uname not in getattr(self, "filter_exceptions", set())):
-                    self._pending_no_photo_checks[_norm_room(room)][uname] = time.time()
-                    try:
-                        self.request_room_occupants(room)
-                    except Exception as exc:
-                        self.log("[NO-PHOTO] occupants refresh failed:", repr(exc))
-
+                        self.send_admin(room,username,"ban")
+                        st["banned_until"]=now+120
+                        _record_filter_ban(username,room,"حماية الدخول والخروج", "دخول/خروج متكرر")
+                        self.send_room_text(room,f"🚫 تم حظر @{username} لمدة دقيقتين بسبب تكرار الدخول والخروج.")
+                        threading.Timer(120.0, lambda r=room,u=username: self._auto_unban(r,u)).start()
+                    except Exception as exc: self.log("[JOINLEAVE] ban failed",repr(exc))
+        
         if event_type == "user_joined" and username:
             self.room_users[room][username] = role or "none"
             _remember_roster(room, [{"username": username, "role": role or "none"}])
@@ -10792,9 +10683,17 @@ class TalkinBot:
     def on_message(self, ws, message):
         try:
             if isinstance(message, str):
-                self.log("[WS] unexpected text frame received")
+                self.log("[WS_TEXT_FULL]", repr(message))
                 return
+            self.log("[WS_BINARY] bytes=", len(message), "hex=", bytes(message).hex()[:4000])
             result = decode_result_message(message)
+            # FULL LIVE DEBUG: print every decoded ResultMessage so the Railway
+            # log shows the complete event envelope, not only invite-related frames.
+            try:
+                self.log("[WS_EVENT_FULL]", repr(result))
+            except Exception as exc:
+                self.log("[WS_EVENT_FULL] log failed:", repr(exc))
+            self._handle_stream_result_ack(result)
             self._cache_user_photos_from_result(result)
             # Room join outcomes are emitted as top-level ResultMessage types
             # by some TalkinChat builds, not as nested RoomEvent packets.
@@ -10837,15 +10736,18 @@ class TalkinBot:
             if result.get("rooms"):
                 self._process_room_list(result.get("rooms"))
             if result.get("users") or result.get("room_admin"):
-                self._process_pending_no_photo_checks(result)
                 self.process_occupants_for_invite(result)
             # Different Talkin builds wrap the live invitation as StreamEvent,
             # CallInfo, or (less commonly) a RoomEvent. Try all wrappers.
             for stream_event in tuple(
                     x for x in (result.get("stream_event"), result.get("call_info"), result.get("room_event"))
                     if isinstance(x, dict)):
-                self.log("[STREAM]", stream_event)
+                self.log("[STREAM_EVENT_FULL]", repr(stream_event))
                 self._handle_stream_event(stream_event)
+            top_type = str(result.get("type", "") or "").strip().casefold()
+            if "invite" in top_type or "invited" in top_type:
+                self.log("[STREAM] top-level invitation", result)
+                self._handle_stream_event(result)
             if result.get("room_admin"):
                 self.log("[ROOM_ADMIN]", result["room_admin"])
             if result.get("chat_message"):
