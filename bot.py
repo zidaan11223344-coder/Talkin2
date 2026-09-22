@@ -5167,7 +5167,7 @@ class TalkinBot:
             self.log("[STREAM] request live seat", room, STREAM_INVITE_ACTION)
 
             if STREAM_MANUAL_ACCEPT_ONLY:
-                self.send_room_text(room, "📡 البوت جاهز لاستقبال دعوة البث من تطبيق Talkin وسيقبلها تلقائيًا عند وصولها.")
+                self.send_room_text(room, "🎙️ جاهز، أرسل: بث اسم الأغنية لتشغيلها")
                 return True
 
             # A self-seat request must use the same real invitation packet as
@@ -5178,7 +5178,7 @@ class TalkinBot:
                 raise RuntimeError("تعذر إرسال دعوة البث الفعلية إلى البوت")
             # Do not send a guessed accept packet here. The real acceptance
             # requires token/room_id/room_name/session_id from `you_invited`.
-            self.send_room_text(room, "📡 أرسلت دعوة بث فعلية إلى البوت؛ بانتظار حدث you_invited ثم قبول الخادم.")
+            self.send_room_text(room, "🎙️ جاهز، أرسل: بث اسم الأغنية لتشغيلها")
         except Exception as exc:
             self._live_ready_rooms.discard(room)
             self.log("[STREAM] manual live join failed:", repr(exc))
@@ -5729,7 +5729,7 @@ class TalkinBot:
             self.log("[STREAM] publish confirmation report failed:", repr(exc))
 
         try:
-            self.send_room_text(room, "🎙️ تم قبول دعوة البث والصعود إلى المايك بنجاح.")
+            pass  # الصعود الناجح يكون صامتًا؛ تم إرسال رسالة الجاهزية عند أمر اصعد
         except Exception as exc:
             self.log("[STREAM] room live announcement failed:", repr(exc))
 
