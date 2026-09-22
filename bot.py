@@ -3525,6 +3525,12 @@ class TalkinBot:
         }
         self._monitor_invited = set()
         self._pending_live_accepts = {}
+        # Persistent live-seat state for the current WebSocket session.
+        # The server may send publish_stream after the temporary invitation
+        # record has already been consumed by stream_accept, so music playback
+        # must not depend on _pending_live_accepts alone.
+        self._live_ready_rooms = set()
+        self._live_session_by_room = {}
         self._stream_error_log_lock = threading.Lock()
         self._stream_error_log_file = Path(
             os.getenv("STREAM_ERROR_LOG_FILE", str(DATA_DIR / "stream_accept_errors.log"))
@@ -4609,8 +4615,22 @@ class TalkinBot:
         try:
             ready_rooms = getattr(self, "_live_ready_rooms", set())
             pending_accepts = getattr(self, "_pending_live_accepts", {})
-            accepted = pending_accepts.get(room, {}) or {}
-            is_active = (room in ready_rooms) or accepted.get("publish_confirmed") or getattr(self, f"_livekit_active_{room}", False)
+            live_sessions = getattr(self, "_live_session_by_room", {})
+            accepted = (pending_accepts.get(room, {}) or live_sessions.get(room, {}) or {})
+            # Also tolerate case/Unicode differences in the room key returned
+            # by different Talkin builds.
+            if not accepted:
+                rkey = _norm_room(room).casefold()
+                for rk, rv in list(live_sessions.items()):
+                    if _norm_room(rk).casefold() == rkey:
+                        accepted = rv or {}
+                        break
+            is_active = (
+                room in ready_rooms
+                or accepted.get("publish_confirmed")
+                or getattr(self, f"_livekit_active_{room}", False)
+                or bool(accepted.get("livekit_active"))
+            )
 
             # إذا كان البوت صاعداً للبث والمايك بالفعل، نبث الصوت فوراً لجميع القنوات
             if is_active:
@@ -4748,6 +4768,89 @@ class TalkinBot:
         except Exception as exc:
             self.log("[STREAM] live play failed:", repr(exc))
             return False
+
+    def _feed_livekit_audio(self, room: str, media_url: str, duration: int = 0):
+        """Feed an MP3/other public audio URL into the already-published LiveKit mic.
+
+        The previous bot called this method but the method itself was missing,
+        which made an already-promoted bot fall into the generic "لم يصعد"
+        error path.  Playback is deliberately asynchronous so the command
+        handler stays responsive while ffmpeg decodes the track to 48 kHz PCM.
+        """
+        room = str(room or "").strip()
+        media_url = str(media_url or "").strip()
+        if not room or not media_url:
+            return False
+
+        source = getattr(self, f"_livekit_source_{room}", None)
+        loop = getattr(self, f"_livekit_loop_{room}", None)
+        if source is None or loop is None or getattr(loop, "is_closed", lambda: True)():
+            self.log("[LIVEKIT] audio feeder not ready:", room)
+            return False
+
+        def _run():
+            proc = None
+            try:
+                # Decode through ffmpeg so YouTube/MP3/M4A/WebM URLs all arrive
+                # at LiveKit as signed 16-bit mono PCM at the track sample rate.
+                proc = subprocess.Popen(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-reconnect", "1", "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "5",
+                        "-i", media_url,
+                        "-vn", "-ac", "1", "-ar", "48000",
+                        "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                bytes_per_frame = 960 * 2  # 20 ms @ 48 kHz mono s16le
+                deadline = time.time() + max(5, int(duration or 900)) + 8
+                while time.time() < deadline:
+                    chunk = proc.stdout.read(bytes_per_frame)
+                    if not chunk:
+                        break
+                    if len(chunk) < bytes_per_frame:
+                        chunk += b"\x00" * (bytes_per_frame - len(chunk))
+                    try:
+                        from livekit import rtc
+                        frame = rtc.AudioFrame(
+                            data=chunk,
+                            sample_rate=48000,
+                            num_channels=1,
+                            samples_per_channel=960,
+                        )
+                        capture = source.capture_frame(frame)
+                        if asyncio.iscoroutine(capture):
+                            fut = asyncio.run_coroutine_threadsafe(capture, loop)
+                            fut.result(timeout=5)
+                    except Exception as exc:
+                        self.log("[LIVEKIT] capture_frame failed:", repr(exc))
+                        break
+                self.log("[LIVEKIT] اكتمل/توقف بث الصوت:", room)
+            except FileNotFoundError:
+                self.log("[LIVEKIT] ffmpeg غير مثبت؛ لا يمكن بث الملف داخل المايك:", room)
+            except Exception as exc:
+                self.log("[LIVEKIT] audio feeder failed:", repr(exc))
+            finally:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+
+        threading.Thread(
+            target=_run,
+            name=f"livekit-audio-{room}",
+            daemon=True,
+        ).start()
+        return True
 
     def request_live_room(self, room: str):
         """Request a live seat using the app-compatible native invitation flow."""
@@ -5085,14 +5188,9 @@ class TalkinBot:
             return False
 
         pending = getattr(self, "_pending_live_accepts", {})
-        if not isinstance(pending, dict) or not pending:
-            self.log("[STREAM] ignored stale publish_stream: no pending invitation")
-            self._log_stream_stage(
-                "3_تجاهل",
-                "publish_stream_بدون_دعوة_معلقة",
-                hint="وصل حدث غير مرتبط بطلب صعود حالي",
-            )
-            return True
+        if not isinstance(pending, dict):
+            pending = {}
+            self._pending_live_accepts = pending
 
         room = ""
         if isinstance(result, dict):
@@ -5105,17 +5203,42 @@ class TalkinBot:
 
         if not room and len(pending) == 1:
             room = next(iter(pending))
+        if not room:
+            sessions = getattr(self, "_live_session_by_room", {})
+            if len(sessions) == 1:
+                room = next(iter(sessions))
 
-        if not room or room not in pending:
-            self.log("[STREAM] ignored publish_stream: no matching pending room", room)
+        # Some server builds consume the invitation record before publish_stream
+        # arrives. Rebuild a usable session from the publish event instead of
+        # treating it as stale.
+        accepted = pending.get(room) or getattr(self, "_live_session_by_room", {}).get(room) or {}
+        stream_event_probe = result.get("stream_event", {}) if isinstance(result, dict) else {}
+        if not accepted and isinstance(stream_event_probe, dict):
+            probe_room_id = str(stream_event_probe.get(8, "") or stream_event_probe.get("room_id", "") or "").strip()
+            probe_id = str(stream_event_probe.get(9, "") or stream_event_probe.get("id", "") or "").strip()
+            probe_token = str(stream_event_probe.get(5, "") or stream_event_probe.get("token", "") or "").strip()
+            if room:
+                accepted = {
+                    "room_id": probe_room_id if probe_room_id.isdigit() else "",
+                    "session_id": probe_id,
+                    "publish_id": probe_id,
+                    "livekit_token": probe_token,
+                    "token": probe_token,
+                    "invite_id": probe_id,
+                    "sent_at": time.time(),
+                    "publish_confirmed": False,
+                }
+                pending[room] = accepted
+
+        if not room or not accepted:
+            self.log("[STREAM] ignored publish_stream: no room/session data", room)
             self._log_stream_stage(
                 "3_تجاهل",
-                "غرفة_غير_مطابقة",
+                "publish_stream_بدون_جلسة",
                 room=room,
             )
             return True
 
-        accepted = pending.get(room) or {}
         stream_event = result.get("stream_event", {}) if isinstance(result, dict) else {}
 
         # === المرحلة 3.1: استلام وتطابق حدث publish_stream ===
@@ -5177,6 +5300,11 @@ class TalkinBot:
         accepted["publish_confirmed_at"] = time.time()
         pending[room] = accepted
         self._pending_live_accepts = pending
+        live_sessions = getattr(self, "_live_session_by_room", {})
+        live_sessions[room] = accepted
+        self._live_session_by_room = live_sessions
+        self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
+        self._live_ready_rooms.add(room)
 
         # === المرحلة 3.2: تثبيت المقعد ومعالجة publish_stream ===
         # ملاحظة هامة: حدث publish_stream هو تأكيد الخادم الرسمي بأن البوت أصبح على المايك.
@@ -5389,6 +5517,10 @@ class TalkinBot:
                 room=room,
             )
             accepted = pending.pop(room, None) or {}
+            live_sessions = getattr(self, "_live_session_by_room", {})
+            if accepted:
+                live_sessions[room] = accepted
+                self._live_session_by_room = live_sessions
             self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
             self._live_ready_rooms.add(room)
             self.send_private_text(BOT_MASTER, f"✅ أكد الخادم صعود البوت للبث في الغرفة: {room}")
