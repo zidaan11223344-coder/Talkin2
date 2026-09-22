@@ -3517,7 +3517,6 @@ class TalkinBot:
         }
         self._monitor_invited = set()
         self._pending_live_accepts = {}
-        self._live_accept_handshake_sent = set()
         self._stream_error_log_lock = threading.Lock()
         self._stream_error_log_file = Path(
             os.getenv("STREAM_ERROR_LOG_FILE", str(DATA_DIR / "stream_accept_errors.log"))
@@ -4668,7 +4667,25 @@ class TalkinBot:
         # the older stream_accept query. It echoes field 5 of you_invited as
         # query field 4 (to), and carries field 8 as query field 6 (room).
         stream_token = str(event.get(5, "") or event.get("token", "") or "").strip()
+
+        self._live_master_debug(
+            "you_invited",
+            event_type=event_type,
+            room=room_name,
+            room_id=room_id,
+            invite_id=invite_id,
+            token=stream_token,
+            fields=",".join(str(k) for k in sorted(event.keys(), key=str) if str(k).isdigit())[:80],
+        )
+
         if not stream_token:
+            self._live_master_debug(
+                "ناقص token",
+                room=room_name,
+                room_id=room_id,
+                invite_id=invite_id,
+                hint="field5/token غير موجود",
+            )
             self._log_stream_accept_error(
                 "missing_invite_token", "you_invited has no field-5 token", room_name, room_id, invite_id
             )
@@ -4703,10 +4720,57 @@ class TalkinBot:
                 self.log("[STREAM] duplicate invitation ignored", room_name)
                 return True
             self.log("[STREAM] publish invitation", STREAM_ROOM_ACTION, STREAM_ROOM_TYPE)
+            self._live_master_debug(
+                "إرسال publish",
+                action=STREAM_ROOM_ACTION,
+                type=STREAM_ROOM_TYPE,
+                to=stream_token,
+                room=room_name,
+                room_id=room_id,
+            )
             self.send_query(encode_query(
                 STREAM_ROOM_ACTION, type_=STREAM_ROOM_TYPE, to=stream_token,
                 room=room_name,
             ))
+
+            # Some gateway builds use the human room name here; others use
+            # the numeric room id from you_invited field 6. Try the canonical
+            # app form first, then the numeric form only if no publish_stream
+            # confirmation arrived for this invitation.
+            if room_id and room_id != room_name and room_id.isdigit():
+                def _live_room_id_fallback():
+                    try:
+                        time.sleep(float(os.getenv("STREAM_ROOM_ID_FALLBACK_DELAY", "1.2")))
+                        current = getattr(self, "_pending_live_accepts", {}).get(room_name, {})
+                        if current.get("publish_confirmed"):
+                            return
+                        self.log(
+                            "[STREAM] no publish_stream yet; retry room_stream/publish with room_id:",
+                            room_id,
+                        )
+                        self._live_master_debug(
+                            "لا يوجد publish_stream",
+                            action=STREAM_ROOM_ACTION,
+                            type=STREAM_ROOM_TYPE,
+                            to=stream_token,
+                            room=room_id,
+                            hint="تجربة room_id بدل اسم الغرفة",
+                        )
+                        self.send_query(encode_query(
+                            STREAM_ROOM_ACTION,
+                            type_=STREAM_ROOM_TYPE,
+                            to=stream_token,
+                            room=room_id,
+                        ))
+                    except Exception as exc:
+                        self.log("[STREAM] room_id fallback failed:", repr(exc))
+
+                threading.Thread(
+                    target=_live_room_id_fallback,
+                    name="talkin-live-room-id-fallback",
+                    daemon=True,
+                ).start()
+
             accepted_invites.add(invitation_key)
             self._accepted_live_invites = accepted_invites
             pending_accepts = getattr(self, "_pending_live_accepts", None)
@@ -4719,6 +4783,7 @@ class TalkinBot:
                 "token": stream_token,
                 "invite_id": invitation_stream_id,
                 "sent_at": time.time(),
+                "publish_confirmed": False,
             }
             try:
                 self.send_private_text(
@@ -4785,83 +4850,52 @@ class TalkinBot:
                     return True
         return False
 
-    def _send_live_publish_accept_handshake(self, room, accepted):
-        """Send the final live-seat acceptance after publish_stream.
-
-        The current flow is two-stage:
-          1) room_stream/type=publish requests the live-seat transition.
-          2) publish_stream is the server/app event that the transition reached
-             the publish stage. At that point the older stream_accept action is
-             sent with the invitation token/room id/session id.
-
-        Keep this isolated so the music/gift/room systems are untouched.
-        """
-        room = str(room or "").strip()
-        accepted = accepted if isinstance(accepted, dict) else {}
-        token = str(accepted.get("token", "") or "").strip()
-        room_id = str(accepted.get("room_id", "") or "").strip()
-        invite_id = str(accepted.get("invite_id", "") or "").strip()
-
-        if not room:
-            return False
-
-        sent_key = (room, token, room_id, invite_id)
-        sent_keys = getattr(self, "_live_accept_handshake_sent", set())
-        if sent_key in sent_keys:
-            self.log("[STREAM] post-publish accept already sent:", room)
-            return True
-
-        if not token:
-            self.log("[STREAM] publish_stream missing invitation token:", room)
-            self._log_stream_accept_error(
-                "publish_stream_missing_token",
-                "publish_stream arrived without the you_invited token",
-                room,
-                room_id,
-                invite_id,
-            )
-            return False
-
-        # The server-side room_stream/publish packet has already moved the
-        # invitation into publish_stream. Now explicitly acknowledge/accept
-        # the seat with the token that arrived in you_invited field 5.
+    def _live_master_debug(self, title, **data):
+        """Send compact live-stream diagnostics privately to the master."""
         try:
-            self.log(
-                "[STREAM] send final live-seat accept",
-                STREAM_ACCEPT_ACTION,
-                "type=", STREAM_ACCEPT_STATE,
-                "room=", room_id or room,
-            )
-            self.send_query(encode_query(
-                STREAM_ACCEPT_ACTION,
-                type_=STREAM_ACCEPT_STATE,
-                to=token,
-                room=room_id or room,
-                state=STREAM_ACCEPT_STATE,
-                value=STREAM_ACCEPT_STATE,
-                id_=invite_id,
-                token=token,
-            ))
-            sent_keys.add(sent_key)
-            self._live_accept_handshake_sent = sent_keys
-            return True
+            master = str(BOT_MASTER or "").strip()
+            if not master:
+                return
+            parts = [f"🔎 بث | {title}"]
+            for key, value in data.items():
+                if value is None:
+                    continue
+                value = str(value).replace("\n", " ").strip()
+                if len(value) > 120:
+                    value = value[:117] + "..."
+                parts.append(f"{key}={value}")
+            msg = " | ".join(parts)
+            # Keep each diagnostic below the platform's 200-char limit.
+            if len(msg) <= 200:
+                self.send_private_text(master, msg)
+                return
+            chunks = [msg[i:i+195] for i in range(0, len(msg), 195)]
+            for chunk in chunks[:4]:
+                self.send_private_text(master, chunk)
         except Exception as exc:
-            self._log_stream_accept_error(
-                "post_publish_accept",
-                exc,
-                room,
-                room_id,
-                invite_id,
-            )
-            self.log("[STREAM] final live-seat accept failed:", repr(exc))
-            return False
+            self.log("[STREAM] master debug failed:", repr(exc))
 
     def _handle_publish_stream_confirmation(self, result):
-        """Handle publish_stream and complete the live-seat acceptance."""
+        """Handle a publish_stream event only when a live invitation is pending.
+
+        IMPORTANT:
+        `publish_stream` is not generated by this bot and must never be used
+        as a free-standing success signal. A stale event can arrive before a
+        new `you_invited` event. Only a pending invitation created by the
+        current connection may consume it.
+        """
         if not self._stream_event_contains_publish_stream(result):
             return False
 
         pending = getattr(self, "_pending_live_accepts", {})
+        if not isinstance(pending, dict) or not pending:
+            self.log("[STREAM] ignored stale publish_stream: no pending invitation")
+            self._live_master_debug(
+                "publish_stream بدون دعوة معلقة",
+                hint="وصل حدث قديم/غير مرتبط بدعوة اصعد الحالية",
+            )
+            return True
+
         room = ""
         if isinstance(result, dict):
             room = str(
@@ -4871,67 +4905,52 @@ class TalkinBot:
                 or ""
             ).strip()
 
-        if not room and isinstance(pending, dict) and len(pending) == 1:
+        if not room and len(pending) == 1:
             room = next(iter(pending))
 
-        if not room and isinstance(getattr(self, "room", ""), str):
-            room = self.room.strip()
-
-        if not room:
-            self.log("[STREAM] publish_stream received but room is unknown")
+        if not room or room not in pending:
+            self.log("[STREAM] ignored publish_stream: no matching pending room", room)
             return True
 
-        accepted = pending.get(room) if isinstance(pending, dict) else None
-        if not isinstance(accepted, dict):
-            accepted = {
-                "room_id": str(
-                    getattr(self, "_live_room_ids", {}).get(room, "") or ""
-                ),
-                "session_id": "",
-                "token": "",
-                "invite_id": "",
-            }
+        accepted = pending.get(room) or {}
 
-        # IMPORTANT: this is the missing step in the current version.
-        # Do NOT treat publish_stream itself as proof that the seat is active.
-        # First send the final acceptance packet.
-        final_accept_sent = self._send_live_publish_accept_handshake(
-            room, accepted
+        self._live_master_debug(
+            "publish_stream",
+            room=room,
+            room_id=accepted.get("room_id", ""),
+            token=accepted.get("token", ""),
+            invite_id=accepted.get("invite_id", ""),
+            result_keys=",".join(str(k) for k in result.keys()) if isinstance(result, dict) else type(result).__name__,
         )
-        if not final_accept_sent:
-            self.send_private_text(
-                BOT_MASTER,
-                f"❌ تعذر تنفيذ قبول صعود البوت بعد publish_stream في {room}.",
-            )
+
+        if accepted.get("publish_confirmed"):
+            self.log("[STREAM] duplicate publish_stream ignored:", room)
             return True
 
-        # Keep the pending record until the server confirms the final accept.
-        self._pending_live_accepts = pending if isinstance(pending, dict) else {}
-
-        self.log(
-            "[STREAM] publish_stream received; final accept packet sent:",
-            room,
-        )
-
-        # A successful publish_stream is still useful as a local readiness hint,
-        # but the user-facing success message is only sent from the normal
-        # stream_accept/result acknowledgement path when available.
+        accepted["publish_confirmed"] = True
+        accepted["publish_confirmed_at"] = time.time()
+        pending[room] = accepted
+        self._pending_live_accepts = pending
         self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
-
-        # Some builds never emit a second ResultMessage after stream_accept.
-        # In those builds, publish_stream is the last event before the seat is
-        # shown, so mark the room ready only after the final packet was sent.
         self._live_ready_rooms.add(room)
 
+        self.log(
+            "[STREAM] publish_stream matched pending invitation:",
+            room,
+            "room_id=", accepted.get("room_id", ""),
+            "token_present=", bool(accepted.get("token")),
+        )
+
+        # publish_stream is the only success event currently observed from
+        # the application. Do not invent a second `stream_accept` protocol.
         try:
             self.send_private_text(
                 BOT_MASTER,
-                f"📡 وصل publish_stream وتم إرسال حزمة قبول الصعود في: {room}",
+                f"📡 وصل تأكيد publish_stream الحقيقي في: {room}",
             )
         except Exception as exc:
-            self.log("[STREAM] final accept report failed:", repr(exc))
+            self.log("[STREAM] publish confirmation report failed:", repr(exc))
 
-        # If music was queued, publish it after the final acceptance packet.
         track = getattr(self, "_pending_live_tracks", {}).pop(room, None)
         if track:
             try:
@@ -4942,7 +4961,7 @@ class TalkinBot:
                     or ""
                 )
                 self.log(
-                    "[STREAM] publish queued audio after final live accept",
+                    "[STREAM] publish queued audio after publish_stream",
                     STREAM_AUDIO_ACTION,
                     room_id,
                 )
@@ -4956,7 +4975,7 @@ class TalkinBot:
                 ))
             except Exception as exc:
                 self._log_stream_accept_error(
-                    "audio_after_final_accept",
+                    "audio_after_publish_stream",
                     exc,
                     room,
                     accepted.get("room_id", ""),
@@ -4976,10 +4995,29 @@ class TalkinBot:
         if not room and len(pending) == 1:
             room = next(iter(pending))
         if not room or room not in pending:
+            self._live_master_debug(
+                "رد بث غير مطابق",
+                type=kind,
+                room=room,
+                pending_rooms=",".join(str(x) for x in pending.keys())[:100],
+            )
             return False
         positive = any(word in kind for word in ("started", "accepted", "accept", "streaming", "live_ok", "success", "ok", "تم"))
         negative = any(word in kind for word in ("reject", "رفض", "failed", "فشل", "denied", "error"))
+        if negative:
+            self._live_master_debug(
+                "الخادم رفض البث",
+                type=kind,
+                room=room,
+                result=str(result),
+            )
+
         if positive and not negative:
+            self._live_master_debug(
+                "الخادم أكد البث",
+                type=kind,
+                room=room,
+            )
             accepted = pending.pop(room, None) or {}
             self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
             self._live_ready_rooms.add(room)
@@ -10991,6 +11029,7 @@ class TalkinBot:
                 self.log("[WS] unexpected text frame received")
                 return
             result = decode_result_message(message)
+            self._handle_stream_result_ack(result)
             self._cache_user_photos_from_result(result)
             # Room join outcomes are emitted as top-level ResultMessage types
             # by some TalkinChat builds, not as nested RoomEvent packets.
