@@ -186,6 +186,13 @@ PROFILE_STATUS_VERIFY = os.getenv("PROFILE_STATUS_VERIFY", "0") == "1"
 MASTER_DISPLAY_NAME = os.getenv(
     "MASTER_DISPLAY_NAME", "ۦاݪــۛـسـ𓆩♛𓆪ـۧۦـ۫فـيــ۫ـۧر𝁤𝆬𝃛"
 ).strip()
+# Username to monitor automatically. This is only a monitor; it does not send
+# invitations or change the monitored account.
+MONITORED_USERNAME = os.getenv(
+    "MONITORED_USERNAME",
+    "ۦاݪــۛـسـ𓆩♛𓆪ـۧۦـ۫فـيــ۫ـۧر𝁤𝆬𝃛",
+).strip()
+
 DEFAULT_BOT_BASE_STATUS = (
     '<B><H4><div style="background-color:#000000;padding:10px;text-align:center;">'
     '<font color="#5DE2E7">بوت حماية وألعاب وأغاني</font><br>'
@@ -3509,6 +3516,12 @@ class TalkinBot:
             _norm_user(item) for item in (monitored if isinstance(monitored, list) else [])
             if _norm_user(item)
         }
+        # Always include the requested account, even after a fresh deployment.
+        if MONITORED_USERNAME:
+            self.monitored_users.add(_norm_user(MONITORED_USERNAME))
+        _save_local_json(DATA_DIR / "monitored_users.json", sorted(self.monitored_users))
+        if MONITORED_USERNAME:
+            self.log("[MONITOR] active username:", MONITORED_USERNAME)
         self._monitor_invited = set()
         self._pending_live_accepts = {}
         self._live_room_ids = {}
@@ -3782,6 +3795,11 @@ class TalkinBot:
         return False
 
     def _report_monitored_event(self, room, event_type, username, detail=""):
+        """Report activity for the configured monitored username only.
+
+        Monitoring is passive: it never sends an invitation, never accepts a
+        live seat, and never changes the monitored user's account.
+        """
         key = _norm_user(username)
         if not key or key not in getattr(self, "monitored_users", set()):
             return
@@ -3793,19 +3811,7 @@ class TalkinBot:
             self.send_private_text(BOT_MASTER, summary)
         except Exception as exc:
             self.log("[MONITOR] report failed:", repr(exc))
-        # Invite once per user/room, using the same native invite path used by
-        # the normal invite command. Never spam the user on every event.
-        invite_key = (_norm_room(room), key)
-        if room and invite_key not in self._monitor_invited:
-            self._monitor_invited.add(invite_key)
-            try:
-                self.send_private_invite(username, room)
-                self.send_private_text(BOT_MASTER, f"📨 أرسلت دعوة إلى @{username} من غرفة {room}.")
-            except Exception as exc:
-                self.log("[MONITOR] invite failed:", repr(exc))
-                self.send_private_text(BOT_MASTER, f"❌ تعذر دعوة @{username} من غرفة {room}: {str(exc)[:180]}")
-        if str(detail or "").strip().casefold() in {"صعدني", "ارفعني", "ارفعني للبث", "صعدني للبث"}:
-            self.send_live_invitation_to_user(username, room)
+
 
     def send_live_invitation_to_user(self, target, room):
         """Send the captured manual live invitation packet to a target."""
@@ -4681,6 +4687,13 @@ class TalkinBot:
         if not STREAM_EXPERIMENTAL_ENABLED or not isinstance(event, dict):
             return False
         event_type = str(event.get(1, "") or event.get("type", "") or "").strip().casefold()
+        stream_room = str(event.get(8, "") or event.get(2, "") or event.get("room", "") or getattr(self, "room", "") or "").strip()
+        stream_inviter = str(event.get(2, "") or event.get("inviter", "") or "").strip()
+        stream_target = str(event.get(3, "") or event.get("target", "") or "").strip()
+        if stream_inviter and _norm_user(stream_inviter) in getattr(self, "monitored_users", set()):
+            self._report_monitored_event(stream_room, event_type, stream_inviter, f"المرسل/صاحب الدعوة → @{stream_target}" if stream_target else "نشاط دعوة بث")
+        if stream_target and _norm_user(stream_target) in getattr(self, "monitored_users", set()):
+            self._report_monitored_event(stream_room, event_type, stream_target, f"المستهدف بالدعوة ← @{stream_inviter}" if stream_inviter else "نشاط دعوة بث")
         if event_type in {"sent_invitation", "you_invited", "invited", "stream_invite", "live_invite"} or "invite" in event_type or "دعوة" in event_type or "دعوه" in event_type:
             self._arm_live_wire_capture(str(event.get(8, "") or event.get(2, "") or event.get("room", "") or ""))
         if event_type not in {"you_invited", "invited", "stream_invite", "live_invite"} and not any(token in event_type for token in ("invite", "invitation", "دعوه", "دعوة")):
