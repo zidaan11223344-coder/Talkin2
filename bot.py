@@ -3517,6 +3517,7 @@ class TalkinBot:
         }
         self._monitor_invited = set()
         self._pending_live_accepts = {}
+        self._live_accept_handshake_sent = set()
         self._stream_error_log_lock = threading.Lock()
         self._stream_error_log_file = Path(
             os.getenv("STREAM_ERROR_LOG_FILE", str(DATA_DIR / "stream_accept_errors.log"))
@@ -4713,7 +4714,10 @@ class TalkinBot:
                 pending_accepts = {}
                 self._pending_live_accepts = pending_accepts
             pending_accepts[room_name] = {
-                "room_id": room_id, "session_id": "",
+                "room_id": room_id,
+                "session_id": "",
+                "token": stream_token,
+                "invite_id": invitation_stream_id,
                 "sent_at": time.time(),
             }
             try:
@@ -4781,8 +4785,79 @@ class TalkinBot:
                     return True
         return False
 
+    def _send_live_publish_accept_handshake(self, room, accepted):
+        """Send the final live-seat acceptance after publish_stream.
+
+        The current flow is two-stage:
+          1) room_stream/type=publish requests the live-seat transition.
+          2) publish_stream is the server/app event that the transition reached
+             the publish stage. At that point the older stream_accept action is
+             sent with the invitation token/room id/session id.
+
+        Keep this isolated so the music/gift/room systems are untouched.
+        """
+        room = str(room or "").strip()
+        accepted = accepted if isinstance(accepted, dict) else {}
+        token = str(accepted.get("token", "") or "").strip()
+        room_id = str(accepted.get("room_id", "") or "").strip()
+        invite_id = str(accepted.get("invite_id", "") or "").strip()
+
+        if not room:
+            return False
+
+        sent_key = (room, token, room_id, invite_id)
+        sent_keys = getattr(self, "_live_accept_handshake_sent", set())
+        if sent_key in sent_keys:
+            self.log("[STREAM] post-publish accept already sent:", room)
+            return True
+
+        if not token:
+            self.log("[STREAM] publish_stream missing invitation token:", room)
+            self._log_stream_accept_error(
+                "publish_stream_missing_token",
+                "publish_stream arrived without the you_invited token",
+                room,
+                room_id,
+                invite_id,
+            )
+            return False
+
+        # The server-side room_stream/publish packet has already moved the
+        # invitation into publish_stream. Now explicitly acknowledge/accept
+        # the seat with the token that arrived in you_invited field 5.
+        try:
+            self.log(
+                "[STREAM] send final live-seat accept",
+                STREAM_ACCEPT_ACTION,
+                "type=", STREAM_ACCEPT_STATE,
+                "room=", room_id or room,
+            )
+            self.send_query(encode_query(
+                STREAM_ACCEPT_ACTION,
+                type_=STREAM_ACCEPT_STATE,
+                to=token,
+                room=room_id or room,
+                state=STREAM_ACCEPT_STATE,
+                value=STREAM_ACCEPT_STATE,
+                id_=invite_id,
+                token=token,
+            ))
+            sent_keys.add(sent_key)
+            self._live_accept_handshake_sent = sent_keys
+            return True
+        except Exception as exc:
+            self._log_stream_accept_error(
+                "post_publish_accept",
+                exc,
+                room,
+                room_id,
+                invite_id,
+            )
+            self.log("[STREAM] final live-seat accept failed:", repr(exc))
+            return False
+
     def _handle_publish_stream_confirmation(self, result):
-        """Treat the application's publish_stream event as successful acceptance."""
+        """Handle publish_stream and complete the live-seat acceptance."""
         if not self._stream_event_contains_publish_stream(result):
             return False
 
@@ -4796,8 +4871,6 @@ class TalkinBot:
                 or ""
             ).strip()
 
-        # If the event is nested and does not expose its room at the top level,
-        # use the only pending live room when unambiguous.
         if not room and isinstance(pending, dict) and len(pending) == 1:
             room = next(iter(pending))
 
@@ -4808,33 +4881,57 @@ class TalkinBot:
             self.log("[STREAM] publish_stream received but room is unknown")
             return True
 
-        accepted = pending.pop(room, None) if isinstance(pending, dict) else None
-        if accepted is None:
-            # The event can arrive after a reconnect or after the pending state
-            # was cleared. Still mark the room ready because publish_stream is
-            # the application's actual success signal.
+        accepted = pending.get(room) if isinstance(pending, dict) else None
+        if not isinstance(accepted, dict):
             accepted = {
-                "room_id": str(getattr(self, "_live_room_ids", {}).get(room, "") or ""),
+                "room_id": str(
+                    getattr(self, "_live_room_ids", {}).get(room, "") or ""
+                ),
                 "session_id": "",
+                "token": "",
+                "invite_id": "",
             }
 
-        self._pending_live_accepts = pending if isinstance(pending, dict) else {}
-        self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
-        self._live_ready_rooms.add(room)
+        # IMPORTANT: this is the missing step in the current version.
+        # Do NOT treat publish_stream itself as proof that the seat is active.
+        # First send the final acceptance packet.
+        final_accept_sent = self._send_live_publish_accept_handshake(
+            room, accepted
+        )
+        if not final_accept_sent:
+            self.send_private_text(
+                BOT_MASTER,
+                f"❌ تعذر تنفيذ قبول صعود البوت بعد publish_stream في {room}.",
+            )
+            return True
 
-        self.log("[STREAM] publish_stream confirmation received:", room)
+        # Keep the pending record until the server confirms the final accept.
+        self._pending_live_accepts = pending if isinstance(pending, dict) else {}
+
+        self.log(
+            "[STREAM] publish_stream received; final accept packet sent:",
+            room,
+        )
+
+        # A successful publish_stream is still useful as a local readiness hint,
+        # but the user-facing success message is only sent from the normal
+        # stream_accept/result acknowledgement path when available.
+        self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
+
+        # Some builds never emit a second ResultMessage after stream_accept.
+        # In those builds, publish_stream is the last event before the seat is
+        # shown, so mark the room ready only after the final packet was sent.
+        self._live_ready_rooms.add(room)
 
         try:
             self.send_private_text(
                 BOT_MASTER,
-                f"✅ أكد التطبيق publish_stream صعود البوت للبث في الغرفة: {room}",
+                f"📡 وصل publish_stream وتم إرسال حزمة قبول الصعود في: {room}",
             )
         except Exception as exc:
-            self.log("[STREAM] publish_stream confirmation report failed:", repr(exc))
+            self.log("[STREAM] final accept report failed:", repr(exc))
 
-        # If a song was queued for live streaming, publish it now. This keeps
-        # the old audio packet format unchanged; only the success trigger is
-        # changed from guessed/result text to publish_stream.
+        # If music was queued, publish it after the final acceptance packet.
         track = getattr(self, "_pending_live_tracks", {}).pop(room, None)
         if track:
             try:
@@ -4844,7 +4941,11 @@ class TalkinBot:
                     or getattr(self, "_live_room_ids", {}).get(room, "")
                     or ""
                 )
-                self.log("[STREAM] publish queued audio after publish_stream", STREAM_AUDIO_ACTION, room_id)
+                self.log(
+                    "[STREAM] publish queued audio after final live accept",
+                    STREAM_AUDIO_ACTION,
+                    room_id,
+                )
                 self.send_query(encode_query(
                     STREAM_AUDIO_ACTION,
                     type_="audio",
@@ -4855,7 +4956,11 @@ class TalkinBot:
                 ))
             except Exception as exc:
                 self._log_stream_accept_error(
-                    "audio_after_publish_stream", exc, room, accepted.get("room_id", ""), ""
+                    "audio_after_final_accept",
+                    exc,
+                    room,
+                    accepted.get("room_id", ""),
+                    accepted.get("invite_id", ""),
                 )
         return True
 
@@ -10886,7 +10991,6 @@ class TalkinBot:
                 self.log("[WS] unexpected text frame received")
                 return
             result = decode_result_message(message)
-            self._handle_stream_result_ack(result)
             self._cache_user_photos_from_result(result)
             # Room join outcomes are emitted as top-level ResultMessage types
             # by some TalkinChat builds, not as nested RoomEvent packets.
@@ -10940,8 +11044,9 @@ class TalkinBot:
             # The native app sends publish_stream after the invitation is
             # accepted. It is the authoritative success signal and may be
             # direct or nested inside a StreamEvent/CallInfo/RoomEvent.
-            if self._handle_publish_stream_confirmation(result):
-                pass
+            publish_handled = self._handle_publish_stream_confirmation(result)
+            if not publish_handled:
+                self._handle_stream_result_ack(result)
 
             top_type = str(result.get("type", "") or "").strip().casefold()
             if "invite" in top_type or "invited" in top_type:
