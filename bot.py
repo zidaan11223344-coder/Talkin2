@@ -4630,7 +4630,23 @@ class TalkinBot:
                 if not room_id:
                     room_id = room
 
-                session_id = str(accepted.get("session_id", "") or accepted.get("id_", "") or "")
+                session_id = str(
+                    accepted.get("session_id", "")
+                    or accepted.get("publish_id", "")
+                    or accepted.get("id_", "")
+                    or accepted.get("invite_id", "")
+                    or ""
+                )
+
+                # انتظر حتى تصبح قناة LiveKit فعّالة فعلياً قبل إرسال الصوت.
+                # إرسال room_stream قبل جاهزية الجلسة يجعل الخادم يعامل البوت
+                # كمستمع ولا يربط الصوت بمقعد المايك.
+                if not getattr(self, f"_livekit_active_{room}", False):
+                    wait_until = time.time() + float(os.getenv("STREAM_LIVEKIT_READY_TIMEOUT", "12"))
+                    while time.time() < wait_until:
+                        if getattr(self, f"_livekit_active_{room}", False):
+                            break
+                        time.sleep(0.25)
 
                 # 1. إرسال حزمة STREAM_AUDIO_ACTION
                 try:
@@ -4962,6 +4978,8 @@ class TalkinBot:
             pending_accepts[room_name] = {
                 "room_id": room_id,
                 "session_id": "",
+                "publish_id": "",
+                "livekit_token": "",
                 "token": stream_token,
                 "invite_id": invitation_stream_id,
                 "sent_at": time.time(),
@@ -5123,10 +5141,6 @@ class TalkinBot:
             )
             return True
 
-        accepted["publish_confirmed"] = True
-        accepted["publish_confirmed_at"] = time.time()
-        pending[room] = accepted
-        self._pending_live_accepts = pending
         self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
         self._live_ready_rooms.add(room)
 
@@ -5136,6 +5150,27 @@ class TalkinBot:
         event_token = str(stream_event_data.get(5, "") or stream_event_data.get("token", "") or accepted.get("token", "") or "").strip()
         event_room = str(stream_event_data.get(8, "") or stream_event_data.get("room", "") or room).strip()
         live_room_id = str(accepted.get("room_id", "") or "").strip()
+
+        # publish_stream يحمل معرف جلسة البث الحقيقي في field 9،
+        # والتوكن الخاص بـLiveKit في field 5. يجب حفظهما قبل تشغيل الصوت.
+        # session_id كان يبقى فارغاً في النسخة السابقة، ولذلك كانت حزمة
+        # room_stream تصل بلا جلسة مرتبطة بمقعد المتحدث.
+        if event_id:
+            accepted["session_id"] = event_id
+            accepted["publish_id"] = event_id
+        if event_token:
+            accepted["livekit_token"] = event_token
+        if event_room and not live_room_id and event_room.isdigit():
+            live_room_id = event_room
+            accepted["room_id"] = event_room
+            try:
+                getattr(self, "_live_room_ids", {})[room] = event_room
+            except Exception:
+                pass
+        accepted["publish_confirmed"] = True
+        accepted["publish_confirmed_at"] = time.time()
+        pending[room] = accepted
+        self._pending_live_accepts = pending
 
         # === المرحلة 3.2: تثبيت المقعد ومعالجة publish_stream ===
         # ملاحظة هامة: حدث publish_stream هو تأكيد الخادم الرسمي بأن البوت أصبح على المايك.
@@ -5283,7 +5318,20 @@ class TalkinBot:
                     or getattr(self, "_live_room_ids", {}).get(room, "")
                     or ""
                 )
-                session_id = str(accepted.get("session_id", "") or "")
+                session_id = str(
+                    accepted.get("session_id", "")
+                    or accepted.get("publish_id", "")
+                    or accepted.get("id_", "")
+                    or accepted.get("invite_id", "")
+                    or ""
+                )
+                # لا نرسل الصوت قبل أن تصبح جلسة LiveKit جاهزة.
+                if not getattr(self, f"_livekit_active_{room}", False):
+                    wait_until = time.time() + float(os.getenv("STREAM_LIVEKIT_READY_TIMEOUT", "12"))
+                    while time.time() < wait_until:
+                        if getattr(self, f"_livekit_active_{room}", False):
+                            break
+                        time.sleep(0.25)
                 self._log_stream_stage(
                     "3.5_بث_الصوت",
                     "إرسال_حزمة_الصوت",
