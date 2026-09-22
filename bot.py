@@ -20,6 +20,7 @@ import queue
 import mimetypes
 import unicodedata
 import html
+import io
 import sys
 import inspect
 from concurrent.futures import ThreadPoolExecutor
@@ -336,6 +337,11 @@ TELEGRAM_LOG_COMMANDS = {
 TELEGRAM_POLL_SECONDS = max(1.0, float(os.getenv("TELEGRAM_POLL_SECONDS", "2")))
 TELEGRAM_LOG_FILE = Path(os.getenv("TELEGRAM_LOG_FILE", str(DATA_DIR / "bot_runtime.log"))).expanduser()
 TELEGRAM_CHAT_FILE = Path(os.getenv("TELEGRAM_CHAT_FILE", str(DATA_DIR / "telegram_chat_id.json"))).expanduser()
+# Route very long Talkin messages to Telegram instead of sending them over the
+# WebSocket. This avoids server close code 1009 even when a result contains
+# large reports, diagnostics, lists, or processing details.
+TELEGRAM_LONG_TEXT_CHARS = max(800, int(os.getenv("TELEGRAM_LONG_TEXT_CHARS", "1800")))
+TELEGRAM_LONG_TEXT_ENABLED = os.getenv("TELEGRAM_LONG_TEXT_ENABLED", "1").strip() == "1"
 
 # Every mutable bot record lives in its own dedicated JSON file.
 MASTERS_FILE = DATA_DIR / "masters.json"
@@ -4403,6 +4409,65 @@ class TalkinBot:
         text = str(text or "")
         return [text] if text else [""]
 
+    def _send_long_text_to_telegram(self, text: str, title="رسالة طويلة من البوت"):
+        """Send oversized Talkin text to Telegram as a UTF-8 text document.
+
+        Returning False never raises: callers can safely fall back to the normal
+        Talkin chunking path when Telegram is not configured or temporarily fails.
+        """
+        if not TELEGRAM_LONG_TEXT_ENABLED or not TELEGRAM_BOT_TOKEN:
+            return False
+        chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
+        if not chat_id:
+            return False
+        text = str(text or "")
+        if not text:
+            return False
+        try:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"talkin_long_{stamp}.txt"
+            payload = text.encode("utf-8")
+            caption = str(title or "رسالة طويلة من البوت")[:900]
+            response = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"document": (filename, io.BytesIO(payload), "text/plain; charset=utf-8")},
+                timeout=60,
+            )
+            data = response.json()
+            if bool(data.get("ok")):
+                self.log(f"[TELEGRAM] long text routed successfully ({len(text)} chars)")
+                return True
+            self.log("[TELEGRAM] long text sendDocument failed:", str(data)[:1200])
+        except Exception as exc:
+            self.log("[TELEGRAM] long text upload failed:", repr(exc))
+        return False
+
+    def _long_text_notice(self, packet_type, kwargs):
+        if packet_type == "chat_message" and kwargs.get("to"):
+            return self.send_private_text(
+                str(kwargs.get("to")),\
+                "📨 الرسالة طويلة؛ تم إرسالها إلى Telegram لتجنب فصل البوت."
+            )
+        room = str(kwargs.get("room") or "").strip()
+        if room:
+            return self._send_text_packets_small_notice(
+                "room_message", room,
+                "📨 الرسالة طويلة؛ تم إرسالها إلى Telegram لتجنب فصل البوت."
+            )
+        return True
+
+    def _send_text_packets_small_notice(self, packet_type, room, text):
+        payload = {"type_": "text", "body": str(text)[:220]}
+        if packet_type == "room_message":
+            payload["room"] = room
+        try:
+            self.send_query(encode_query(packet_type, **payload))
+            return True
+        except Exception as exc:
+            self.log("[WS] long-text notice failed:", repr(exc))
+            return False
+
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
         """Send every textual result in safe ordered chunks, like A3.
 
@@ -4414,6 +4479,21 @@ class TalkinBot:
         text = str(text or "")
         if not text:
             return True
+
+        # Do not put large processing/results payloads on the Talkin WebSocket.
+        # A server-side 1009 close can happen before normal chunking gets a chance
+        # to help when the complete result itself is large. Telegram receives the
+        # full text as a document, while Talkin gets only a short safe notice.
+        if len(text) > TELEGRAM_LONG_TEXT_CHARS:
+            title = "📋 نتيجة طويلة من البوت"
+            if packet_type == "room_message":
+                title = f"📋 رسالة طويلة | الغرفة: {str(kwargs.get('room') or '')[:120]}"
+            elif packet_type == "chat_message":
+                title = f"📋 رسالة طويلة | إلى: {str(kwargs.get('to') or '')[:120]}"
+            if self._send_long_text_to_telegram(text, title=title):
+                return self._long_text_notice(packet_type, kwargs)
+            # Telegram unavailable? Keep the existing safe chunking fallback.
+
         limit = 320
         max_lines = 18
         lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -5152,6 +5232,9 @@ class TalkinBot:
                 return True
             return False
 
+        setattr(self, f"_livekit_audio_stop_event_{room}", threading.Event())
+        stop_audio = getattr(self, f"_livekit_audio_stop_event_{room}")
+        setattr(self, f"_livekit_audio_proc_{room}", None)
         setattr(self, f"_livekit_audio_feeding_{room}", True)
         first_frame = threading.Event()
         setattr(self, f"_livekit_first_frame_event_{room}", first_frame)
@@ -5171,9 +5254,10 @@ class TalkinBot:
                 ]
                 self.log("[LIVEKIT] starting ffmpeg audio feeder:", room, "source=", media_url if is_local_file else "remote")
                 proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                setattr(self, f"_livekit_audio_proc_{room}", proc)
                 bytes_per_frame = 960 * 2
                 deadline = time.time() + max(5, int(duration or 900)) + 8
-                while time.time() < deadline and not self.stop_event.is_set():
+                while time.time() < deadline and not self.stop_event.is_set() and not stop_audio.is_set():
                     chunk = proc.stdout.read(bytes_per_frame)
                     if not chunk:
                         err = b""
@@ -5222,6 +5306,7 @@ class TalkinBot:
                         proc.wait(timeout=2)
                     except Exception:
                         pass
+                setattr(self, f"_livekit_audio_proc_{room}", None)
 
         threading.Thread(target=_run, name=f"livekit-audio-{room}", daemon=True).start()
         # Wait for a short burst of actual PCM frames, not only one frame.
@@ -5232,6 +5317,106 @@ class TalkinBot:
             return True
         self.log("[LIVEKIT] no sufficient audio burst captured:", room, "frames=", state["frames"], state["error"])
         return False
+
+    def _stop_live_song(self, room: str):
+        """Stop only the current song in a live room; keep the bot on the mic."""
+        room = str(room or "").strip()
+        if not room:
+            return False
+        stopped = False
+        try:
+            ev = getattr(self, f"_livekit_audio_stop_event_{room}", None)
+            if ev is not None:
+                ev.set()
+                stopped = True
+        except Exception:
+            pass
+        try:
+            proc = getattr(self, f"_livekit_audio_proc_{room}", None)
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                stopped = True
+        except Exception:
+            pass
+        try:
+            pending = getattr(self, "_pending_live_tracks", {}) or {}
+            if room in pending:
+                pending.pop(room, None)
+                stopped = True
+        except Exception:
+            pass
+
+        key, accepted, _ = self._live_room_is_active(room)
+        room_id = str(
+            accepted.get("room_id", "")
+            or getattr(self, "_live_room_ids", {}).get(key or room, "")
+            or getattr(self, "_live_room_ids", {}).get(room, "")
+            or room
+        )
+        session_id = str(
+            accepted.get("session_id", "")
+            or accepted.get("publish_id", "")
+            or accepted.get("id_", "")
+            or accepted.get("invite_id", "")
+            or ""
+        )
+        for action in (STREAM_AUDIO_ACTION, "room_stream"):
+            try:
+                self.send_query(encode_query(
+                    action, type_="audio_stop", room=room_id, id_=session_id
+                ))
+            except Exception as exc:
+                self.log("[STREAM] audio_stop failed:", action, room, repr(exc))
+        self._last_live_play_status_by_room = getattr(self, "_last_live_play_status_by_room", {})
+        self._last_live_play_status_by_room[room] = "stopped"
+        return stopped or bool(accepted)
+
+    def _stop_live_broadcast(self, room: str):
+        """Stop the song and disconnect the bot's LiveKit publisher for one room."""
+        room = str(room or "").strip()
+        if not room:
+            return False
+        key, accepted, active = self._live_room_is_active(room)
+        target = key or room
+        self._stop_live_song(target)
+        stopped = bool(active or accepted)
+
+        setattr(self, f"_livekit_stop_requested_{target}", True)
+        lk_room = getattr(self, f"_livekit_room_{target}", None)
+        lk_loop = getattr(self, f"_livekit_loop_{target}", None)
+        if lk_room is not None and lk_loop is not None and not getattr(lk_loop, "is_closed", lambda: True)():
+            try:
+                async def _disconnect():
+                    try:
+                        await lk_room.disconnect()
+                    except TypeError:
+                        lk_room.disconnect()
+                fut = asyncio.run_coroutine_threadsafe(_disconnect(), lk_loop)
+                fut.result(timeout=5)
+                stopped = True
+            except Exception as exc:
+                self.log("[LIVEKIT] disconnect failed:", target, repr(exc))
+
+        # Do not let the old session make the next "بث" look already active.
+        try:
+            getattr(self, "_live_ready_rooms", set()).discard(target)
+        except Exception:
+            pass
+        for mapping_name in ("_pending_live_accepts", "_live_session_by_room"):
+            try:
+                getattr(self, mapping_name, {}).pop(target, None)
+            except Exception:
+                pass
+        try:
+            getattr(self, "_live_room_ids", {}).pop(target, None)
+        except Exception:
+            pass
+
+        setattr(self, f"_livekit_active_{target}", False)
+        setattr(self, f"_livekit_stop_requested_{target}", False)
+        self._last_live_play_status_by_room = getattr(self, "_last_live_play_status_by_room", {})
+        self._last_live_play_status_by_room[target] = "broadcast_stopped"
+        return stopped
 
     def request_live_room(self, room: str):
         """Request a live seat using the app-compatible native invitation flow."""
@@ -5334,14 +5519,9 @@ class TalkinBot:
         invitation_stream_id = str(event.get(9, "") or event.get("stream_id", "") or event.get("id", "") or "").strip()
         invite_id = invitation_stream_id
         if event_type in {"sent_invitation", "invitation_sent", "sent_invite", "دعوة_مرسلة", "دعوه_مرسله"}:
-            try:
-                self.send_private_text(
-                    BOT_MASTER,
-                    f"📨 تم إرسال دعوة بث فقط في الغرفة: {room_name}\n⚠️ هذا ليس حدث دعوة واردة للبوت؛ لم يتم قبول البث بعد.",
-                )
-            except Exception as exc:
-                self.log("[STREAM] sent-invitation report failed:", repr(exc))
-            self.log("[STREAM] sent_invitation is not an incoming seat invitation", room_name)
+            # This is an outgoing invitation notification, not an incoming
+            # seat invitation. Ignore it silently so the master is not spammed.
+            self.log("[STREAM] ignoring outgoing sent_invitation event", room_name)
             return False
 
         stream_token = str(event.get(5, "") or event.get("token", "") or "").strip()
@@ -12062,6 +12242,30 @@ class TalkinBot:
             if not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, frm, is_private=False)
             return
+        # Live music controls. These operate only on the current room's live session.
+        low_body = body.strip().casefold()
+        if low_body in (
+            "إيقاف الأغنية", "ايقاف الأغنية", "إيقاف الاغنية", "ايقاف الاغنية",
+            "وقف الأغنية", "وقف الاغنية", "stop song", "stop music"
+        ):
+            if not is_verified:
+                self.send_room_text(room, f"🔒 @{frm} غير موثّق لإيقاف أغنية البث.\n{_verification_notice()}")
+                return
+            self._stop_live_song(room)
+            self.send_room_text(room, "⏹️ تم إيقاف الأغنية في البث، والبوت ما زال على المايك.")
+            return
+
+        if low_body in (
+            "إيقاف البث", "ايقاف البث", "وقف البث", "إيقاف بث", "ايقاف بث",
+            "stop live", "stop broadcast"
+        ):
+            if not is_verified:
+                self.send_room_text(room, f"🔒 @{frm} غير موثّق لإيقاف البث.\n{_verification_notice()}")
+                return
+            self._stop_live_broadcast(room)
+            self.send_room_text(room, "🛑 تم إيقاف البث ومغادرة البوت للمايك في هذه الغرفة.")
+            return
+
         # Live-seat commands:
         #   اصعد  -> send the native invitation to the bot itself.
         #   صعدني -> send the native invitation to the user who issued the command.
