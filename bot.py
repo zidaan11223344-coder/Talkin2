@@ -10,6 +10,7 @@ import socket
 import struct
 import hashlib
 import threading
+import asyncio
 import time
 import uuid
 import subprocess
@@ -34,14 +35,6 @@ except Exception:
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# Telegram log delivery (master-only private command: السجل)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_CHAT_ID_FILE = Path(os.getenv("TELEGRAM_CHAT_ID_FILE", str(Path("/tmp") / "telegram_log_chat_id.txt")))
-TELEGRAM_POLL_SECONDS = float(os.getenv("TELEGRAM_POLL_SECONDS", "3"))
-TELEGRAM_LOG_FILE = Path(os.getenv("TELEGRAM_LOG_FILE", str(Path("/tmp") / "talkin_bot.log")))
-TELEGRAM_LOG_MAX_BYTES = int(os.getenv("TELEGRAM_LOG_MAX_BYTES", "5000000"))
 
 
 # ============================================================
@@ -3745,19 +3738,7 @@ class TalkinBot:
 
     def log(self, *args):
         if DEBUG:
-            message = " ".join(str(x) for x in args)
-            print(message, flush=True)
-            try:
-                TELEGRAM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-                with TELEGRAM_LOG_FILE.open("a", encoding="utf-8") as handle:
-                    handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
-                # Keep the local diagnostic file bounded so Railway storage is not
-                # filled by a long-running bot.
-                if TELEGRAM_LOG_MAX_BYTES > 0 and TELEGRAM_LOG_FILE.stat().st_size > TELEGRAM_LOG_MAX_BYTES:
-                    data = TELEGRAM_LOG_FILE.read_bytes()
-                    TELEGRAM_LOG_FILE.write_bytes(data[-TELEGRAM_LOG_MAX_BYTES:])
-            except Exception:
-                pass
+            print(*args, flush=True)
 
     def _log_stream_stage(self, stage, status, room="", **extra):
         """Log a distinct stage in the live-stream acceptance lifecycle safely to console logs."""
@@ -3801,143 +3782,6 @@ class TalkinBot:
                 self.send_private_text(BOT_MASTER, message)
             except Exception as notify_error:
                 self.log("[MASTER-ERROR] failed:", repr(notify_error))
-
-    def _telegram_saved_chat_id(self):
-        """Return the Telegram group chat id learned from the first /start message."""
-        if TELEGRAM_CHAT_ID:
-            return TELEGRAM_CHAT_ID
-        try:
-            if TELEGRAM_CHAT_ID_FILE.exists():
-                value = TELEGRAM_CHAT_ID_FILE.read_text(encoding="utf-8").strip()
-                if value:
-                    return value
-        except Exception as exc:
-            self.log("[TELEGRAM_LOG] chat id read failed:", repr(exc))
-        return ""
-
-    def _save_telegram_chat_id(self, chat_id, title=""):
-        chat_id = str(chat_id or "").strip()
-        if not chat_id:
-            return False
-        try:
-            TELEGRAM_CHAT_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
-            TELEGRAM_CHAT_ID_FILE.write_text(chat_id, encoding="utf-8")
-            self.log("[TELEGRAM] saved log chat_id:", chat_id, "title=", title)
-            return True
-        except Exception as exc:
-            self.log("[TELEGRAM] save chat_id failed:", repr(exc))
-            return False
-
-    def _telegram_poll_start(self):
-        """Listen for the first /start in a Telegram group and remember its chat_id."""
-        if not TELEGRAM_BOT_TOKEN:
-            self.log("[TELEGRAM] TELEGRAM_BOT_TOKEN غير موجود؛ polling disabled")
-            return
-        offset = 0
-        self.log("[TELEGRAM] polling started; waiting for /start in group")
-        while not self.stop_event.is_set():
-            try:
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-                response = requests.get(
-                    url,
-                    params={"timeout": 25, "offset": offset},
-                    timeout=35,
-                )
-                if not response.ok:
-                    self.log("[TELEGRAM] getUpdates failed:", response.status_code, response.text[:300])
-                    time.sleep(TELEGRAM_POLL_SECONDS)
-                    continue
-                payload = response.json()
-                for update in payload.get("result", []) if isinstance(payload, dict) else []:
-                    offset = max(offset, int(update.get("update_id", 0)) + 1)
-                    message = update.get("message") or update.get("edited_message") or {}
-                    if not isinstance(message, dict):
-                        continue
-                    chat = message.get("chat") or {}
-                    chat_type = str(chat.get("type", "")).casefold()
-                    text = str(message.get("text", "") or "").strip()
-                    if chat_type not in {"group", "supergroup"}:
-                        continue
-                    first_word = text.split()[0] if text else ""
-                    bot_suffix = first_word.split("@", 1)[1] if "@" in first_word else ""
-                    command = first_word.split("@", 1)[0].casefold()
-                    if command == "/start" and (not bot_suffix or bot_suffix.casefold() == BOT_ID.casefold()):
-                        chat_id = str(chat.get("id", "")).strip()
-                        if chat_id and not self._telegram_saved_chat_id():
-                            title = str(chat.get("title", "") or "")
-                            self._save_telegram_chat_id(chat_id, title)
-                            try:
-                                self.log("[TELEGRAM] first /start received from group:", title or chat_id)
-                                requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                                    data={
-                                        "chat_id": chat_id,
-                                        "text": "✅ تم ربط هذه المجموعة بسجل البوت.\nاكتب السجل في خاص البوت لإرسال آخر سجل هنا.",
-                                    },
-                                    timeout=15,
-                                )
-                            except Exception as exc:
-                                self.log("[TELEGRAM] start confirmation failed:", repr(exc))
-            except Exception as exc:
-                self.log("[TELEGRAM] polling error:", repr(exc))
-                time.sleep(TELEGRAM_POLL_SECONDS)
-
-    def _send_log_to_telegram(self, requester: str) -> bool:
-        """Send the bot log to the saved Telegram group learned from /start."""
-        if not TELEGRAM_BOT_TOKEN:
-            self.send_private_text(requester, "❌ أضف متغير TELEGRAM_BOT_TOKEN في Railway أولاً.")
-            return False
-        chat_id = self._telegram_saved_chat_id()
-        if not chat_id:
-            self.send_private_text(
-                requester,
-                "❌ لم يتم ربط مجموعة تيليجرام بعد. أضف البوت إلى المجموعة وأرسل /start فيها.",
-            )
-            return False
-
-        try:
-            path = TELEGRAM_LOG_FILE
-            if not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("لا يوجد سجل محفوظ حتى الآن.\n", encoding="utf-8")
-
-            # Telegram accepts the file as a document. Limit the upload to the
-            # configured tail size if an external process made the file larger.
-            if TELEGRAM_LOG_MAX_BYTES > 0 and path.stat().st_size > TELEGRAM_LOG_MAX_BYTES:
-                data = path.read_bytes()[-TELEGRAM_LOG_MAX_BYTES:]
-                path.write_bytes(data)
-
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-            with path.open("rb") as handle:
-                response = requests.post(
-                    url,
-                    data={
-                        "chat_id": chat_id,
-                        "caption": f"📋 سجل البوت | طلب من @{requester}",
-                    },
-                    files={"document": ("talkin_bot.log", handle, "text/plain")},
-                    timeout=30,
-                )
-            if not response.ok:
-                self.log("[TELEGRAM_LOG] sendDocument failed:", response.status_code, response.text[:500])
-                self.send_private_text(requester, "❌ تعذر إرسال السجل إلى تيليجرام.")
-                return False
-
-            self.send_private_text(requester, "✅ تم إرسال سجل البوت إلى تيليجرام.")
-            return True
-        except Exception as exc:
-            self.log("[TELEGRAM_LOG] error:", repr(exc))
-            self.send_private_text(requester, f"❌ فشل إرسال السجل: {str(exc)[:150]}")
-            return False
-
-    def _telegram_log_command(self, sender, text):
-        """Master-only private command for sending the latest bot log to Telegram."""
-        if not _is_primary_master(sender):
-            return False
-        if str(text or "").strip().casefold() in {"السجل", "سجل", "log", "logs"}:
-            self._send_log_to_telegram(sender)
-            return True
-        return False
 
     def _monitor_command(self, sender, text):
         """Handle master-only private monitoring commands."""
@@ -4805,6 +4649,11 @@ class TalkinBot:
                             break
                         time.sleep(0.25)
 
+                # البث الحقيقي: أرسل الملف داخل مسار LiveKit المنشور فعلياً.
+                # حزم room_stream أدناه تبقى للتوافق مع خوادم Talkin القديمة.
+                live_audio_started = self._feed_livekit_audio(room, media_url, duration)
+                self.log("[STREAM_VERIFY] LiveKit publisher audio=", live_audio_started, "room=", room)
+
                 # 1. إرسال حزمة STREAM_AUDIO_ACTION
                 try:
                     self.send_query(encode_query(
@@ -5351,93 +5200,56 @@ class TalkinBot:
         livekit_token = event_token or accepted.get("token", "")
         if livekit_token and len(livekit_token) > 50:
             def _run_livekit_client(token_jwt, r_name, r_id):
+                """Connect to LiveKit as a real publisher using the official SDK."""
+                loop = None
                 try:
-                    self.log("[LIVEKIT] بدء الاتصال بخادم الصوت RTC للصعود الفعلي في الغرفة:", r_name, "معرف:", r_id)
-                    lk_url = f"ws://chatp.net:7880/rtc?access_token={token_jwt}&protocol=8&auto_subscribe=1"
-                    lk_ws = RawWebSocket(lk_url, [], timeout=20)
-                    lk_ws.connect()
-                    self.log("[LIVEKIT] تم الاتصال بنجاح بخادم الصوت LiveKit!")
+                    from livekit import rtc
 
-                    # إرسال طلب نشر مسار الصوت (AddTrackRequest / MICROPHONE)
-                    # لنقل البوت فوراً من قائمة المستمعين (Listeners) إلى مقاعد المتحدثين (Mic Seats)
-                    try:
-                        def _varint(n):
-                            res = bytearray()
-                            while n > 0x7f:
-                                res.append((n & 0x7f) | 0x80)
-                                n >>= 7
-                            res.append(n & 0x7f)
-                            return bytes(res)
-                        def _field_str(fn, s):
-                            d = s.encode('utf-8')
-                            return _varint((fn << 3) | 2) + _varint(len(d)) + d
-                        def _field_var(fn, v):
-                            return _varint((fn << 3) | 0) + _varint(v)
+                    lk_url = os.getenv("LIVEKIT_URL", "ws://chatp.net:7880").strip()
+                    if lk_url.endswith("/rtc"):
+                        lk_url = lk_url[:-4].rstrip("/")
 
-                        add_tr = bytearray()
-                        add_tr += _field_str(1, 'TR_audio_mic')
-                        add_tr += _field_str(2, 'microphone')
-                        add_tr += _field_var(3, 0) # AUDIO (0)
-                        add_tr += _field_var(6, 0) # unmuted = false (0)
-                        add_tr += _field_var(8, 2) # MICROPHONE = 2 (LiveKit official TrackSource)
-                        sig_req = bytearray()
-                        sig_req += _varint((4 << 3) | 2) + _varint(len(add_tr)) + add_tr
-                        
-                        lk_ws.send_binary(bytes(sig_req))
-                        self.log("[LIVEKIT] ✅ أُرسلت حزمة نشر المايك (AddTrackRequest) بمصدر MICROPHONE=2 والمعرف TR_audio_mic لنقل البوت لمقعد المتحدث.")
-                    except Exception as tr_err:
-                        self.log("[LIVEKIT] تنبيه أثناء إرسال AddTrackRequest:", repr(tr_err))
+                    self.log("[LIVEKIT] بدء Publisher حقيقي:", r_name, lk_url)
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
 
-                    stop_evt = threading.Event()
-                    setattr(self, "_livekit_stop_" + r_name, stop_evt)
-                    setattr(self, "_livekit_ws_" + r_name, lk_ws)
-                    setattr(self, "_livekit_active_" + r_name, True)
+                    room_obj = rtc.Room()
+                    setattr(self, "_livekit_loop_" + r_name, loop)
+                    setattr(self, "_livekit_room_" + r_name, room_obj)
 
-                    # خيط قراءة مستمر للرد على أي Ping أو إشارات من خادم LiveKit لمنع انتهاء المهلة ومغادرة البث
-                    def _reader():
-                        try:
-                            while not stop_evt.is_set():
-                                if not lk_ws or not lk_ws.sock:
-                                    break
-                                msg = lk_ws.recv()
-                                if not msg:
-                                    break
-                                if msg[0] == 'close':
-                                    self.log("[LIVEKIT] وصل إغلاق الاتصال من خادم الصوت RTC:", repr(msg[1]))
-                                    break
-                                # lk_ws.recv() يتولى الرد التلقائي على Ping opcode 0x9 بـ Pong opcode 0xA
-                        except Exception as r_err:
-                            self.log("[LIVEKIT] انتهت حلقة القراءة أو انقطع اتصال RTC:", repr(r_err))
-                        finally:
-                            stop_evt.set()
+                    async def _connect_publish():
+                        await room_obj.connect(lk_url, token_jwt)
+                        self.log("[LIVEKIT] ✅ تم Join WebRTC:", r_name)
 
-                    reader_t = threading.Thread(target=_reader, name=f"lk-reader-{r_name}", daemon=True)
-                    reader_t.start()
+                        source = rtc.AudioSource(48000, 1, queue_size_ms=1000)
+                        track = rtc.LocalAudioTrack.create_audio_track("microphone", source)
+                        options = rtc.TrackPublishOptions(
+                            source=rtc.TrackSource.SOURCE_MICROPHONE
+                        )
+                        publication = await room_obj.local_participant.publish_track(track, options)
 
-                    # حلقة إبقاء الاتصال حياً (Heartbeat/Ping) كل 6 ثوانٍ مع بروتوكول LiveKit Protobuf
-                    while not stop_evt.wait(6.0):
-                        if not lk_ws or not lk_ws.sock:
-                            break
-                        try:
-                            # 1. إرسال LiveKit Protobuf Signal Ping (field 14 timestamp in ms) لمنع قطع الاتصال بعد دقيقة
-                            now_ms = int(time.time() * 1000)
-                            sig_ping = _varint((14 << 3) | 0) + _varint(now_ms)
-                            lk_ws.send_binary(bytes(sig_ping))
-                            # 2. إرسال WebSocket control frame ping
-                            lk_ws.send_control(0x9, b"lk-ping")
-                        except Exception as p_err:
-                            self.log("[LIVEKIT] خطأ أثناء إرسال نبض الحياة LiveKit Ping:", repr(p_err))
-                            break
+                        setattr(self, "_livekit_source_" + r_name, source)
+                        setattr(self, "_livekit_track_" + r_name, track)
+                        setattr(self, "_livekit_publication_" + r_name, publication)
+                        setattr(self, "_livekit_active_" + r_name, True)
 
-                    self.log("[LIVEKIT] انتهت جلسة البث أو انقطع الاتصال في:", r_name)
-                except Exception as lk_exc:
-                    self.log("[LIVEKIT] تنبيه في اتصال خادم الصوت LiveKit:", repr(lk_exc))
-                finally:
+                        sid = str(getattr(publication, "sid", "") or "")
+                        self.log("[LIVEKIT] 🎙️ البوت الآن Publisher/متحدث:", r_name, "track_sid=", sid)
+
+                        # Keep the SDK event loop alive for the entire live-seat session.
+                        while not getattr(self, "_livekit_stop_requested_" + r_name, False):
+                            await asyncio.sleep(2)
+
+                    loop.run_until_complete(_connect_publish())
+                except Exception as exc:
+                    self.log("[LIVEKIT] ❌ فشل Publisher الحقيقي:", repr(exc))
                     setattr(self, "_livekit_active_" + r_name, False)
-                    try:
-                        lk_ws.close()
-                    except Exception:
-                        pass
+                finally:
+                    if loop is not None:
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass
 
             threading.Thread(
                 target=_run_livekit_client,
@@ -5495,6 +5307,13 @@ class TalkinBot:
                     room=room,
                     room_id=room_id,
                 )
+                wait_until = time.time() + float(os.getenv("STREAM_LIVEKIT_READY_TIMEOUT", "15"))
+                while not getattr(self, f"_livekit_active_{room}", False) and time.time() < wait_until:
+                    time.sleep(0.25)
+                if getattr(self, f"_livekit_active_{room}", False):
+                    self._feed_livekit_audio(room, str(track["url"]), int(track.get("duration") or 0))
+                else:
+                    self.log("[LIVEKIT] لم تصبح جلسة Publisher جاهزة ضمن المهلة:", room)
                 self.send_query(encode_query(
                     STREAM_AUDIO_ACTION,
                     type_="audio",
@@ -11729,8 +11548,6 @@ class TalkinBot:
                         self.master_last_seen = time.time()
                     if body and self._handle_master_process_command(frm, body, is_private=True):
                         return
-                    if body and self._telegram_log_command(frm, body):
-                        return
                     if body and self._monitor_command(frm, body):
                         return
                     # When this process is the master account, it owns the
@@ -12132,12 +11949,6 @@ class TalkinBot:
                 "Add them to Railway Variables (not the source code) and redeploy."
             )
         self.asset_server = start_asset_server()
-        if TELEGRAM_BOT_TOKEN:
-            threading.Thread(
-                target=self._telegram_poll_start,
-                name="telegram-log-poller",
-                daemon=True,
-            ).start()
         while not self.stop_event.is_set():
             try:
                 self.run_once()
