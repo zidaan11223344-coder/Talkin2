@@ -830,8 +830,11 @@ class RawWebSocket:
         raw = self._connect_android_like()
 
         # Android Client obtains the platform default SSLSocketFactory.
-        ctx = ssl.create_default_context()
-        self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+        if self.scheme == "wss":
+            ctx = ssl.create_default_context()
+            self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+        else:
+            self.sock = raw
         self.sock.settimeout(self.timeout)
 
         # Y9/v: SecureRandom -> 16 bytes -> Base64.
@@ -919,6 +922,10 @@ class RawWebSocket:
 
     def send_binary(self, payload):
         payload = bytes(payload)
+        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1800"))
+        if len(payload) > max_bytes:
+            print(f"[WS_DROP_OVERSIZE] تم تجاهل إرسال حزمة WebSocket بحجم {len(payload)} بايت لتجاوزها الحد الآمن ({max_bytes} بايت) لمنع فصل الخادم برمز 1009.", flush=True)
+            return
         mask = os.urandom(4)
         n = len(payload)
         if n < 126:
@@ -5039,6 +5046,37 @@ class TalkinBot:
                 )
         except Exception as exc:
             self.log("[STREAM] ack_msg error:", repr(exc))
+
+        # === ربط جلسة الصوت الحية عبر خادم LiveKit للصعود الفعلي للمايك ===
+        livekit_token = event_token or accepted.get("token", "")
+        if livekit_token and len(livekit_token) > 50:
+            def _run_livekit_client(token_jwt, r_name, r_id):
+                try:
+                    self.log("[LIVEKIT] بدء الاتصال بخادم الصوت RTC للصعود الفعلي في الغرفة:", r_name, "معرف:", r_id)
+                    lk_url = f"ws://chatp.net:7880/rtc?access_token={token_jwt}&protocol=8&auto_subscribe=1"
+                    lk_ws = RawWebSocket(lk_url, [], timeout=15)
+                    lk_ws.connect()
+                    self.log("[LIVEKIT] تم الاتصال بنجاح بخادم الصوت LiveKit! البوت الآن موجود فعلياً على المايك.")
+                    # حلقة إبقاء الاتصال حياً (Heartbeat/Ping) لحجز المقعد الصوتي
+                    stop_evt = threading.Event()
+                    setattr(self, "_livekit_stop_" + r_name, stop_evt)
+                    while not stop_evt.wait(15.0):
+                        if not lk_ws or not lk_ws.sock:
+                            break
+                        try:
+                            lk_ws.send_control(0x9, b"lk-ping")
+                        except Exception:
+                            break
+                    self.log("[LIVEKIT] انتهت جلسة البث أو انقطع الاتصال في:", r_name)
+                except Exception as lk_exc:
+                    self.log("[LIVEKIT] تنبيه في اتصال خادم الصوت LiveKit:", repr(lk_exc))
+
+            threading.Thread(
+                target=_run_livekit_client,
+                args=(livekit_token, room, live_room_id),
+                name=f"talkin-livekit-{room}",
+                daemon=True,
+            ).start()
 
         # === المرحلة 3.4: إعلان الصعود والنجاح النهائي ===
         try:
@@ -11047,11 +11085,13 @@ class TalkinBot:
                 return
 
             if live_command in ("صعدني", "صعدني للبث"):
+                # إذا كان صاحب الأمر هو الماستر أو تم استخدام الأمر بهدف صعود البوت
                 target = str(frm or "").strip().lstrip("@")
-                if not target:
-                    self.send_room_text(room, "❌ تعذر تحديد صاحب الأمر.")
-                    return
-                self.send_live_invitation_to_user(target, room)
+                # طلب صعود البوت نفسه للبث
+                self.request_live_room(room)
+                if target and target != BOT_ID:
+                    # وأيضاً إرسال دعوة للمستخدم لضمان صعود الطرفين
+                    self.send_live_invitation_to_user(target, room)
             else:
                 self.request_live_room(room)
             return
