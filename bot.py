@@ -4692,32 +4692,16 @@ class TalkinBot:
                 
                 # دورة إدارة تشغيل الأغنية في خيط مستقل لضمان استمرار البث حتى انتهاء الملف
                 # وتوقف الصوت بأمان دون مغادرة البوت أو إغلاق LiveKit
-                def _playback_lifecycle(target_room, r_id, s_id, track_len):
+                # دورة خفيفة جداً: مؤقت واحد بدلاً من حلقة تستيقظ كل ثانيتين.
+                def _stop_live_audio(target_room, r_id, s_id):
                     try:
-                        self.log(f"[STREAM_PLAYBACK] بدء مراقبة تشغيل الأغنية في {target_room} لمدة {track_len} ثانية.")
-                        start_time = time.time()
-                        # إبقاء البوت متصلاً والنبض مستمراً طوال مدة الأغنية
-                        while time.time() - start_time < track_len:
-                            time.sleep(2.0)
-                            # إرسال تأكيد بقاء الصوت حياً داخل البث
-                            if getattr(self, f"_livekit_active_{target_room}", False) is False:
-                                self.log(f"[STREAM_PLAYBACK] تنبيه: انقطع اتصال البث أثناء تشغيل الأغنية في {target_room}")
-                                break
-                        self.log(f"[STREAM_PLAYBACK] اكتملت مدة الأغنية ({track_len} ثانية) في {target_room}. البوت يبقى على المايك بأمان.")
-                        # إرسال حزمة توقف الصوت الآمنة بدون خروج من الغرفة
-                        try:
-                            self.send_query(encode_query("room_stream", type_="audio_stop", room=r_id, id_=s_id))
-                        except Exception:
-                            pass
-                    except Exception as play_err:
-                        self.log("[STREAM_PLAYBACK] خطأ أثناء دورة تشغيل الصوت:", repr(play_err))
+                        self.send_query(encode_query("room_stream", type_="audio_stop", room=r_id, id_=s_id))
+                    except Exception as stop_err:
+                        self.log("[STREAM_PLAYBACK] audio_stop failed:", repr(stop_err))
 
                 dur_sec = max(5, int(duration or 180))
-                threading.Thread(
-                    target=_playback_lifecycle,
-                    args=(room, room_id, session_id, dur_sec),
-                    name=f"stream-lifecycle-{room}",
-                    daemon=True,
+                threading.Timer(
+                    dur_sec, _stop_live_audio, args=(room, room_id, session_id)
                 ).start()
 
                 return True
@@ -4741,10 +4725,11 @@ class TalkinBot:
                 except Exception as exc:
                     self.log("[STREAM] live room id lookup failed:", room, repr(exc))
 
-            if room_id.isdigit():
-                self.log("[STREAM] send native live invitation", room, "room_id=", room_id)
-                self.send_live_invitation_to_user(BOT_ID, room)
-            return True
+            # اطلب صعود البوت تلقائياً؛ لا تشترط أن يكون room_id رقمياً،
+            # لأن بعض إصدارات Talkin تعيد اسم الغرفة فقط في هذه المرحلة.
+            if self.request_live_room(room):
+                return "pending"
+            return False
         except Exception as exc:
             self.log("[STREAM] live play failed:", repr(exc))
             return False
@@ -4769,9 +4754,9 @@ class TalkinBot:
             # the gateway and never produced a usable you_invited callback.
             if not self.send_live_invitation_to_user(BOT_ID, room):
                 raise RuntimeError("تعذر إرسال دعوة البث الفعلية إلى البوت")
-            # Do not send a guessed accept packet here. The real acceptance
-            # requires token/room_id/room_name/session_id from `you_invited`.
-            self.send_room_text(room, "📡 أرسلت دعوة بث فعلية إلى البوت؛ بانتظار حدث you_invited ثم قبول الخادم.")
+            # Do not guess the accept token. The real invitation event carries
+            # token/room_id/session_id and is accepted automatically by the event handler.
+            self.send_room_text(room, "📡 جاري صعود البوت للبث تلقائياً…")
         except Exception as exc:
             self._live_ready_rooms.discard(room)
             self.log("[STREAM] manual live join failed:", repr(exc))
@@ -6545,20 +6530,23 @@ class TalkinBot:
                 # `.sa` publishes the audio file to the connected rooms.
                 # `بث` is the separate live-room mode and must not duplicate
                 # the track as a normal room attachment.
-                live_started = self._play_music_in_live_room(room, url, duration) if live_stream else False
+                live_result = self._play_music_in_live_room(room, url, duration) if live_stream else False
                 if room_output:
                     target_rooms=self._active_rooms() if broadcast_all else [room]
                     for target_room in target_rooms:
                         self.send_room_text(target_room,caption)
-                        # If the live actions are unavailable, retain the
-                        # proven room-audio fallback for visible commands.
-                        if not live_started:
+                        # Keep the normal room-audio fallback only when live mode
+                        # was not requested. In live mode the track is queued for
+                        # the speaker seat and must not be duplicated in every room.
+                        if not live_stream and not live_result:
                             self.send_room_media(target_room,url,"audio",duration)
                 elif live_stream:
-                    if live_started:
+                    if live_result is True:
                         self.send_room_text(room, f"✅ تم تشغيل {title} في البث الحي.")
+                    elif live_result == "pending":
+                        self.send_room_text(room, "📡 جاري صعود البوت للبث ثم تشغيل الأغنية تلقائياً…")
                     else:
-                        self.send_room_text(room, "❌ لم يصعد البوت للبث؛ استخدم أمر صعود ثم أعد أمر بث.")
+                        self.send_room_text(room, "❌ تعذر صعود البوت للبث. راجع سجل الخطأ.")
             except Exception as e:
                 self.report_master_error("تشغيل الأغنية", e, room)
                 if room_output:
