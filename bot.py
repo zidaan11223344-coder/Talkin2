@@ -4698,6 +4698,16 @@ class TalkinBot:
             self._arm_live_wire_capture(str(event.get(8, "") or event.get(2, "") or event.get("room", "") or ""))
         if event_type not in {"you_invited", "invited", "stream_invite", "live_invite"} and not any(token in event_type for token in ("invite", "invitation", "دعوه", "دعوة")):
             return False
+
+        # A live seat is accepted only when the incoming invitation is for
+        # this bot account.  `sent_invitation` is an outgoing request and is
+        # never treated as acceptance.  The server-side `you_invited` event is
+        # the trigger for the automatic acceptance packet.
+        if event_type in {"you_invited", "invited", "stream_invite", "live_invite"}:
+            if stream_target and _norm_user(stream_target) != _norm_user(BOT_ID):
+                self.log("[STREAM] ignored invitation for another user:", stream_target)
+                return False
+
         room_name = str(event.get(8, "") or event.get(2, "") or event.get("room", "") or getattr(self, "room", "") or "").strip()
         room_id = str(event.get(6, "") or event.get(3, "") or event.get("room_id", "") or room_name).strip()
         if room_name and room_id.isdigit():
@@ -4738,7 +4748,10 @@ class TalkinBot:
             # The captured field 9 changes between the invitation and the
             # acceptance packet, so it is a fresh client-side session id.
             stream_id = str(secrets.randbelow(90000000000000000) + 10000000000000000)
-            self.log("[STREAM] accept invitation", STREAM_CHECK_ACTION)
+            self.log("[STREAM] AUTO-ACCEPT incoming live invitation",
+                     "target=", stream_target or BOT_ID,
+                     "room=", room_name, "room_id=", room_id,
+                     "action=", STREAM_CHECK_ACTION)
             self.send_query(encode_query(
                 STREAM_CHECK_ACTION, body=stream_token, room=room_id,
                 uid=room_name, password=stream_id,
@@ -10680,11 +10693,12 @@ class TalkinBot:
             if not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, frm, is_private=False)
             return
-        if body.strip().casefold() in ("صعود", "اصعد", "إصعد", ".صعود", "live", "join live"):
+        if body.strip().casefold() in ("صعود", "اصعد", "إصعد", "صعدني", ".صعود", ".صعدني", "live", "join live"):
             if not is_verified:
                 self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام البث.\n{_verification_notice()}")
                 return
             self.request_live_room(room)
+            self.log("[STREAM] صعدني -> invitation requested; waiting for you_invited")
             return
         m_share_ar = re.fullmatch(r"(?:مشاركه|مشاركة)\s+@?([^\s@]+)", body.strip(), re.I)
         if m_share_ar:
