@@ -4914,6 +4914,7 @@ class TalkinBot:
 
         accepted = pending.get(room) or {}
 
+        stream_event = result.get("stream_event", {}) if isinstance(result, dict) else {}
         self._live_master_debug(
             "publish_stream",
             room=room,
@@ -4921,7 +4922,21 @@ class TalkinBot:
             token=accepted.get("token", ""),
             invite_id=accepted.get("invite_id", ""),
             result_keys=",".join(str(k) for k in result.keys()) if isinstance(result, dict) else type(result).__name__,
+            type=result.get("type", "") if isinstance(result, dict) else "",
+            value=result.get("value", "") if isinstance(result, dict) else "",
+            uid=result.get("uid", "") if isinstance(result, dict) else "",
         )
+        if isinstance(stream_event, dict) and stream_event:
+            self._live_master_debug(
+                "publish_stream تفاصيل",
+                event_keys=",".join(str(k) for k in stream_event.keys())[:100],
+                event_type=stream_event.get("type", ""),
+                event_value=stream_event.get("value", ""),
+                event_uid=stream_event.get("uid", ""),
+                event_room=stream_event.get("room", "") or stream_event.get(8, ""),
+                event_id=stream_event.get("id", "") or stream_event.get(9, ""),
+                event_token=stream_event.get("token", "") or stream_event.get(5, ""),
+            )
 
         if accepted.get("publish_confirmed"):
             self.log("[STREAM] duplicate publish_stream ignored:", room)
