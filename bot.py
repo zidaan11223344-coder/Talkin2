@@ -4738,55 +4738,49 @@ class TalkinBot:
                                 if str(item.get("room_id", "")) == room_id), None)
             pending = pending_tracks.get(pending_key) if pending_key else None
             room_name = pending_key or room_name
-        self.log("[STREAM] you_invited", room_name, "room_id=", room_id, "invite_id=", invite_id)
-        if not room_id:
-            self.log("[STREAM] no queued track for invitation", room_name)
+        self.log("[STREAM] you_invited", room_name, "token=", bool(stream_token), "room_id=", room_id, "invite_id=", invite_id)
+
+        # Manual invitation acceptance, exactly like the Talkin application:
+        # action = room_stream
+        # type   = publish
+        # to     = token from field 5 of you_invited
+        # room   = room name from field 8 of you_invited
+        #
+        # Do not use the old check_streaming packet here.
+        if not stream_token or not room_name:
+            self.log("[STREAM] cannot accept you_invited: missing field 5 token or field 8 room")
             return False
+
         try:
-            # Manual capture proved the accept packet is:
-            # 1=check_streaming, 5=token, 6=room_id, 8=room_name, 9=stream_id.
-            # The captured field 9 changes between the invitation and the
-            # acceptance packet, so it is a fresh client-side session id.
-            stream_id = str(secrets.randbelow(90000000000000000) + 10000000000000000)
-            self.log("[STREAM] AUTO-ACCEPT incoming live invitation",
-                     "target=", stream_target or BOT_ID,
-                     "room=", room_name, "room_id=", room_id,
-                     "action=", STREAM_CHECK_ACTION)
+            self.log(
+                "[STREAM] AUTO-ACCEPT manual invitation",
+                "target=", stream_target or BOT_ID,
+                "room=", room_name,
+                "action=room_stream type=publish",
+            )
             self.send_query(encode_query(
-                STREAM_CHECK_ACTION, body=stream_token, room=room_id,
-                uid=room_name, password=stream_id,
+                "room_stream",
+                type_="publish",
+                to=stream_token,
+                room=room_name,
             ))
-            pending_accepts = getattr(self, "_pending_live_accepts", None)
-            if not isinstance(pending_accepts, dict):
-                pending_accepts = {}
-                self._pending_live_accepts = pending_accepts
-            pending_accepts[room_name] = {
-                "room_id": room_id, "session_id": stream_id,
-                "sent_at": time.time(),
-            }
+
+            self._live_ready_rooms = getattr(self, "_live_ready_rooms", set())
+            self._live_ready_rooms.add(room_name)
+
             try:
                 self.send_private_text(
                     BOT_MASTER,
-                    f"📤 أرسلت حزمة check_streaming، بانتظار قبول الخادم في {room_name}\n"
-                    f"📌 room_id={room_id} | session_id={stream_id}\n"
-                    "⚠️ هذا إرسال للحزمة وليس تأكيد صعود نهائي.",
+                    f"✅ تم قبول دعوة البث تلقائياً في الغرفة: {room_name}\n"
+                    "📡 action=room_stream | type=publish\n"
+                    "🎫 تم استخدام token من الحقل 5 واسم الغرفة من الحقل 8.",
                 )
             except Exception as exc:
                 self.log("[STREAM] acceptance report failed:", repr(exc))
-            if not pending:
-                self.log("[STREAM] accepted seat invitation; waiting for بث command", room_name)
-                return True
-            time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.8")))
-            self.log("[STREAM] publish queued audio", STREAM_AUDIO_ACTION, room_id)
-            self.send_query(encode_query(
-                STREAM_AUDIO_ACTION, type_="audio", room=room_id, id_=stream_id,
-                url=str(pending["url"]),
-                length=str(max(0, int(pending.get("duration") or 0))),
-            ))
-            self._pending_live_tracks.pop(room_name, None)
+
             return True
         except Exception as exc:
-            self.log("[STREAM] invitation accept/audio failed:", repr(exc))
+            self.log("[STREAM] manual invitation accept failed:", repr(exc))
             return False
 
     def _handle_stream_result_ack(self, result):
