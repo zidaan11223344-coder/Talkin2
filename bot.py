@@ -4578,7 +4578,7 @@ class TalkinBot:
         raise last_error
 
     def _play_music_in_live_room(self, room: str, media_url: str, duration: int = 0):
-        """Queue audio and wait for a manually sent invitation."""
+        """Play immediately if already live on mic, or queue audio and join live stream."""
         room = str(room or "").strip()
         if not room or not media_url:
             return False
@@ -4586,37 +4586,94 @@ class TalkinBot:
             self.log("[STREAM] experimental actions are not fully configured")
             return False
         try:
+            ready_rooms = getattr(self, "_live_ready_rooms", set())
+            pending_accepts = getattr(self, "_pending_live_accepts", {})
+            accepted = pending_accepts.get(room, {}) or {}
+            is_active = (room in ready_rooms) or accepted.get("publish_confirmed") or getattr(self, f"_livekit_active_{room}", False)
+
+            # إذا كان البوت صاعداً للبث والمايك بالفعل، نبث الصوت فوراً لجميع القنوات
+            if is_active:
+                self.log("[STREAM] البوت صاعد للمايك؛ جاري بث الصوت فوراً في:", room)
+                ready_rooms.add(room)
+                self._live_ready_rooms = ready_rooms
+
+                room_id = str(
+                    accepted.get("room_id", "")
+                    or getattr(self, "_live_room_ids", {}).get(room, "")
+                    or ""
+                )
+                if not room_id and getattr(self, "db", None):
+                    try:
+                        room_id = str(self.db.room_id(room) or "").strip()
+                    except Exception:
+                        pass
+                if not room_id:
+                    room_id = room
+
+                session_id = str(accepted.get("session_id", "") or accepted.get("id_", "") or "")
+
+                # 1. إرسال حزمة STREAM_AUDIO_ACTION
+                try:
+                    self.send_query(encode_query(
+                        STREAM_AUDIO_ACTION,
+                        type_="audio",
+                        room=room_id,
+                        id_=session_id,
+                        url=str(media_url),
+                        length=str(max(0, int(duration or 0))),
+                    ))
+                    self.log("[STREAM] أُرسلت حزمة STREAM_AUDIO_ACTION بنجاح إلى:", room)
+                except Exception as exc:
+                    self.log("[STREAM] فشل إرسال STREAM_AUDIO_ACTION:", repr(exc))
+
+                # 2. إرسال حزمة room_stream المخصصة للبث
+                try:
+                    self.send_query(encode_query(
+                        "room_stream",
+                        type_="audio",
+                        room=room_id,
+                        id_=session_id,
+                        url=str(media_url),
+                        length=str(max(0, int(duration or 0))),
+                    ))
+                    self.log("[STREAM] أُرسلت حزمة room_stream audio بنجاح إلى:", room)
+                except Exception as exc:
+                    self.log("[STREAM] فشل إرسال room_stream audio:", repr(exc))
+
+                # 3. إرسال الصوت عبر قناة صوت الغرفة لضمان سماع جميع الحاضرين
+                try:
+                    self.send_room_media(room, str(media_url), "audio", int(duration or 0))
+                    self.log("[STREAM] أُرسلت وسائط الصوت للغرفة بنجاح:", room)
+                except Exception as exc:
+                    self.log("[STREAM] فشل send_room_media في البث:", repr(exc))
+
+                return True
+
+            # إذا لم يكن البوت على المايك بعد، نحفظ الصوت معلقاً ونطلب الصعود
             self._pending_live_tracks = getattr(self, "_pending_live_tracks", {})
             pending = {
                 "url": media_url, "duration": int(duration or 0),
                 "room_id": "", "created_at": time.time()
             }
             self._pending_live_tracks[room] = pending
-            ready_rooms = getattr(self, "_live_ready_rooms", set())
-            if room in ready_rooms:
-                ready_rooms.discard(room)
-            elif STREAM_MANUAL_ACCEPT_ONLY:
+
+            if STREAM_MANUAL_ACCEPT_ONLY:
                 self.log("[STREAM] manual invitation mode: waiting for you_invited", room)
-            else:
-                room_id = str(getattr(self, "_live_room_ids", {}).get(room, "") or "").strip()
-                if not room_id:
-                    try:
-                        room_id = str(self.db.room_id(room) or "").strip() if getattr(self, "db", None) else ""
-                    except Exception as exc:
-                        self.log("[STREAM] live room id lookup failed:", room, repr(exc))
-                if not room_id.isdigit():
-                    self._pending_live_tracks.pop(room, None)
-                    self.log("[STREAM] live invitation skipped: numeric room_id unavailable", room)
-                    return False
+                return True
+
+            room_id = str(getattr(self, "_live_room_ids", {}).get(room, "") or "").strip()
+            if not room_id and getattr(self, "db", None):
+                try:
+                    room_id = str(self.db.room_id(room) or "").strip()
+                except Exception as exc:
+                    self.log("[STREAM] live room id lookup failed:", room, repr(exc))
+
+            if room_id.isdigit():
                 self.log("[STREAM] send native live invitation", room, "room_id=", room_id)
-                if not self.send_live_invitation_to_user(BOT_ID, room):
-                    self._pending_live_tracks.pop(room, None)
-                    return False
-            # Never publish audio before the server sends `you_invited` and
-            # the exact stream_accept packet has been sent.
+                self.send_live_invitation_to_user(BOT_ID, room)
             return True
         except Exception as exc:
-            self.log("[STREAM] experimental live flow failed:", repr(exc))
+            self.log("[STREAM] live play failed:", repr(exc))
             return False
 
     def request_live_room(self, room: str):
@@ -5054,22 +5111,55 @@ class TalkinBot:
                 try:
                     self.log("[LIVEKIT] بدء الاتصال بخادم الصوت RTC للصعود الفعلي في الغرفة:", r_name, "معرف:", r_id)
                     lk_url = f"ws://chatp.net:7880/rtc?access_token={token_jwt}&protocol=8&auto_subscribe=1"
-                    lk_ws = RawWebSocket(lk_url, [], timeout=15)
+                    lk_ws = RawWebSocket(lk_url, [], timeout=20)
                     lk_ws.connect()
                     self.log("[LIVEKIT] تم الاتصال بنجاح بخادم الصوت LiveKit! البوت الآن موجود فعلياً على المايك.")
-                    # حلقة إبقاء الاتصال حياً (Heartbeat/Ping) لحجز المقعد الصوتي
+
                     stop_evt = threading.Event()
                     setattr(self, "_livekit_stop_" + r_name, stop_evt)
-                    while not stop_evt.wait(15.0):
+                    setattr(self, "_livekit_ws_" + r_name, lk_ws)
+                    setattr(self, "_livekit_active_" + r_name, True)
+
+                    # خيط قراءة مستمر للرد على أي Ping أو إشارات من خادم LiveKit لمنع انتهاء المهلة ومغادرة البث
+                    def _reader():
+                        try:
+                            while not stop_evt.is_set():
+                                if not lk_ws or not lk_ws.sock:
+                                    break
+                                msg = lk_ws.recv()
+                                if not msg:
+                                    break
+                                if msg[0] == 'close':
+                                    self.log("[LIVEKIT] وصل إغلاق الاتصال من خادم الصوت RTC:", repr(msg[1]))
+                                    break
+                                # lk_ws.recv() يتولى الرد التلقائي على Ping opcode 0x9 بـ Pong opcode 0xA
+                        except Exception as r_err:
+                            self.log("[LIVEKIT] انتهت حلقة القراءة أو انقطع اتصال RTC:", repr(r_err))
+                        finally:
+                            stop_evt.set()
+
+                    reader_t = threading.Thread(target=_reader, name=f"lk-reader-{r_name}", daemon=True)
+                    reader_t.start()
+
+                    # حلقة إبقاء الاتصال حياً (Heartbeat/Ping) كل 8 ثوانٍ
+                    while not stop_evt.wait(8.0):
                         if not lk_ws or not lk_ws.sock:
                             break
                         try:
                             lk_ws.send_control(0x9, b"lk-ping")
-                        except Exception:
+                        except Exception as p_err:
+                            self.log("[LIVEKIT] خطأ أثناء إرسال نبض الحياة LiveKit Ping:", repr(p_err))
                             break
+
                     self.log("[LIVEKIT] انتهت جلسة البث أو انقطع الاتصال في:", r_name)
                 except Exception as lk_exc:
                     self.log("[LIVEKIT] تنبيه في اتصال خادم الصوت LiveKit:", repr(lk_exc))
+                finally:
+                    setattr(self, "_livekit_active_" + r_name, False)
+                    try:
+                        lk_ws.close()
+                    except Exception:
+                        pass
 
             threading.Thread(
                 target=_run_livekit_client,
@@ -5107,6 +5197,7 @@ class TalkinBot:
                     or getattr(self, "_live_room_ids", {}).get(room, "")
                     or ""
                 )
+                session_id = str(accepted.get("session_id", "") or "")
                 self._log_stream_stage(
                     "3.5_بث_الصوت",
                     "إرسال_حزمة_الصوت",
@@ -5116,11 +5207,26 @@ class TalkinBot:
                 self.send_query(encode_query(
                     STREAM_AUDIO_ACTION,
                     type_="audio",
-                    room=room_id,
-                    id_=str(accepted.get("session_id", "") or ""),
+                    room=room_id or room,
+                    id_=session_id,
                     url=str(track["url"]),
                     length=str(max(0, int(track.get("duration") or 0))),
                 ))
+                try:
+                    self.send_query(encode_query(
+                        "room_stream",
+                        type_="audio",
+                        room=room_id or room,
+                        id_=session_id,
+                        url=str(track["url"]),
+                        length=str(max(0, int(track.get("duration") or 0))),
+                    ))
+                except Exception:
+                    pass
+                try:
+                    self.send_room_media(room, str(track["url"]), "audio", int(track.get("duration") or 0))
+                except Exception:
+                    pass
             except Exception as exc:
                 self._log_stream_stage(
                     "3.5_خطأ_بث_الصوت",
