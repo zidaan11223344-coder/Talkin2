@@ -3512,6 +3512,13 @@ class TalkinBot:
         self._monitor_invited = set()
         self._pending_live_accepts = {}
         self._live_room_ids = {}
+        # Temporary wire-level diagnostics for live-stream protocol research.
+        # It is armed by a live invitation and records incoming ResultMessage
+        # structure for a short window so server-generated green room notices
+        # and the packet sequence around manual acceptance are visible.
+        self._live_wire_capture_until = 0.0
+        self._live_wire_capture_room = ""
+        self._live_wire_capture_seen = 0
         self.invite_pending = False
         self.invites_enabled = True
         self.invite_silent_master = False
@@ -3917,8 +3924,6 @@ class TalkinBot:
                         for key, values in fields.items() if key in {1, 2, 4, 6, 8, 9, 10, 11, 13, 18}}
                 if 5 in fields:
                     safe[5] = f"<token:{len(fields[5][0]) if isinstance(fields[5][0], bytes) else len(str(fields[5][0]))}>"
-                self.log("[STREAM_OUT_FULL_FIELDS]", safe)
-                self.log("[STREAM_OUT_RAW_HEX]", payload.hex()[:4000])
                 self.log("[STREAM_OUT]", safe)
         except Exception as exc:
             self.log("[STREAM_OUT] decode failed:", repr(exc))
@@ -4601,11 +4606,83 @@ class TalkinBot:
         """Return the latest presence state known by this bot connection."""
         return bool(getattr(self, "master_online", False))
 
+    def _arm_live_wire_capture(self, room_name="", seconds=None):
+        try:
+            window = float(seconds if seconds is not None else os.getenv("STREAM_WIRE_CAPTURE_SECONDS", "30"))
+        except Exception:
+            window = 30.0
+        window = max(5.0, min(window, 120.0))
+        self._live_wire_capture_until = max(
+            float(getattr(self, "_live_wire_capture_until", 0.0) or 0.0),
+            time.time() + window,
+        )
+        if room_name:
+            self._live_wire_capture_room = str(room_name)
+        self._live_wire_capture_seen = 0
+        self.log("[STREAM_WIRE] capture armed",
+                 "room=", getattr(self, "_live_wire_capture_room", ""),
+                 "seconds=", int(window))
+
+    def _trace_live_wire_frame(self, message, result):
+        """Trace incoming frames around a live invitation/acceptance test.
+
+        This deliberately reports protobuf field numbers, wire types, lengths,
+        and decoded wrapper contents rather than pretending that a green room
+        notice is a dedicated event. It lets us correlate server traffic with
+        the visible system notice produced by the room.
+        """
+        until = float(getattr(self, "_live_wire_capture_until", 0.0) or 0.0)
+        if until <= time.time() or not isinstance(message, (bytes, bytearray)):
+            return
+        self._live_wire_capture_seen = int(getattr(self, "_live_wire_capture_seen", 0) or 0) + 1
+        try:
+            fields = decode_message(bytes(message))
+            schema = []
+            for num in sorted(fields):
+                vals = fields[num]
+                sample = vals[0] if vals else b""
+                if isinstance(sample, bytes):
+                    try:
+                        text_value = sample.decode("utf-8")
+                        printable = all((c.isprintable() or c in "\n\r\t") for c in text_value)
+                    except Exception:
+                        text_value, printable = "", False
+                    if printable and len(text_value) <= 160:
+                        desc = f"text={text_value!r}"
+                    else:
+                        desc = f"bytes={len(sample)}"
+                else:
+                    desc = f"varint={sample}"
+                schema.append(f"{num}:{len(vals)}:{desc}")
+            self.log("[STREAM_WIRE] FRAME", self._live_wire_capture_seen,
+                     "top_fields=", " | ".join(schema)[:2500])
+
+            wrappers = ("stream_event", "call_info", "room_event", "chat_message", "room_admin", "users", "rooms")
+            for name in wrappers:
+                value = result.get(name) if isinstance(result, dict) else None
+                if value is not None:
+                    if isinstance(value, list):
+                        self.log("[STREAM_WIRE]", name, "count=", len(value),
+                                 "sample=", repr(value[:2])[:1800])
+                    else:
+                        self.log("[STREAM_WIRE]", name, repr(value)[:3000])
+
+            top = {k: result.get(k) for k in ("handler_id", "type", "page", "uid", "value", "int_value") if result.get(k) not in (None, "", 0)}
+            if top:
+                self.log("[STREAM_WIRE] result=", repr(top)[:2000])
+        except Exception as exc:
+            self.log("[STREAM_WIRE] trace failed:", repr(exc))
+        if time.time() >= until:
+            self.log("[STREAM_WIRE] capture ended; frames=", self._live_wire_capture_seen)
+            self._live_wire_capture_until = 0.0
+
     def _handle_stream_event(self, event):
         """Accept a real you_invited event, then publish the queued track."""
         if not STREAM_EXPERIMENTAL_ENABLED or not isinstance(event, dict):
             return False
         event_type = str(event.get(1, "") or event.get("type", "") or "").strip().casefold()
+        if event_type in {"sent_invitation", "you_invited", "invited", "stream_invite", "live_invite"} or "invite" in event_type or "دعوة" in event_type or "دعوه" in event_type:
+            self._arm_live_wire_capture(str(event.get(8, "") or event.get(2, "") or event.get("room", "") or ""))
         if event_type not in {"you_invited", "invited", "stream_invite", "live_invite"} and not any(token in event_type for token in ("invite", "invitation", "دعوه", "دعوة")):
             return False
         room_name = str(event.get(8, "") or event.get(2, "") or event.get("room", "") or getattr(self, "room", "") or "").strip()
@@ -10683,16 +10760,14 @@ class TalkinBot:
     def on_message(self, ws, message):
         try:
             if isinstance(message, str):
-                self.log("[WS_TEXT_FULL]", repr(message))
+                self.log("[WS] unexpected text frame received")
                 return
-            self.log("[WS_BINARY] bytes=", len(message), "hex=", bytes(message).hex()[:4000])
             result = decode_result_message(message)
-            # FULL LIVE DEBUG: print every decoded ResultMessage so the Railway
-            # log shows the complete event envelope, not only invite-related frames.
-            try:
-                self.log("[WS_EVENT_FULL]", repr(result))
-            except Exception as exc:
-                self.log("[WS_EVENT_FULL] log failed:", repr(exc))
+            # When a live invitation is being tested, inspect every incoming
+            # server frame before normal handlers consume it. This includes
+            # ordinary RoomEvent/ChatMessage traffic used for green system
+            # notices, not only StreamEvent.
+            self._trace_live_wire_frame(message, result)
             self._handle_stream_result_ack(result)
             self._cache_user_photos_from_result(result)
             # Room join outcomes are emitted as top-level ResultMessage types
@@ -10742,7 +10817,7 @@ class TalkinBot:
             for stream_event in tuple(
                     x for x in (result.get("stream_event"), result.get("call_info"), result.get("room_event"))
                     if isinstance(x, dict)):
-                self.log("[STREAM_EVENT_FULL]", repr(stream_event))
+                self.log("[STREAM]", stream_event)
                 self._handle_stream_event(stream_event)
             top_type = str(result.get("type", "") or "").strip().casefold()
             if "invite" in top_type or "invited" in top_type:
