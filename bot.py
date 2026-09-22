@@ -4728,10 +4728,27 @@ class TalkinBot:
                 room=room_name,
                 room_id=room_id,
             )
+            # Send room_stream publish with token and id fields
             self.send_query(encode_query(
                 STREAM_ROOM_ACTION, type_=STREAM_ROOM_TYPE, to=stream_token,
+                token=stream_token, id_=invitation_stream_id,
                 room=room_name,
             ))
+            # Also send explicit stream_accept to ensure gateway registers mic seat
+            try:
+                self.send_query(encode_query(
+                    STREAM_ACCEPT_ACTION, type_="accept", to=stream_token,
+                    token=stream_token, id_=invitation_stream_id,
+                    room=room_name, state="accept", value="accept",
+                ))
+                if room_id and room_id != room_name and room_id.isdigit():
+                    self.send_query(encode_query(
+                        STREAM_ACCEPT_ACTION, type_="accept", to=stream_token,
+                        token=stream_token, id_=invitation_stream_id,
+                        room=room_id, state="accept", value="accept",
+                    ))
+            except Exception as _exc:
+                self.log("[STREAM] initial stream_accept error:", repr(_exc))
 
             # Some gateway builds use the human room name here; others use
             # the numeric room id from you_invited field 6. Try the canonical
@@ -4956,15 +4973,49 @@ class TalkinBot:
             "token_present=", bool(accepted.get("token")),
         )
 
-        # publish_stream is the only success event currently observed from
-        # the application. Do not invent a second `stream_accept` protocol.
+        # Extract live session details from stream_event
+        stream_event_data = result.get("stream_event", {}) if isinstance(result, dict) else {}
+        event_id = str(stream_event_data.get(9, "") or stream_event_data.get("id", "") or accepted.get("invite_id", "") or "").strip()
+        event_token = str(stream_event_data.get(5, "") or stream_event_data.get("token", "") or accepted.get("token", "") or "").strip()
+        event_room = str(stream_event_data.get(8, "") or stream_event_data.get("room", "") or room).strip()
+        live_room_id = str(accepted.get("room_id", "") or "").strip()
+
+        # Complete live seat confirmation so the bot officially ascends to the mic/stream
+        try:
+            if event_token:
+                self.send_query(encode_query(
+                    STREAM_ROOM_ACTION, type_="publish", to=event_token,
+                    token=event_token, id_=event_id, room=event_room,
+                ))
+                self.send_query(encode_query(
+                    STREAM_ACCEPT_ACTION, type_="accept", to=event_token,
+                    token=event_token, id_=event_id, room=event_room,
+                    state="accept", value="accept",
+                ))
+                if live_room_id and live_room_id != event_room:
+                    self.send_query(encode_query(
+                        STREAM_ACCEPT_ACTION, type_="accept", to=event_token,
+                        token=event_token, id_=event_id, room=live_room_id,
+                        state="accept", value="accept",
+                    ))
+            uid_val = str(result.get("uid") or "").strip()
+            if uid_val:
+                self.send_query(encode_query("ack_msg", uid=uid_val))
+        except Exception as exc:
+            self.log("[STREAM] post-publish confirmation failed:", repr(exc))
+
         try:
             self.send_private_text(
                 BOT_MASTER,
-                f"📡 وصل تأكيد publish_stream الحقيقي في: {room}",
+                f"📡 وصل تأكيد publish_stream وصعد البث بنجاح في: {room}",
             )
         except Exception as exc:
             self.log("[STREAM] publish confirmation report failed:", repr(exc))
+
+        try:
+            self.send_room_text(room, "🎙️ تم قبول دعوة البث والصعود إلى المايك بنجاح.")
+        except Exception as exc:
+            self.log("[STREAM] room live announcement failed:", repr(exc))
 
         track = getattr(self, "_pending_live_tracks", {}).pop(room, None)
         if track:
