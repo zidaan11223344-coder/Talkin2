@@ -3733,14 +3733,10 @@ class TalkinBot:
             print(*args, flush=True)
 
     def _log_stream_stage(self, stage, status, room="", **extra):
-        """Log a distinct stage in the live-stream acceptance lifecycle."""
+        """Log a distinct stage in the live-stream acceptance lifecycle safely to console logs."""
         tag = f"[STREAM_{stage.upper()}]"
-        self.log(tag, f"status={status}", f"room={room}", " ".join(f"{k}={v}" for k, v in extra.items() if v))
-        self._live_master_debug(
-            f"مرحلة {stage} | {status}",
-            room=room,
-            **extra
-        )
+        details = " ".join(f"{k}={v}" for k, v in extra.items() if v)
+        self.log(tag, f"status={status}", f"room={room}", details)
 
     def _log_stream_accept_error(self, stage, error, room="", room_id="", invite_id=""):
         """Persist a safe diagnostic when accepting a live-seat invitation fails."""
@@ -4703,7 +4699,7 @@ class TalkinBot:
 
         try:
             if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
-                self.send_private_text(BOT_MASTER, f"📡 [مرحلة 1: دعوة] استلام دعوة بث واردة | الغرفة: {room_name} | room_id={room_id}")
+                pass
         except Exception as exc:
             self.log("[STREAM] invite event report failed:", repr(exc))
 
@@ -4930,29 +4926,19 @@ class TalkinBot:
         return False
 
     def _live_master_debug(self, title, **data):
-        """Send compact live-stream diagnostics privately to the master."""
+        """Safely record live-stream diagnostics in console logs without spamming private chat."""
         try:
-            master = str(BOT_MASTER or "").strip()
-            if not master:
-                return
-            parts = [f"🔎 بث | {title}"]
+            parts = [f"[STREAM_DEBUG] {title}"]
             for key, value in data.items():
                 if value is None:
                     continue
-                value = str(value).replace("\n", " ").strip()
-                if len(value) > 120:
-                    value = value[:117] + "..."
-                parts.append(f"{key}={value}")
-            msg = " | ".join(parts)
-            # Keep each diagnostic below the platform's 200-char limit.
-            if len(msg) <= 200:
-                self.send_private_text(master, msg)
-                return
-            chunks = [msg[i:i+195] for i in range(0, len(msg), 195)]
-            for chunk in chunks[:4]:
-                self.send_private_text(master, chunk)
-        except Exception as exc:
-            self.log("[STREAM] master debug failed:", repr(exc))
+                v_str = str(value).replace("\n", " ").strip()
+                if len(v_str) > 60:
+                    v_str = v_str[:57] + "..."
+                parts.append(f"{key}={v_str}")
+            self.log(" | ".join(parts))
+        except Exception:
+            pass
 
     def _handle_publish_stream_confirmation(self, result):
         """Handle a publish_stream event only when a live invitation is pending with distinct stage logs."""
@@ -5036,61 +5022,23 @@ class TalkinBot:
         event_room = str(stream_event_data.get(8, "") or stream_event_data.get("room", "") or room).strip()
         live_room_id = str(accepted.get("room_id", "") or "").strip()
 
-        # === المرحلة 3.2: تثبيت المقعد النهائي (Post-Publish Lock) ===
+        # === المرحلة 3.2: تثبيت المقعد ومعالجة publish_stream ===
+        # ملاحظة هامة: حدث publish_stream هو تأكيد الخادم الرسمي بأن البوت أصبح على المايك.
+        # توكن publish_stream (event_token) هو توكن وسائط JWT طويل (500 بايت) مخصص لخادم الميديا.
+        # إرساله في stream_accept أو كرسالة خاصة يتسبب فوراً في إغلاق السيرفر للاتصال بالرمز 1009 (رسالة كبيرة جداً).
         try:
-            if event_token:
-                self._log_stream_stage(
-                    "3.2_تثبيت_المقعد",
-                    "إرسال_حزم_التثبيت_النهائي",
-                    room=event_room,
-                    event_id=event_id,
-                )
-                self.send_query(encode_query(
-                    STREAM_ROOM_ACTION, type_="publish", to=event_token,
-                    token=event_token, id_=event_id, room=event_room,
-                ))
-                self.send_query(encode_query(
-                    STREAM_ACCEPT_ACTION, type_="accept", to=event_token,
-                    token=event_token, id_=event_id, room=event_room,
-                    state="accept", value="accept",
-                ))
-                if live_room_id and live_room_id != event_room:
-                    self.send_query(encode_query(
-                        STREAM_ACCEPT_ACTION, type_="accept", to=event_token,
-                        token=event_token, id_=event_id, room=live_room_id,
-                        state="accept", value="accept",
-                    ))
-                self._log_stream_stage(
-                    "3.2_تم_تثبيت_المقعد",
-                    "نجاح_إرسال_حزم_التثبيت",
-                    room=event_room,
-                )
-            else:
-                self._log_stream_stage(
-                    "3.2_تنبيه",
-                    "لا_يوجد_event_token_للتثبيت_النهائي",
-                    room=room,
-                )
-
-            # === المرحلة 3.3: تأكيد استلام الرسالة (ack_msg) ===
+            # إرسال ack_msg فقط إذا توفر معرف الرسالة لتأكيد الاستلام دون إرسال توكنات ضخمة
             uid_val = str(result.get("uid") or "").strip()
             if uid_val:
                 self.send_query(encode_query("ack_msg", uid=uid_val))
                 self._log_stream_stage(
-                    "3.3_ack_msg",
+                    "3.2_ack_msg",
                     "تم_إرسال_ack",
                     room=room,
                     uid=uid_val,
                 )
         except Exception as exc:
-            self._log_stream_stage(
-                "3.2_خطأ_تثبيت_المقعد",
-                "فشل_حزم_التثبيت_النهائي",
-                room=room,
-                error=str(exc),
-            )
-            self._log_stream_accept_error("stage3_post_publish_failed", exc, room, live_room_id, event_id)
-            self.log("[STREAM] post-publish confirmation failed:", repr(exc))
+            self.log("[STREAM] ack_msg error:", repr(exc))
 
         # === المرحلة 3.4: إعلان الصعود والنجاح النهائي ===
         try:
