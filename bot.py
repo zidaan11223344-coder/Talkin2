@@ -23,7 +23,7 @@ import html
 import sys
 import inspect
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urlencode
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from collections import defaultdict
 from pathlib import Path
@@ -61,6 +61,14 @@ except Exception:
 
 MUSIC_MAX_SECONDS = int(os.getenv("MUSIC_MAX_SECONDS", "900"))
 MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
+# Audius is an additional lightweight source used primarily by live broadcast.
+# It can search the catalog and expose a streamable MP3 URL without first
+# downloading the whole song to Railway. The API supports read-only access;
+# an optional API key can be supplied for higher limits.
+AUDIUS_API_BASE = os.getenv("AUDIUS_API_BASE", "https://api.audius.co/v1").strip().rstrip("/")
+AUDIUS_API_KEY = os.getenv("AUDIUS_API_KEY", "").strip()
+AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "7"))
+AUDIUS_CACHE_TTL = float(os.getenv("AUDIUS_CACHE_TTL", "90"))
 # Optional YouTube Netscape cookies supplied as a Railway secret variable.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 YOUTUBE_COOKIE_FILE = None
@@ -4801,10 +4809,57 @@ class TalkinBot:
                     time.sleep(0.8)
         raise last_error
 
+    def _find_live_room_state(self, room: str):
+        """Return the canonical in-memory live-room key matching ``room``.
+
+        Talkin can report the same room with small formatting/case differences
+        between chat messages and stream events. In a multi-room session that
+        used to make an already-live room look inactive, causing ``بث`` to send
+        a second invitation and then display a false "تعذر صعود البوت" error.
+        """
+        target = str(room or "").strip()
+        if not target:
+            return ""
+        target_key = _norm_room(target).casefold()
+        candidates = []
+        candidates.extend(list(getattr(self, "_live_ready_rooms", set()) or set()))
+        candidates.extend(list((getattr(self, "_pending_live_accepts", {}) or {}).keys()))
+        candidates.extend(list((getattr(self, "_live_session_by_room", {}) or {}).keys()))
+        for key in candidates:
+            key_s = str(key or "").strip()
+            if key_s and _norm_room(key_s).casefold() == target_key:
+                return key_s
+        # Finally inspect the per-room LiveKit publisher flags.
+        for key in candidates:
+            key_s = str(key or "").strip()
+            if key_s and getattr(self, f"_livekit_active_{key_s}", False):
+                if _norm_room(key_s).casefold() == target_key:
+                    return key_s
+        return target
+
+    def _live_room_is_active(self, room: str):
+        """Return (canonical_key, accepted_session, active) for one room."""
+        key = self._find_live_room_state(room)
+        pending = getattr(self, "_pending_live_accepts", {}) or {}
+        sessions = getattr(self, "_live_session_by_room", {}) or {}
+        accepted = pending.get(key, {}) or sessions.get(key, {}) or {}
+        if not accepted and key != room:
+            accepted = pending.get(room, {}) or sessions.get(room, {}) or {}
+        active = bool(
+            key in (getattr(self, "_live_ready_rooms", set()) or set())
+            or accepted.get("publish_confirmed")
+            or getattr(self, f"_livekit_active_{key}", False)
+            or getattr(self, f"_livekit_active_{room}", False)
+            or accepted.get("livekit_active")
+        )
+        return key, accepted, active
+
     def _play_music_in_live_room(self, room: str, media_url: str, duration: int = 0):
         """Play immediately if already live on mic, or queue audio and join live stream."""
         room = str(room or "").strip()
         media_url = str(media_url or "").strip()
+        self._last_live_play_status_by_room = getattr(self, "_last_live_play_status_by_room", {})
+        self._last_live_play_status_by_room[room] = "failed"
         if not room or not media_url:
             return False
         # الملف المحلي هو المصدر الحقيقي للـLiveKit، والرابط العام يستخدم فقط
@@ -4825,21 +4880,10 @@ class TalkinBot:
             ready_rooms = getattr(self, "_live_ready_rooms", set())
             pending_accepts = getattr(self, "_pending_live_accepts", {})
             live_sessions = getattr(self, "_live_session_by_room", {})
-            accepted = (pending_accepts.get(room, {}) or live_sessions.get(room, {}) or {})
-            # Also tolerate case/Unicode differences in the room key returned
-            # by different Talkin builds.
-            if not accepted:
-                rkey = _norm_room(room).casefold()
-                for rk, rv in list(live_sessions.items()):
-                    if _norm_room(rk).casefold() == rkey:
-                        accepted = rv or {}
-                        break
-            is_active = (
-                room in ready_rooms
-                or accepted.get("publish_confirmed")
-                or getattr(self, f"_livekit_active_{room}", False)
-                or bool(accepted.get("livekit_active"))
-            )
+            state_room, accepted, is_active = self._live_room_is_active(room)
+            if state_room and state_room != room:
+                self.log("[STREAM] mapped command room to live session:", room, "->", state_room)
+                room = state_room
 
             # إذا كان البوت صاعداً للبث والمايك بالفعل، نبث الصوت فوراً لجميع القنوات
             if is_active:
@@ -4968,6 +5012,7 @@ class TalkinBot:
                     daemon=True,
                 ).start()
 
+                self._last_live_play_status_by_room[room] = "started"
                 return True
 
             # إذا لم يكن البوت على المايك بعد، نحفظ الصوت معلقاً ونطلب الصعود
@@ -4995,10 +5040,13 @@ class TalkinBot:
             self.log("[STREAM] send native live invitation", room, "room_id=", room_id or "<name-only>")
             if not self.send_live_invitation_to_user(BOT_ID, room):
                 raise RuntimeError("تعذر إنشاء دعوة البث للغرفة")
-            # الصوت أصبح معلّقاً بانتظار publish_stream؛ لا نرسل للمستخدم
-            # "تم التشغيل" قبل أن يصبح البوت Publisher فعلياً.
+            # الطلب نجح، لكن قبول المقعد وpublish_stream غير متزامنين.
+            # لا نعتبره فشلاً ولا نرسل رسالة خطأ للمستخدم؛ عند وصول
+            # publish_stream سيُشغَّل المسار المعلّق تلقائياً.
+            self._last_live_play_status_by_room[room] = "queued"
             return False
         except Exception as exc:
+            self._last_live_play_status_by_room[room] = "failed"
             self.log("[STREAM] live play failed:", repr(exc))
             return False
 
@@ -6852,6 +6900,101 @@ class TalkinBot:
             "room_message", type_=media_type, room=room, url=media_url
         ))
 
+    def _audius_live_source(self, query):
+        """Find a streamable Audius track for live broadcast without downloading it.
+
+        This is deliberately separate from _music_download: normal `.sa` keeps
+        the existing SoundCloud/YouTube pipeline, while `بث` can use Audius as
+        a lightweight broadcast source. The returned URL is an MP3 stream that
+        ffmpeg/LiveKit can consume directly, so Railway does not wait for a
+        complete download/conversion before the broadcast starts.
+        """
+        q = str(query or "").strip()
+        if not q:
+            return None
+        if re.match(r"^https?://", q, re.I):
+            # Audius direct links can be resolved by yt-dlp/normal pipeline;
+            # do not guess an Audius track id from arbitrary URLs here.
+            return None
+
+        now = time.time()
+        cache = getattr(self, "_audius_live_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_audius_live_cache", cache)
+        key = re.sub(r"\s+", " ", q.casefold()).strip()
+        cached = cache.get(key)
+        if cached and now - float(cached.get("created_at", 0)) < AUDIUS_CACHE_TTL:
+            return dict(cached.get("value") or {})
+
+        params = {"query": q, "limit": 5, "sort_method": "relevant"}
+        if AUDIUS_API_KEY:
+            params["api_key"] = AUDIUS_API_KEY
+        headers = {"User-Agent": "TalkinBot/24"}
+        try:
+            r = requests.get(
+                f"{AUDIUS_API_BASE}/tracks/search",
+                params=params, headers=headers, timeout=AUDIUS_TIMEOUT,
+            )
+            r.raise_for_status()
+            payload = r.json()
+            tracks = payload.get("data") or []
+            if not isinstance(tracks, list):
+                tracks = []
+
+            selected = None
+            q_words = [w for w in re.split(r"\s+", key) if len(w) > 1]
+            for track in tracks:
+                if not isinstance(track, dict):
+                    continue
+                duration = int(track.get("duration") or 0)
+                streamable = track.get("is_streamable", True)
+                if streamable in (False, "false", "False", 0, "0"):
+                    continue
+                if duration and duration > MUSIC_MAX_SECONDS:
+                    continue
+                title = str(track.get("title") or "").strip()
+                artist = str((track.get("user") or {}).get("name") or "Audius").strip()
+                haystack = f"{title} {artist}".casefold()
+                score = sum(1 for w in q_words if w in haystack)
+                candidate = (score, int(track.get("play_count") or 0), track)
+                if selected is None or candidate[:2] > selected[:2]:
+                    selected = candidate
+
+            if selected is None:
+                return None
+            track = selected[2]
+            track_id = str(track.get("id") or "").strip()
+            if not track_id:
+                return None
+
+            # Audius documents /tracks/{track_id}/stream as the streamable MP3
+            # endpoint. Keep it as a remote URL; LiveKit's ffmpeg feeder follows
+            # redirects and streams it progressively instead of downloading it.
+            stream_url = f"{AUDIUS_API_BASE}/tracks/{track_id}/stream"
+            if AUDIUS_API_KEY:
+                stream_url += "?" + urlencode({"api_key": AUDIUS_API_KEY})
+
+            value = {
+                "id": track_id,
+                "title": str(track.get("title") or q),
+                "uploader": str((track.get("user") or {}).get("name") or "Audius"),
+                "duration": int(track.get("duration") or 0),
+                "url": stream_url,
+                "source": "Audius",
+                "created_at": now,
+            }
+            cache[key] = {"created_at": now, "value": value}
+            # Keep the tiny cache bounded.
+            if len(cache) > 80:
+                oldest = sorted(cache.items(), key=lambda item: float(item[1].get("created_at", 0)))[:20]
+                for old_key, _ in oldest:
+                    cache.pop(old_key, None)
+            return dict(value)
+        except Exception as exc:
+            self.log("[AUDIUS] live source unavailable:", repr(exc))
+            return None
+
     def _music_download(self,query):
         """Search/download public audio and return an MP3 ready for TalkinChat.
 
@@ -7008,12 +7151,40 @@ class TalkinBot:
         def worker():
             try:
                 public_base = _public_base_url()
-                if not public_base: raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
-                info,path=self._music_download(query)
-                title=str(info.get("title") or query)
-                artist=str(info.get("uploader") or info.get("channel") or "YouTube")
-                duration=int(info.get("duration") or 0)
-                url=public_base+"/media/"+path.name
+                info = None
+                path = None
+                url = ""
+
+                # للبث فقط: جرّب Audius أولاً لأنه يعطينا رابط MP3 مباشر
+                # ويمكن لـ ffmpeg قراءته تدريجياً، فلا ننتظر تنزيل الأغنية كاملة.
+                if live_stream:
+                    audius = self._audius_live_source(query)
+                    if audius:
+                        info = audius
+                        url = str(audius.get("url") or "")
+                        duration = int(audius.get("duration") or 0)
+                        title = str(audius.get("title") or query)
+                        artist = str(audius.get("uploader") or "Audius")
+                        self.log("[MUSIC] live source=Audius title=", title, "room=", room)
+                    else:
+                        # الاحتياطي القديم: SoundCloud ثم YouTube عبر yt-dlp.
+                        if not public_base:
+                            raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
+                        info, path = self._music_download(query)
+                        title=str(info.get("title") or query)
+                        artist=str(info.get("uploader") or info.get("channel") or "YouTube")
+                        duration=int(info.get("duration") or 0)
+                        url=public_base+"/media/"+path.name
+                        self.log("[MUSIC] live source=legacy fallback title=", title, "room=", room)
+                else:
+                    if not public_base:
+                        raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
+                    info,path=self._music_download(query)
+                    title=str(info.get("title") or query)
+                    artist=str(info.get("uploader") or info.get("channel") or "YouTube")
+                    duration=int(info.get("duration") or 0)
+                    url=public_base+"/media/"+path.name
+
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
                     "url": url, "duration": duration, "created_at": time.time(),
@@ -7032,26 +7203,24 @@ class TalkinBot:
                     caption=(f"🎶 تم تشغيل الأغنية\n━━━━━━━━━━━━\n"
                              f"🎵 العنوان: {title}\n🎤 الطلب: @{requester}\n"
                              f"📡 المصدر: {artist or 'Music'}")
-                # `.sa` publishes the audio file to the connected rooms.
-                # `بث` is the separate live-room mode and must not duplicate
-                # the track as a normal room attachment.
-                # استخدم الملف المحلي للبث الحي؛ رابط PUBLIC_BASE_URL يبقى للرسائل
-                # والمشاركة فقط. هذا يمنع فشل ffmpeg بسبب مسار Railway العام.
-                live_source = str(path) if live_stream else url
+
+                # في وضع البث نمرر رابط Audius مباشرة أو الملف المحلي القديم.
+                # لا نرفع الأغنية إلى PUBLIC_BASE_URL عندما يكون المصدر Audius.
+                live_source = url if (live_stream and path is None) else (str(path) if live_stream else url)
                 live_started = self._play_music_in_live_room(room, live_source, duration) if live_stream else False
                 if room_output:
                     target_rooms=self._active_rooms() if broadcast_all else [room]
                     for target_room in target_rooms:
                         self.send_room_text(target_room,caption)
-                        # If the live actions are unavailable, retain the
-                        # proven room-audio fallback for visible commands.
-                        if not live_started:
+                        if not live_started and not live_stream:
                             self.send_room_media(target_room,url,"audio",duration)
                 elif live_stream:
                     if live_started:
                         self.send_room_text(room, f"✅ تم تشغيل {title} في البث الحي.")
+                    elif getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed") == "queued":
+                        self.send_room_text(room, "📡 جاري صعود البوت للبث وتشغيل الأغنية تلقائياً...")
                     else:
-                        self.send_room_text(room, "❌ لم يصعد البوت للبث؛ استخدم أمر صعود ثم أعد أمر بث.")
+                        self.send_room_text(room, "❌ تعذر تشغيل الأغنية في البث؛ تم استخدام المصدر الاحتياطي إن توفر.")
             except Exception as e:
                 self.report_master_error("تشغيل الأغنية", e, room)
                 if room_output:
