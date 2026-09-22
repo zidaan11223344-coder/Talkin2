@@ -35,6 +35,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Telegram log delivery (master-only private command: السجل)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_ID_FILE = Path(os.getenv("TELEGRAM_CHAT_ID_FILE", str(Path("/tmp") / "telegram_log_chat_id.txt")))
+TELEGRAM_POLL_SECONDS = float(os.getenv("TELEGRAM_POLL_SECONDS", "3"))
+TELEGRAM_LOG_FILE = Path(os.getenv("TELEGRAM_LOG_FILE", str(Path("/tmp") / "talkin_bot.log")))
+TELEGRAM_LOG_MAX_BYTES = int(os.getenv("TELEGRAM_LOG_MAX_BYTES", "5000000"))
+
 
 # ============================================================
 # Media / music / gifts ported from the supplied Giant bot + Talkin APK.
@@ -3737,7 +3745,19 @@ class TalkinBot:
 
     def log(self, *args):
         if DEBUG:
-            print(*args, flush=True)
+            message = " ".join(str(x) for x in args)
+            print(message, flush=True)
+            try:
+                TELEGRAM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with TELEGRAM_LOG_FILE.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+                # Keep the local diagnostic file bounded so Railway storage is not
+                # filled by a long-running bot.
+                if TELEGRAM_LOG_MAX_BYTES > 0 and TELEGRAM_LOG_FILE.stat().st_size > TELEGRAM_LOG_MAX_BYTES:
+                    data = TELEGRAM_LOG_FILE.read_bytes()
+                    TELEGRAM_LOG_FILE.write_bytes(data[-TELEGRAM_LOG_MAX_BYTES:])
+            except Exception:
+                pass
 
     def _log_stream_stage(self, stage, status, room="", **extra):
         """Log a distinct stage in the live-stream acceptance lifecycle safely to console logs."""
@@ -3781,6 +3801,143 @@ class TalkinBot:
                 self.send_private_text(BOT_MASTER, message)
             except Exception as notify_error:
                 self.log("[MASTER-ERROR] failed:", repr(notify_error))
+
+    def _telegram_saved_chat_id(self):
+        """Return the Telegram group chat id learned from the first /start message."""
+        if TELEGRAM_CHAT_ID:
+            return TELEGRAM_CHAT_ID
+        try:
+            if TELEGRAM_CHAT_ID_FILE.exists():
+                value = TELEGRAM_CHAT_ID_FILE.read_text(encoding="utf-8").strip()
+                if value:
+                    return value
+        except Exception as exc:
+            self.log("[TELEGRAM_LOG] chat id read failed:", repr(exc))
+        return ""
+
+    def _save_telegram_chat_id(self, chat_id, title=""):
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            return False
+        try:
+            TELEGRAM_CHAT_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TELEGRAM_CHAT_ID_FILE.write_text(chat_id, encoding="utf-8")
+            self.log("[TELEGRAM] saved log chat_id:", chat_id, "title=", title)
+            return True
+        except Exception as exc:
+            self.log("[TELEGRAM] save chat_id failed:", repr(exc))
+            return False
+
+    def _telegram_poll_start(self):
+        """Listen for the first /start in a Telegram group and remember its chat_id."""
+        if not TELEGRAM_BOT_TOKEN:
+            self.log("[TELEGRAM] TELEGRAM_BOT_TOKEN غير موجود؛ polling disabled")
+            return
+        offset = 0
+        self.log("[TELEGRAM] polling started; waiting for /start in group")
+        while not self.stop_event.is_set():
+            try:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+                response = requests.get(
+                    url,
+                    params={"timeout": 25, "offset": offset},
+                    timeout=35,
+                )
+                if not response.ok:
+                    self.log("[TELEGRAM] getUpdates failed:", response.status_code, response.text[:300])
+                    time.sleep(TELEGRAM_POLL_SECONDS)
+                    continue
+                payload = response.json()
+                for update in payload.get("result", []) if isinstance(payload, dict) else []:
+                    offset = max(offset, int(update.get("update_id", 0)) + 1)
+                    message = update.get("message") or update.get("edited_message") or {}
+                    if not isinstance(message, dict):
+                        continue
+                    chat = message.get("chat") or {}
+                    chat_type = str(chat.get("type", "")).casefold()
+                    text = str(message.get("text", "") or "").strip()
+                    if chat_type not in {"group", "supergroup"}:
+                        continue
+                    first_word = text.split()[0] if text else ""
+                    bot_suffix = first_word.split("@", 1)[1] if "@" in first_word else ""
+                    command = first_word.split("@", 1)[0].casefold()
+                    if command == "/start" and (not bot_suffix or bot_suffix.casefold() == BOT_ID.casefold()):
+                        chat_id = str(chat.get("id", "")).strip()
+                        if chat_id and not self._telegram_saved_chat_id():
+                            title = str(chat.get("title", "") or "")
+                            self._save_telegram_chat_id(chat_id, title)
+                            try:
+                                self.log("[TELEGRAM] first /start received from group:", title or chat_id)
+                                requests.post(
+                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                    data={
+                                        "chat_id": chat_id,
+                                        "text": "✅ تم ربط هذه المجموعة بسجل البوت.\nاكتب السجل في خاص البوت لإرسال آخر سجل هنا.",
+                                    },
+                                    timeout=15,
+                                )
+                            except Exception as exc:
+                                self.log("[TELEGRAM] start confirmation failed:", repr(exc))
+            except Exception as exc:
+                self.log("[TELEGRAM] polling error:", repr(exc))
+                time.sleep(TELEGRAM_POLL_SECONDS)
+
+    def _send_log_to_telegram(self, requester: str) -> bool:
+        """Send the bot log to the saved Telegram group learned from /start."""
+        if not TELEGRAM_BOT_TOKEN:
+            self.send_private_text(requester, "❌ أضف متغير TELEGRAM_BOT_TOKEN في Railway أولاً.")
+            return False
+        chat_id = self._telegram_saved_chat_id()
+        if not chat_id:
+            self.send_private_text(
+                requester,
+                "❌ لم يتم ربط مجموعة تيليجرام بعد. أضف البوت إلى المجموعة وأرسل /start فيها.",
+            )
+            return False
+
+        try:
+            path = TELEGRAM_LOG_FILE
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("لا يوجد سجل محفوظ حتى الآن.\n", encoding="utf-8")
+
+            # Telegram accepts the file as a document. Limit the upload to the
+            # configured tail size if an external process made the file larger.
+            if TELEGRAM_LOG_MAX_BYTES > 0 and path.stat().st_size > TELEGRAM_LOG_MAX_BYTES:
+                data = path.read_bytes()[-TELEGRAM_LOG_MAX_BYTES:]
+                path.write_bytes(data)
+
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+            with path.open("rb") as handle:
+                response = requests.post(
+                    url,
+                    data={
+                        "chat_id": chat_id,
+                        "caption": f"📋 سجل البوت | طلب من @{requester}",
+                    },
+                    files={"document": ("talkin_bot.log", handle, "text/plain")},
+                    timeout=30,
+                )
+            if not response.ok:
+                self.log("[TELEGRAM_LOG] sendDocument failed:", response.status_code, response.text[:500])
+                self.send_private_text(requester, "❌ تعذر إرسال السجل إلى تيليجرام.")
+                return False
+
+            self.send_private_text(requester, "✅ تم إرسال سجل البوت إلى تيليجرام.")
+            return True
+        except Exception as exc:
+            self.log("[TELEGRAM_LOG] error:", repr(exc))
+            self.send_private_text(requester, f"❌ فشل إرسال السجل: {str(exc)[:150]}")
+            return False
+
+    def _telegram_log_command(self, sender, text):
+        """Master-only private command for sending the latest bot log to Telegram."""
+        if not _is_primary_master(sender):
+            return False
+        if str(text or "").strip().casefold() in {"السجل", "سجل", "log", "logs"}:
+            self._send_log_to_telegram(sender)
+            return True
+        return False
 
     def _monitor_command(self, sender, text):
         """Handle master-only private monitoring commands."""
@@ -11572,6 +11729,8 @@ class TalkinBot:
                         self.master_last_seen = time.time()
                     if body and self._handle_master_process_command(frm, body, is_private=True):
                         return
+                    if body and self._telegram_log_command(frm, body):
+                        return
                     if body and self._monitor_command(frm, body):
                         return
                     # When this process is the master account, it owns the
@@ -11973,6 +12132,12 @@ class TalkinBot:
                 "Add them to Railway Variables (not the source code) and redeploy."
             )
         self.asset_server = start_asset_server()
+        if TELEGRAM_BOT_TOKEN:
+            threading.Thread(
+                target=self._telegram_poll_start,
+                name="telegram-log-poller",
+                daemon=True,
+            ).start()
         while not self.stop_event.is_set():
             try:
                 self.run_once()
