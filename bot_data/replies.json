@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "replies": {},
+  "messages": {
+    "master_silent": "",
+    "master_denied": "",
+    "game_invalid_amount": "❌ المبلغ يجب أن يكون أكبر من صفر.",
+    "game_insufficient": "❌ رصيدك غير كافٍ. رصيدك الحالي: {balance} نقطة.",
+    "wager_open": "🎯 {game_label} جديد\n━━━━━━━━━━━━\n👤 {verb}: @{username}\n💰 المبلغ: {amount} نقطة\n\n🤝 للمشاركة ارسل: {command}@{amount}\n━━━━━━━━━━━━",
+    "wager_result": "🏆 انتهى {game}\n━━━━━━━━━━━━\n🥊 @{p1} × @{p2}\n\n👑 الفائز: @{winner}\n💰 مبلغ الجولة: {amount} نقطة\n🎁 مكسب الفائز: +{amount} نقطة\n📉 الخاسر: @{loser} (-{amount} نقطة)\n━━━━━━━━━━━━",
+    "luck_result": "🍀✨ حظ\n━━━━━━━━━━━━\n👤 اللاعب: @{username}\n🎯 النتيجة: {result}\n💰 الرهان: {amount} نقطة\n💵 التغير: {delta} نقطة\n💳 الرصيد: {balance} نقطة"
+  },
+  "auto_replies": {},
+  "auto_replies_enabled": true
+}
