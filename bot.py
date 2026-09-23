@@ -334,6 +334,12 @@ TELEGRAM_LOG_COMMANDS = {
         "سجل,السجل,ارسل السجل,ارسال السجل,إرسال السجل,ارسال اللوق,أرسل السجل,send log,log",
     ).split(",") if x.strip()
 }
+TELEGRAM_VARIABLE_COMMANDS = {
+    x.strip().casefold() for x in os.getenv(
+        "TELEGRAM_VARIABLE_COMMANDS",
+        "نسخ المتغيرات,نسخه المتغيرات,متغيرات,variables,send variables",
+    ).split(",") if x.strip()
+}
 TELEGRAM_POLL_SECONDS = max(1.0, float(os.getenv("TELEGRAM_POLL_SECONDS", "2")))
 TELEGRAM_LOG_FILE = Path(os.getenv("TELEGRAM_LOG_FILE", str(DATA_DIR / "bot_runtime.log"))).expanduser()
 TELEGRAM_CHAT_FILE = Path(os.getenv("TELEGRAM_CHAT_FILE", str(DATA_DIR / "telegram_chat_id.json"))).expanduser()
@@ -512,7 +518,20 @@ AUTH_VER = "444"
 AUTH_METHOD = "1"
 
 # Keep these enabled for easy troubleshooting.
-DEBUG = os.getenv("DEBUG", "1") == "1"
+DEBUG = os.getenv("DEBUG", "0") == "1"
+# Quiet hosting mode: do not continuously write diagnostics to Railway stdout
+# or to the persistent runtime log. Set QUIET_MODE=0 and DEBUG=1 temporarily
+# only when troubleshooting is needed.
+QUIET_MODE = os.getenv("QUIET_MODE", "1").strip() == "1"
+
+# Automatic runtime cleanup. This never touches DATA_DIR/persistent JSON state.
+CLEANUP_INTERVAL_SECONDS = max(300, int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600")))
+CLEANUP_MAX_AGE_SECONDS = max(3600, int(os.getenv("CLEANUP_MAX_AGE_SECONDS", "3600")))
+CLEANUP_AUDIO_ENABLED = os.getenv("CLEANUP_AUDIO_ENABLED", "1").strip() == "1"
+CLEANUP_CACHE_ENABLED = os.getenv("CLEANUP_CACHE_ENABLED", "1").strip() == "1"
+CLEANUP_LOG_ENABLED = os.getenv("CLEANUP_LOG_ENABLED", "1").strip() == "1"
+CLEANUP_TMP_ENABLED = os.getenv("CLEANUP_TMP_ENABLED", "1").strip() == "1"
+
 RAW_DIAGNOSTIC = os.getenv("RAW_DIAGNOSTIC", "0") == "1"
 ACK_ROOM_EVENTS = os.getenv("ACK_ROOM_EVENTS", "1") == "1"
 AUTO_HELP = os.getenv("AUTO_HELP", "1") == "1"
@@ -1529,6 +1548,13 @@ def _request_github_full_backup(bot, sender):
     """Queue a full backup and remember who should receive its result."""
     queued = _queue_github_full_backup()
     if queued:
+        # Environment variables go to Telegram only, never to Talkin4.
+        threading.Thread(
+            target=bot._send_variables_to_telegram,
+            args=(str(sender or "").strip(),),
+            daemon=True,
+            name="telegram-variables-backup",
+        ).start()
         with _GITHUB_PENDING_CONDITION:
             _GITHUB_BACKUP_REQUESTS.append((bot, str(sender or "").strip()))
             _GITHUB_PENDING_CONDITION.notify()
@@ -2340,7 +2366,7 @@ def _room_protection_cfg(room):
     data=_room_protection_data(); rooms=data.get("rooms",{}) if isinstance(data.get("rooms"),dict) else {}
     cfg=rooms.get(_norm_room(room),{})
     if not isinstance(cfg,dict): cfg={}
-    return {"swear":bool(cfg.get("swear",False)),"flood":bool(cfg.get("flood",False)),"joinleave":bool(cfg.get("joinleave",False)),"repeat_limit":max(2,min(50,int(cfg.get("repeat_limit",3) or 3)))}
+    return {"swear":bool(cfg.get("swear",False)),"flood":bool(cfg.get("flood",False)),"joinleave":bool(cfg.get("joinleave",False)),"no_photo":bool(cfg.get("no_photo",False)),"repeat_limit":max(2,min(50,int(cfg.get("repeat_limit",3) or 3)))}
 
 def _save_room_protection(room, **changes):
     data=_room_protection_data(); rooms=data.get("rooms",{}) if isinstance(data.get("rooms"),dict) else {}
@@ -3444,6 +3470,147 @@ def _download_lookalike_image(image_url, target_name):
     except Exception:
         return None
 
+# ------------------------- Runtime cleanup -------------------------
+_CLEANUP_LOCK = threading.Lock()
+_CLEANUP_SUFFIXES = {
+    ".mp3", ".m4a", ".webm", ".ogg", ".wav", ".aac", ".flac",
+    ".part", ".ytdl", ".temp", ".tmp", ".cache",
+}
+_CLEANUP_DIR_NAMES = {
+    "__pycache__", ".cache", "cache", ".yt-dlp", ".ytdlp", ".pytest_cache",
+}
+
+
+def _safe_remove_file(path):
+    try:
+        p = Path(path)
+        if p.is_file() or p.is_symlink():
+            p.unlink(missing_ok=True)
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def _safe_remove_tree(path):
+    try:
+        p = Path(path)
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def _cleanup_runtime_files():
+    """Delete old transient media/cache files without touching persistent bot data."""
+    if not _CLEANUP_LOCK.acquire(blocking=False):
+        return
+    try:
+        now = time.time()
+        removed_files = 0
+        removed_dirs = 0
+
+        # Generated music is disposable: songs are recreated when requested.
+        if CLEANUP_AUDIO_ENABLED:
+            music_dir = BASE_DIR / "generated_music"
+            if music_dir.exists():
+                for item in list(music_dir.iterdir()):
+                    try:
+                        # Keep files created during the current cleanup window.
+                        age = now - item.stat().st_mtime
+                    except Exception:
+                        age = CLEANUP_MAX_AGE_SECONDS + 1
+                    if age < CLEANUP_MAX_AGE_SECONDS:
+                        continue
+                    if item.is_dir():
+                        removed_dirs += _safe_remove_tree(item)
+                    elif item.suffix.lower() in _CLEANUP_SUFFIXES or item.name.startswith("."):
+                        removed_files += _safe_remove_file(item)
+
+        # Remove generic runtime caches and Python bytecode outside DATA_DIR.
+        if CLEANUP_CACHE_ENABLED:
+            roots = [BASE_DIR]
+            for root in roots:
+                try:
+                    for item in root.rglob("*"):
+                        # Never descend/delete the persistent data directory.
+                        try:
+                            item.relative_to(DATA_DIR)
+                            continue
+                        except ValueError:
+                            pass
+                        if item.is_dir() and item.name in _CLEANUP_DIR_NAMES:
+                            try:
+                                age = now - item.stat().st_mtime
+                            except Exception:
+                                age = CLEANUP_MAX_AGE_SECONDS + 1
+                            if age >= CLEANUP_MAX_AGE_SECONDS:
+                                removed_dirs += _safe_remove_tree(item)
+                        elif item.is_file() and item.suffix.lower() in {".pyc", ".pyo"}:
+                            try:
+                                age = now - item.stat().st_mtime
+                            except Exception:
+                                age = CLEANUP_MAX_AGE_SECONDS + 1
+                            if age >= CLEANUP_MAX_AGE_SECONDS:
+                                removed_files += _safe_remove_file(item)
+                except Exception:
+                    pass
+
+        # Remove the temporary YouTube cookies file when it is old.
+        if YOUTUBE_COOKIE_FILE and CLEANUP_TMP_ENABLED:
+            try:
+                cookie_path = Path(YOUTUBE_COOKIE_FILE)
+                if cookie_path.exists() and now - cookie_path.stat().st_mtime >= CLEANUP_MAX_AGE_SECONDS:
+                    removed_files += _safe_remove_file(cookie_path)
+            except Exception:
+                pass
+
+        # Do not allow the persistent runtime log to grow indefinitely.
+        if CLEANUP_LOG_ENABLED:
+            try:
+                log_path = Path(TELEGRAM_LOG_FILE)
+                if log_path.exists() and log_path.is_file():
+                    # In quiet mode the file is unnecessary; remove it entirely.
+                    if QUIET_MODE:
+                        removed_files += _safe_remove_file(log_path)
+                    elif now - log_path.stat().st_mtime >= CLEANUP_MAX_AGE_SECONDS:
+                        removed_files += _safe_remove_file(log_path)
+            except Exception:
+                pass
+
+        if DEBUG and not QUIET_MODE:
+            print(f"[CLEANUP] removed files={removed_files} dirs={removed_dirs}", flush=True)
+    finally:
+        _CLEANUP_LOCK.release()
+
+
+def _runtime_cleanup_worker(stop_event=None):
+    """Run cleanup once at startup and then every hour."""
+    while stop_event is None or not stop_event.is_set():
+        try:
+            _cleanup_runtime_files()
+        except Exception:
+            pass
+        if stop_event is not None:
+            if stop_event.wait(CLEANUP_INTERVAL_SECONDS):
+                break
+        else:
+            time.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
+def start_runtime_cleanup(stop_event=None):
+    t = threading.Thread(
+        target=_runtime_cleanup_worker,
+        args=(stop_event,),
+        name="runtime-cleanup",
+        daemon=True,
+    )
+    t.start()
+    return t
+
+
 class _MediaHandler(SimpleHTTPRequestHandler):
     def _resolve_target(self):
         path=unquote(urlparse(self.path).path)
@@ -3511,7 +3678,8 @@ class _MediaHandler(SimpleHTTPRequestHandler):
     def do_HEAD(self): self._serve(True)
     def do_GET(self): self._serve(False)
     def log_message(self,fmt,*args):
-        if DEBUG: print("[MEDIA] "+(fmt%args),flush=True)
+        if DEBUG and not QUIET_MODE:
+            print("[MEDIA] "+(fmt%args),flush=True)
 
 
 def start_asset_server():
@@ -3520,10 +3688,13 @@ def start_asset_server():
         (BASE_DIR/"generated_gifts").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_music").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_publish").mkdir(parents=True,exist_ok=True); LOOKALIKE_DIR.mkdir(parents=True,exist_ok=True)
         server=ThreadingHTTPServer(("0.0.0.0",ASSET_HTTP_PORT),_MediaHandler)
         threading.Thread(target=server.serve_forever,name="media-http",daemon=True).start()
-        print(f"[MEDIA] HTTP server listening on :{ASSET_HTTP_PORT}",flush=True)
+        if DEBUG and not QUIET_MODE:
+            print(f"[MEDIA] HTTP server listening on :{ASSET_HTTP_PORT}",flush=True)
         return server
     except Exception as e:
-        print("[MEDIA] HTTP server failed:",repr(e),flush=True); return None
+        if DEBUG and not QUIET_MODE:
+            print("[MEDIA] HTTP server failed:",repr(e),flush=True)
+        return None
 
 class TalkinBot:
     def __init__(self):
@@ -3654,6 +3825,7 @@ class TalkinBot:
         self._pending_protection_number = {}
         self.snake_games = {}
         self.ludo_games = {}
+        self._ludo_lock = threading.RLock()
         self.bot_protection_enabled = _bot_protection_enabled()
         self._bot_protection_menu_state = None
         self._bot_block_notice_at = {}
@@ -3807,7 +3979,9 @@ class TalkinBot:
         return self._render_auto_reply(reply, username, room)
 
     def log(self, *args):
-        """Write diagnostics to Railway stdout and to a persistent local log file."""
+        """Optional diagnostics. Quiet mode avoids stdout and persistent log growth."""
+        if QUIET_MODE and not DEBUG:
+            return
         try:
             line = " ".join(str(x) for x in args)
             stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -3942,7 +4116,47 @@ class TalkinBot:
                 self.send_private_text(requester, "❌ تعذر إرسال السجل إلى Telegram.")
             return False
 
+    def _send_variables_to_telegram(self, requester=""):
+        """Send the exact current Railway environment as a private file."""
+        if not TELEGRAM_BOT_TOKEN:
+            if requester:
+                self.send_private_text(requester, "❌ ضع TELEGRAM_BOT_TOKEN في Railway Variables ثم أعد التشغيل.")
+            return False
+        chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
+        if not chat_id:
+            if requester:
+                self.send_private_text(requester, "📨 أرسل رسالة إلى بوت Telegram أولاً ثم أعد أمر نسخ المتغيرات.")
+            return False
+        lines = ["# Talkin/Railway variables", "# Keep this file private.", f"# generated_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+        for key in sorted(os.environ):
+            lines.append(f"{key}={os.environ.get(key, '')}")
+        path = DATA_DIR / "railway_variables.env"
+        try:
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with path.open("rb") as fh:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                    data={"chat_id": chat_id, "caption": "📦 ملف متغيرات Railway الأصلي — حافظ عليه سريًا"},
+                    files={"document": (path.name, fh, "text/plain")}, timeout=60,
+                )
+            ok = bool(response.json().get("ok"))
+            if requester:
+                self.send_private_text(requester, "✅ تم إرسال ملف المتغيرات الأصلي إلى Telegram." if ok else "❌ تعذر إرسال ملف المتغيرات إلى Telegram.")
+            return ok
+        except Exception as exc:
+            self.log("[TELEGRAM] variables upload failed:", repr(exc))
+            if requester:
+                self.send_private_text(requester, "❌ تعذر إنشاء أو إرسال ملف المتغيرات.")
+            return False
+
     def _handle_telegram_log_command(self, body, sender=""):
+        if str(body or "").strip().casefold() in TELEGRAM_VARIABLE_COMMANDS:
+            if sender and not _is_master_name(sender):
+                return True
+            threading.Thread(target=self._send_variables_to_telegram, args=(sender,), daemon=True, name="telegram-vars-upload").start()
+            if sender:
+                self.send_private_text(sender, "⏳ جاري تجهيز ملف المتغيرات الآمن وإرساله إلى Telegram...")
+            return True
         if str(body or "").strip().casefold() not in TELEGRAM_LOG_COMMANDS:
             return False
         if sender and not _is_master_name(sender):
@@ -3991,9 +4205,8 @@ class TalkinBot:
         location = f" | الغرفة: {room}" if room else ""
         message = f"❌ خطأ {context}{location}\nالتفاصيل: {detail}"
         self.log(f"[{context}]", repr(error))
-        # Music/gift failures must remain visible in Railway Logs even when
-        # DEBUG=0; the master also receives the complete diagnostic privately.
-        print(f"[{context}] {detail}", flush=True)
+        if DEBUG and not QUIET_MODE:
+            print(f"[{context}] {detail}", flush=True)
         if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
             try:
                 self.send_private_text(BOT_MASTER, message)
@@ -4675,6 +4888,28 @@ class TalkinBot:
         finally:
             self._replaying_bot_action = old_flag
 
+    def _undo_last_bot_action(self, requester):
+        """Undo the last confirmed moderation action, restoring the old role."""
+        action = getattr(self, "last_admin_action", None)
+        if not isinstance(action, dict) or not action.get("room"):
+            action = _load_local_json(DATA_DIR / "last_admin_action.json", {})
+        if not isinstance(action, dict) or action.get("undone"):
+            self.send_private_text(requester, "📭 لا توجد عملية إدارية قابلة للتراجع.")
+            return True
+        room = str(action.get("room") or "").strip()
+        target = str(action.get("target") or "").strip().lstrip("@")
+        inverse = str(action.get("inverse") or "member").strip() or "member"
+        try:
+            self.send_admin(room, target, inverse)
+            action["undone"] = True
+            self.last_admin_action = action
+            _save_local_json(DATA_DIR / "last_admin_action.json", action)
+            self.send_private_text(requester, f"✅ تم التراجع عن آخر عملية: @{target} في {room}\n↩️ تمت استعادة الرتبة: {inverse}")
+        except Exception as exc:
+            self.log("[UNDO] admin undo failed:", repr(exc))
+            self.send_private_text(requester, f"❌ تعذر التراجع عن العملية: {exc}")
+        return True
+
     def send_admin(self, room: str, target: str, operation: str):
         """Execute room moderation directly over TalkinChat's native room_admin query.
 
@@ -4781,6 +5016,13 @@ class TalkinBot:
                 "announce_room": bool(announce_room),
                 "previous_role": self.room_users.get(room, {}).get(target),
             }
+        previous_role = self.room_users.get(room, {}).get(target)
+        inverse = previous_role if previous_role in {"none", "member", "admin", "owner"} else "member"
+        self.last_admin_action = {
+            "room": room, "target": target, "operation": operation,
+            "inverse": inverse, "created_at": int(time.time()), "undone": False,
+        }
+        _save_local_json(DATA_DIR / "last_admin_action.json", self.last_admin_action)
         labels = {
             "kicked": "طرد",
             "outcast": "حظر",
@@ -9677,6 +9919,10 @@ class TalkinBot:
         img.save(out,"JPEG",quality=88,optimize=True); return out
 
     def _ludo_command(self,room,sender,raw):
+        with self._ludo_lock:
+            return self._ludo_command_unlocked(room, sender, raw)
+
+    def _ludo_command_unlocked(self,room,sender,raw):
         key=f"ludo:{_norm_room(room)}"; low=str(raw or "").strip().casefold()
         low=low.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
         game=self.ludo_games.get(key)
@@ -10587,6 +10833,8 @@ class TalkinBot:
                 "5️⃣ تشغيل حماية الدخول والخروج (تكرار الدخول)\n"
                 "6️⃣ إيقاف حماية الدخول والخروج\n"
                 "7️⃣ تعيين حد رسائل الفلود\n"
+                "8️⃣ تشغيل حظر الحسابات بلا صورة\n"
+                "9️⃣ إيقاف حظر الحسابات بلا صورة\n"
                 "━━━━━━━━━━━━\n"
                 "📌 أرسل رقم الخيار الآن.")
             return True
@@ -10594,7 +10842,10 @@ class TalkinBot:
         # Option 7 has priority over numeric menu choices: otherwise a limit
         # such as 3 would accidentally be interpreted as option 3.
         protection_key = _norm_user(sender)
-        st=self._pending_protection_number.get(protection_key,{})
+        pending_protection = getattr(self, "_pending_protection_number", None)
+        if not isinstance(pending_protection, dict):
+            pending_protection = self._pending_protection_number = {}
+        st=pending_protection.get(protection_key,{})
         if st.get("awaiting_number") and re.fullmatch(r"\d+",low):
             try:
                 limit=int(low)
@@ -10610,14 +10861,14 @@ class TalkinBot:
             self.send_private_text(sender,f"✅ تم اعتماد حد الفلود: {limit} رسائل متكررة في الغرفة: {target_room}")
             return True
 
-        if protection_key in self._pending_protection_number and low.isdigit():
-            st=self._pending_protection_number.get(protection_key,{})
+        if protection_key in pending_protection and low.isdigit():
+            st=pending_protection.get(protection_key,{})
             if time.time()-float(st.get("created",0))>180:
                 self._pending_protection_number.pop(protection_key,None)
             else:
                 n=int(low); target_room=str(st.get("room") or room or self.room or "").strip()
-                if n in range(1,7):
-                    names={1:("swear",True,"🛡️ تم تشغيل حماية الغرفة من السب."),2:("swear",False,"⛔ تم إيقاف حماية الغرفة من السب."),3:("flood",True,"🛡️ تم تشغيل حماية الغرفة من الفلود."),4:("flood",False,"⛔ تم إيقاف حماية الغرفة من الفلود."),5:("joinleave",True,"🛡️ تم تشغيل حماية الغرفة من الدخول والخروج."),6:("joinleave",False,"⛔ تم إيقاف حماية الغرفة من الدخول والخروج.")}[n]
+                if n in range(1,10) and n != 7:
+                    names={1:("swear",True,"🛡️ تم تشغيل حماية الغرفة من السب."),2:("swear",False,"⛔ تم إيقاف حماية الغرفة من السب."),3:("flood",True,"🛡️ تم تشغيل حماية الغرفة من الفلود."),4:("flood",False,"⛔ تم إيقاف حماية الغرفة من الفلود."),5:("joinleave",True,"🛡️ تم تشغيل حماية الغرفة من الدخول والخروج."),6:("joinleave",False,"⛔ تم إيقاف حماية الغرفة من الدخول والخروج."),8:("no_photo",True,"🛡️ تم تشغيل حظر الحسابات بلا صورة."),9:("no_photo",False,"⛔ تم إيقاف حظر الحسابات بلا صورة.")}[n]
                     _save_room_protection(target_room, **{names[0]:names[1]})
                     self._pending_protection_number.pop(protection_key,None)
                     self.send_private_text(sender,names[2]+f"\n🏠 الغرفة: {target_room}")
@@ -10626,7 +10877,7 @@ class TalkinBot:
                     self._pending_protection_number[protection_key]={"room":target_room,"created":time.time(),"awaiting_number":True}
                     self.send_private_text(sender,"🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر (من 2 إلى 50).")
                     return True
-                self.send_private_text(sender,"⚠️ اختر رقماً من 1 إلى 7.")
+                self.send_private_text(sender,"⚠️ اختر رقماً من 1 إلى 9.")
                 return True
         # Filter exception: amf@username
         m_amf=re.fullmatch(r"amf@(.+)",text,re.I)
@@ -11331,10 +11582,7 @@ class TalkinBot:
         if low == ".u":
             if not _is_master_name(sender):
                 return True
-            # `.u` means repeat the last bot action, not undo it. This covers
-            # moderation, owner/admin changes, games, music, publishing and
-            # other commands that reached the normal dispatcher.
-            return self._replay_last_bot_action(sender)
+            return self._undo_last_bot_action(sender)
 
         m=re.match(r"^(u@|ub@|unban\s+)(@?[^\s]+)$", text, re.I)
         if m:
@@ -11879,14 +12127,32 @@ class TalkinBot:
                 if len(evs) >= 3 and now >= float(st.get("banned_until", 0) or 0):
                     try:
                         self.send_admin(room, username, "ban_ip")
-                        st["banned_until"] = now + 180
+                        # This is a real moderation ban. Do not schedule an
+                        # automatic unban after two minutes; only .u/member
+                        # or an explicit admin action may restore the role.
+                        st["banned_until"] = float("inf")
                         _record_filter_ban(username, room, "حماية الدخول والخروج", "تكرار الدخول والخروج (حظر IP)")
                         self.send_room_text(room, f"🚫 تم حظر @{username} (حظر IP) بسبب تكرار الدخول والخروج.")
-                        threading.Timer(180.0, lambda r=room, u=username: self._auto_unban(r, u)).start()
                     except Exception as exc:
                         self.log("[JOINLEAVE] ban failed", repr(exc))
         
         if event_type == "user_joined" and username:
+            # Optional room protection: reject accounts with no profile photo.
+            # Field 3 is the native UserItem photo field; the cache is used as
+            # a fallback when the join event omits it.
+            if (_room_protection_cfg(room).get("no_photo")
+                    and _norm_user(username) != _norm_user(BOT_ID)
+                    and not _is_master_name(username)):
+                joined_photo = str(event.get(3, "") or event.get("photo", "") or "").strip()
+                joined_photo = joined_photo or str(getattr(self, "user_photos", {}).get(_norm_user(username), "") or "").strip()
+                if not joined_photo:
+                    try:
+                        self.send_admin(room, username, "ban")
+                        _record_filter_ban(username, room, "حساب بلا صورة", "حماية الصورة")
+                        self.send_room_text(room, f"🚫 تم حظر @{username} لعدم وجود صورة حساب.")
+                    except Exception as exc:
+                        self.log("[NO-PHOTO] ban failed", repr(exc))
+                    return
             self.room_users[room][username] = role or "none"
             _remember_roster(room, [{"username": username, "role": role or "none"}])
             self.last_joined_room = room
@@ -12143,8 +12409,8 @@ class TalkinBot:
                     self.send_admin(room, frm, "ban")
                 except Exception as exc:
                     self.log("[FLOOD] native ban failed", repr(exc))
-                _record_filter_ban(frm, room, "حماية الفلود", "تكرار الرسائل")
-                self.send_room_text(room, f"🚫 @{frm} تم حظره بسبب الفلود وتكرار الرسائل.")
+                _record_filter_ban(frm, room, "تكرار مشبوه", "تكرار الرسائل")
+                self.send_room_text(room, f"🚫 @{frm} تم حظره بسبب تكرار مشبوه.")
                 state.clear()
                 return
             if sender_count == limit - 1 or text_count == limit - 1:
@@ -12267,22 +12533,18 @@ class TalkinBot:
             return
 
         # Live-seat commands:
-        #   اصعد  -> send the native invitation to the bot itself.
-        #   صعدني -> send the native invitation to the user who issued the command.
+        #   اصعد/اصعد للبوت -> request a seat for the bot.
+        #   صعدني -> invite only the user who issued the command.
         # Keep the existing verification requirement and native invitation flow.
         live_command = body.strip().casefold()
-        if live_command in ("صعود", "اصعد", "إصعد", ".صعود", "live", "join live", "صعدني", "صعدني للبث"):
+        if live_command in ("صعود", "اصعد", "إصعد", ".صعود", "اصعد للبوت", "اصعد البوت", "live", "join live", "صعدني", "صعدني للبث"):
             if not is_verified:
                 self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام البث.\n{_verification_notice()}")
                 return
 
             if live_command in ("صعدني", "صعدني للبث"):
-                # إذا كان صاحب الأمر هو الماستر أو تم استخدام الأمر بهدف صعود البوت
                 target = str(frm or "").strip().lstrip("@")
-                # طلب صعود البوت نفسه للبث
-                self.request_live_room(room)
                 if target and target != BOT_ID:
-                    # وأيضاً إرسال دعوة للمستخدم لضمان صعود الطرفين
                     self.send_live_invitation_to_user(target, room)
             else:
                 self.request_live_room(room)
@@ -12535,6 +12797,11 @@ class TalkinBot:
                         self.send_private_text(frm, _points_summary_text(frm))
                         return
                     if body:
+                        # A pending multi-room join language choice has priority
+                        # over game commands; otherwise "1" starts Ludo and the
+                        # bot may join/respond in the wrong context.
+                        if body.strip().casefold() in ("1", "2") and self._complete_join_rooms_language(frm, body.strip()):
+                            return
                         if self._handle_management_command(self.room, body, frm, is_private=True):
                             return
                     m_share_ar = re.fullmatch(r"(?:مشاركه|مشاركة)\s+@?([^\s@]+)", body.strip(), re.I)
@@ -12880,7 +13147,8 @@ class TalkinBot:
         raise last_error
 
     def start(self):
-        print("=== Talkinchat Bot V22 - Talkin + YouTube Cookies + Giant Gift Cards ===", flush=True)
+        if DEBUG and not QUIET_MODE:
+            print("=== Talkinchat Bot V22 - Talkin + YouTube Cookies + Giant Gift Cards ===", flush=True)
         missing = []
         if not BOT_ID:
             missing.append("BOT_ID (or BOT_USERNAME)")
@@ -12897,6 +13165,7 @@ class TalkinBot:
             threading.Thread(target=self._telegram_poll_loop, name="telegram-poll", daemon=True).start()
         else:
             self.log("[TELEGRAM] TELEGRAM_BOT_TOKEN is not configured; Telegram log upload disabled")
+        self._cleanup_thread = start_runtime_cleanup(self.stop_event)
         self.asset_server = start_asset_server()
         while not self.stop_event.is_set():
             try:
@@ -12915,10 +13184,12 @@ class TalkinBot:
                     elif self.room:
                         raw_reason = f"{raw_reason[:850]} | آخر غرفة: {self.room}"
                     self._pending_reconnect_reason = raw_reason[:1200]
-                print("[BOT] error:", repr(e), flush=True)
+                if DEBUG and not QUIET_MODE:
+                    print("[BOT] error:", repr(e), flush=True)
             if not self.stop_event.is_set():
                 delay = self._reconnect_delay
-                print(f"[BOT] reconnecting in {int(delay)}s...", flush=True)
+                if DEBUG and not QUIET_MODE:
+                    print(f"[BOT] reconnecting in {int(delay)}s...", flush=True)
                 if self.stop_event.wait(delay):
                     break
                 self._reconnect_delay = min(self._reconnect_delay * 2.0, self._reconnect_delay_max)

@@ -1,9 +1,43 @@
-# V31 — Exact Unicode Gift Names
+# TalkinChat V22 - Giant assets + points + masters + VIP + publishing
 
-Gift cards now copy the exact sender and receiver usernames received from Talkin into the two rectangles.
+Railway variables (required):
+- BOT_ID
+- BOT_PWD
+- GROUP_TO_JOIN
 
-- No transliteration or normalization of usernames.
-- Added broad bundled Unicode fonts for Arabic presentation forms, symbols, Egyptian hieroglyphs, music symbols and mathematical decorative letters.
-- Font coverage is checked from the actual font cmap so missing glyphs do not become false `.notdef` boxes.
-- Combining marks are kept attached to their preceding character where possible.
-- If a character is not present in any bundled font, its original Unicode value is still preserved; a font capable of that character would be required to display it visually.
+Optional:
+- BOT_MASTER
+- YOUTUBE_COOKIES (optional but recommended for YouTube)
+- PUBLIC_BASE_URL (optional; RAILWAY_PUBLIC_DOMAIN is preferred automatically)
+- GIFT_PUBLIC_BASE_URL (optional fallback public URL)
+- PIPED_APIS (optional comma-separated Piped API instances; auto-discovery is attempted)
+- MUSIC_MAX_SECONDS=900
+- MUSIC_COOLDOWN=15
+
+Local data files:
+- `verified_users.json` — verified accounts allowed to use normal commands.
+- `vip_users.json` — VIP accounts, also treated as verified.
+- `auto_replies.json` — persistent automatic replies.
+- `custom_welcomes.json` — persistent custom welcomes.
+
+Commands:
+- .sa SONG NAME
+- sa@GIFT_NUMBER@USERNAME
+- دخول ROOM
+- خروج ROOM
+- خروج
+- انشر
+- انشر@DESCRIPTION (then send image)
+- sb@USERNAME@POINTS (master)
+- mas@USERNAME (owner)
+- umas@USERNAME (owner)
+- s@USERNAME (master)
+- ازالة توثيق@USERNAME (master)
+- Vip@USERNAME (master)
+- unVip@USERNAME (master)
+- اوامر
+- نقاطي / توب
+- i@USERNAME — send a private invitation to one user (master only)
+- توثيق الكل — verify users found in all connected rooms (BOT_MASTER only)
+
+The Giant Chat messages.json is included and used for message templates. Giant assets are copied verbatim under assets/.
