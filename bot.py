@@ -70,6 +70,7 @@ MUSIC_CONCURRENT_FRAGMENTS = int(os.getenv("MUSIC_CONCURRENT_FRAGMENTS", "16"))
 MUSIC_BUFFER_SIZE = int(os.getenv("MUSIC_BUFFER_SIZE", str(4 * 1024 * 1024)))
 MUSIC_THROTTLED_RATE = int(os.getenv("MUSIC_THROTTLED_RATE", str(128 * 1024)))
 MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
+MUSIC_DIRECT_CACHE_TTL = float(os.getenv("MUSIC_DIRECT_CACHE_TTL", "45"))
 # Audius is an additional lightweight source used primarily by live broadcast.
 # It can search the catalog and expose a streamable MP3 URL without first
 # downloading the whole song to Railway. The API supports read-only access;
@@ -7712,6 +7713,17 @@ class TalkinBot:
         if not q:
             return None
         target = q if re.match(r"^https?://", q, re.I) else "ytsearch1:" + q
+        # Direct YouTube URLs are short-lived, so cache only briefly. This
+        # avoids repeating the slow extractor step when the same song is
+        # requested again while keeping the URL fresh enough to play.
+        cache = getattr(self, "_music_direct_cache", None)
+        if cache is None:
+            cache = {}
+            self._music_direct_cache = cache
+        cache_key = re.sub(r"\s+", " ", q.casefold()).strip()
+        cached = cache.get(cache_key)
+        if cached and time.time() - float(cached.get("created_at", 0) or 0) < MUSIC_DIRECT_CACHE_TTL:
+            return dict(cached.get("value") or {})
         errors = []
 
         clients = ("web_embedded", "default", "native_default")
@@ -7789,7 +7801,7 @@ class TalkinBot:
                 if not direct_url:
                     continue
                 source = str(info.get("extractor_key") or info.get("extractor") or "YouTube")
-                return {
+                value = {
                     "id": str(info.get("id") or ""),
                     "title": str(info.get("title") or q),
                     "uploader": str(info.get("uploader") or info.get("channel") or source),
@@ -7797,6 +7809,12 @@ class TalkinBot:
                     "url": direct_url,
                     "source": source,
                 }
+                cache[cache_key] = {"created_at": time.time(), "value": value}
+                if len(cache) > 80:
+                    oldest = sorted(cache.items(), key=lambda item: float(item[1].get("created_at", 0) or 0))[:20]
+                    for old_key, _ in oldest:
+                        cache.pop(old_key, None)
+                return dict(value)
             except Exception as exc:
                 errors.append(f"{client}: {type(exc).__name__}: {exc}")
                 continue
@@ -8012,30 +8030,25 @@ class TalkinBot:
                             url=public_base+"/media/"+path.name
                             self.log("[MUSIC] live source=legacy fallback title=", title, "room=", room)
                 else:
-                    # Fast path: Audius exposes a direct MP3 stream, so when
-                    # the requested track exists there we can send it without
-                    # downloading/converting the entire song on the host.
-                    audius = self._audius_live_source(query)
-                    if audius:
-                        info = audius
-                        url = str(audius.get("url") or "")
-                        duration = int(audius.get("duration") or 0)
-                        title = str(audius.get("title") or query)
-                        artist = str(audius.get("uploader") or "Audius")
-                        self.log("[MUSIC] fast source=Audius title=", title, "room=", room)
+                    # Normal room playback: resolve a direct YouTube/SoundCloud
+                    # audio URL first. Audius and full download are fallbacks.
+                    direct = self._music_live_source(query)
+                    if direct:
+                        info = direct
+                        url = str(direct.get("url") or "")
+                        duration = int(direct.get("duration") or 0)
+                        title = str(direct.get("title") or query)
+                        artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
+                        self.log("[MUSIC] fast source=direct-audio title=", title, "room=", room)
                     else:
-                        # YouTube/SoundCloud direct audio fallback.  yt-dlp only
-                        # resolves metadata and a short-lived audio URL here;
-                        # the room receives it as an audio/voice media packet
-                        # instead of waiting for a complete local download.
-                        direct = self._music_live_source(query)
-                        if direct:
-                            info = direct
-                            url = str(direct.get("url") or "")
-                            duration = int(direct.get("duration") or 0)
-                            title = str(direct.get("title") or query)
-                            artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
-                            self.log("[MUSIC] fast source=direct-audio title=", title, "room=", room)
+                        audius = self._audius_live_source(query)
+                        if audius:
+                            info = audius
+                            url = str(audius.get("url") or "")
+                            duration = int(audius.get("duration") or 0)
+                            title = str(audius.get("title") or query)
+                            artist = str(audius.get("uploader") or "Audius")
+                            self.log("[MUSIC] fallback source=Audius title=", title, "room=", room)
                         else:
                             # Final fallback: download and convert in this
                             # background worker, then expose the MP3 through
@@ -8074,9 +8087,9 @@ class TalkinBot:
                 if room_output:
                     target_rooms=self._active_rooms() if broadcast_all else [room]
                     for target_room in target_rooms:
-                        self.send_room_text(target_room,caption)
                         if not live_started and not live_stream:
                             self.send_room_media(target_room,url,"audio",duration)
+                        self.send_room_text(target_room,caption)
                 elif live_stream:
                     if live_started:
                         self.send_room_text(room, f"✅ تم تشغيل {title} في البث الحي.")
