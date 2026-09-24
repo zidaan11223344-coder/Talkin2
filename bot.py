@@ -11032,6 +11032,10 @@ class TalkinBot:
         }
         is_game_cmd = str(body or "").strip().casefold() in ("تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب")
         is_creator_cmd = bool(re.match(r"^[+-]?صانع(?:ي| الغرفة| الغرفه)?(?:@.+)?$", str(body or "").strip(), re.I))
+        pending_protection_choice = bool(
+            room and _room_manager(self, room, sender)
+            and isinstance(getattr(self, "_pending_protection_number", {}).get(_norm_user(sender)), dict)
+        )
         if (not _is_master_name(sender)
                 and not public_top_command
                 and not (verification_manager_command and _is_mvip_master(sender))
@@ -11040,7 +11044,7 @@ class TalkinBot:
                 and not join_command
                 and not join_all_command
                 and not repeat_last_command
-                and not ((security_command or is_game_cmd or is_creator_cmd) and room and _room_manager(self, room, sender))):
+                and not ((security_command or is_game_cmd or is_creator_cmd or pending_protection_choice) and room and _room_manager(self, room, sender))):
             return False
         # A private command can be replayed by the Talkin transport with a new
         # frame/uid. Do not answer the same account-list request twice in a row.
@@ -11355,8 +11359,8 @@ class TalkinBot:
 
         # New master protection menu.
         if low in ("حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه"):
-            if not _is_master_name(sender):
-                self.send_private_text(sender, "🚫 أمر الحماية مخصص للماستر.")
+            if not room or not _room_manager(self, room, sender):
+                self.send_private_text(sender, "🚫 أمر الحماية مخصص لماستر الغرفة أو صانعها.")
                 return True
             target_room = str(room or self.room or "").strip()
             if not target_room:
@@ -12893,7 +12897,7 @@ class TalkinBot:
             norm_r = _norm_room(room)
 
             # --- حماية الفلود: كشف دخول عدد نكات غير محدود/جماعي بنفس الوقت وحظرهم IP ---
-            if event_type == "user_joined" and pcfg.get("flood") and norm_u != _norm_user(BOT_ID) and not _is_master_name(username):
+            if event_type == "user_joined" and pcfg.get("flood") and norm_u != _norm_user(BOT_ID) and not _room_manager(self, room, username):
                 if not hasattr(self, "_join_flood_history"):
                     self._join_flood_history = defaultdict(list)
                 history = self._join_flood_history[norm_r]
@@ -12905,7 +12909,7 @@ class TalkinBot:
                     self.log(f"[FLOOD] كشف فلود دخول جماعي في {room}: {len(history)} نكات خلال 5 ثوانٍ")
                     banned_names = []
                     for _, u_flood in list(history):
-                        if _norm_user(u_flood) != _norm_user(BOT_ID) and not _is_master_name(u_flood):
+                        if _norm_user(u_flood) != _norm_user(BOT_ID) and not _room_manager(self, room, u_flood):
                             try:
                                 self.send_admin(room, u_flood, "ban_ip")
                                 _record_filter_ban(u_flood, room, "حماية الفلود", "دخول جماعي متزامن (حظر IP)")
@@ -12917,7 +12921,7 @@ class TalkinBot:
                         self.send_room_text(room, f"🚫 [حماية الفلود] تم حظر IP للنكات التالية لدخولها المتزامن: {' '.join(banned_names[:5])}")
 
             # --- حماية الدخول والخروج: كشف تكرار الدخول والخروج لنفس النك وحظره ---
-            if pcfg.get("joinleave") and norm_u != _norm_user(BOT_ID) and not _is_master_name(username):
+            if pcfg.get("joinleave") and norm_u != _norm_user(BOT_ID) and not _room_manager(self, room, username):
                 st = self._joinleave_state[norm_r][norm_u]
                 evs = st.setdefault("events", [])
                 evs[:] = [x for x in evs if now - float(x[0]) <= 300]
@@ -12941,7 +12945,7 @@ class TalkinBot:
             # a fallback when the join event omits it.
             if (_room_protection_cfg(room).get("no_photo")
                     and _norm_user(username) != _norm_user(BOT_ID)
-                    and not _is_master_name(username)):
+                    and not _room_manager(self, room, username)):
                 joined_photo = str(event.get(3, "") or event.get("photo", "") or "").strip()
                 joined_photo = joined_photo or str(getattr(self, "user_photos", {}).get(_norm_user(username), "") or "").strip()
                 if not joined_photo:
@@ -13195,7 +13199,7 @@ class TalkinBot:
         # room ban operation as b@, with Arabic normalization and no public reply.
         room_cfg = _room_moderation_config(room)
         protection_cfg = _room_protection_cfg(room)
-        if protection_cfg["flood"] and not _is_master_name(frm):
+        if protection_cfg["flood"] and not _room_manager(self, room, frm):
             now = time.time()
             state = self._room_repeat_state[room]
             last_sender = str(state.get("sender", ""))
@@ -13239,7 +13243,7 @@ class TalkinBot:
                   if _norm_filter_text(w) and _norm_filter_text(w) in normalized_body), None)
             if filter_enabled else None
         )
-        if hit and not _is_master_name(frm):
+        if hit and not _room_manager(self, room, frm):
             try:
                 exempt = _norm_user(frm) in getattr(self,"filter_exceptions",set())
                 if exempt:
