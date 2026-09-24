@@ -1890,6 +1890,41 @@ def _auto_reply_key(value):
     text = re.sub(r"[؟?!.,،؛:]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
+
+def _normalize_lang_choice(val):
+    """Normalize 1/2 language selection from Arabic/English numerals or words."""
+    s = str(val or "").strip().casefold()
+    if not s:
+        return ""
+    if s in ("1", "١", "1️⃣", "ar", "عربي", "العربية", "عربيه", "العربيه"):
+        return "1"
+    if s in ("2", "٢", "2️⃣", "en", "انجليزي", "الانجليزية", "انكليزي", "الانكليزية", "english"):
+        return "2"
+    if s.startswith(("1", "١")):
+        return "1"
+    if s.startswith(("2", "٢")):
+        return "2"
+    return ""
+
+ROOM_CREATORS_FILE = BASE_DIR / "room_creators.json"
+
+def _room_creators_data():
+    data = _load_local_json(ROOM_CREATORS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+def _save_room_creators(data):
+    _save_local_json(ROOM_CREATORS_FILE, data)
+
+def _is_room_creator(room, sender):
+    if not room or not sender:
+        return False
+    rnorm = _norm_room(room)
+    unorm = _norm_user(sender)
+    creators = _room_creators_data().get(rnorm, [])
+    if isinstance(creators, list):
+        return unorm in [_norm_user(x) for x in creators]
+    return False
+
 def _looks_like_admin_command(text):
     low = str(text or "").strip().casefold()
     prefixes = (
@@ -2458,13 +2493,13 @@ def _save_bot_blocked_users(users):
 def _room_manager(bot, room, sender):
     if _is_master_name(sender):
         return True
+    if _is_room_creator(room, sender):
+        return True
     users = getattr(bot, "room_users", {}).get(room, {})
     role = str(users.get(sender, "") or "").casefold()
     if not role and isinstance(users, dict):
         role = next((str(v or "").casefold() for k, v in users.items() if _norm_user(k) == _norm_user(sender)), "")
-    # Room protection is intentionally limited to the room creator/owner and
-    # configured masters. Ordinary room admins/moderators cannot toggle it.
-    return role in {"owner", "creator", "room_owner", "room_creator"}
+    return role in {"owner", "creator", "room_owner", "room_creator", "host", "صانع", "صانع_الغرفة", "مالك"}
 
 def _norm_filter_text(text):
     value = str(text or "").casefold()
@@ -7581,42 +7616,35 @@ class TalkinBot:
 
     def _music_download(self,query):
         """Search/download public audio and return an MP3 ready for TalkinChat.
-
-        Primary source: SoundCloud (public audio, independent of YouTube).
-        Fallback: YouTube through yt-dlp with optional YOUTUBE_COOKIES.
-        Public YouTube/Spotify URLs are first resolved to a title so the
-        SoundCloud route can still be used when YouTube extraction is blocked.
+        Fast YouTube search (ytsearch1:) first for speed, with SoundCloud fallback.
         """
         if yt_dlp is None:
             raise RuntimeError("yt-dlp غير مثبت")
 
-        outdir=BASE_DIR/"generated_music"
-        outdir.mkdir(parents=True,exist_ok=True)
-        stamp=uuid.uuid4().hex
-        out_mp3=outdir/(stamp+".mp3")
-        errors=[]
+        outdir = BASE_DIR / "generated_music"
+        outdir.mkdir(parents=True, exist_ok=True)
+        stamp = uuid.uuid4().hex
+        out_mp3 = outdir / (stamp + ".mp3")
+        errors = []
 
         def resolve_public_title(value):
-            """Get public page title without downloading media."""
             try:
-                u=str(value or "").strip()
-                if not re.match(r"^https?://",u,re.I):
+                u = str(value or "").strip()
+                if not re.match(r"^https?://", u, re.I):
                     return ""
                 if "youtube.com" in u.lower() or "youtu.be" in u.lower():
-                    r=requests.get("https://www.youtube.com/oembed",params={"url":u,"format":"json"},
-                                   headers={"User-Agent":"Mozilla/5.0"},timeout=15)
+                    r = requests.get("https://www.youtube.com/oembed", params={"url": u, "format": "json"},
+                                     headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
                     if r.ok:
-                        data=r.json()
-                        return str(data.get("title") or "").strip()
+                        return str(r.json().get("title") or "").strip()
                 if "open.spotify.com" in u.lower():
-                    r=requests.get(u,headers={"User-Agent":"Mozilla/5.0"},timeout=15)
+                    r = requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
                     if r.ok:
-                        m=re.search(r'<meta[^>]+property=[\"\']og:title[\"\'][^>]+content=[\"\']([^\"\']+)',r.text,re.I)
+                        m = re.search(r'property="og:title"\s+content="([^"]+)"', r.text, re.I)
                         if not m:
-                            m=re.search(r'<meta[^>]+content=[\"\']([^\"\']+)[\"\'][^>]+property=[\"\']og:title[\"\']',r.text,re.I)
+                            m = re.search(r'content="([^"]+)"\s+property="og:title"', r.text, re.I)
                         if m:
-                            title=re.sub(r'\s*\|\s*Spotify\s*$','',m.group(1),flags=re.I).strip()
-                            return title
+                            return re.sub(r'\s*\|\s*Spotify\s*$', '', m.group(1), flags=re.I).strip()
             except Exception as exc:
                 errors.append(f"Public metadata: {type(exc).__name__}: {exc}")
             return ""
@@ -7624,128 +7652,128 @@ class TalkinBot:
         def normalize_to_mp3(source, duration=0):
             if duration and int(duration) > MUSIC_MAX_SECONDS:
                 raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
-            source=Path(source)
+            source = Path(source)
             if source.is_file() and source.stat().st_size > MUSIC_MAX_BYTES:
                 raise RuntimeError(f"ملف الصوت أكبر من {int(MUSIC_MAX_MB)} ميجابايت")
-            if source.suffix.lower()==".mp3":
+            if source.suffix.lower() == ".mp3":
                 return source
-            ffmpeg_bin=shutil.which("ffmpeg")
+            ffmpeg_bin = shutil.which("ffmpeg")
             if not ffmpeg_bin:
                 raise RuntimeError("FFmpeg غير موجود على الاستضافة")
-            proc=subprocess.run([
-                ffmpeg_bin,"-y","-hide_banner","-loglevel","error",
-                "-i",str(source),"-vn","-ac","2","-ar","44100",
-                "-codec:a","libmp3lame","-b:a","192k",str(out_mp3)
-            ],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,timeout=180)
-            if proc.returncode!=0 or not out_mp3.is_file() or out_mp3.stat().st_size<=4096:
-                detail=" | ".join((proc.stderr or "").strip().splitlines()[-4:])
-                raise RuntimeError("فشل تحويل الصوت إلى MP3: "+detail[:500])
+            proc = subprocess.run([
+                ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
+                "-threads", "0",
+                "-i", str(source), "-vn", "-ac", "2", "-ar", "44100",
+                "-codec:a", "libmp3lame", "-b:a", "192k", str(out_mp3)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=90)
+            if proc.returncode != 0 or not out_mp3.is_file() or out_mp3.stat().st_size <= 4096:
+                detail = " | ".join((proc.stderr or "").strip().splitlines()[-4:])
+                raise RuntimeError("فشل تحويل الصوت إلى MP3: " + detail[:500])
             try: source.unlink()
             except Exception: pass
             return out_mp3
 
-        def download_with_ydl(target,label,cookies=False):
-            tmpdir=outdir/f".{stamp}_{label}"
-            tmpdir.mkdir(parents=True,exist_ok=True)
-            template=str(tmpdir/"source.%(ext)s")
+        def download_with_ydl(target, label, cookies=False):
+            tmpdir = outdir / f".{stamp}_{label}"
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            template = str(tmpdir / "source.%(ext)s")
             def pre_download_filter(info, *, incomplete):
-                # Reject oversized/too-long media BEFORE any bytes are downloaded.
-                # This prevents accidental 100s-of-MB or multi-hour downloads.
-                duration = int(info.get("duration") or 0)
-                if duration > MUSIC_MAX_SECONDS:
+                dur = int(info.get("duration") or 0)
+                if dur > MUSIC_MAX_SECONDS:
                     return f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية"
-                size = info.get("filesize") or info.get("filesize_approx")
-                if size and int(size) > MUSIC_MAX_BYTES:
+                sz = info.get("filesize") or info.get("filesize_approx")
+                if sz and int(sz) > MUSIC_MAX_BYTES:
                     return f"حجم المصدر أكبر من {int(MUSIC_MAX_MB)} ميجابايت"
                 return None
 
-            opts={
-                "quiet":True,"no_warnings":True,"noplaylist":True,
-                "format":"bestaudio[abr<=192][filesize<=64M]/bestaudio[abr<=192]/bestaudio[filesize<=64M]",
-                "outtmpl":template,
-                "socket_timeout":25,"retries":2,"fragment_retries":2,
-                "extractor_retries":1,"file_access_retries":2,
-                "cachedir":False,"overwrites":True,
-                "continuedl":True,
-                "concurrent_fragment_downloads":MUSIC_CONCURRENT_FRAGMENTS,
-                "buffersize":MUSIC_BUFFER_SIZE,
-                "http_chunk_size":MUSIC_HTTP_CHUNK_SIZE,
-                "throttled_rate":MUSIC_THROTTLED_RATE,
-                "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"},
-                "check_formats":False,
-                "js_runtimes":{"node":{}},
-                "remote_components":{"ejs":"github"},
-                "match_filter":pre_download_filter,
+            opts = {
+                "quiet": True, "no_warnings": True, "noplaylist": True,
+                "format": "bestaudio[ext=m4a][abr<=192]/bestaudio[ext=mp3]/bestaudio[abr<=192]/bestaudio/best",
+                "outtmpl": template,
+                "socket_timeout": 12, "retries": 1, "fragment_retries": 1,
+                "extractor_retries": 1, "file_access_retries": 1,
+                "cachedir": False, "overwrites": True,
+                "continuedl": True,
+                "concurrent_fragment_downloads": 8,
+                "buffersize": 4 * 1024 * 1024,
+                "http_chunk_size": 8 * 1024 * 1024,
+                "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"},
+                "check_formats": False,
+                "js_runtimes": {"node": {}},
+                "remote_components": {"ejs": "github"},
+                "match_filter": pre_download_filter,
             }
             if cookies and YOUTUBE_COOKIE_FILE:
-                opts["cookiefile"]=YOUTUBE_COOKIE_FILE
+                opts["cookiefile"] = YOUTUBE_COOKIE_FILE
             if label.startswith("youtube_"):
-                client=label.split("_",1)[1]
+                client = label.split("_", 1)[1]
                 if client != "native_default":
-                    opts["extractor_args"]={"youtube":{"player_client":[client]}}
+                    opts["extractor_args"] = {"youtube": {"player_client": [client]}}
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info=ydl.extract_info(target,download=True)
+                    info = ydl.extract_info(target, download=True)
                     if info and info.get("entries"):
-                        info=next((x for x in info["entries"] if x),None)
+                        info = next((x for x in info["entries"] if x), None)
                     if not info:
                         raise RuntimeError("لم يتم العثور على الأغنية")
-                candidates=[x for x in tmpdir.iterdir() if x.is_file() and x.suffix.lower() not in (".part",".ytdl",".temp") and x.stat().st_size>4096]
+                candidates = [x for x in tmpdir.iterdir() if x.is_file() and x.suffix.lower() not in (".part", ".ytdl", ".temp") and x.stat().st_size > 4096]
                 if not candidates:
                     raise RuntimeError("تم العثور على الأغنية لكن لم يكتمل الملف الصوتي")
-                source=max(candidates,key=lambda x:x.stat().st_mtime)
-                duration=int(info.get("duration") or 0)
+                source = max(candidates, key=lambda x: x.stat().st_mtime)
+                duration = int(info.get("duration") or 0)
                 if duration and duration > MUSIC_MAX_SECONDS:
                     raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
                 if source.stat().st_size > MUSIC_MAX_BYTES:
                     raise RuntimeError(f"ملف الصوت أكبر من {int(MUSIC_MAX_MB)} ميجابايت")
-                mp3=normalize_to_mp3(source,duration)
+                mp3 = normalize_to_mp3(source, duration)
                 return {
-                    "id":str(info.get("id") or ""),
-                    "title":str(info.get("title") or query),
-                    "uploader":str(info.get("uploader") or info.get("channel") or ""),
-                    "duration":duration,
-                },mp3
+                    "id": str(info.get("id") or ""),
+                    "title": str(info.get("title") or query),
+                    "uploader": str(info.get("uploader") or info.get("channel") or ""),
+                    "duration": duration,
+                }, mp3
             except Exception as exc:
                 errors.append(f"{label}: {type(exc).__name__}: {exc}")
-                shutil.rmtree(tmpdir,ignore_errors=True)
+                shutil.rmtree(tmpdir, ignore_errors=True)
                 return None
 
-        # Resolve URL to a searchable title when possible. This lets a
-        # blocked YouTube/Spotify URL still use SoundCloud as the source.
-        search_query=str(query or "").strip()
-        if re.match(r"^https?://",search_query,re.I):
-            title=resolve_public_title(search_query)
-            if title:
-                search_query=title
+        search_query = str(query or "").strip()
+        if re.match(r"^https?://", search_query, re.I):
+            t = resolve_public_title(search_query)
+            if t: search_query = t
 
-        # -------- SoundCloud primary source --------
-        sc_targets=[]
-        if re.match(r"^https?://",query,re.I) and "soundcloud.com" in query.lower():
-            sc_targets=[query]
+        # Primary fast source: YouTube (1 result)
+        if re.match(r"^https?://", query, re.I) and not ("soundcloud.com" in query.lower()):
+            yt_targets = [query]
+        else:
+            yt_targets = ["ytsearch1:" + search_query]
+
+        for yt_target in yt_targets:
+            for client in ("android", "web_embedded", "web", "default"):
+                res = download_with_ydl(yt_target, f"youtube_{client}", cookies=True)
+                if res:
+                    info, mp3 = res
+                    for child in outdir.glob(f".{stamp}_*"):
+                        if child.is_dir(): shutil.rmtree(child, ignore_errors=True)
+                    return info, mp3
+
+        # Fallback source: SoundCloud (1 result)
+        sc_targets = []
+        if re.match(r"^https?://", query, re.I) and "soundcloud.com" in query.lower():
+            sc_targets = [query]
         elif search_query:
-            sc_targets=["scsearch3:"+search_query]
+            sc_targets = ["scsearch1:" + search_query]
 
         for target in sc_targets:
-            result=download_with_ydl(target,"soundcloud",cookies=False)
-            if result:
-                info,mp3=result
+            res = download_with_ydl(target, "soundcloud", cookies=False)
+            if res:
+                info, mp3 = res
                 for child in outdir.glob(f".{stamp}_*"):
-                    if child.is_dir(): shutil.rmtree(child,ignore_errors=True)
-                return info,mp3
+                    if child.is_dir(): shutil.rmtree(child, ignore_errors=True)
+                return info, mp3
 
-        # -------- YouTube fallback --------
-        youtube_target=query if re.match(r"^https?://",query,re.I) else "ytsearch3:"+query
-        for client in ("web_embedded","default","native_default"):
-            result=download_with_ydl(youtube_target,f"youtube_{client}",cookies=True)
-            if result:
-                info,mp3=result
-                for child in outdir.glob(f".{stamp}_*"):
-                    if child.is_dir(): shutil.rmtree(child,ignore_errors=True)
-                return info,mp3
-
-        detail=" | ".join(errors[-10:])
-        raise RuntimeError("تعذر تنزيل ملف صوت من SoundCloud أو YouTube."+(f" تفاصيل: {detail[:1200]}" if detail else ""))
+        detail = " | ".join(errors[-10:])
+        raise RuntimeError("تعذر تنزيل ملف صوت من YouTube أو SoundCloud." + (f" تفاصيل: {detail[:1200]}" if detail else ""))
 
     def handle_music_command(self,room,text,requester,private_to="",broadcast_all=True,with_reactions=True,room_output=True,live_stream=False):
         raw=text.strip()
@@ -10747,21 +10775,24 @@ class TalkinBot:
         # A pending room-join language choice belongs to the user who started
         # `دخول@...`, even when that user is not a master.  Handle it before
         # the master-only management permission gate.
-        if str(body or "").strip().casefold() in ("1", "2"):
-            pending_join = getattr(self, "_pending_room_language", {}).get(self._room_language_pending_key(sender))
+        _norm_ch = _normalize_lang_choice(body)
+        if _norm_ch in ("1", "2"):
+            response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
+            pending_key, pending_join = self._find_pending_join_for_message(sender, response_room)
             if isinstance(pending_join, dict):
-                response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
                 return self._complete_join_rooms_language(
-                    sender, str(body).strip(), response_room=response_room, is_private=is_private
+                    sender, _norm_ch, response_room=response_room, is_private=is_private
                 )
 
-        join_command = bool(re.match(r"^دخول@.+$", str(body or "").strip(), re.I))
+        join_command = bool(re.match(r"^دخول\s*@\s*.+$", str(body or "").strip(), re.I))
         join_all_command = str(body or "").strip().casefold() in {"دخول الكل", "دخولكل", "join all"}
         verification_manager_command = _is_verification_manager_command(body)
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
         public_top_command = str(body or "").strip().casefold() in {
             "توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"
         }
+        is_game_cmd = str(body or "").strip().casefold() in ("تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب")
+        is_creator_cmd = bool(re.match(r"^[+-]?صانع(?:ي| الغرفة| الغرفه)?(?:@.+)?$", str(body or "").strip(), re.I))
         if (not _is_master_name(sender)
                 and not public_top_command
                 and not (verification_manager_command and _is_mvip_master(sender))
@@ -10770,7 +10801,7 @@ class TalkinBot:
                 and not join_command
                 and not join_all_command
                 and not repeat_last_command
-                and not (security_command and room and _room_manager(self, room, sender))):
+                and not ((security_command or is_game_cmd or is_creator_cmd) and room and _room_manager(self, room, sender))):
             return False
         # A private command can be replayed by the Talkin transport with a new
         # frame/uid. Do not answer the same account-list request twice in a row.
@@ -10822,28 +10853,32 @@ class TalkinBot:
         return _norm_user(sender)
 
     def _find_pending_join_for_message(self, sender, room=""):
-        """Find the pending join-language request even when the room event
-        exposes a slightly different sender field than ChatMessage did."""
+        """Find the pending join-language request even when sender format differs."""
         pending_map = getattr(self, "_pending_room_language", {}) or {}
-        direct = pending_map.get(self._room_language_pending_key(sender))
+        if not pending_map:
+            return None, None
+        key = self._room_language_pending_key(sender)
+        direct = pending_map.get(key)
         if isinstance(direct, dict):
-            return self._room_language_pending_key(sender), direct
+            return key, direct
         room_key = _norm_room(room).casefold() if str(room or "").strip() else ""
         now = time.time()
         candidates = []
-        for key, value in pending_map.items():
+        for pkey, value in pending_map.items():
             if not isinstance(value, dict):
                 continue
             created = float(value.get("created", 0) or 0)
-            if created and now - created > 180:
+            if created and now - created > 300:
                 continue
             response_room = str(value.get("response_room") or "").strip()
             if room_key and response_room and _norm_room(response_room).casefold() == room_key:
-                candidates.append((created, key, value))
+                candidates.append((created + 100, pkey, value))
+            else:
+                candidates.append((created, pkey, value))
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
-            _, key, value = candidates[0]
-            return key, value
+            _, best_key, value = candidates[0]
+            return best_key, value
         return None, None
 
     def _begin_join_rooms_language(self, sender, rooms, response_room="", is_private=True):
@@ -10898,10 +10933,10 @@ class TalkinBot:
             self._pending_room_language.pop(pending_key or self._room_language_pending_key(sender),None)
             self.send_private_text(sender,"⌛ انتهت مهلة اختيار اللغة. أرسل أمر دخول الغرف من جديد.")
             return True
-        choice=str(choice or "").strip().casefold()
-        if choice not in ("1","2"):
+        choice_norm = _normalize_lang_choice(choice)
+        if choice_norm not in ("1", "2"):
             return False
-        lang="ar" if choice=="1" else "en"
+        lang = "ar" if choice_norm == "1" else "en"
         rooms=list(pending.get("rooms") or [])
         self._pending_room_language.pop(pending_key or self._room_language_pending_key(sender),None)
         if not hasattr(self,"room_languages"):
@@ -11333,9 +11368,8 @@ class TalkinBot:
         # - Any configured master can stop/start games in the room where the command is issued.
         # - The primary master (BOT_MASTER) controls the global game switch for all rooms.
         if low in ("ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب"):
-            # Primary master and MVIP verification masters can control games.
-            # MVIP masters affect only the room where the command is issued.
-            if not _is_verification_manager(sender):
+            # Primary master, verification masters, and room creators/managers can control games.
+            if not _is_verification_manager(sender) and not (room and _room_manager(self, room, sender)):
                 return True
             if _is_primary_master(sender):
                 _set_games_global(False)
@@ -11348,9 +11382,8 @@ class TalkinBot:
             return True
 
         if low in ("تشغيل الالعاب", "تشغيل الألعاب"):
-            # Primary master and MVIP verification masters can control games.
-            # MVIP masters affect only the room where the command is issued.
-            if not _is_verification_manager(sender):
+            # Primary master, verification masters, and room creators/managers can control games.
+            if not _is_verification_manager(sender) and not (room and _room_manager(self, room, sender)):
                 return True
             if _is_primary_master(sender):
                 data = _game_control_data()
@@ -11505,16 +11538,76 @@ class TalkinBot:
             )
             return True
 
-        # Joining one or multiple rooms: دخول@مشاعر ادم نبض ...
-        m_join = re.fullmatch(r"دخول@(.+)", text, re.I | re.S)
-        if m_join:
-            raw_rooms=m_join.group(1).strip()
-            rooms=[x.strip() for x in raw_rooms.split() if x.strip()]
-            if not rooms:
-                self.send_private_text(sender, "❌ الصيغة: دخول@اسم_الغرفة أو دخول@غرفة1 غرفة2 غرفة3")
+        # إدارة صانعي الغرفة
+        m_add_creator = re.fullmatch(r"(?:\+صانع|اضف صانع|أضف صانع|صانع)\s*@\s*([^\s@]+)", text.strip(), re.I)
+        if m_add_creator:
+            if not room:
+                self.send_private_text(sender, "⚠️ نفّذ الأمر داخل الغرفة لإضافة صانع لها.")
                 return True
-            # Explicit join retries are allowed even for rooms the server
-            # previously marked as blocked.
+            if not _room_manager(self, room, sender):
+                self.send_room_text(room, f"🔒 @{sender} هذا الأمر مخصص لصانع الغرفة أو الماستر.")
+                return True
+            target = m_add_creator.group(1).strip()
+            data = _room_creators_data()
+            rnorm = _norm_room(room)
+            c_list = data.get(rnorm, [])
+            if not isinstance(c_list, list): c_list = []
+            if _norm_user(target) not in [_norm_user(x) for x in c_list]:
+                c_list.append(target)
+                data[rnorm] = c_list
+                _save_room_creators(data)
+                self.send_room_text(room, f"👑 تم تعيين @{target} صانعاً للغرفة بنجاح.")
+            else:
+                self.send_room_text(room, f"ℹ️ @{target} مضاف بالفعل كصانع لهذه الغرفة.")
+            return True
+
+        m_del_creator = re.fullmatch(r"(?:-صانع|حذف صانع|ازالة صانع|إزالة صانع)\s*@\s*([^\s@]+)", text.strip(), re.I)
+        if m_del_creator:
+            if not room:
+                self.send_private_text(sender, "⚠️ نفّذ الأمر داخل الغرفة لحذف صانع منها.")
+                return True
+            if not _room_manager(self, room, sender):
+                self.send_room_text(room, f"🔒 @{sender} هذا الأمر مخصص لصانع الغرفة أو الماستر.")
+                return True
+            target = m_del_creator.group(1).strip()
+            data = _room_creators_data()
+            rnorm = _norm_room(room)
+            c_list = data.get(rnorm, [])
+            if isinstance(c_list, list):
+                new_list = [x for x in c_list if _norm_user(x) != _norm_user(target)]
+                data[rnorm] = new_list
+                _save_room_creators(data)
+                self.send_room_text(room, f"🗑️ تم حذف @{target} من صانعي الغرفة.")
+            else:
+                self.send_room_text(room, "ℹ️ قائمة صناع الغرفة فارغة.")
+            return True
+
+        if low in ("صانعي", "صناع", "صانعي الغرفة", "صناع الغرفة", "صانع الغرفة", "creators"):
+            if not room:
+                self.send_private_text(sender, "⚠️ نفّذ الأمر داخل الغرفة لعرض صانعيها.")
+                return True
+            data = _room_creators_data()
+            rnorm = _norm_room(room)
+            c_list = data.get(rnorm, [])
+            if c_list:
+                names = " • ".join(f"@{x}" for x in c_list)
+                msg = f"👑 صانعو الغرفة ({room}):\n━━━━━━━━━━━━\n{names}"
+            else:
+                msg = f"ℹ️ لم يتم تعيين صانعين مخصصين لغرفة {room} بعد (أو يعتمد على رتبة الروم)."
+            if is_private: self.send_private_text(sender, msg)
+            else: self.send_room_text(room, msg)
+            return True
+
+        # Joining one or multiple rooms: دخول@مشاعر ادم نبض ... (متاح لأي عضو بالغرفة)
+        m_join = re.fullmatch(r"دخول\s*@\s*(.+)", text, re.I | re.S)
+        if m_join:
+            raw_rooms = m_join.group(1).strip()
+            rooms = [x.strip() for x in raw_rooms.split() if x.strip()]
+            if not rooms:
+                msg = "❌ الصيغة: دخول@اسم_الغرفة أو دخول@غرفة1 غرفة2"
+                if is_private: self.send_private_text(sender, msg)
+                elif room: self.send_room_text(room, msg)
+                return True
             for target in rooms:
                 blocked = _norm_room(target) in getattr(self, "blocked_rooms", set())
                 if blocked:
@@ -11526,9 +11619,26 @@ class TalkinBot:
             self._save_blocked_rooms()
             _save_persistent_rooms(self.known_rooms)
             response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
-            return self._begin_join_rooms_language(
-                sender, rooms, response_room=response_room, is_private=is_private
-            )
+            
+            # قبول الطلب فوراً من أي عضو والدخول مباشرة بلغة عربية افتراضية
+            if not hasattr(self, "room_languages"):
+                self.room_languages = {}
+            for target in rooms:
+                self.room_languages[_norm_room(target)] = "ar"
+                try:
+                    self.join_room(target, force=True, requested_by=sender)
+                except Exception as exc:
+                    self.log("[ROOM] join error:", target, repr(exc))
+            
+            confirm_msg = f"✅ تم قبول طلب دخول الغرفة: {', '.join(rooms)}\n⏳ جاري الانضمام إلى الغرفة..."
+            if response_room and not is_private:
+                self.send_room_text(response_room, confirm_msg)
+            else:
+                self.send_private_text(sender, confirm_msg)
+                
+            # حفظ الطلب المعلق لاختيار اللغة (1 عربي / 2 إنجليزي) بدون تعطيل الدخول
+            self._begin_join_rooms_language(sender, rooms, response_room=response_room, is_private=is_private)
+            return True
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
         if m_transfer and _is_verified_user(sender):
             target, amount = m_transfer.group(1).strip().lstrip("@"), int(m_transfer.group(2))
@@ -12126,7 +12236,7 @@ class TalkinBot:
             return ""
         try:
             from io import BytesIO
-            r = requests.get(media_url, headers={"User-Agent":"Mozilla/5.0", "Accept":"image/*"}, timeout=(6,20))
+            r = requests.get(media_url, headers={"User-Agent":"Mozilla/5.0", "Accept":"image/*"}, timeout=(4,8))
             r.raise_for_status()
             if len(r.content) > 12 * 1024 * 1024:
                 return ""
@@ -12257,21 +12367,18 @@ class TalkinBot:
             if self._handle_publish_media(room, sender, media_url):
                 return True
 
-        # Talkin image frames on some server builds expose the uploader as
-        # the bot, an internal numeric id, or no username at all. If there is
-        # exactly one fresh pending publish request, that request itself is
-        # the authorization; consume it rather than silently dropping the
-        # image because the media wrapper changed its sender field.
+        # Fallback: إذا وُجد أي طلب نشر معلق حديث (خلال 3 دقائق)، اعتمد الصورة فوراً وانشرها
         pending = getattr(self, "publish_pending", {})
-        if len(pending) == 1:
-            sender_key, item = next(iter(pending.items()))
-            try:
-                if time.time() - float(item.get("created_at", 0) or 0) <= 120:
-                    if self._handle_publish_media(room, sender_key, media_url):
-                        self.log("[PUBLISH] consumed image using the single pending request fallback")
-                        return True
-            except Exception as exc:
-                self.log("[PUBLISH] pending fallback failed:", repr(exc))
+        if pending:
+            now = time.time()
+            for sender_key, item in list(pending.items()):
+                try:
+                    if now - float(item.get("created_at", 0) or 0) <= 180:
+                        if self._handle_publish_media(room, sender_key, media_url):
+                            self.log("[PUBLISH] consumed image using active pending fallback for:", sender_key)
+                            return True
+                except Exception as exc:
+                    self.log("[PUBLISH] pending fallback error:", repr(exc))
         return False
 
     def _is_duplicate_incoming(self, kind, values, event_id=""):
@@ -12582,29 +12689,35 @@ class TalkinBot:
             except Exception as e:
                 self.log("[ACK] failed:", e)
 
-        # A photo sent in a room arrives as RoomEvent type=image with its
-        # public URL in field 7 (url). If a master previously used `انشر`,
-        # publish that image even when it was sent from a different room.
+        # استخراج رابط الصورة من كافة الحقول المحتملة بما فيها النص
         media_url = next(
-                (str(event.get(key, "") or "").strip() for key in (7, 6, 9, 10, 11, "url", "media_url", "image_url")
+                (str(event.get(key, "") or "").strip() for key in (7, 6, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url", "photo", "attachment")
                  if str(event.get(key, "") or "").strip().startswith(("http://", "https://"))),
                 "",
-        ) or first_http_url(event)
+        ) or first_http_url(event) or first_http_url(body)
+
+        # فحص مباشر إذا كان المستخدم أرسل رابط صورة داخل النص
+        if not media_url and body and ("http://" in body or "https://" in body):
+            img_match = re.search(r'https?://\S+\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?', body, re.I)
+            if img_match:
+                media_url = img_match.group(0)
+
+        # استخراج كافة المرشحين لمرسل الصورة
+        media_senders = []
+        for candidate in (frm, event.get(22, ""), event.get(17, ""), event.get(2, ""),
+                          event.get("sender", ""), event.get("username", ""), event.get("from", "")):
+            candidate = str(candidate or "").strip()
+            if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
+                media_senders.append(candidate)
+
+        # إذا كانت هناك عملية نشر معلقة وتم إرسال صورة أو رابط وسائط بأي نوع حدث (حتى text)
+        if getattr(self, "publish_pending", {}):
+            if media_url or event_type in {"image", "photo", "picture", "media", "file"}:
+                if media_url and self._try_publish_pending_media(room, media_url, media_senders):
+                    return
+
         if event_type in {"image", "photo", "picture", "media", "file"} or (media_url and event_type not in {"text", "user_joined", "user_left"}):
-            # Different Talkin server versions put the image author in field
-            # 2 or field 22 (or expose it by name). Try all candidates so a
-            # valid انشر followed by a photo is never silently discarded.
-            media_senders = []
-            for candidate in (frm, event.get(22, ""), event.get(17, ""), event.get(2, ""),
-                              event.get("sender", ""), event.get("username", ""), event.get("from", "")):
-                candidate = str(candidate or "").strip()
-                if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
-                    media_senders.append(candidate)
             if media_url:
-                # The pending publish record is the authorization. Do not add
-                # a second verification gate here: some servers identify the
-                # sender differently on media events, which used to make the
-                # image silently disappear after a valid انشر command.
                 if self._try_publish_pending_media(room, media_url, media_senders):
                     return
             return
@@ -12617,11 +12730,12 @@ class TalkinBot:
         # Complete an in-room `دخول@اسم_الغرفة` language selection before
         # admin/verification gates.  This is intentionally available to normal
         # users because the original join request itself is public.
-        if body.strip().casefold() in ("1", "2"):
-            pending_join = getattr(self, "_pending_room_language", {}).get(self._room_language_pending_key(frm))
+        _norm_ch_room = _normalize_lang_choice(body)
+        if _norm_ch_room in ("1", "2"):
+            response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
+            pending_key, pending_join = self._find_pending_join_for_message(frm, response_room)
             if isinstance(pending_join, dict):
-                response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
-                if self._complete_join_rooms_language(frm, body.strip(), response_room=response_room, is_private=False):
+                if self._complete_join_rooms_language(frm, _norm_ch_room, response_room=response_room, is_private=False):
                     return
 
         # Direct private message for everyone:
@@ -12654,8 +12768,15 @@ class TalkinBot:
         # not send an authorization message to other users and do not allow
         # verified/VIP users to reach the management handlers accidentally.
         is_publish_command = _is_publish_command(body)
+        is_creator_allowed = bool(room and _room_manager(self, room, frm) and (
+            body.strip().casefold() in ("تشغيل الحماية", "تشغيل الحمايه", "ايقاف الحماية", "إيقاف الحماية",
+                                        "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب",
+                                        "صانعي", "صناع", "صانعي الغرفة", "صناع الغرفة")
+            or re.match(r"^[+-]?صانع(?:ي| الغرفة| الغرفه)?(?:@.+)?$", body.strip(), re.I)
+        ))
         if (_looks_like_admin_command(body)
                 and not _is_master_name(frm)
+                and not is_creator_allowed
                 and not (_is_mvip_master(frm) and _is_verification_manager_command(body))
                 and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and _is_verified_user(frm))
                 and not (is_publish_command and _is_verified_user(frm))
@@ -12774,7 +12895,7 @@ class TalkinBot:
         is_verified = _is_verified_user(frm)
         if (not is_verified
                 and _looks_like_bot_command(body)
-                and not re.match(r"^دخول@.+$", body.strip(), re.I)
+                and not re.match(r"^دخول\s*@\s*.+$", body.strip(), re.I)
                 and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}):
             self.send_room_text(room, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
             return
@@ -12994,10 +13115,14 @@ class TalkinBot:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
                     media_url = next(
-                        (str(cm.get(key, "") or "").strip() for key in (6, 7, 9, 10)
+                        (str(cm.get(key, "") or "").strip() for key in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url")
                          if str(cm.get(key, "") or "").strip().startswith(("http://", "https://"))),
                         "",
-                    ) or first_http_url(cm)
+                    ) or first_http_url(cm) or first_http_url(body)
+                    if not media_url and body and ("http://" in body or "https://" in body):
+                        img_m = re.search(r'https?://\S+\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?', body, re.I)
+                        if img_m:
+                            media_url = img_m.group(0)
                     if body and self._handle_telegram_log_command(body, frm):
                         return
                     # Every NS is a fresh navigation request. Do not suppress
@@ -13066,14 +13191,14 @@ class TalkinBot:
                             and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and _is_verified_user(frm))
                             and not (is_publish_command and _is_verified_user(frm))
                             and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}
-                            and not re.match(r"^دخول@.+$", body, re.I)):
+                            and not re.match(r"^دخول\s*@\s*.+$", body, re.I)):
                         if not _is_verified_user(frm):
                             self.send_private_text(frm, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
                         return
                     if (body
                             and not _is_verified_user(frm)
                             and _looks_like_bot_command(body)
-                            and not re.match(r"^دخول@.+$", body.strip(), re.I)
+                            and not re.match(r"^دخول\s*@\s*.+$", body.strip(), re.I)
                             and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}):
                         self.send_room_text(self.room, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
                         return
@@ -13084,7 +13209,8 @@ class TalkinBot:
                         # A pending multi-room join language choice has priority
                         # over game commands; otherwise "1" starts Ludo and the
                         # bot may join/respond in the wrong context.
-                        if body.strip().casefold() in ("1", "2") and self._complete_join_rooms_language(frm, body.strip(), response_room=self.room, is_private=True):
+                        _pm_choice = _normalize_lang_choice(body)
+                        if _pm_choice in ("1", "2") and self._complete_join_rooms_language(frm, _pm_choice, response_room=self.room, is_private=True):
                             return
                         if self._handle_management_command(self.room, body, frm, is_private=True):
                             return
