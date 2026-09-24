@@ -7882,7 +7882,7 @@ class TalkinBot:
                 self.report_master_error("تشغيل الأغنية", e, room)
                 if room_output:
                     self.send_room_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.")
-        threading.Thread(target=worker,name="music-request",daemon=True).start(); self.send_room_text(room,"⏳ جاري البحث عن الأغنية وتحضير الصوت..."); return True
+        threading.Thread(target=worker,name="music-request",daemon=True).start(); self.send_room_text(room, f"جاري تلبيه طلبك\n@{requester}"); return True
 
     def share_last_music(self, sender: str, target: str, room: str = ""):
         """Share the sender's latest successfully prepared song privately."""
@@ -9236,13 +9236,7 @@ class TalkinBot:
 
         victim_balance = _get_points(victim)
         if self._steal_protected(victim):
-            self.send_room_text(
-                room,
-                f"🐎🛡️ @{victim} محصّن حالياً.\n"
-                f"❌ فشلت السرقة، الحصانة تحميه من السرقة لمدة دقيقة.\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
-            )
-            _record_game(sender, "steal", 0, 500)
-            self._send_game_winner_card("اسرق_فشل", sender, [room])
+            self.send_room_text(room, f"@{victim} لديه حصانه من السرقه")
             return True
         if victim_balance < 500:
             self.send_room_text(
