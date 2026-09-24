@@ -3980,6 +3980,10 @@ class TalkinBot:
         self.room = GROUP_TO_JOIN
         self.auth = None
         self.last_error = None
+        # The last inbound command being processed when the WebSocket failed.
+        # It is reported to the master after the next successful reconnect.
+        self._inflight_command = None
+        self._pending_reconnect_command = None
         self.banned_words = set()
         self.moderation_enabled = AUTO_BAN_WORDS
         self.last_messages = defaultdict(list)
@@ -5102,6 +5106,24 @@ class TalkinBot:
         except Exception as exc:
             self.log("[UNDO] save last action failed:", repr(exc))
         self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
+
+    def _remember_inflight_command(self, room, body, sender, is_private=False):
+        """Record the command currently entering the dispatcher.
+
+        Unlike last_action.json, this is diagnostic state: it identifies the
+        command that was in flight when the socket crashed, so the master can
+        reproduce and fix the failure after reconnect.
+        """
+        text = str(body or "").strip()
+        if not text or text.casefold() in {".u", "help", "مساعدة", "اوامر", "الأوامر"}:
+            return
+        self._inflight_command = {
+            "command": text[:800],
+            "room": str(room or "")[:200],
+            "sender": str(sender or "")[:120],
+            "is_private": bool(is_private),
+            "created_at": int(time.time()),
+        }
 
     def _replay_last_bot_action(self, requester):
         """Replay the last stored bot command once, without replacing it."""
@@ -12830,6 +12852,8 @@ class TalkinBot:
         to = str(event.get(3, ""))
         body = str(event.get(6, ""))
         room = str(event.get(13, self.room))
+        if body:
+            self._remember_inflight_command(room, body, frm, is_private=False)
         if room and room != BOT_MASTER:
             self.known_rooms.add(room)
             _save_persistent_rooms(self.known_rooms)
@@ -13496,6 +13520,8 @@ class TalkinBot:
                 try:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
+                    if body:
+                        self._remember_inflight_command(self.room, body, frm, is_private=True)
                     media_url = next(
                         (str(cm.get(key, "") or "").strip() for key in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url")
                          if str(cm.get(key, "") or "").strip().startswith(("http://", "https://"))),
@@ -13892,15 +13918,23 @@ class TalkinBot:
                             now = time.time()
                             reason = self._pending_reconnect_reason
                             self._pending_reconnect_reason = ""
+                            reconnect_command = self._pending_reconnect_command
+                            self._pending_reconnect_command = None
                             should_notify = bool(reason and "1009" in reason) or (
                                 now - self._last_connection_notice >= self._connection_notice_cooldown
                             )
                             if should_notify:
                                 if reason:
-                                    self.send_private_text(
-                                        BOT_MASTER,
-                                        "✅ عاد اتصال البوت بنجاح بعد انقطاع مؤقت. تم تقسيم الرسائل الكبيرة تلقائياً.",
-                                    )
+                                    reconnect_notice = "✅ عاد اتصال البوت بنجاح بعد انقطاع مؤقت. تم تقسيم الرسائل الكبيرة تلقائياً."
+                                    if isinstance(reconnect_command, dict) and reconnect_command.get("command"):
+                                        reconnect_notice += (
+                                            "\n\n⚠️ الأمر الذي كان قيد التنفيذ عند حدوث الخطأ:"
+                                            f"\n📌 الأمر: {reconnect_command['command']}"
+                                            f"\n🏠 الغرفة: {reconnect_command.get('room') or 'خاص'}"
+                                            f"\n👤 المرسل: @{reconnect_command.get('sender') or 'غير معروف'}"
+                                            "\n🔎 أعد تجربة الأمر لتحديد سبب المشكلة."
+                                        )
+                                    self.send_private_text(BOT_MASTER, reconnect_notice)
                                 elif not self._had_connection:
                                     self.send_private_text(BOT_MASTER, "✅ تم الدخول والاتصال بنجاح.")
                                 self._last_connection_notice = now
@@ -13976,6 +14010,8 @@ class TalkinBot:
                     elif self.room:
                         raw_reason = f"{raw_reason[:850]} | آخر غرفة: {self.room}"
                     self._pending_reconnect_reason = raw_reason[:1200]
+                    if isinstance(getattr(self, "_inflight_command", None), dict):
+                        self._pending_reconnect_command = dict(self._inflight_command)
                 if DEBUG and not QUIET_MODE:
                     print("[BOT] error:", repr(e), flush=True)
             if not self.stop_event.is_set():
