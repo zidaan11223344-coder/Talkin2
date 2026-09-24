@@ -550,18 +550,20 @@ SAFE_TEXT_PACKET_LIMIT = max(120, int(os.getenv("SAFE_TEXT_PACKET_LIMIT", "260")
 HELP_LINES_PER_MESSAGE = max(1, int(os.getenv("HELP_LINES_PER_MESSAGE", "10")))
 HELP_PACKET_MAX_CHARS = max(400, int(os.getenv("HELP_PACKET_MAX_CHARS", "900")))
 _BUILTIN_OFFENSIVE_WORDS = {
-    "كس","كسم","كسك","كسكسم","كس امك","كس اختك","زب","زبي","زبك","زبالة","زباله","طيز","طيزي","طيزك",
-    "شرموط","شرموطة","شرموطه","شراميط","شرموطات","شرموطين","قحبة","قحبه","قحاب","قحبات","قحب","قحبة امك",
-    "عاهرة","عاهر","زانية","زاني","زواني","بغي","بغاء","دعارة","فاجر","فاجرة","فاجرات",
-    "نيك","نايك","نيكت","نيكك","نيك امك","نيك اختك","منيوك","منيوكة","منيك","منيكه","مناك","متناك","متناكة","متناكه",
-    "مخنث","خنيث","خول","خولات","ديوث","قواد","قوادة","قواده","سحاق","سحاقية","سحاقيه","لواط","لوطي","لوطية","لوطيه",
-    "عرص","عريص","عراص","عرصة","عرصه","معرص","معرصين","خرا","خراء","خريان","خري","خرا عليك","اكل خرا","كل خرا",
-    "تبن","قذر","قذرة","قذره","وسخ","وسخة","وسخه","نجس","نجسة","نجسه","سافل","سافلة","سافله","ساقط","ساقطة",
-    "حقير","حقيرة","حقيره","تافه","تافهة","تافهه","زفت","كلب","كلبة","كلبه","ياكلب","يا كلب","حيوان","ياحيوان","يا حيوان",
-    "حمار","ياحمار","يا حمار","بقرة","بقره","خنزير","قرد","قردة","ابن الكلب","ابن كلب","ابن الحرام","ابن حرام","ولد الحرام","بنت الحرام",
-    "يا ابن الكلب","يا ابن حرام","امك قحبة","امك شرموطة","اختك قحبة","ملعون","ملعونة","ملعونه","اللعنة","يلعن","يلعن امك","يلعن ابوك",
-    "يلعن شكلك","يلعن اصلك","يلعن ابو","يلعن ام","الله يلعنك","لعنة الله","تفوو","تف عليك","طز","طز فيك","روح انقلع","انقلع","انجب",
-    "يا وسخ","يا قذر","يا حقير","يا ساقط","يا سافل"
+    # Arabic explicit sexual insults only. Ordinary criticism, animal names,
+    # religious expressions, and English words are deliberately excluded.
+    "كس", "كسم", "كسك", "كسكسم", "كس امك", "كس اختك",
+    "زب", "زبي", "زبك", "طيز", "طيزي", "طيزك",
+    "شرموط", "شرموطة", "شرموطه", "شراميط", "شرموطات", "شرموطين",
+    "قحبة", "قحبه", "قحاب", "قحبات", "قحب", "قحبة امك",
+    "عاهرة", "عاهر", "زانية", "زاني", "زواني", "دعارة",
+    "نيك", "نايك", "نيكت", "نيكك", "نيك امك", "نيك اختك",
+    "منيوك", "منيوكة", "منيك", "منيكه", "مناك", "متناك", "متناكة", "متناكه",
+    "مخنث", "خنيث", "خول", "خولات", "ديوث", "قواد", "قوادة", "قواده",
+    "سحاق", "سحاقية", "سحاقيه", "لواط", "لوطي", "لوطية", "لوطيه",
+    "عرص", "عريص", "عراص", "عرصة", "عرصه", "معرص", "معرصين",
+    "خرا", "خراء", "خريان", "خري", "خرا عليك", "اكل خرا", "كل خرا",
+    "امك قحبة", "امك شرموطة", "اختك قحبة"
 }
 
 _ENV_BANNED_WORDS = {w.strip() for w in os.getenv("BANNED_WORDS", "").split(",") if w.strip()}
@@ -569,7 +571,9 @@ def _arabic_filter_word(word):
     text = str(word or "").strip()
     return bool(text) and bool(re.search(r"[\u0600-\u06ff]", text)) and not bool(re.search(r"[A-Za-z]", text))
 BANNED_WORDS = {w for w in (_ENV_BANNED_WORDS | _BUILTIN_OFFENSIVE_WORDS) if _arabic_filter_word(w)}
-AUTO_BAN_WORDS = os.getenv("AUTO_BAN_WORDS", "1") == "1"
+# Never enable word filtering implicitly on a new deployment. A room manager
+# must explicitly turn on room protection option 1 (or use mf@on as intended).
+AUTO_BAN_WORDS = os.getenv("AUTO_BAN_WORDS", "0") == "1"
 
 # ------------------------- protobuf wire helpers -------------------------
 
@@ -11007,7 +11011,7 @@ class TalkinBot:
             re.match(r"^(?:تشغيل|إيقاف) الحماية$", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
             or str(body or "").strip().casefold() in {"حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "l@mfb"}
-            or re.match(r"^amf@.+$", str(body or "").strip(), re.I)
+            or re.match(r"^(?:amf|[-+]amf)@.+$", str(body or "").strip(), re.I)
             or re.match(r"^l@mfb$", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
         )
@@ -11423,14 +11427,26 @@ class TalkinBot:
                     return True
                 self.send_private_text(sender,"⚠️ اختر رقماً من 1 إلى 9.")
                 return True
-        # Filter exception: amf@username
-        m_amf=re.fullmatch(r"amf@(.+)",text,re.I)
+        # Filter exceptions: amf@username adds, -amf@username removes, and
+        # l@amf lists the accounts that the word filter must never ban.
+        m_amf=re.fullmatch(r"([+-]?)amf@(.+)",text,re.I)
         if m_amf:
             if not _is_master_name(sender): return True
-            target=m_amf.group(1).strip().lstrip("@")
+            action, target = m_amf.group(1), m_amf.group(2).strip().lstrip("@")
             if target:
-                self.filter_exceptions=_save_filter_exception_users(self.filter_exceptions|{target})
-                self.send_private_text(sender,f"✅ تمت إضافة @{target} إلى استثناءات حظر الفلتر.")
+                if action == "-":
+                    self.filter_exceptions = _save_filter_exception_users(
+                        self.filter_exceptions - {_norm_user(target)}
+                    )
+                    self.send_private_text(sender,f"✅ تمت إزالة @{target} من استثناءات الفلتر.")
+                else:
+                    self.filter_exceptions=_save_filter_exception_users(self.filter_exceptions|{target})
+                    self.send_private_text(sender,f"✅ تمت إضافة @{target} إلى استثناءات الفلتر.")
+            return True
+        if low == "l@amf":
+            if not _is_master_name(sender): return True
+            users = sorted(self.filter_exceptions)
+            self.send_private_text(sender, "🛡️ مستثنو الفلتر:\n" + ("\n".join(f"@{x}" for x in users) if users else "لا يوجد مستثنون حالياً."))
             return True
         if low == "l@mfb":
             if not _is_master_name(sender): return True
