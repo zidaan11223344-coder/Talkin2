@@ -12630,10 +12630,13 @@ class TalkinBot:
     def _handle_publish_media(self, room, sender, media_url, description=""):
         if not media_url: return False
         # Accept the pending image from ANY room (or private chat).
-        key=_norm_user(sender); pending=self.publish_pending.get(key)
+        key=_norm_user(sender)
+        # Claim before OCR/rendering/network work so a failure cannot leave
+        # publish_pending active and swallow later commands.
+        pending=self.publish_pending.pop(key, None)
         if not pending: return False
         if time.time()-pending.get("created_at",0)>120:
-            self.publish_pending.pop(key,None); self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد."); return True
+            self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد."); return True
         desc=pending.get("description",description or "")
         if _is_publish_banned(sender):
             self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
