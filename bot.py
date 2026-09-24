@@ -730,6 +730,30 @@ def as_text(v):
     return str(v)
 
 
+
+def _extract_media_url_universal(event, body=""):
+    """Robustly extract image or media URL from any field or body text."""
+    if not isinstance(event, dict):
+        event = {}
+    for key in (7, 6, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url", "photo", "attachment"):
+        val = str(event.get(key, "") or "").strip()
+        if val.startswith(("http://", "https://")):
+            return val
+        if val.startswith("//"):
+            return "https:" + val
+    if body:
+        m = re.search(r"https?://\S+\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?", str(body), re.I)
+        if m:
+            return m.group(0)
+        m2 = re.search(r"https?://\S+", str(body), re.I)
+        if m2:
+            return m2.group(0)
+    for k, v in event.items():
+        val = str(v or "").strip()
+        if val.startswith(("http://", "https://")):
+            return val
+    return first_http_url(event) or first_http_url(body) or ""
+
 def first_http_url(value):
     """Find the first public HTTP(S) URL in a decoded Talkin payload."""
     if isinstance(value, str):
@@ -1896,13 +1920,14 @@ def _normalize_lang_choice(val):
     s = str(val or "").strip().casefold()
     if not s:
         return ""
-    if s in ("1", "١", "1️⃣", "ar", "عربي", "العربية", "عربيه", "العربيه"):
+    s_clean = re.sub(r"^(?:الرقم|رقم|الخيار|خيار|option|number|no\.?)\s*", "", s).strip()
+    if s in ("1", "١", "1️⃣", "ar", "عربي", "العربية", "عربيه", "العربيه", "واحد", "الواحد") or s_clean in ("1", "١", "1️⃣", "واحد", "الواحد", "ar", "عربي", "العربية"):
         return "1"
-    if s in ("2", "٢", "2️⃣", "en", "انجليزي", "الانجليزية", "انكليزي", "الانكليزية", "english"):
+    if s in ("2", "٢", "2️⃣", "en", "انجليزي", "الانجليزية", "انكليزي", "الانكليزية", "english", "اثنين", "إثنين", "اثنان", "إثنان", "الاثنين", "الإثنين") or s_clean in ("2", "٢", "2️⃣", "اثنين", "إثنين", "اثنان", "إثنان", "en", "انجليزي"):
         return "2"
-    if s.startswith(("1", "١")):
+    if s_clean.startswith(("1", "١", "واحد")):
         return "1"
-    if s.startswith(("2", "٢")):
+    if s_clean.startswith(("2", "٢", "اثنين", "إثنين", "اثنان")):
         return "2"
     return ""
 
@@ -10862,17 +10887,20 @@ class TalkinBot:
             if not isinstance(value, dict):
                 continue
             created = float(value.get("created", 0) or 0)
-            if created and now - created > 300:
+            if created and now - created > 600:
                 continue
             response_room = str(value.get("response_room") or "").strip()
+            score = created
             if room_key and response_room and _norm_room(response_room).casefold() == room_key:
-                candidates.append((created + 100, pkey, value))
-            else:
-                candidates.append((created, pkey, value))
+                score += 500
+            candidates.append((score, pkey, value))
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
             _, best_key, value = candidates[0]
             return best_key, value
+        for pkey, value in pending_map.items():
+            if isinstance(value, dict):
+                return pkey, value
         return None, None
 
     def _begin_join_rooms_language(self, sender, rooms, response_room="", is_private=True):
@@ -10961,11 +10989,9 @@ class TalkinBot:
             f"⚠️ تخطّي/فشل: {skipped}\n"
             "⏳ انتظر تأكيد الخادم لكل غرفة."
         )
-        if private_reply:
-            self.send_private_text(sender, result_msg)
-        elif target_room:
+        if target_room:
             self.send_room_text(target_room, result_msg)
-        else:
+        if sender and (private_reply or not target_room):
             self.send_private_text(sender, result_msg)
         return True
 
@@ -12336,9 +12362,176 @@ class TalkinBot:
             except Exception as e:
                 errors.append((target,str(e)))
                 self.log("[PUBLISH] failed",target,repr(e))
-        # Master publish commands may be silent; public publication itself remains active.
-        if not silent_publish:
-            self.send_private_text(sender,f"✅ تم نشر الصورة في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else ""))
+        # إشعار بنجاح النشر في الروم وفي الخاص
+        confirm_text = f"✅ تم نشر الصورة بنجاح في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else "")
+        if source_room:
+            self.send_room_text(source_room, confirm_text)
+        elif room:
+            self.send_room_text(room, confirm_text)
+        if not silent_publish and sender:
+            self.send_private_text(sender, confirm_text)
+            if errors:
+                self.send_private_text(sender, "❌ أخطاء النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors))
+        return True
+
+    def _try_publish_pending_media(self, room, media_url, candidates=()):
+        """Consume a pending publish request from any Talkin media wrapper."""
+        media_url = str(media_url or "").strip()
+        if not media_url:
+            return False
+        pending = getattr(self, "publish_pending", {})
+        if not pending:
+            return False
+        tried = set()
+        ordered = list(candidates or [])
+        ordered.extend(list(pending.keys()))
+        for sender in ordered:
+            sender = str(sender or "").strip()
+            key = _norm_user(sender)
+            if not key or key in tried:
+                continue
+            tried.add(key)
+            if key in pending:
+                if self._handle_publish_media(room, sender, media_url):
+                    return True
+
+        # Fallback to the latest pending publish
+        now = time.time()
+        for sender_key, item in list(pending.items()):
+            try:
+                if now - float(item.get("created_at", 0) or 0) <= 300:
+                    if self._handle_publish_media(room, sender_key, media_url):
+                        self.log("[PUBLISH] consumed image using active fallback for:", sender_key)
+                        return True
+            except Exception as exc:
+                self.log("[PUBLISH] pending fallback error:", repr(exc))
+        return False
+
+    def _ocr_publish_image(self, media_url):
+        """Extract visible text from a publish image for the same word filter.
+
+        OCR is best-effort: if OCR is unavailable or the image has no readable
+        text, publication continues normally. Arabic and English are both
+        scanned.
+        """
+        if not TESSERACT_AVAILABLE or not PIL_AVAILABLE or not media_url:
+            return ""
+        try:
+            from io import BytesIO
+            r = requests.get(media_url, headers={"User-Agent":"Mozilla/5.0", "Accept":"image/*"}, timeout=(4,8))
+            r.raise_for_status()
+            if len(r.content) > 12 * 1024 * 1024:
+                return ""
+            img = Image.open(BytesIO(r.content)).convert("RGB")
+            # Keep OCR responsive on Railway while retaining enough detail for
+            # Arabic text in normal phone screenshots/photos.
+            max_side = 2200
+            if max(img.size) > max_side:
+                ratio = max_side / float(max(img.size))
+                img = img.resize((max(1,int(img.width*ratio)), max(1,int(img.height*ratio))))
+            try:
+                return str(pytesseract.image_to_string(img, lang="ara+eng", config="--psm 6") or "").strip()
+            except Exception:
+                return str(pytesseract.image_to_string(img, lang="eng", config="--psm 6") or "").strip()
+        except Exception as exc:
+            self.log("[PUBLISH-OCR] skipped:", repr(exc))
+            return ""
+
+    def _find_publish_filter_hit(self, text):
+        normalized = _norm_filter_text(text)
+        if not normalized:
+            return None
+        return next((w for w in sorted(self.banned_words, key=lambda x: _norm_filter_text(x))
+                     if _norm_filter_text(w) and _norm_filter_text(w) in normalized), None)
+
+    def _handle_publish_media(self, room, sender, media_url, description=""):
+        if not media_url: return False
+        # Accept the pending image from ANY room (or private chat).
+        key=_norm_user(sender); pending=self.publish_pending.get(key)
+        if not pending: return False
+        if time.time()-pending.get("created_at",0)>120:
+            self.publish_pending.pop(key,None); self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد."); return True
+        desc=pending.get("description",description or "")
+        if _is_publish_banned(sender):
+            self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
+            self.publish_pending.pop(key,None)
+            return True
+        # Check both the written description and text visible inside the image.
+        publish_hit = self._find_publish_filter_hit(desc)
+        ocr_text = ""
+        if not publish_hit:
+            ocr_text = self._ocr_publish_image(media_url)
+            publish_hit = self._find_publish_filter_hit(ocr_text)
+        if publish_hit:
+            source = "الوصف" if self._find_publish_filter_hit(desc) else "الصورة"
+            self.send_private_text(sender, f"🚫 تم منع النشر: تم اكتشاف كلمة محظورة في {source}.\n⛔ تم منع حسابك من النشر حتى فك المنع.")
+            self.publish_pending.pop(key,None)
+            _record_filter_ban(sender,room,"محاولة نشر كلمة مسيئة",publish_hit)
+            _record_publish_ban(sender,room,publish_hit)
+            return True
+        source_room=str(pending.get("source_room") or room or "")
+        silent_publish=bool(pending.get("silent"))
+        self.publish_pending.pop(key,None)
+        # A room that rejected/banned the bot must not abort or receive this
+        # publication; all other active rooms continue normally.
+        rooms=self._active_rooms()
+        # In rooms, the successful publish message contains ONLY the reaction
+        # controls. The publish status/result is sent privately to the master.
+        base_code=uuid.uuid4().hex[:4]
+        reaction_codes={
+            "like": base_code,
+            "love": uuid.uuid4().hex[:4],
+            "dislike": uuid.uuid4().hex[:4],
+            "comment": uuid.uuid4().hex[:4],
+            "report": uuid.uuid4().hex[:4],
+        }
+        for kind,code in reaction_codes.items():
+            self.reaction_targets[code]={"publisher": sender, "kind": kind, "description": desc or "منشور صورة", "created_at": time.time()}
+        caption=_message_template(
+            "publish", "broadcast",
+            "🖼️ {description}\n👤 {publisher}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
+            publisher=sender, description=desc or "منشور صورة",
+            source_label=source_room, code=base_code,
+            like=reaction_codes["like"], love=reaction_codes["love"], dislike=reaction_codes["dislike"],
+            comment=reaction_codes["comment"], report=reaction_codes["report"], room=source_room
+        )
+        # Build a fresh card for this publication: submitted image + current
+        # publisher photo + username, using the same visual treatment as the
+        # billion winner card. The generated URL is unique for every publish.
+        publish_url = media_url
+        try:
+            publisher_key = _norm_user(sender)
+            publisher_photo = self.user_photos.get(publisher_key, "")
+            if not publisher_photo:
+                publisher_photo = self._lookup_profile_photo(sender)
+            card = render_publish_card(media_url, sender, publisher_photo)
+            base = _public_base_url()
+            if base:
+                publish_url = f"{base}/publish/{card.name}"
+                self._verify_public_media_url(publish_url, "image")
+            else:
+                self.log("[PUBLISH] public base URL unavailable; using original media URL")
+        except Exception as exc:
+            self.log("[PUBLISH] template render failed; using original image:", repr(exc))
+
+        ok=0
+        errors=[]
+        for target in rooms:
+            try:
+                self.send_room_media(target,publish_url,"image")
+                self.send_room_text(target,caption)
+                ok+=1
+            except Exception as e:
+                errors.append((target,str(e)))
+                self.log("[PUBLISH] failed",target,repr(e))
+        # إشعار بنجاح النشر في الروم وفي الخاص
+        confirm_text = f"✅ تم نشر الصورة بنجاح في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else "")
+        if source_room:
+            self.send_room_text(source_room, confirm_text)
+        elif room:
+            self.send_room_text(room, confirm_text)
+        if not silent_publish and sender:
+            self.send_private_text(sender, confirm_text)
             if errors:
                 self.send_private_text(sender, "❌ أخطاء النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors))
         return True
@@ -12683,20 +12876,9 @@ class TalkinBot:
             except Exception as e:
                 self.log("[ACK] failed:", e)
 
-        # استخراج رابط الصورة من كافة الحقول المحتملة بما فيها النص
-        media_url = next(
-                (str(event.get(key, "") or "").strip() for key in (7, 6, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url", "photo", "attachment")
-                 if str(event.get(key, "") or "").strip().startswith(("http://", "https://"))),
-                "",
-        ) or first_http_url(event) or first_http_url(body)
+        # استخراج رابط الصورة الشامل
+        media_url = _extract_media_url_universal(event, body)
 
-        # فحص مباشر إذا كان المستخدم أرسل رابط صورة داخل النص
-        if not media_url and body and ("http://" in body or "https://" in body):
-            img_match = re.search(r'https?://\S+\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?', body, re.I)
-            if img_match:
-                media_url = img_match.group(0)
-
-        # استخراج كافة المرشحين لمرسل الصورة
         media_senders = []
         for candidate in (frm, event.get(22, ""), event.get(17, ""), event.get(2, ""),
                           event.get("sender", ""), event.get("username", ""), event.get("from", "")):
@@ -12704,10 +12886,10 @@ class TalkinBot:
             if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
                 media_senders.append(candidate)
 
-        # إذا كانت هناك عملية نشر معلقة وتم إرسال صورة أو رابط وسائط بأي نوع حدث (حتى text)
+        # إذا كان هناك طلب نشر معلق وتم استلام أي صورة أو رابط صورة
         if getattr(self, "publish_pending", {}):
-            if media_url or event_type in {"image", "photo", "picture", "media", "file"}:
-                if media_url and self._try_publish_pending_media(room, media_url, media_senders):
+            if media_url:
+                if self._try_publish_pending_media(room, media_url, media_senders):
                     return
 
         if event_type in {"image", "photo", "picture", "media", "file"} or (media_url and event_type not in {"text", "user_joined", "user_left"}):
