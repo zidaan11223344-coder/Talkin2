@@ -61,6 +61,8 @@ except Exception:
     get_display = None
 
 MUSIC_MAX_SECONDS = int(os.getenv("MUSIC_MAX_SECONDS", "900"))
+MUSIC_MAX_MB = float(os.getenv("MUSIC_MAX_MB", "64"))
+MUSIC_MAX_BYTES = int(MUSIC_MAX_MB * 1024 * 1024)
 MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
 # Audius is an additional lightweight source used primarily by live broadcast.
 # It can search the catalog and expose a streamable MP3 URL without first
@@ -68,7 +70,7 @@ MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
 # an optional API key can be supplied for higher limits.
 AUDIUS_API_BASE = os.getenv("AUDIUS_API_BASE", "https://api.audius.co/v1").strip().rstrip("/")
 AUDIUS_API_KEY = os.getenv("AUDIUS_API_KEY", "").strip()
-AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "7"))
+AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "4"))
 AUDIUS_CACHE_TTL = float(os.getenv("AUDIUS_CACHE_TTL", "90"))
 # Optional YouTube Netscape cookies supplied as a Railway secret variable.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
@@ -123,37 +125,19 @@ GAME_IMAGE_FILES = {
     "ludo": "game_ludo.jpg",
 }
 GAME_COMMANDS = {}
-# Hosting providers expose the service through different environment variables.
-# Railway is supported first for backward compatibility; the generic aliases are
-# useful on hosts such as Alghorab that do not define RAILWAY_PUBLIC_DOMAIN.
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+# Railway exposes this service through RAILWAY_PUBLIC_DOMAIN after a public domain is generated.
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL", "").strip() or os.getenv("RAVEN_PUBLIC_URL", "").strip()).rstrip("/")
 GIFT_PUBLIC_BASE_URL = os.getenv("GIFT_PUBLIC_BASE_URL", "").strip().rstrip("/")
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
-GENERIC_PUBLIC_BASE_URL = next(
-    (
-        os.getenv(name, "").strip().rstrip("/")
-        for name in (
-            "ALGHORAB_PUBLIC_URL",
-            "APP_PUBLIC_URL",
-            "SERVICE_PUBLIC_URL",
-            "PUBLIC_URL",
-            "APP_URL",
-        )
-        if os.getenv(name, "").strip()
-    ),
-    "",
-)
+RAVEN_PUBLIC_DOMAIN = os.getenv("RAVEN_PUBLIC_DOMAIN", "").strip()
 
 def _public_base_url():
-    domain = RAILWAY_PUBLIC_DOMAIN
+    domain = RAVEN_PUBLIC_DOMAIN or RAILWAY_PUBLIC_DOMAIN
     if domain:
         if not domain.startswith(("http://", "https://")):
             domain = "https://" + domain
         return domain.rstrip("/")
-    base = (PUBLIC_BASE_URL or GIFT_PUBLIC_BASE_URL or GENERIC_PUBLIC_BASE_URL).strip().rstrip("/")
-    if base and not base.startswith(("http://", "https://")):
-        base = "https://" + base
-    return base
+    return (PUBLIC_BASE_URL or GIFT_PUBLIC_BASE_URL).rstrip("/")
 
 MEDIA_PUBLIC_BASE_URL = _public_base_url()
 ASSET_HTTP_PORT = int(os.getenv("PORT", "8080"))
@@ -200,7 +184,7 @@ STREAM_CHECK_ACTION = os.getenv("STREAM_CHECK_ACTION", "check_streaming").strip(
 # enabled by default because some Talkin builds can show the bot as a listener
 # even though the LiveKit publisher is already connected.
 STREAM_REASSERT_SPEAKER = os.getenv("STREAM_REASSERT_SPEAKER", "1").strip() == "1"
-STREAM_REASSERT_DELAY = max(0.0, float(os.getenv("STREAM_REASSERT_DELAY", "0.8")))
+STREAM_REASSERT_DELAY = max(0.0, float(os.getenv("STREAM_REASSERT_DELAY", "0.15")))
 STREAM_INVITE_TOKEN = os.getenv("STREAM_INVITE_TOKEN", "Token").strip() or "Token"
 STREAM_ACCEPT_STATE = os.getenv("STREAM_ACCEPT_STATE", "accept").strip() or "accept"
 STREAM_AUTO_ACCEPT = os.getenv("STREAM_AUTO_ACCEPT", "1").strip() == "1"
@@ -538,9 +522,6 @@ AUTH_METHOD = "1"
 
 # Keep these enabled for easy troubleshooting.
 DEBUG = os.getenv("DEBUG", "0") == "1"
-# Temporary emergency workaround for an expired chatp.net certificate.
-# Keep this disabled unless the Talkin server certificate is confirmed broken.
-ALLOW_INSECURE_TLS = os.getenv("ALLOW_INSECURE_TLS", "0").strip() == "1"
 # Quiet hosting mode: do not continuously write diagnostics to Railway stdout
 # or to the persistent runtime log. Set QUIET_MODE=0 and DEBUG=1 temporarily
 # only when troubleshooting is needed.
@@ -906,13 +887,7 @@ class RawWebSocket:
 
         # Android Client obtains the platform default SSLSocketFactory.
         if self.scheme == "wss":
-            # Temporary emergency switch for an expired Talkin certificate.
-            # Keep certificate verification enabled by default.
-            ctx = (
-                ssl._create_unverified_context()
-                if ALLOW_INSECURE_TLS
-                else ssl.create_default_context()
-            )
+            ctx = ssl.create_default_context()
             self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
         else:
             self.sock = raw
@@ -3640,17 +3615,6 @@ def start_runtime_cleanup(stop_event=None):
 
 
 class _MediaHandler(SimpleHTTPRequestHandler):
-    def _send_health(self):
-        """Return a lightweight 200 response for hosting-provider health checks."""
-        body = b"ok\n"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
-
     def _resolve_target(self):
         path=unquote(urlparse(self.path).path)
         if path.startswith("/assets/"):
@@ -3680,12 +3644,6 @@ class _MediaHandler(SimpleHTTPRequestHandler):
         }.get(target.suffix.lower(),"application/octet-stream")
 
     def _serve(self,head_only=False):
-        request_path = urlparse(self.path).path
-        # Several bot hosts probe / or /health before routing public requests.
-        # Returning 404 here makes an otherwise healthy process appear as 502.
-        if request_path in ("", "/", "/health", "/healthz"):
-            self._send_health()
-            return
         target=self._resolve_target()
         if not target:
             self.send_error(404); return
@@ -4357,7 +4315,6 @@ class TalkinBot:
             data=body,
             headers={"Content-Type": "application/octet-stream", "User-Agent": "Talkinchat/1.0 (Android 12; net.chatp)"},
             timeout=15,
-            verify=not ALLOW_INSECURE_TLS,
         )
         r.raise_for_status()
         self.auth = decode_auth_result(r.content)
@@ -5284,7 +5241,7 @@ class TalkinBot:
                 # إرسال room_stream قبل جاهزية الجلسة يجعل الخادم يعامل البوت
                 # كمستمع ولا يربط الصوت بمقعد المايك.
                 if not getattr(self, f"_livekit_active_{room}", False):
-                    wait_until = time.time() + float(os.getenv("STREAM_LIVEKIT_READY_TIMEOUT", "20"))
+                    wait_until = time.time() + float(os.getenv("STREAM_LIVEKIT_READY_TIMEOUT", "8"))
                     while time.time() < wait_until:
                         if getattr(self, f"_livekit_active_{room}", False):
                             break
@@ -5533,11 +5490,19 @@ class TalkinBot:
             try:
                 source_path = Path(media_url).expanduser()
                 is_local_file = source_path.is_file()
-                ffmpeg_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-re"]
+                ffmpeg_cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                    "-probesize", "32k", "-analyzeduration", "100000",
+                    "-fflags", "nobuffer", "-flags", "low_delay", "-re",
+                ]
                 if not is_local_file:
-                    ffmpeg_cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+                    ffmpeg_cmd += [
+                        "-reconnect", "1", "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "2",
+                    ]
                 ffmpeg_cmd += [
                     "-i", media_url, "-vn", "-ac", "1", "-ar", "48000",
+                    "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0",
                     "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
                 ]
                 self.log("[LIVEKIT] starting ffmpeg audio feeder:", room, "source=", media_url if is_local_file else "remote")
@@ -5573,7 +5538,7 @@ class TalkinBot:
                     # the LiveKit source. This avoids a false positive where the
                     # first frame is accepted but the publisher remains effectively
                     # silent.
-                    if state["frames"] >= 12 and not first_frame.is_set():
+                    if state["frames"] >= 4 and not first_frame.is_set():
                         first_frame.set()
                 self.log("[LIVEKIT] audio feeder finished:", room, "ok=", state["ok"], "error=", state["error"][:300])
             except FileNotFoundError as exc:
@@ -7509,11 +7474,13 @@ class TalkinBot:
             if duration and int(duration) > MUSIC_MAX_SECONDS:
                 raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
             source=Path(source)
+            if source.is_file() and source.stat().st_size > MUSIC_MAX_BYTES:
+                raise RuntimeError(f"ملف الصوت أكبر من {int(MUSIC_MAX_MB)} ميجابايت")
             if source.suffix.lower()==".mp3":
                 return source
             ffmpeg_bin=shutil.which("ffmpeg")
             if not ffmpeg_bin:
-                raise RuntimeError("FFmpeg غير موجود داخل Railway")
+                raise RuntimeError("FFmpeg غير موجود على الاستضافة")
             proc=subprocess.run([
                 ffmpeg_bin,"-y","-hide_banner","-loglevel","error",
                 "-i",str(source),"-vn","-ac","2","-ar","44100",
@@ -7530,17 +7497,31 @@ class TalkinBot:
             tmpdir=outdir/f".{stamp}_{label}"
             tmpdir.mkdir(parents=True,exist_ok=True)
             template=str(tmpdir/"source.%(ext)s")
+            def pre_download_filter(info, *, incomplete):
+                # Reject oversized/too-long media BEFORE any bytes are downloaded.
+                # This prevents accidental 100s-of-MB or multi-hour downloads.
+                duration = int(info.get("duration") or 0)
+                if duration > MUSIC_MAX_SECONDS:
+                    return f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية"
+                size = info.get("filesize") or info.get("filesize_approx")
+                if size and int(size) > MUSIC_MAX_BYTES:
+                    return f"حجم المصدر أكبر من {int(MUSIC_MAX_MB)} ميجابايت"
+                return None
+
             opts={
                 "quiet":True,"no_warnings":True,"noplaylist":True,
-                "format":"bestaudio/best","outtmpl":template,
-                "socket_timeout":45,"retries":5,"fragment_retries":5,
-                "extractor_retries":3,"file_access_retries":3,
+                "format":"bestaudio[abr<=192][filesize<=64M]/bestaudio[abr<=192]/bestaudio[filesize<=64M]",
+                "outtmpl":template,
+                "socket_timeout":30,"retries":3,"fragment_retries":3,
+                "extractor_retries":2,"file_access_retries":2,
                 "cachedir":False,"overwrites":True,
-                "concurrent_fragment_downloads":1,
+                "concurrent_fragment_downloads":8,
+                "buffersize":1024*1024,
                 "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"},
                 "check_formats":False,
                 "js_runtimes":{"node":{}},
                 "remote_components":{"ejs":"github"},
+                "match_filter":pre_download_filter,
             }
             if cookies and YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"]=YOUTUBE_COOKIE_FILE
@@ -7560,6 +7541,10 @@ class TalkinBot:
                     raise RuntimeError("تم العثور على الأغنية لكن لم يكتمل الملف الصوتي")
                 source=max(candidates,key=lambda x:x.stat().st_mtime)
                 duration=int(info.get("duration") or 0)
+                if duration and duration > MUSIC_MAX_SECONDS:
+                    raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
+                if source.stat().st_size > MUSIC_MAX_BYTES:
+                    raise RuntimeError(f"ملف الصوت أكبر من {int(MUSIC_MAX_MB)} ميجابايت")
                 mp3=normalize_to_mp3(source,duration)
                 return {
                     "id":str(info.get("id") or ""),
@@ -7585,7 +7570,7 @@ class TalkinBot:
         if re.match(r"^https?://",query,re.I) and "soundcloud.com" in query.lower():
             sc_targets=[query]
         elif search_query:
-            sc_targets=["scsearch1:"+search_query]
+            sc_targets=["scsearch3:"+search_query]
 
         for target in sc_targets:
             result=download_with_ydl(target,"soundcloud",cookies=False)
@@ -7596,7 +7581,7 @@ class TalkinBot:
                 return info,mp3
 
         # -------- YouTube fallback --------
-        youtube_target=query if re.match(r"^https?://",query,re.I) else "ytsearch1:"+query
+        youtube_target=query if re.match(r"^https?://",query,re.I) else "ytsearch3:"+query
         for client in ("web_embedded","default","native_default"):
             result=download_with_ydl(youtube_target,f"youtube_{client}",cookies=True)
             if result:
@@ -7637,7 +7622,7 @@ class TalkinBot:
                     else:
                         # الاحتياطي القديم: SoundCloud ثم YouTube عبر yt-dlp.
                         if not public_base:
-                            raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
+                            raise RuntimeError("لا يوجد رابط عام للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
                         info, path = self._music_download(query)
                         title=str(info.get("title") or query)
                         artist=str(info.get("uploader") or info.get("channel") or "YouTube")
@@ -7645,13 +7630,25 @@ class TalkinBot:
                         url=public_base+"/media/"+path.name
                         self.log("[MUSIC] live source=legacy fallback title=", title, "room=", room)
                 else:
-                    if not public_base:
-                        raise RuntimeError("لا يوجد رابط عام للصوت؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
-                    info,path=self._music_download(query)
-                    title=str(info.get("title") or query)
-                    artist=str(info.get("uploader") or info.get("channel") or "YouTube")
-                    duration=int(info.get("duration") or 0)
-                    url=public_base+"/media/"+path.name
+                    # Fast path: Audius exposes a direct MP3 stream, so when
+                    # the requested track exists there we can send it without
+                    # downloading/converting the entire song on the host.
+                    audius = self._audius_live_source(query)
+                    if audius:
+                        info = audius
+                        url = str(audius.get("url") or "")
+                        duration = int(audius.get("duration") or 0)
+                        title = str(audius.get("title") or query)
+                        artist = str(audius.get("uploader") or "Audius")
+                        self.log("[MUSIC] fast source=Audius title=", title, "room=", room)
+                    else:
+                        if not public_base:
+                            raise RuntimeError("لا يوجد رابط عام للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
+                        info,path=self._music_download(query)
+                        title=str(info.get("title") or query)
+                        artist=str(info.get("uploader") or info.get("channel") or "YouTube")
+                        duration=int(info.get("duration") or 0)
+                        url=public_base+"/media/"+path.name
 
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
@@ -7911,7 +7908,7 @@ class TalkinBot:
             if not public_base:
                 if charged:
                     _add_points(sender_name, cost)
-                raise RuntimeError("لا يوجد رابط عام لصور الهدايا؛ أنشئ Railway Public Domain أو ضع PUBLIC_BASE_URL")
+                raise RuntimeError("لا يوجد رابط عام لصور الهدايا؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
             sender_key = sender_name.casefold().lstrip("@")
             receiver_key = target.casefold().lstrip("@")
             # Use each account's own cached/profile image beside its own name.
