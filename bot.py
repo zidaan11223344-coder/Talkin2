@@ -537,6 +537,7 @@ QUIET_MODE = os.getenv("QUIET_MODE", "1").strip() == "1"
 CLEANUP_INTERVAL_SECONDS = max(300, int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600")))
 CLEANUP_MAX_AGE_SECONDS = max(3600, int(os.getenv("CLEANUP_MAX_AGE_SECONDS", "3600")))
 CLEANUP_AUDIO_ENABLED = os.getenv("CLEANUP_AUDIO_ENABLED", "1").strip() == "1"
+CLEANUP_GENERATED_ENABLED = os.getenv("CLEANUP_GENERATED_ENABLED", "1").strip() == "1"
 CLEANUP_CACHE_ENABLED = os.getenv("CLEANUP_CACHE_ENABLED", "1").strip() == "1"
 CLEANUP_LOG_ENABLED = os.getenv("CLEANUP_LOG_ENABLED", "1").strip() == "1"
 CLEANUP_TMP_ENABLED = os.getenv("CLEANUP_TMP_ENABLED", "1").strip() == "1"
@@ -3537,6 +3538,44 @@ def _cleanup_runtime_files():
                         removed_dirs += _safe_remove_tree(item)
                     elif item.suffix.lower() in _CLEANUP_SUFFIXES or item.name.startswith("."):
                         removed_files += _safe_remove_file(item)
+
+        # Remove generated images/audio from all disposable runtime folders.
+        # Persistent bot state is kept in DATA_DIR and is never touched here.
+        # Files younger than CLEANUP_MAX_AGE_SECONDS are kept so an active
+        # request/broadcast is not interrupted. The base folders themselves
+        # are preserved because the HTTP media server uses them as roots.
+        if CLEANUP_GENERATED_ENABLED:
+            generated_dirs = (
+                BASE_DIR / "generated_music",
+                BASE_DIR / "generated_gifts",
+                BASE_DIR / "generated_billion",
+                BASE_DIR / "generated_games",
+                BASE_DIR / "generated_publish",
+                BASE_DIR / "generated_lookalikes",
+            )
+            for generated_dir in generated_dirs:
+                if not generated_dir.exists():
+                    continue
+                try:
+                    for item in list(generated_dir.rglob("*")):
+                        # Only delete files/directories that are actually
+                        # inside the disposable generated root.
+                        try:
+                            item.relative_to(generated_dir)
+                        except ValueError:
+                            continue
+                        try:
+                            age = now - item.stat().st_mtime
+                        except Exception:
+                            age = CLEANUP_MAX_AGE_SECONDS + 1
+                        if age < CLEANUP_MAX_AGE_SECONDS:
+                            continue
+                        if item.is_file() or item.is_symlink():
+                            removed_files += _safe_remove_file(item)
+                        elif item.is_dir():
+                            removed_dirs += _safe_remove_tree(item)
+                except Exception:
+                    pass
 
         # Remove generic runtime caches and Python bytecode outside DATA_DIR.
         if CLEANUP_CACHE_ENABLED:
