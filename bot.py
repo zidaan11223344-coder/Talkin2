@@ -736,7 +736,9 @@ def _extract_media_url_universal(event, body=""):
     if not isinstance(event, dict):
         event = {}
     for key in (7, 6, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url", "photo", "attachment"):
-        val = str(event.get(key, "") or "").strip()
+        # URL fields may be decoded as bytes by the protobuf reader.
+        # str(bytes) adds a b'' wrapper and hides the image from the handler.
+        val = as_text(event.get(key, "") or "").strip()
         if val.startswith(("http://", "https://")):
             return val
         if val.startswith("//"):
@@ -749,15 +751,16 @@ def _extract_media_url_universal(event, body=""):
         if m2:
             return m2.group(0)
     for k, v in event.items():
-        val = str(v or "").strip()
+        val = as_text(v or "").strip()
         if val.startswith(("http://", "https://")):
             return val
     return first_http_url(event) or first_http_url(body) or ""
 
 def first_http_url(value):
     """Find the first public HTTP(S) URL in a decoded Talkin payload."""
-    if isinstance(value, str):
-        for token in value.replace("\n", " ").split():
+    if isinstance(value, (str, bytes)):
+        text = as_text(value)
+        for token in text.replace("\n", " ").split():
             token = token.strip("<>[](){}\"'")
             if token.startswith(("http://", "https://")):
                 return token.rstrip(",.;")
@@ -2637,6 +2640,111 @@ def _command_help(page=1):
 
 # ------------------------------ Bot ----------------------
 
+
+# ===== محرك تشكيل العربية المدمج (يعمل بدون مكتبات خارجية) =====
+_ARABIC_FORMS = {
+    '\u0621': ('\uFE80', '\uFE80', '\uFE80', '\uFE80'),
+    '\u0622': ('\uFE81', '\uFE82', '\uFE81', '\uFE82'),
+    '\u0623': ('\uFE83', '\uFE84', '\uFE83', '\uFE84'),
+    '\u0624': ('\uFE85', '\uFE86', '\uFE85', '\uFE86'),
+    '\u0625': ('\uFE87', '\uFE88', '\uFE87', '\uFE88'),
+    '\u0626': ('\uFE89', '\uFE8A', '\uFE8B', '\uFE8C'),
+    '\u0627': ('\uFE8D', '\uFE8E', '\uFE8D', '\uFE8E'),
+    '\u0628': ('\uFE8F', '\uFE90', '\uFE91', '\uFE92'),
+    '\u0629': ('\uFE93', '\uFE94', '\uFE93', '\uFE94'),
+    '\u062A': ('\uFE95', '\uFE96', '\uFE97', '\uFE98'),
+    '\u062B': ('\uFE99', '\uFE9A', '\uFE9B', '\uFE9C'),
+    '\u062C': ('\uFE9D', '\uFE9E', '\uFE9F', '\uFEA0'),
+    '\u062D': ('\uFEA1', '\uFEA2', '\uFEA3', '\uFEA4'),
+    '\u062E': ('\uFEA5', '\uFEA6', '\uFEA7', '\uFEA8'),
+    '\u062F': ('\uFEA9', '\uFEAA', '\uFEA9', '\uFEAA'),
+    '\u0630': ('\uFEAB', '\uFEAC', '\uFEAB', '\uFEAC'),
+    '\u0631': ('\uFEAD', '\uFEAE', '\uFEAD', '\uFEAE'),
+    '\u0632': ('\uFEAF', '\uFEB0', '\uFEAF', '\uFEB0'),
+    '\u0633': ('\uFEB1', '\uFEB2', '\uFEB3', '\uFEB4'),
+    '\u0634': ('\uFEB5', '\uFEB6', '\uFEB7', '\uFEB8'),
+    '\u0635': ('\uFEB9', '\uFEBA', '\uFEBB', '\uFEBC'),
+    '\u0636': ('\uFEBD', '\uFEBE', '\uFEBF', '\uFEC0'),
+    '\u0637': ('\uFEC1', '\uFEC2', '\uFEC3', '\uFEC4'),
+    '\u0638': ('\uFEC5', '\uFEC6', '\uFEC7', '\uFEC8'),
+    '\u0639': ('\uFEC9', '\uFECA', '\uFECB', '\uFECC'),
+    '\u063A': ('\uFECD', '\uFECE', '\uFECF', '\uFED0'),
+    '\u0641': ('\uFED1', '\uFED2', '\uFED3', '\uFED4'),
+    '\u0642': ('\uFED5', '\uFED6', '\uFED7', '\uFED8'),
+    '\u0643': ('\uFED9', '\uFEDA', '\uFEDB', '\uFEDC'),
+    '\u0644': ('\uFEDD', '\uFEDE', '\uFEDF', '\uFEE0'),
+    '\u0645': ('\uFEE1', '\uFEE2', '\uFEE3', '\uFEE4'),
+    '\u0646': ('\uFEE5', '\uFEE6', '\uFEE7', '\uFEE8'),
+    '\u0647': ('\uFEE9', '\uFEEA', '\uFEEB', '\uFEEC'),
+    '\u0648': ('\uFEED', '\uFEEE', '\uFEED', '\uFEEE'),
+    '\u0649': ('\uFEEF', '\uFEF0', '\uFEEF', '\uFEF0'),
+    '\u064A': ('\uFEF1', '\uFEF2', '\uFEF3', '\uFEF4'),
+    '\u0671': ('\uFB50', '\uFB51', '\uFB50', '\uFB51'),
+    '\u0686': ('\uFB7C', '\uFB7D', '\uFB7E', '\uFB7F'),
+    '\u06A9': ('\uFB8E', '\uFB8F', '\uFB90', '\uFB91'),
+    '\u06AF': ('\uFB92', '\uFB93', '\uFB94', '\uFB95'),
+    '\u06CC': ('\uFBFC', '\uFBFD', '\uFBFE', '\uFBFF'),
+    '\u0640': ('\u0640', '\u0640', '\u0640', '\u0640'),
+}
+_AR_RIGHT_JOIN = set('\u0621\u0622\u0623\u0624\u0625\u0627\u062F\u0630\u0631\u0632\u0648\u0629\u0649\u0671')
+_AR_DUAL_JOIN = {c for c in _ARABIC_FORMS if c not in _AR_RIGHT_JOIN and c != '\u0621'}
+_AR_TASHKEEL = set('\u064B\u064C\u064D\u064E\u064F\u0650\u0651\u0652\u0670\u0640')
+_AR_LAM_ALEF = {
+    ('\u0644', '\u0622'): '\uFEF5', ('\u0644', '\u0623'): '\uFEF7',
+    ('\u0644', '\u0625'): '\uFEF9', ('\u0644', '\u0627'): '\uFEFB',
+}
+_AR_LAM_ALEF_FINAL = {
+    ('\u0644', '\u0622'): '\uFEF6', ('\u0644', '\u0623'): '\uFEF8',
+    ('\u0644', '\u0625'): '\uFEFA', ('\u0644', '\u0627'): '\uFEFC',
+}
+
+def _embedded_reshape(source_text):
+    """Shape Arabic letters into Unicode Presentation Forms without any library."""
+    chars = list(str(source_text or ""))
+    letters = [i for i, c in enumerate(chars) if c not in _AR_TASHKEEL]
+    out = list(chars)
+    m = len(letters)
+    for idx, i in enumerate(letters):
+        c = chars[i]
+        if c not in _ARABIC_FORMS:
+            continue
+        prev_c = chars[letters[idx - 1]] if idx > 0 else None
+        next_c = chars[letters[idx + 1]] if idx < m - 1 else None
+        # Lam-Alef ligature
+        if c == '\u0644' and (prev_c, next_c is not None) and next_c in ('\u0622', '\u0623', '\u0625', '\u0627'):
+            joined_prev = prev_c in _AR_DUAL_JOIN
+            pair = (c, next_c)
+            out[i] = (_AR_LAM_ALEF_FINAL if joined_prev else _AR_LAM_ALEF).get(pair, out[i])
+            out[letters[idx + 1]] = ""
+            continue
+        connect_prev = prev_c in _AR_DUAL_JOIN
+        connect_next = c in _AR_DUAL_JOIN and next_c in _ARABIC_FORMS
+        forms = _ARABIC_FORMS[c]
+        if connect_prev and connect_next:
+            out[i] = forms[3]
+        elif connect_prev:
+            out[i] = forms[1]
+        elif connect_next:
+            out[i] = forms[2]
+        else:
+            out[i] = forms[0]
+    return "".join(out)
+
+def _embedded_bidi(source_text):
+    """Reorder shaped Arabic text into visual order for LTR drawing engines.
+
+    Combining marks (tashkeel) stay attached to their base letter cluster so
+    the marks do not detach when the string is reversed.
+    """
+    s = _embedded_reshape(source_text)
+    clusters = []
+    for ch in s:
+        if clusters and (ch in _AR_TASHKEEL or unicodedata.category(ch).startswith("M")):
+            clusters[-1].append(ch)
+        else:
+            clusters.append([ch])
+    return "".join("".join(c) for c in reversed(clusters))
+
 def _shape_name(text):
     """Convert the logical username into visual RTL order exactly once.
 
@@ -2657,6 +2765,12 @@ def _shape_name(text):
     if arabic_reshaper is not None and get_display is not None and _has_arabic(raw):
         try:
             return get_display(arabic_reshaper.reshape(raw), base_dir="R")
+        except Exception:
+            pass
+    # Embedded fallback: correct shaping and visual order with no external libs.
+    if _has_arabic(raw):
+        try:
+            return _embedded_bidi(raw)
         except Exception:
             pass
     return raw
@@ -2817,17 +2931,9 @@ def _draw_name_visual(draw, xy, raw_text, size, fill, stroke_width=2,
     # musical symbols, and tatweel.  No single font contains all of them, so
     # shape/bidi the complete logical string once, then draw visual runs with
     # real fallback fonts. This avoids tofu squares without reversing twice.
-    if _has_arabic(raw_text) and arabic_reshaper is not None and get_display is not None:
-        try:
-            # Keep the logical string and lay out its font runs from the
-            # right edge to the left.  Using get_display here reverses the
-            # already RTL name once more for mixed decorative usernames.
-            logical = raw_text
-        except Exception:
-            logical = raw_text
-    else:
-        logical = raw_text
-    visual = logical
+    # Without Raqm the runs path must draw the already-shaped visual string
+    # (reshaped + bidi-ordered once by _shape_name) or Arabic renders reversed.
+    visual = _shape_name(raw_text) if not native_rtl else raw_text
     if not visual:
         return xy[0]
     base=_gift_font(visual,int(size))
@@ -3291,36 +3397,94 @@ def render_billion_card(winner_name, winner_photo_url=""):
 
 
 def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
-    """Keep the original game artwork and add a compact winner panel below it."""
+    """Elegant winner card in the same style as the gift cards.
+
+    - The original game artwork fills the card.
+    - The winner name sits INSIDE a gold-outlined rounded rectangle.
+    - The player photo sits BESIDE the rectangle (outside, on the left),
+      exactly like the sender/receiver photos on gift cards.
+    - Rendered large and sharpened for clarity on modern phones.
+    """
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبت")
     source_name = GAME_IMAGE_FILES.get(game_key) or GAME_IMAGE_FILES.get("billion")
     source = ASSETS_DIR / source_name
     if not source.is_file():
         raise FileNotFoundError(f"صورة اللعبة غير موجودة: {source}")
+
     image = Image.open(source).convert("RGBA")
+    # Enlarge for a crisp final card, preserving aspect ratio.
+    target_w = 1100
+    target_h = max(1, round(target_w * image.height / image.width))
+    image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    d = ImageDraw.Draw(image)
     w, h = image.size
-    panel_h = max(120, int(h * 0.22))
-    panel_y = max(0, h - panel_h - max(8, int(h * 0.025)))
-    margin = max(12, int(w * 0.035))
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    panel = (margin, panel_y, w - margin, h - max(8, int(h * 0.025)))
-    draw.rounded_rectangle(panel, radius=max(12, int(w * 0.02)), fill=(8, 12, 24, 232),
-                           outline=(244, 196, 92, 255), width=max(2, int(w * 0.004)))
-    avatar = _load_sender_avatar(winner_photo_url, max(70, int(h * 0.12)))
-    left = panel[0] + max(12, int(w * 0.025))
+    gold = (244, 196, 92, 255)
+    panel = (10, 14, 28, 248)
+
+    # Title ribbon at the top, same style as the gift header.
+    header = (int(w * .22), int(h * .05), int(w * .78), int(h * .16))
+    d.rounded_rectangle(header, radius=30, fill=panel, outline=gold, width=4)
+    game_names = {"billion": "المليار", "hangman": "المعلقة", "roulette": "الروليت", "race": "السباق"}
+    game_label = game_names.get(str(game_key), "اللعبة")
+    _draw_centered(
+        d,
+        ((header[0] + header[2]) / 2, header[1] + (header[3] - header[1]) / 2),
+        "🏆 فائز لعبة " + game_label,
+        34,
+        (255, 222, 155, 255),
+        header[2] - header[0] - 40,
+    )
+
+    # Winner identity panel near the bottom: name INSIDE the rectangle,
+    # photo OUTSIDE it on the left, mirroring the gift card layout.
+    box_w = int(w * .73)
+    box_h = int(h * .145)
+    box_x = int(w * .22)
+    box_y = int(h * .78)
+
+    d.rounded_rectangle(
+        (box_x, box_y, box_x + box_w, box_y + box_h),
+        radius=24,
+        fill=panel,
+        outline=gold,
+        width=4,
+    )
+
+    avatar_size = 116
+    avatar_x = max(8, box_x - avatar_size - 16)
+    avatar_y = box_y + (box_h - avatar_size) // 2
+    avatar = _load_sender_avatar(winner_photo_url, avatar_size)
     if avatar is not None:
-        ay = panel_y + (panel_h - avatar.height) // 2
-        overlay.alpha_composite(avatar, (left, ay))
-        left += avatar.width + max(12, int(w * 0.02))
-    right = panel[2] - max(12, int(w * 0.025))
-    center = (left + right) / 2
-    _draw_centered(draw, (center, panel_y + panel_h * 0.32), "🏆 الفائز",
-                   max(18, int(h * 0.045)), (255, 224, 145, 255), max(80, right - left))
-    _draw_name_centered(draw, (center, panel_y + panel_h * 0.70), "@" + str(winner_name or ""),
-                        max(20, int(h * 0.055)), (255, 255, 255, 255), max(80, right - left))
-    image = Image.alpha_composite(image, overlay).convert("RGB")
+        image.alpha_composite(avatar, (int(avatar_x), int(avatar_y)))
+
+    text_center_x = box_x + box_w / 2
+    text_max_w = box_w - 34
+
+    _draw_centered(
+        d,
+        (text_center_x, box_y + int(box_h * .27)),
+        "الفائز",
+        24,
+        (255, 224, 165, 255),
+        text_max_w,
+    )
+    _draw_name_centered(
+        d,
+        (text_center_x, box_y + box_h * .68),
+        "@" + str(winner_name or ""),
+        38,
+        (126, 226, 255, 255),
+        text_max_w,
+    )
+
+    try:
+        image = image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=120, threshold=3))
+    except Exception:
+        pass
+
+    image = image.convert("RGB")
     out_dir = BASE_DIR / "generated_games"
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -3330,7 +3494,7 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
     except Exception:
         pass
     out = out_dir / f"winner_{uuid.uuid4().hex}.jpg"
-    for quality in (92, 88, 84, 80, 76):
+    for quality in (94, 92, 90, 88, 86, 84, 82):
         image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
         if out.stat().st_size <= 300 * 1024:
             break
@@ -3852,6 +4016,7 @@ class TalkinBot:
         # image-publish worker can write to it.
         self.reaction_targets = {}
         self.publish_pending = {}
+        self._publish_media_lock = threading.Lock()
         monitored = _load_local_json(DATA_DIR / "monitored_users.json", [])
         self.monitored_users = {
             _norm_user(item) for item in (monitored if isinstance(monitored, list) else [])
@@ -7859,13 +8024,29 @@ class TalkinBot:
                         artist = str(audius.get("uploader") or "Audius")
                         self.log("[MUSIC] fast source=Audius title=", title, "room=", room)
                     else:
-                        if not public_base:
-                            raise RuntimeError("لا يوجد رابط عام للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
-                        info,path=self._music_download(query)
-                        title=str(info.get("title") or query)
-                        artist=str(info.get("uploader") or info.get("channel") or "YouTube")
-                        duration=int(info.get("duration") or 0)
-                        url=public_base+"/media/"+path.name
+                        # YouTube/SoundCloud direct audio fallback.  yt-dlp only
+                        # resolves metadata and a short-lived audio URL here;
+                        # the room receives it as an audio/voice media packet
+                        # instead of waiting for a complete local download.
+                        direct = self._music_live_source(query)
+                        if direct:
+                            info = direct
+                            url = str(direct.get("url") or "")
+                            duration = int(direct.get("duration") or 0)
+                            title = str(direct.get("title") or query)
+                            artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
+                            self.log("[MUSIC] fast source=direct-audio title=", title, "room=", room)
+                        else:
+                            # Final fallback: download and convert in this
+                            # background worker, then expose the MP3 through
+                            # the bot media server before sending audio.
+                            if not public_base:
+                                raise RuntimeError("لا يوجد رابط عام للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
+                            info,path=self._music_download(query)
+                            title=str(info.get("title") or query)
+                            artist=str(info.get("uploader") or info.get("channel") or "YouTube")
+                            duration=int(info.get("duration") or 0)
+                            url=public_base+"/media/"+path.name
 
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
@@ -7907,7 +8088,9 @@ class TalkinBot:
                 self.report_master_error("تشغيل الأغنية", e, room)
                 if room_output:
                     self.send_room_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.")
-        threading.Thread(target=worker,name="music-request",daemon=True).start(); self.send_room_text(room, f"جاري تلبيه طلبك\n@{requester}"); return True
+        self.send_room_text(room, f"جاري تلبيه طلبك\n@{requester}")
+        threading.Thread(target=worker, name="music-request", daemon=True).start()
+        return True
 
     def share_last_music(self, sender: str, target: str, room: str = ""):
         """Share the sender's latest successfully prepared song privately."""
@@ -7933,7 +8116,9 @@ class TalkinBot:
         # Do not send a caption to the recipient: on this gateway the caption
         # is often the only visible private message while the media card is
         # hidden. The recipient must receive the audio/file packet alone.
-        time.sleep(0.45)
+        # The audio packet is already sent above; avoid an unnecessary fixed
+        # delay before the confirmation so the recipient sees the song faster.
+        time.sleep(0.05)
         if room:
             self.send_room_text(room, f"✅ تمت مشاركة أغنية {title} مع @{target} في الخاص.")
         else:
@@ -12044,16 +12229,14 @@ class TalkinBot:
                 self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != blocked_key}
                 self._save_blocked_rooms()
                 _save_persistent_rooms(self.known_rooms)
-            if self.join_room(target, force=True, requested_by=sender):
-                msg = f"⏳ تم إرسال طلب دخول الغرفة: {target}. انتظر تأكيد الخادم."
-            else:
-                msg = f"⚠️ تعذر إرسال طلب دخول الغرفة: {target}."
-            if is_private:
-                self.send_private_text(sender, msg)
-            elif room:
-                self.send_room_text(room, msg)
-            else:
-                self.send_private_text(sender, msg)
+            # Ask for the language before sending room_join. The previous
+            # room-command path joined first and showed the prompt afterward.
+            self._begin_join_rooms_language(
+                sender,
+                [target],
+                response_room=room if not is_private else "",
+                is_private=is_private,
+            )
             return True
         if low in ("خروج","leave","exit") or low.startswith(("خروج ","leave ","exit ")):
             parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
@@ -12256,7 +12439,7 @@ class TalkinBot:
             return ""
         try:
             from io import BytesIO
-            r = requests.get(media_url, headers={"User-Agent":"Mozilla/5.0", "Accept":"image/*"}, timeout=(4,8))
+            r = requests.get(media_url, headers={"User-Agent":"Mozilla/5.0", "Accept":"image/*"}, timeout=(1.5, 2.5))
             r.raise_for_status()
             if len(r.content) > 12 * 1024 * 1024:
                 return ""
@@ -12541,32 +12724,40 @@ class TalkinBot:
         media_url = str(media_url or "").strip()
         if not media_url:
             return False
-        tried = set()
-        ordered = list(candidates or [])
-        pending_keys = list(getattr(self, "publish_pending", {}).keys())
-        ordered.extend(pending_keys)
-        for sender in ordered:
-            sender = str(sender or "").strip()
-            key = _norm_user(sender)
-            if not key or key in tried:
-                continue
-            tried.add(key)
-            if self._handle_publish_media(room, sender, media_url):
-                return True
-
-        # Fallback: إذا وُجد أي طلب نشر معلق حديث (خلال 3 دقائق)، اعتمد الصورة فوراً وانشرها
-        pending = getattr(self, "publish_pending", {})
-        if pending:
+        lock = getattr(self, "_publish_media_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._publish_media_lock = lock
+        if not lock.acquire(blocking=False):
+            return True
+        try:
+            tried = set()
+            ordered = list(candidates or [])
+            ordered.extend(list(getattr(self, "publish_pending", {}).keys()))
+            for sender in ordered:
+                sender = str(sender or "").strip()
+                key = _norm_user(sender)
+                if not key or key in tried:
+                    continue
+                tried.add(key)
+                try:
+                    if self._handle_publish_media(room, sender, media_url):
+                        return True
+                except Exception as exc:
+                    self.log("[PUBLISH] media handling failed:", repr(exc))
+            pending = getattr(self, "publish_pending", {})
             now = time.time()
             for sender_key, item in list(pending.items()):
                 try:
                     if now - float(item.get("created_at", 0) or 0) <= 180:
                         if self._handle_publish_media(room, sender_key, media_url):
-                            self.log("[PUBLISH] consumed image using active pending fallback for:", sender_key)
+                            self.log("[PUBLISH] consumed image using pending fallback:", sender_key)
                             return True
                 except Exception as exc:
                     self.log("[PUBLISH] pending fallback error:", repr(exc))
-        return False
+            return False
+        finally:
+            lock.release()
 
     def _is_duplicate_incoming(self, kind, values, event_id=""):
         """Return True when the server has replayed an inbound event.
@@ -12886,16 +13077,15 @@ class TalkinBot:
             if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
                 media_senders.append(candidate)
 
-        # إذا كان هناك طلب نشر معلق وتم استلام أي صورة أو رابط صورة
+        # إذا كان هناك طلب نشر معلق وتم استلام أي صورة، نفّذ النشر في خيط منفصل فوراً دون تجميد البوت
         if getattr(self, "publish_pending", {}):
             if media_url:
-                if self._try_publish_pending_media(room, media_url, media_senders):
-                    return
+                threading.Thread(target=self._try_publish_pending_media, args=(room, media_url, media_senders), daemon=True).start()
+                return
 
         if event_type in {"image", "photo", "picture", "media", "file"} or (media_url and event_type not in {"text", "user_joined", "user_left"}):
             if media_url:
-                if self._try_publish_pending_media(room, media_url, media_senders):
-                    return
+                threading.Thread(target=self._try_publish_pending_media, args=(room, media_url, media_senders), daemon=True).start()
             return
 
         if event_type != "text" or not body:
