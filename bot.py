@@ -63,6 +63,12 @@ except Exception:
 MUSIC_MAX_SECONDS = int(os.getenv("MUSIC_MAX_SECONDS", "900"))
 MUSIC_MAX_MB = float(os.getenv("MUSIC_MAX_MB", "64"))
 MUSIC_MAX_BYTES = int(MUSIC_MAX_MB * 1024 * 1024)
+# Fast-download tuning. yt-dlp documents http_chunk_size as a way to split
+# HTTP downloads and notes it can help with webserver throttling.
+MUSIC_HTTP_CHUNK_SIZE = int(os.getenv("MUSIC_HTTP_CHUNK_SIZE", str(8 * 1024 * 1024)))
+MUSIC_CONCURRENT_FRAGMENTS = int(os.getenv("MUSIC_CONCURRENT_FRAGMENTS", "16"))
+MUSIC_BUFFER_SIZE = int(os.getenv("MUSIC_BUFFER_SIZE", str(4 * 1024 * 1024)))
+MUSIC_THROTTLED_RATE = int(os.getenv("MUSIC_THROTTLED_RATE", str(128 * 1024)))
 MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
 # Audius is an additional lightweight source used primarily by live broadcast.
 # It can search the catalog and expose a streamable MP3 URL without first
@@ -70,7 +76,7 @@ MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
 # an optional API key can be supplied for higher limits.
 AUDIUS_API_BASE = os.getenv("AUDIUS_API_BASE", "https://api.audius.co/v1").strip().rstrip("/")
 AUDIUS_API_KEY = os.getenv("AUDIUS_API_KEY", "").strip()
-AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "4"))
+AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "2.5"))
 AUDIUS_CACHE_TTL = float(os.getenv("AUDIUS_CACHE_TTL", "90"))
 # Optional YouTube Netscape cookies supplied as a Railway secret variable.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
@@ -5245,7 +5251,7 @@ class TalkinBot:
                     while time.time() < wait_until:
                         if getattr(self, f"_livekit_active_{room}", False):
                             break
-                        time.sleep(0.25)
+                        time.sleep(0.10)
 
                 # لا نعتبر الأمر ناجحاً لمجرد وصول publish_stream؛ يجب أن تكون
                 # جلسة LiveKit نفسها متصلة وبها AudioSource قبل إعلان التشغيل.
@@ -5564,8 +5570,8 @@ class TalkinBot:
         threading.Thread(target=_run, name=f"livekit-audio-{room}", daemon=True).start()
         # Wait for a short burst of actual PCM frames, not only one frame.
         # This prevents a false "تم التشغيل" message when the publisher is silent.
-        first_frame.wait(timeout=10)
-        if state["frames"] >= 12:
+        first_frame.wait(timeout=5)
+        if state["frames"] >= 6:
             self.log("[LIVEKIT] real audio burst captured successfully:", room, "frames=", state["frames"])
             return True
         self.log("[LIVEKIT] no sufficient audio burst captured:", room, "frames=", state["frames"], state["error"])
@@ -6323,7 +6329,7 @@ class TalkinBot:
         track = getattr(self, "_pending_live_tracks", {}).pop(room, None)
         if track:
             try:
-                time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.8")))
+                time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.05")))
                 room_id = str(
                     accepted.get("room_id", "")
                     or getattr(self, "_live_room_ids", {}).get(room, "")
@@ -6342,7 +6348,7 @@ class TalkinBot:
                     while time.time() < wait_until:
                         if getattr(self, f"_livekit_active_{room}", False):
                             break
-                        time.sleep(0.25)
+                        time.sleep(0.10)
                 self._log_stream_stage(
                     "3.5_بث_الصوت",
                     "إرسال_حزمة_الصوت",
@@ -6441,7 +6447,7 @@ class TalkinBot:
             track = getattr(self, "_pending_live_tracks", {}).pop(room, None)
             if track:
                 try:
-                    time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.8")))
+                    time.sleep(float(os.getenv("STREAM_AUDIO_DELAY", "0.05")))
                     self.log("[STREAM] publish queued audio", STREAM_AUDIO_ACTION, accepted.get("room_id", ""))
                     self.send_query(encode_query(
                         STREAM_AUDIO_ACTION,
@@ -7428,6 +7434,112 @@ class TalkinBot:
             self.log("[AUDIUS] live source unavailable:", repr(exc))
             return None
 
+    def _music_live_source(self, query):
+        """Resolve a direct audio URL for live broadcast without downloading it.
+
+        Audius is still preferred by handle_music_command. This method is the
+        fast fallback for YouTube/SoundCloud-style searches: yt-dlp extracts
+        metadata and a playable audio URL only, then LiveKit/FFmpeg consumes the
+        remote stream directly. That removes the full-download-before-play delay.
+        """
+        if yt_dlp is None:
+            return None
+        q = str(query or "").strip()
+        if not q:
+            return None
+        target = q if re.match(r"^https?://", q, re.I) else "ytsearch1:" + q
+        errors = []
+
+        clients = ("web_embedded", "default", "native_default")
+        for client in clients:
+            try:
+                opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "skip_download": True,
+                    "format": "bestaudio[abr<=192]/bestaudio",
+                    "socket_timeout": 12,
+                    "retries": 1,
+                    "extractor_retries": 1,
+                    "cachedir": False,
+                    "check_formats": False,
+                    "http_headers": {
+                        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+                    },
+                    "js_runtimes": {"node": {}},
+                    "remote_components": {"ejs": "github"},
+                }
+                if YOUTUBE_COOKIE_FILE:
+                    opts["cookiefile"] = YOUTUBE_COOKIE_FILE
+                if not (target.startswith("http") and "soundcloud.com" in target.lower()):
+                    if client != "native_default":
+                        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(target, download=False)
+                if info and info.get("entries"):
+                    entries = [x for x in (info.get("entries") or []) if x]
+                    info = entries[0] if entries else None
+                if not info:
+                    continue
+
+                duration = int(info.get("duration") or 0)
+                if duration and duration > MUSIC_MAX_SECONDS:
+                    errors.append(f"{client}: duration>{MUSIC_MAX_SECONDS}")
+                    continue
+
+                # Prefer a concrete audio-only format URL. Avoid video formats
+                # and avoid extremely large audio choices.
+                formats = []
+                for fmt in (info.get("formats") or []):
+                    if not isinstance(fmt, dict):
+                        continue
+                    url = str(fmt.get("url") or "").strip()
+                    if not url:
+                        continue
+                    acodec = str(fmt.get("acodec") or "").strip()
+                    vcodec = str(fmt.get("vcodec") or "none").strip()
+                    if not acodec or acodec == "none" or vcodec not in ("none", ""):
+                        continue
+                    abr = float(fmt.get("abr") or 0)
+                    size = fmt.get("filesize") or fmt.get("filesize_approx") or 0
+                    if size and int(size) > MUSIC_MAX_BYTES:
+                        continue
+                    if abr and abr > 192:
+                        continue
+                    formats.append(fmt)
+
+                def score(fmt):
+                    abr = float(fmt.get("abr") or 0)
+                    size = int(fmt.get("filesize") or fmt.get("filesize_approx") or 0)
+                    proto = str(fmt.get("protocol") or "").casefold()
+                    # Prefer progressive/direct HTTPS audio, then 128-192 kbps,
+                    # while avoiding large files.
+                    proto_bonus = 2 if proto.startswith("http") else 0
+                    abr_score = -abs(160 - abr) if abr else -50
+                    size_penalty = -(size / (1024 * 1024 * 10)) if size else 0
+                    return (proto_bonus, abr_score, size_penalty)
+
+                chosen = max(formats, key=score) if formats else None
+                direct_url = str((chosen or {}).get("url") or info.get("url") or "").strip()
+                if not direct_url:
+                    continue
+                source = str(info.get("extractor_key") or info.get("extractor") or "YouTube")
+                return {
+                    "id": str(info.get("id") or ""),
+                    "title": str(info.get("title") or q),
+                    "uploader": str(info.get("uploader") or info.get("channel") or source),
+                    "duration": duration,
+                    "url": direct_url,
+                    "source": source,
+                }
+            except Exception as exc:
+                errors.append(f"{client}: {type(exc).__name__}: {exc}")
+                continue
+        if errors:
+            self.log("[MUSIC] direct live source failed:", " | ".join(errors[-6:]))
+        return None
+
     def _music_download(self,query):
         """Search/download public audio and return an MP3 ready for TalkinChat.
 
@@ -7512,11 +7624,14 @@ class TalkinBot:
                 "quiet":True,"no_warnings":True,"noplaylist":True,
                 "format":"bestaudio[abr<=192][filesize<=64M]/bestaudio[abr<=192]/bestaudio[filesize<=64M]",
                 "outtmpl":template,
-                "socket_timeout":30,"retries":3,"fragment_retries":3,
-                "extractor_retries":2,"file_access_retries":2,
+                "socket_timeout":25,"retries":2,"fragment_retries":2,
+                "extractor_retries":1,"file_access_retries":2,
                 "cachedir":False,"overwrites":True,
-                "concurrent_fragment_downloads":8,
-                "buffersize":1024*1024,
+                "continuedl":True,
+                "concurrent_fragment_downloads":MUSIC_CONCURRENT_FRAGMENTS,
+                "buffersize":MUSIC_BUFFER_SIZE,
+                "http_chunk_size":MUSIC_HTTP_CHUNK_SIZE,
+                "throttled_rate":MUSIC_THROTTLED_RATE,
                 "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"},
                 "check_formats":False,
                 "js_runtimes":{"node":{}},
@@ -7620,15 +7735,25 @@ class TalkinBot:
                         artist = str(audius.get("uploader") or "Audius")
                         self.log("[MUSIC] live source=Audius title=", title, "room=", room)
                     else:
-                        # الاحتياطي القديم: SoundCloud ثم YouTube عبر yt-dlp.
-                        if not public_base:
-                            raise RuntimeError("لا يوجد رابط عام للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
-                        info, path = self._music_download(query)
-                        title=str(info.get("title") or query)
-                        artist=str(info.get("uploader") or info.get("channel") or "YouTube")
-                        duration=int(info.get("duration") or 0)
-                        url=public_base+"/media/"+path.name
-                        self.log("[MUSIC] live source=legacy fallback title=", title, "room=", room)
+                        # Fast fallback: resolve a DIRECT audio URL, so live
+                        # playback can start without waiting for a full download.
+                        direct = self._music_live_source(query)
+                        if direct:
+                            info = direct
+                            url = str(direct.get("url") or "")
+                            duration = int(direct.get("duration") or 0)
+                            title = str(direct.get("title") or query)
+                            artist = str(direct.get("uploader") or "Music")
+                            self.log("[MUSIC] live source=direct title=", title, "room=", room)
+                        else:
+                            if not public_base:
+                                raise RuntimeError("لا يوجد رابط عام للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
+                            info, path = self._music_download(query)
+                            title=str(info.get("title") or query)
+                            artist=str(info.get("uploader") or info.get("channel") or "YouTube")
+                            duration=int(info.get("duration") or 0)
+                            url=public_base+"/media/"+path.name
+                            self.log("[MUSIC] live source=legacy fallback title=", title, "room=", room)
                 else:
                     # Fast path: Audius exposes a direct MP3 stream, so when
                     # the requested track exists there we can send it without
@@ -10580,6 +10705,17 @@ class TalkinBot:
             or re.match(r"^l@mfb$", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
         )
+        # A pending room-join language choice belongs to the user who started
+        # `دخول@...`, even when that user is not a master.  Handle it before
+        # the master-only management permission gate.
+        if str(body or "").strip().casefold() in ("1", "2"):
+            pending_join = getattr(self, "_pending_room_language", {}).get(self._room_language_pending_key(sender))
+            if isinstance(pending_join, dict):
+                response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
+                return self._complete_join_rooms_language(
+                    sender, str(body).strip(), response_room=response_room, is_private=is_private
+                )
+
         join_command = bool(re.match(r"^دخول@.+$", str(body or "").strip(), re.I))
         join_all_command = str(body or "").strip().casefold() in {"دخول الكل", "دخولكل", "join all"}
         verification_manager_command = _is_verification_manager_command(body)
@@ -10646,8 +10782,37 @@ class TalkinBot:
     def _room_language_pending_key(self, sender):
         return _norm_user(sender)
 
-    def _begin_join_rooms_language(self, sender, rooms):
-        """Ask once for language, then join all requested rooms."""
+    def _find_pending_join_for_message(self, sender, room=""):
+        """Find the pending join-language request even when the room event
+        exposes a slightly different sender field than ChatMessage did."""
+        pending_map = getattr(self, "_pending_room_language", {}) or {}
+        direct = pending_map.get(self._room_language_pending_key(sender))
+        if isinstance(direct, dict):
+            return self._room_language_pending_key(sender), direct
+        room_key = _norm_room(room).casefold() if str(room or "").strip() else ""
+        now = time.time()
+        candidates = []
+        for key, value in pending_map.items():
+            if not isinstance(value, dict):
+                continue
+            created = float(value.get("created", 0) or 0)
+            if created and now - created > 180:
+                continue
+            response_room = str(value.get("response_room") or "").strip()
+            if room_key and response_room and _norm_room(response_room).casefold() == room_key:
+                candidates.append((created, key, value))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            _, key, value = candidates[0]
+            return key, value
+        return None, None
+
+    def _begin_join_rooms_language(self, sender, rooms, response_room="", is_private=True):
+        """Ask once for language, then join all requested rooms.
+
+        Keep the reply context with the pending request so a normal user can
+        issue `دخول@الغرفة` from inside a room and answer `1`/`2` there.
+        """
         cleaned=[]
         seen=set()
         for value in rooms or []:
@@ -10666,25 +10831,32 @@ class TalkinBot:
         self._pending_room_language[self._room_language_pending_key(sender)]={
             "rooms": cleaned,
             "created": time.time(),
+            "response_room": str(response_room or "").strip(),
+            "is_private": bool(is_private),
         }
         preview=" ".join(cleaned[:20])
         extra=" ..." if len(cleaned)>20 else ""
-        self.send_private_text(
-            sender,
+        prompt=(
             "🌐 اختر لغة البوت للغرف المحددة\n"
             f"🏠 الغرف: {preview}{extra}\n\n"
             "1️⃣ العربية\n2️⃣ English\n\n"
             "أرسل 1 أو 2."
         )
+        if is_private:
+            self.send_private_text(sender, prompt)
+        elif response_room:
+            self.send_room_text(response_room, prompt)
+        else:
+            self.send_private_text(sender, prompt)
         return True
 
-    def _complete_join_rooms_language(self, sender, choice):
-        pending=getattr(self,"_pending_room_language",{}).get(self._room_language_pending_key(sender))
+    def _complete_join_rooms_language(self, sender, choice, response_room="", is_private=None):
+        pending_key, pending = self._find_pending_join_for_message(sender, response_room)
         if not isinstance(pending,dict):
             return False
         created=float(pending.get("created",0) or 0)
         if created and time.time()-created > 180:
-            self._pending_room_language.pop(self._room_language_pending_key(sender),None)
+            self._pending_room_language.pop(pending_key or self._room_language_pending_key(sender),None)
             self.send_private_text(sender,"⌛ انتهت مهلة اختيار اللغة. أرسل أمر دخول الغرف من جديد.")
             return True
         choice=str(choice or "").strip().casefold()
@@ -10692,7 +10864,7 @@ class TalkinBot:
             return False
         lang="ar" if choice=="1" else "en"
         rooms=list(pending.get("rooms") or [])
-        self._pending_room_language.pop(self._room_language_pending_key(sender),None)
+        self._pending_room_language.pop(pending_key or self._room_language_pending_key(sender),None)
         if not hasattr(self,"room_languages"):
             self.room_languages={}
         sent=0
@@ -10708,14 +10880,25 @@ class TalkinBot:
                 skipped+=1
                 self.log("[ROOM] multi join failed:", target, repr(exc))
         label="العربية" if lang=="ar" else "English"
-        self.send_private_text(
-            sender,
+        saved_room = str(pending.get("response_room") or "").strip()
+        target_room = str(response_room or saved_room).strip()
+        if is_private is None:
+            private_reply = bool(pending.get("is_private", True))
+        else:
+            private_reply = bool(is_private)
+        result_msg=(
             f"✅ تم اختيار اللغة: {label}\n"
             f"🏠 عدد الغرف: {len(rooms)}\n"
             f"📨 أُرسلت طلبات الدخول: {sent}\n"
             f"⚠️ تخطّي/فشل: {skipped}\n"
             "⏳ انتظر تأكيد الخادم لكل غرفة."
         )
+        if private_reply:
+            self.send_private_text(sender, result_msg)
+        elif target_room:
+            self.send_room_text(target_room, result_msg)
+        else:
+            self.send_private_text(sender, result_msg)
         return True
 
     def _add_rooms_to_saved_file(self, sender, raw_rooms):
@@ -11303,7 +11486,10 @@ class TalkinBot:
                     self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(target)}
             self._save_blocked_rooms()
             _save_persistent_rooms(self.known_rooms)
-            return self._begin_join_rooms_language(sender, rooms)
+            response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
+            return self._begin_join_rooms_language(
+                sender, rooms, response_room=response_room, is_private=is_private
+            )
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
         if m_transfer and _is_verified_user(sender):
             target, amount = m_transfer.group(1).strip().lstrip("@"), int(m_transfer.group(2))
@@ -11690,9 +11876,15 @@ class TalkinBot:
                 self._save_blocked_rooms()
                 _save_persistent_rooms(self.known_rooms)
             if self.join_room(target, force=True, requested_by=sender):
-                self.send_private_text(sender, f"⏳ تم إرسال طلب دخول الغرفة: {target}. انتظر تأكيد الخادم.")
+                msg = f"⏳ تم إرسال طلب دخول الغرفة: {target}. انتظر تأكيد الخادم."
             else:
-                self.send_private_text(sender, f"⚠️ تعذر إرسال طلب دخول الغرفة: {target}.")
+                msg = f"⚠️ تعذر إرسال طلب دخول الغرفة: {target}."
+            if is_private:
+                self.send_private_text(sender, msg)
+            elif room:
+                self.send_room_text(room, msg)
+            else:
+                self.send_private_text(sender, msg)
             return True
         if low in ("خروج","leave","exit") or low.startswith(("خروج ","leave ","exit ")):
             parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
@@ -12383,6 +12575,16 @@ class TalkinBot:
         if frm == BOT_ID:
             return
 
+        # Complete an in-room `دخول@اسم_الغرفة` language selection before
+        # admin/verification gates.  This is intentionally available to normal
+        # users because the original join request itself is public.
+        if body.strip().casefold() in ("1", "2"):
+            pending_join = getattr(self, "_pending_room_language", {}).get(self._room_language_pending_key(frm))
+            if isinstance(pending_join, dict):
+                response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
+                if self._complete_join_rooms_language(frm, body.strip(), response_room=response_room, is_private=False):
+                    return
+
         # Direct private message for everyone:
         #   رساله اسم_المستخدم نص الرسالة
         #   رساله@اسم_المستخدم نص الرسالة
@@ -12843,7 +13045,7 @@ class TalkinBot:
                         # A pending multi-room join language choice has priority
                         # over game commands; otherwise "1" starts Ludo and the
                         # bot may join/respond in the wrong context.
-                        if body.strip().casefold() in ("1", "2") and self._complete_join_rooms_language(frm, body.strip()):
+                        if body.strip().casefold() in ("1", "2") and self._complete_join_rooms_language(frm, body.strip(), response_room=self.room, is_private=True):
                             return
                         if self._handle_management_command(self.room, body, frm, is_private=True):
                             return
@@ -12895,7 +13097,7 @@ class TalkinBot:
                                 self._pending_add_rooms = {}
                             self._pending_add_rooms[_norm_user(frm)] = {"created": time.time()}
                             self.send_private_text(frm, "📁 أضف الغرف إلى ملف الغرف\n📨 أرسل أسماء الغرف مفصولة بمسافة.\nمثال: مشاعر ادم نبض قلوب سوالف")
-                        elif body.strip().casefold() in ("1", "2") and self._complete_join_rooms_language(frm, body.strip()):
+                        elif body.strip().casefold() in ("1", "2") and self._complete_join_rooms_language(frm, body.strip(), response_room=ctx_room, is_private=True):
                             return
                         elif body.strip().casefold() in ("تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات") and _is_primary_master(frm):
                             if body.strip().casefold() == "تشغيل الدعوات":
