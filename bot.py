@@ -123,10 +123,26 @@ GAME_IMAGE_FILES = {
     "ludo": "game_ludo.jpg",
 }
 GAME_COMMANDS = {}
-# Railway exposes this service through RAILWAY_PUBLIC_DOMAIN after a public domain is generated.
+# Hosting providers expose the service through different environment variables.
+# Railway is supported first for backward compatibility; the generic aliases are
+# useful on hosts such as Alghorab that do not define RAILWAY_PUBLIC_DOMAIN.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 GIFT_PUBLIC_BASE_URL = os.getenv("GIFT_PUBLIC_BASE_URL", "").strip().rstrip("/")
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+GENERIC_PUBLIC_BASE_URL = next(
+    (
+        os.getenv(name, "").strip().rstrip("/")
+        for name in (
+            "ALGHORAB_PUBLIC_URL",
+            "APP_PUBLIC_URL",
+            "SERVICE_PUBLIC_URL",
+            "PUBLIC_URL",
+            "APP_URL",
+        )
+        if os.getenv(name, "").strip()
+    ),
+    "",
+)
 
 def _public_base_url():
     domain = RAILWAY_PUBLIC_DOMAIN
@@ -134,7 +150,10 @@ def _public_base_url():
         if not domain.startswith(("http://", "https://")):
             domain = "https://" + domain
         return domain.rstrip("/")
-    return (PUBLIC_BASE_URL or GIFT_PUBLIC_BASE_URL).rstrip("/")
+    base = (PUBLIC_BASE_URL or GIFT_PUBLIC_BASE_URL or GENERIC_PUBLIC_BASE_URL).strip().rstrip("/")
+    if base and not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    return base
 
 MEDIA_PUBLIC_BASE_URL = _public_base_url()
 ASSET_HTTP_PORT = int(os.getenv("PORT", "8080"))
@@ -3612,6 +3631,17 @@ def start_runtime_cleanup(stop_event=None):
 
 
 class _MediaHandler(SimpleHTTPRequestHandler):
+    def _send_health(self):
+        """Return a lightweight 200 response for hosting-provider health checks."""
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
     def _resolve_target(self):
         path=unquote(urlparse(self.path).path)
         if path.startswith("/assets/"):
@@ -3641,6 +3671,12 @@ class _MediaHandler(SimpleHTTPRequestHandler):
         }.get(target.suffix.lower(),"application/octet-stream")
 
     def _serve(self,head_only=False):
+        request_path = urlparse(self.path).path
+        # Several bot hosts probe / or /health before routing public requests.
+        # Returning 404 here makes an otherwise healthy process appear as 502.
+        if request_path in ("", "/", "/health", "/healthz"):
+            self._send_health()
+            return
         target=self._resolve_target()
         if not target:
             self.send_error(404); return
