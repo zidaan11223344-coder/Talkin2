@@ -538,6 +538,9 @@ AUTH_METHOD = "1"
 
 # Keep these enabled for easy troubleshooting.
 DEBUG = os.getenv("DEBUG", "0") == "1"
+# Temporary emergency workaround for an expired chatp.net certificate.
+# Keep this disabled unless the Talkin server certificate is confirmed broken.
+ALLOW_INSECURE_TLS = os.getenv("ALLOW_INSECURE_TLS", "0").strip() == "1"
 # Quiet hosting mode: do not continuously write diagnostics to Railway stdout
 # or to the persistent runtime log. Set QUIET_MODE=0 and DEBUG=1 temporarily
 # only when troubleshooting is needed.
@@ -903,7 +906,13 @@ class RawWebSocket:
 
         # Android Client obtains the platform default SSLSocketFactory.
         if self.scheme == "wss":
-            ctx = ssl.create_default_context()
+            # Temporary emergency switch for an expired Talkin certificate.
+            # Keep certificate verification enabled by default.
+            ctx = (
+                ssl._create_unverified_context()
+                if ALLOW_INSECURE_TLS
+                else ssl.create_default_context()
+            )
             self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
         else:
             self.sock = raw
@@ -4348,6 +4357,7 @@ class TalkinBot:
             data=body,
             headers={"Content-Type": "application/octet-stream", "User-Agent": "Talkinchat/1.0 (Android 12; net.chatp)"},
             timeout=15,
+            verify=not ALLOW_INSECURE_TLS,
         )
         r.raise_for_status()
         self.auth = decode_auth_result(r.content)
