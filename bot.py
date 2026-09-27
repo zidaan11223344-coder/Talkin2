@@ -23,6 +23,7 @@ import html
 import io
 import sys
 import inspect
+import gc
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, unquote, urlencode
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -176,7 +177,7 @@ MASTER_SUPPORT_USERNAME = os.getenv(
     "MASTER_SUPPORT_USERNAME",
     "∫♚∫اݪـــۛــ⃮ـاۿــ𓏺𓏺ـيّـــّٰـبــۃ∫♚∫",
 ).strip()
-MASTER_SERVICE_ENABLED = os.getenv("MASTER_SERVICE_ENABLED", "0") == "1"
+MASTER_SERVICE_ENABLED = os.getenv("RUNNING_AS_MASTER", "0") == "1"
 # Experimental Talkin live-room actions.  These names are configurable because
 # older APK/server builds use different Query action strings.  The defaults
 # match the action family observed by the current bot transport.
@@ -263,7 +264,10 @@ def _start_master_process():
         env = os.environ.copy()
         env["MASTER_ID"] = master_id
         env["MASTER_PWD"] = master_pwd
+        # This flag belongs only to the standalone master process.
+        # The primary bot ignores MASTER_SERVICE_ENABLED from .env.
         env["MASTER_SERVICE_ENABLED"] = "1"
+        env["RUNNING_AS_MASTER"] = "1"
         env["GROUP_TO_JOIN"] = ""
         env["FIRST_ROOM"] = ""
         env["PRIMARY_BOT_ID"] = BOT_ID
@@ -542,6 +546,8 @@ CLEANUP_GENERATED_ENABLED = os.getenv("CLEANUP_GENERATED_ENABLED", "1").strip() 
 CLEANUP_CACHE_ENABLED = os.getenv("CLEANUP_CACHE_ENABLED", "1").strip() == "1"
 CLEANUP_LOG_ENABLED = os.getenv("CLEANUP_LOG_ENABLED", "1").strip() == "1"
 CLEANUP_TMP_ENABLED = os.getenv("CLEANUP_TMP_ENABLED", "1").strip() == "1"
+CLEANUP_MEMORY_ENABLED = os.getenv("CLEANUP_MEMORY_ENABLED", "1").strip() == "1"
+CLEANUP_MEMORY_MAX_AGE_SECONDS = max(300, int(os.getenv("CLEANUP_MEMORY_MAX_AGE_SECONDS", "1800")))
 
 RAW_DIAGNOSTIC = os.getenv("RAW_DIAGNOSTIC", "0") == "1"
 ACK_ROOM_EVENTS = os.getenv("ACK_ROOM_EVENTS", "1") == "1"
@@ -1017,7 +1023,7 @@ class RawWebSocket:
 
     def send_binary(self, payload):
         payload = bytes(payload)
-        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1800"))
+        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "950"))
         if len(payload) > max_bytes:
             print(f"[WS_DROP_OVERSIZE] تم تجاهل إرسال حزمة WebSocket بحجم {len(payload)} بايت لتجاوزها الحد الآمن ({max_bytes} بايت) لمنع فصل الخادم برمز 1009.", flush=True)
             return
@@ -1861,8 +1867,13 @@ def _master_list():
     return data if isinstance(data,list) else []
 
 def _is_master_name(name):
-    n=_norm_user(name)
-    return bool(n and (n == _norm_user(BOT_MASTER) or n in {_norm_user(x) for x in _master_list()}))
+    n = _norm_user(name)
+    configured = {
+        _norm_user(BOT_MASTER),
+        _norm_user(os.getenv("MASTER_ID", "").strip()),
+    }
+    configured.discard("")
+    return bool(n and (n in configured or n in {_norm_user(x) for x in _master_list()}))
 def _mvip_master_list():
     data = _load_local_json(MVIP_MASTERS_FILE, [])
     return data if isinstance(data, list) else []
@@ -2585,7 +2596,7 @@ def _default_help_sections():
     return {
         1: [
             '📋 أوامر الإدارة — 1\n━━━━━━━━━━━━\nk@اسم — طرد عضو\nkick اسم — طرد عضو\nb@اسم — حظر عضو\nban اسم — حظر عضو\nbl@اسم — حظر عضو بالقائمة\namf@اسم — استثناء من حظر الفلتر\nl@mf — عرض كلمات الفلتر\nl@mfb — المحظورون من الفلتر مع السبب\nl@mbp — المحظورون من النشر\nmbp@اسم — فك منع النشر عن مستخدم\nحماية — إعداد حماية الغرفة\nub@اسم — فك الحظر\nu@اسم — فك الحظر\nunban اسم — فك الحظر\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك',
-            '📋 أوامر الإدارة — 2\n━━━━━━━━━━━━\nتشغيل الحماية — تشغيل حماية الغرفة\nإيقاف الحماية — إيقاف حماية الغرفة\nmr@عدد — تحديد حد التكرار\nخاص@النص — إرسال رسالة خاصة لجميع المستخدمين\nرسالة@النص — نفس الأمر\nbroadcast@النص — نفس الأمر\nنسخ احتياطي — إنشاء نسخة احتياطية\nإعادة تشغيل البوت — إعادة تشغيل البوت\nتشغيل الماستر — تشغيل حساب الماستر\nإيقاف الماستر — إيقاف حساب الماستر\nحالة الماستر — حالة حساب الماستر\n\n📌 هذه الأوامر مخصصة للماستر/الإدارة حسب صلاحية الأمر.',
+            '📋 أوامر الإدارة — 2\n━━━━━━━━━━━━\nتشغيل الحماية — تشغيل حماية الغرفة\nإيقاف الحماية — إيقاف حماية الغرفة\nmr@عدد — تحديد حد التكرار\nخاص@النص — إرسال رسالة خاصة لجميع المستخدمين\nرسالة@النص — نفس الأمر\nbroadcast@النص — نفس الأمر\nنسخ احتياطي — إنشاء نسخة احتياطية\nإعادة تشغيل البوت — إعادة تشغيل البوت\nتشغيل الماستر — تشغيل حساب الماستر\nإيقاف الماستر — إيقاف حساب الماستر\nحالة الماستر — حالة حساب الماستر\nتنضيف — تنظيف ملفات التشغيل والذاكرة المؤقتة (ماستر فقط)\nحالة الحماية — فحص حالة حماية الغرفة فعلياً\nحالة البوت — فحص الاتصال والخدمات والذاكرة\n\n📌 هذه الأوامر مخصصة للماستر/الإدارة حسب صلاحية الأمر.',
         ],
         2: [
             '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال: .sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
@@ -3742,10 +3753,10 @@ def _safe_remove_tree(path):
     return 0
 
 
-def _cleanup_runtime_files():
-    """Delete old transient media/cache files without touching persistent bot data."""
+def _cleanup_runtime_files(bot=None):
+    """Delete disposable runtime files and optionally prune in-memory caches. Persistent bot data is never touched."""
     if not _CLEANUP_LOCK.acquire(blocking=False):
-        return
+        return {"files": 0, "dirs": 0, "memory": False}
     try:
         now = time.time()
         removed_files = 0
@@ -3857,17 +3868,24 @@ def _cleanup_runtime_files():
             except Exception:
                 pass
 
+        memory_cleaned = False
+        if bot is not None and CLEANUP_MEMORY_ENABLED:
+            try:
+                memory_cleaned = bool(bot._cleanup_memory_state())
+            except Exception:
+                memory_cleaned = False
         if DEBUG and not QUIET_MODE:
-            print(f"[CLEANUP] removed files={removed_files} dirs={removed_dirs}", flush=True)
+            print(f"[CLEANUP] removed files={removed_files} dirs={removed_dirs} memory={memory_cleaned}", flush=True)
+        return {"files": removed_files, "dirs": removed_dirs, "memory": memory_cleaned}
     finally:
         _CLEANUP_LOCK.release()
 
 
-def _runtime_cleanup_worker(stop_event=None):
-    """Run cleanup once at startup and then every hour."""
+def _runtime_cleanup_worker(stop_event=None, bot=None):
+    """Run cleanup once at startup and then on the configured interval."""
     while stop_event is None or not stop_event.is_set():
         try:
-            _cleanup_runtime_files()
+            _cleanup_runtime_files(bot=bot)
         except Exception:
             pass
         if stop_event is not None:
@@ -3877,10 +3895,10 @@ def _runtime_cleanup_worker(stop_event=None):
             time.sleep(CLEANUP_INTERVAL_SECONDS)
 
 
-def start_runtime_cleanup(stop_event=None):
+def start_runtime_cleanup(stop_event=None, bot=None):
     t = threading.Thread(
         target=_runtime_cleanup_worker,
-        args=(stop_event,),
+        args=(stop_event, bot),
         name="runtime-cleanup",
         daemon=True,
     )
@@ -4659,9 +4677,115 @@ class TalkinBot:
             path if path is not None else getattr(self, "ws_path", WS_PATHS[0]),
         )
 
+    def _report_oversize_delivery(self, packet_type, target, room, size, error_text=""):
+        """Report an oversized outgoing packet without ever killing the bot."""
+        size = int(size or 0)
+        target = str(target or "").strip()
+        room = str(room or "").strip()
+        detail = str(error_text or "تجاوز حجم حزمة WebSocket الحد الآمن").strip()[:700]
+        context = "رسالة خاصة" if packet_type == "chat_message" else "رسالة غرفة" if packet_type == "room_message" else "حزمة WebSocket"
+        location = f" | الغرفة: {room}" if room else (f" | إلى: @{target}" if target else "")
+        master_msg = (
+            "⚠️ تم تجاهل إرسال رسالة كبيرة لمنع فصل البوت."
+            f"\n📦 الحجم: {size} بايت"
+            f"\n📍 النوع: {context}{location}"
+            f"\n❌ التفاصيل: {detail}"
+            "\n📨 تم إرسال للمستخدم: غير قادر على إرسال الرسالة."
+        )
+        self.log("[WS_OVERSIZE_HANDLED]", master_msg.replace("\n", " | "))
+
+        # Send the real diagnostic to the configured master privately.
+        if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
+            try:
+                self.send_private_text(BOT_MASTER, master_msg)
+            except Exception as exc:
+                self.log("[WS_OVERSIZE] master notification failed:", repr(exc))
+
+        # Also send the diagnostic to the configured Telegram chat.
+        if TELEGRAM_BOT_TOKEN:
+            chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
+            if chat_id:
+                try:
+                    self._telegram_api("sendMessage", chat_id=chat_id, text=master_msg)
+                except Exception as exc:
+                    self.log("[WS_OVERSIZE] Telegram notification failed:", repr(exc))
+
+    def _send_oversize_user_notice(self, packet_type, target, room):
+        """Best-effort small user-facing message; never raises."""
+        notice = "❌ غير قادر على إرسال الرسالة، حجمها أكبر من الحد المسموح."
+        try:
+            if packet_type == "chat_message" and target:
+                if _norm_user(target) != _norm_user(BOT_ID):
+                    payload = encode_query("chat_message", type_="text", to=target, body=notice)
+                    if len(payload) <= int(os.getenv("WS_MAX_MESSAGE_BYTES", "950")):
+                        self.ws.send_binary(payload)
+                return
+            if packet_type == "room_message" and room:
+                payload = encode_query("room_message", type_="text", room=room, body=notice)
+                if len(payload) <= int(os.getenv("WS_MAX_MESSAGE_BYTES", "950")):
+                    self.ws.send_binary(payload)
+        except Exception as exc:
+            self.log("[WS_OVERSIZE] user notice failed:", repr(exc))
+
     def send_query(self, payload: bytes):
         if not self.ws:
             raise RuntimeError("WebSocket is not connected")
+
+        # Never pass an oversized protobuf packet to RawWebSocket. The server
+        # closes the whole connection with 1009, so handle it locally instead.
+        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "950"))
+        payload = bytes(payload)
+        if len(payload) > max_bytes:
+            packet_type = ""
+            target = ""
+            room = ""
+            body = ""
+            try:
+                fields = decode_message(payload)
+                packet_type = as_text((fields.get(1) or [b""])[0])
+                target = as_text((fields.get(4) or [b""])[0])
+                body = as_text((fields.get(5) or [b""])[0])
+                room = as_text((fields.get(6) or [b""])[0])
+            except Exception as exc:
+                self.log("[WS_OVERSIZE] decode failed:", repr(exc))
+
+            # If the oversized packet is a real text message, send the ORIGINAL
+            # message to Telegram instead of sending only an error/diagnostic.
+            # The WebSocket packet is still blocked so the server cannot close
+            # the bot with code 1009.
+            if packet_type in {"chat_message", "room_message"} and body:
+                telegram_title = "رسالة طويلة من البوت"
+                if packet_type == "room_message" and room:
+                    telegram_title = f"رسالة طويلة من غرفة: {room}"
+                elif packet_type == "chat_message" and target:
+                    telegram_title = f"رسالة طويلة إلى: @{target}"
+                try:
+                    telegram_sent = bool(self._send_long_text_to_telegram(body, title=telegram_title))
+                except Exception as exc:
+                    telegram_sent = False
+                    self.log("[TELEGRAM] oversized packet routing failed:", repr(exc))
+                if telegram_sent:
+                    # Master gets only a short confirmation, never the long diagnostic.
+                    if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
+                        try:
+                            self.send_private_text(BOT_MASTER, "📨 تم إرسال الرسالة الطويلة كاملة إلى Telegram.")
+                        except Exception as exc:
+                            self.log("[WS_OVERSIZE] master short notification failed:", repr(exc))
+                else:
+                    self._report_oversize_delivery(
+                        packet_type, target, room, len(payload),
+                        "تعذر إرسال الرسالة الطويلة إلى Telegram"
+                    )
+                self._send_oversize_user_notice(packet_type, target, room)
+                return False
+
+            # No recoverable text body (for example a non-text packet): keep the
+            # old diagnostic path.
+            self._report_oversize_delivery(packet_type, target, room, len(payload), "حزمة WebSocket تجاوزت 950 بايت")
+            if packet_type in {"chat_message", "room_message"}:
+                self._send_oversize_user_notice(packet_type, target, room)
+            return False
+
         # Keep a compact trace of the live protocol. This is intentionally
         # limited to stream actions and never logs credentials or media URLs.
         try:
@@ -4676,6 +4800,7 @@ class TalkinBot:
         except Exception as exc:
             self.log("[STREAM_OUT] decode failed:", repr(exc))
         self.ws.send_binary(payload)
+        return True
 
     def _start_heartbeat(self):
         """Keep the realtime socket alive while the room is idle.
@@ -4756,6 +4881,19 @@ class TalkinBot:
                 "قد يكون البوت محظوراً من الغرفة أو تحتاج الغرفة إلى صلاحية مشرف/أونر. "
                 "تحقق من صلاحية البوت ثم أعد المحاولة.",
             )
+
+    def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
+        """Auto rejoin a room immediately when kicked or removed."""
+        if not room:
+            return
+        def _rejoin_worker():
+            time.sleep(delay)
+            try:
+                self.log(f"[AUTO_REJOIN] Attempting to rejoin {room}...")
+                self.join_room(room, force=True)
+            except Exception as e:
+                self.log(f"[AUTO_REJOIN] Rejoin failed for {room}:", repr(e))
+        threading.Thread(target=_rejoin_worker, name=f"auto-rejoin-{room}", daemon=True).start()
 
     def join_room(self, room: str, force: bool = False, requested_by: str = ""):
         """Join a room, allowing a previously-left room to be joined again.
@@ -4905,10 +5043,11 @@ class TalkinBot:
         return [text] if text else [""]
 
     def _send_long_text_to_telegram(self, text: str, title="رسالة طويلة من البوت"):
-        """Send oversized Talkin text to Telegram as a UTF-8 text document.
+        """Send the complete oversized Talkin message to Telegram.
 
-        Returning False never raises: callers can safely fall back to the normal
-        Talkin chunking path when Telegram is not configured or temporarily fails.
+        Uses a normal Telegram text message when possible. If Telegram's text
+        limit is exceeded, sends the complete original text as a UTF-8 .txt
+        document. Never raises to the caller.
         """
         if not TELEGRAM_LONG_TEXT_ENABLED or not TELEGRAM_BOT_TOKEN:
             return False
@@ -4919,21 +5058,34 @@ class TalkinBot:
         if not text:
             return False
         try:
+            title = str(title or "رسالة طويلة من البوت").strip()[:900]
+            # Telegram text messages support up to about 4096 characters.
+            if len(text) <= 4000:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    data={"chat_id": chat_id, "text": text},
+                    timeout=30,
+                )
+                data = response.json()
+                if bool(data.get("ok")):
+                    self.log(f"[TELEGRAM] long text sent as message ({len(text)} chars)")
+                    return True
+                self.log("[TELEGRAM] sendMessage failed:", str(data)[:1200])
+
             stamp = time.strftime("%Y%m%d_%H%M%S")
             filename = f"talkin_long_{stamp}.txt"
             payload = text.encode("utf-8")
-            caption = str(title or "رسالة طويلة من البوت")[:900]
             response = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                data={"chat_id": chat_id, "caption": caption},
+                data={"chat_id": chat_id, "caption": title},
                 files={"document": (filename, io.BytesIO(payload), "text/plain; charset=utf-8")},
                 timeout=60,
             )
             data = response.json()
             if bool(data.get("ok")):
-                self.log(f"[TELEGRAM] long text routed successfully ({len(text)} chars)")
+                self.log(f"[TELEGRAM] long text sent as document ({len(text)} chars)")
                 return True
-            self.log("[TELEGRAM] long text sendDocument failed:", str(data)[:1200])
+            self.log("[TELEGRAM] sendDocument failed:", str(data)[:1200])
         except Exception as exc:
             self.log("[TELEGRAM] long text upload failed:", repr(exc))
         return False
@@ -4964,86 +5116,76 @@ class TalkinBot:
             return False
 
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
-        """Send every textual result in safe ordered chunks, like A3.
-
-        Talkin can close the WebSocket when a large result is sent as one
-        protobuf packet.  All text responses therefore use the same line-based
-        batching rule as the A3 command: short packets, preserved order, and
-        no loss of lines.
-        """
+        """Send one text message unless the actual protobuf packet exceeds 950 bytes."""
         text = str(text or "")
         if not text:
             return True
 
-        # Do not put large processing/results payloads on the Talkin WebSocket.
-        # A server-side 1009 close can happen before normal chunking gets a chance
-        # to help when the complete result itself is large. Telegram receives the
-        # full text as a document, while Talkin gets only a short safe notice.
-        if len(text) > TELEGRAM_LONG_TEXT_CHARS:
-            title = "📋 نتيجة طويلة من البوت"
-            if packet_type == "room_message":
-                title = f"📋 رسالة طويلة | الغرفة: {str(kwargs.get('room') or '')[:120]}"
-            elif packet_type == "chat_message":
-                title = f"📋 رسالة طويلة | إلى: {str(kwargs.get('to') or '')[:120]}"
-            if self._send_long_text_to_telegram(text, title=title):
-                return self._long_text_notice(packet_type, kwargs)
-            # Telegram unavailable? Keep the existing safe chunking fallback.
+        limit = int(os.getenv("WS_MAX_MESSAGE_BYTES", "950"))
 
-        limit = 320
-        max_lines = 18
-        lines = [line.strip() for line in text.split("\n") if line.strip()]
-        if not lines:
-            lines = [text[:limit]]
-        chunks = []
-        current = ""
-        count = 0
-        for line in lines:
-            # A single unusually long line is split too, so no result can
-            # produce an oversized packet.
-            while len(line) > limit:
-                piece = line[:limit]
-                if current:
-                    chunks.append(current)
-                    current = ""
-                    count = 0
-                chunks.append(piece)
-                line = line[limit:]
-            if not line:
-                continue
-            candidate = line if not current else current + "\n" + line
-            if current and (len(candidate) > limit or count >= max_lines):
-                chunks.append(current)
-                current = line
-                count = 1
-            else:
-                current = candidate
-                count += 1
-        if current:
-            chunks.append(current)
-        # Long results are paginated.  Only the first page is sent now; the
-        # user can type Ns to receive the next page.  This prevents a large
-        # result from flooding the room or closing the websocket.
-        if len(chunks) > 1:
-            if not hasattr(self, "_result_pages"):
-                self._result_pages = {}
-            room_key = str(kwargs.get("room") or "")
-            user_key = str(kwargs.get("to") or "")
-            key = (str(packet_type), room_key, user_key)
-            self._result_pages[key] = {
-                "pages": chunks,
-                "part": 1,
-                "created": time.time(),
-                "kwargs": dict(kwargs),
-            }
-            chunk = chunks[0] + "\n\n📌 للقائمة التالية اكتب Ns"
+        def make_payload(value):
+            payload = dict(kwargs)
+            payload["type_"] = "text"
+            payload["body"] = value
+            return encode_query(packet_type, **payload)
+
+        # Important: measure the COMPLETE WebSocket/protobuf payload, not just
+        # the text bytes. This prevents a 950-byte text from becoming e.g. a
+        # 990-byte protobuf packet and triggering server close code 1009.
+        if len(make_payload(text)) <= limit:
+            self.send_query(make_payload(text))
+            return True
+
+        # The complete message is too large for Talkin/WebSocket. Do NOT
+        # split it into visible Talkin messages. Route the original full text
+        # to Telegram instead, then tell the master privately that delivery
+        # was redirected successfully. This keeps the WebSocket connection
+        # safe from close code 1009.
+        telegram_title = "رسالة طويلة من البوت"
+        if packet_type == "room_message":
+            room_name = str(kwargs.get("room") or "").strip()
+            if room_name:
+                telegram_title = f"رسالة طويلة من غرفة: {room_name}"
+        elif packet_type == "chat_message":
+            target_name = str(kwargs.get("to") or "").strip()
+            if target_name:
+                telegram_title = f"رسالة طويلة إلى: @{target_name}"
+
+        telegram_sent = False
+        try:
+            telegram_sent = bool(self._send_long_text_to_telegram(text, title=telegram_title))
+        except Exception as exc:
+            self.log("[TELEGRAM] oversized message routing failed:", repr(exc))
+
+        if telegram_sent:
+            master_notice = (
+                "📨 تم إرسال الرسالة الطويلة إلى Telegram بنجاح."
+                f"\n📦 الحجم: {len(make_payload(text))} بايت"
+                f"\n📍 {telegram_title}"
+            )
+            self.log("[WS_OVERSIZE] long message routed to Telegram")
+            if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
+                try:
+                    self.send_private_text(BOT_MASTER, master_notice)
+                except Exception as exc:
+                    self.log("[WS_OVERSIZE] master Telegram-routing notice failed:", repr(exc))
         else:
-            chunk = chunks[0]
+            # Telegram was unavailable/failed; report the failure to the master
+            # and keep the bot alive without sending an oversized WebSocket packet.
+            self._report_oversize_delivery(
+                packet_type,
+                str(kwargs.get("to") or ""),
+                str(kwargs.get("room") or ""),
+                len(make_payload(text)),
+                "تعذر إرسال الرسالة الطويلة إلى Telegram"
+            )
 
-        payload = dict(kwargs)
-        payload["type_"] = "text"
-        payload["body"] = chunk
-        self.send_query(encode_query(packet_type, **payload))
-        return True
+        self._send_oversize_user_notice(
+            packet_type,
+            str(kwargs.get("to") or ""),
+            str(kwargs.get("room") or "")
+        )
+        return False
 
     def _send_help_chunks(self, packet_type: str, text: str, limit: int = 320, **kwargs):
         """Send one visible page at a time; use Ns for continuation."""
@@ -5111,6 +5253,71 @@ class TalkinBot:
             self.log("[UNDO] save last action failed:", repr(exc))
         self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
 
+    def _cleanup_memory_state(self):
+        """Prune bounded runtime caches and force Python GC without touching persistent data."""
+        now = time.time()
+        cutoff = now - CLEANUP_MEMORY_MAX_AGE_SECONDS
+        changed = False
+
+        # Transport de-duplication caches can grow during long-lived sessions.
+        for attr in ("_incoming_seen", "_management_command_seen"):
+            cache = getattr(self, attr, None)
+            if isinstance(cache, dict):
+                stale = []
+                for key, value in list(cache.items()):
+                    try:
+                        stamp = float(value if isinstance(value, (int, float)) else (value.get("created_at", 0) if isinstance(value, dict) else 0))
+                    except Exception:
+                        stamp = 0
+                    if stamp and stamp < cutoff:
+                        stale.append(key)
+                for key in stale:
+                    cache.pop(key, None)
+                if stale:
+                    changed = True
+                # Hard cap as a safety valve.
+                if len(cache) > 3000:
+                    for key in list(cache)[:len(cache) - 3000]:
+                        cache.pop(key, None)
+                    changed = True
+
+        # Message/repeat history is deliberately short-lived.
+        for mapping_name in ("last_messages", "_room_repeat_state", "_joinleave_state"):
+            mapping = getattr(self, mapping_name, None)
+            if isinstance(mapping, dict) and len(mapping) > 500:
+                for key in list(mapping)[:len(mapping) - 500]:
+                    mapping.pop(key, None)
+                changed = True
+
+        for mapping_name in ("game_cooldown", "board_game_cooldown"):
+            mapping = getattr(self, mapping_name, None)
+            if isinstance(mapping, dict):
+                stale = []
+                for key, value in list(mapping.items()):
+                    try:
+                        if float(value or 0) < cutoff:
+                            stale.append(key)
+                    except Exception:
+                        stale.append(key)
+                for key in stale:
+                    mapping.pop(key, None)
+                if stale:
+                    changed = True
+
+        # Never let a completed/old diagnostic command survive indefinitely.
+        inflight = getattr(self, "_inflight_command", None)
+        if isinstance(inflight, dict):
+            try:
+                if float(inflight.get("created_at", 0) or 0) < cutoff:
+                    self._inflight_command = None
+                    changed = True
+            except Exception:
+                self._inflight_command = None
+                changed = True
+
+        gc.collect()
+        return changed
+
     def _remember_inflight_command(self, room, body, sender, is_private=False):
         """Record the command currently entering the dispatcher.
 
@@ -5119,7 +5326,22 @@ class TalkinBot:
         reproduce and fix the failure after reconnect.
         """
         text = str(body or "").strip()
-        if not text or text.casefold() in {".u", "help", "مساعدة", "اوامر", "الأوامر"}:
+        if not text:
+            return
+        low = text.casefold()
+        if low in {".u", "help", "مساعدة", "اوامر", "الأوامر", "ns", "n", "التالي"}:
+            return
+        # IMPORTANT: this diagnostic record must contain only actual bot commands.
+        # Previously every normal room sentence was recorded here, so after a
+        # WebSocket 1009 reconnect the bot falsely reported ordinary chat text
+        # as the command that caused the disconnect.
+        is_command = bool(
+            _looks_like_admin_command(text)
+            or re.match(r"^(?:بث|\.تشغيل|\.sa|sher@|is@|vip@|\+vip@|-vip@|mf@|\+mf@|-mf@)\s*.+", text, re.I | re.S)
+            or re.match(r"^(?:sa|هدايا|gifts|gv|نقاطي|points|صعود|اصعد|إصعد|\.صعود)$", text, re.I)
+            or re.fullmatch(r"a[1-6]", text, re.I)
+        )
+        if not is_command:
             return
         self._inflight_command = {
             "command": text[:800],
@@ -5568,6 +5790,10 @@ class TalkinBot:
                     self.log("[STREAM_VERIFY] ❌ لم يتم إدخال أي إطار صوت فعلي إلى LiveKit:", room)
                     return False
 
+                # حماية WebSocket من خطأ 1009: روابط اليوتيوب المباشرة تتجاوز 1500 بايت
+                # وبث الصوت يتم عبر WebRTC/LiveKit، لذلك نرسل رابط قصير فقط إن وجد
+                safe_ws_url = str(packet_url) if len(str(packet_url)) <= 250 else ""
+
                 # 1. إرسال حزمة STREAM_AUDIO_ACTION
                 try:
                     self.send_query(encode_query(
@@ -5575,7 +5801,7 @@ class TalkinBot:
                         type_="audio",
                         room=room_id,
                         id_=session_id,
-                        url=str(packet_url),
+                        url=safe_ws_url,
                         length=str(max(0, int(duration or 0))),
                     ))
                     self.log("[STREAM] أُرسلت حزمة STREAM_AUDIO_ACTION بنجاح إلى:", room)
@@ -5590,7 +5816,7 @@ class TalkinBot:
                         type_="audio",
                         room=room_id,
                         id_=session_id,
-                        url=str(packet_url),
+                        url=safe_ws_url,
                         length=str(max(0, int(duration or 0))),
                     ))
                     audio_sent = True
@@ -6777,15 +7003,18 @@ class TalkinBot:
     def _offline_support_menu(self, username: str = ""):
         return self._master_service_menu(username)
 
-    def _handle_master_process_command(self, sender: str, body: str, is_private: bool = False):
-        """Control the standalone master account from the primary bot private chat."""
-        if not is_private or not _is_master_name(sender):
+    def _handle_master_process_command(self, sender: str, body: str, is_private: bool = False, room: str = ""):
+        """Control the standalone master account from private or room chat."""
+        if not _is_master_name(sender):
             return False
         low = str(body or "").strip().casefold()
         if low in ("تشغيل الماستر", "تشغيل الماستر@", "تشغيل الخدمة", "تشغيل الخدمه", "تشغيل", "start master", "master on"):
             before = _master_process_running()
             ok, msg = _start_master_process()
-            self.send_private_text(sender, msg)
+            if is_private or not room:
+                self.send_private_text(sender, msg)
+            else:
+                self.send_room_text(room, msg)
             # Record only a real state change. A repeated تشغيل while already
             # running is reported as already running and does not replace .u.
             if ok and not before and not getattr(self, "_replaying_bot_action", False):
@@ -6794,7 +7023,10 @@ class TalkinBot:
         if low in ("ايقاف الماستر", "إيقاف الماستر", "ايقاف الماستر@", "إيقاف الماستر@", "إيقاف الخدمة", "ايقاف الخدمة", "إيقاف الخدمه", "ايقاف الخدمه", "إيقاف", "ايقاف", "stop master", "master off"):
             before = _master_process_running()
             ok, msg = _stop_master_process()
-            self.send_private_text(sender, msg)
+            if is_private or not room:
+                self.send_private_text(sender, msg)
+            else:
+                self.send_room_text(room, msg)
             if ok and before and not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(self.room, body, sender, is_private=True)
             return True
@@ -8056,36 +8288,31 @@ class TalkinBot:
                             url=public_base+"/media/"+path.name
                             self.log("[MUSIC] live source=legacy fallback title=", title, "room=", room)
                 else:
-                    # Normal room playback: resolve a direct YouTube/SoundCloud
-                    # audio URL first. Audius and full download are fallbacks.
-                    direct = self._music_live_source(query)
-                    if direct:
+                    # Normal `.sa` playback: use the old/stable local-MP3 path.
+                    # A direct YouTube/SoundCloud URL can be a long signed URL;
+                    # putting that URL inside the Talkin protobuf can make the
+                    # server close the WebSocket with 1009.  The local public
+                    # media URL is short and keeps the WebSocket packet small.
+                    if public_base:
+                        info, path = self._music_download(query)
+                        title = str(info.get("title") or query)
+                        artist = str(info.get("uploader") or info.get("channel") or "YouTube")
+                        duration = int(info.get("duration") or 0)
+                        url = public_base + "/media/" + path.name
+                        self.log("[MUSIC] normal source=local-public-media title=", title, "room=", room)
+                    else:
+                        # Only use a direct URL when it is short enough to be
+                        # safely embedded in a Talkin message packet.
+                        direct = self._music_live_source(query)
+                        direct_url = str((direct or {}).get("url") or "")
+                        if not direct or not direct_url or len(direct_url) > 500:
+                            raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
                         info = direct
-                        url = str(direct.get("url") or "")
+                        url = direct_url
                         duration = int(direct.get("duration") or 0)
                         title = str(direct.get("title") or query)
                         artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
-                        self.log("[MUSIC] fast source=direct-audio title=", title, "room=", room)
-                    else:
-                        audius = self._audius_live_source(query)
-                        if audius:
-                            info = audius
-                            url = str(audius.get("url") or "")
-                            duration = int(audius.get("duration") or 0)
-                            title = str(audius.get("title") or query)
-                            artist = str(audius.get("uploader") or "Audius")
-                            self.log("[MUSIC] fallback source=Audius title=", title, "room=", room)
-                        else:
-                            # Final fallback: download and convert in this
-                            # background worker, then expose the MP3 through
-                            # the bot media server before sending audio.
-                            if not public_base:
-                                raise RuntimeError("لا يوجد رابط عام للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
-                            info,path=self._music_download(query)
-                            title=str(info.get("title") or query)
-                            artist=str(info.get("uploader") or info.get("channel") or "YouTube")
-                            duration=int(info.get("duration") or 0)
-                            url=public_base+"/media/"+path.name
+                        self.log("[MUSIC] normal source=short-direct-audio title=", title, "room=", room)
 
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
@@ -10887,6 +11114,27 @@ class TalkinBot:
         # master-only management gate below.
         _body_text = str(body or "").strip()
         _body_low = _body_text.casefold()
+        # أمر استعلام تواجد المستخدم is@اسم أو is اسم
+        m_is = re.fullmatch(r"(?:is@|is\s+@?)([^\s@]+)", _body_text, re.I)
+        if m_is:
+            target_user = m_is.group(1).strip()
+            norm_target = _norm_user(target_user)
+            found_rooms = []
+            for r_name, roster in getattr(self, "room_users", {}).items():
+                for u_name, u_role in roster.items():
+                    if _norm_user(u_name) == norm_target:
+                        found_rooms.append((r_name, u_role))
+            if found_rooms:
+                locs = "، ".join([f"غرفة [{r}] (رتبة: {role})" for r, role in found_rooms])
+                reply = "👤 المستخدم: @" + target_user + "\n🟢 الحالة: متصل الآن (Online)\n📍 متواجد في: " + locs
+            else:
+                reply = "👤 المستخدم: @" + target_user + "\n🔴 الحالة: غير متصل (Offline)\nℹ️ غير متواجد حالياً في أي من الغرف المتصل بها البوت."
+            if is_private:
+                self.send_private_text(sender, reply)
+            elif room:
+                self.send_room_text(room, reply)
+            return True
+
         if _body_low in ("اوامر", "الاوامر", "help", "مساعدة"):
             menu = _command_menu_for(_is_primary_master(sender), is_private=is_private)
             if is_private:
@@ -11083,10 +11331,12 @@ class TalkinBot:
             if handled and not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, sender, is_private=is_private)
             if handled and _is_master_name(sender) and not help_command:
+                # Never claim success merely because a handler returned True.
+                # A command-specific handler must provide the actual state/result.
                 if is_private and not self._master_reply_local.private_replied:
-                    self.send_private_text(sender, f"✅ تم تنفيذ الأمر: {str(body or '').strip()}")
+                    self.send_private_text(sender, "ℹ️ تم استقبال الأمر، لكن لا توجد نتيجة حالة إضافية من هذا الأمر.")
                 elif not is_private and not self._master_reply_local.replied:
-                    self.send_room_text(room, f"✅ تم تنفيذ الأمر: {str(body or '').strip()}")
+                    self.send_room_text(room, "ℹ️ تم استقبال الأمر، لكن لا توجد نتيجة حالة إضافية من هذا الأمر.")
             return handled
         finally:
             self._master_reply_local.tracking = old_tracking
@@ -11261,6 +11511,55 @@ class TalkinBot:
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
+
+        # Master runtime cleanup: تنضيف / تنظيف. This never deletes persistent
+        # JSON state; it only removes disposable files and prunes memory caches.
+        if low in ("تنضيف", "تنظيف", "cleanup", "clean"):
+            if not _is_master_name(sender):
+                self.send_private_text(sender, "🔒 أمر التنضيف مخصص للماستر فقط.")
+                return True
+            stats = _cleanup_runtime_files(bot=self) or {}
+            self.send_private_text(
+                sender,
+                "🧹 تم تنفيذ التنضيف الآمن.\n"
+                f"📁 ملفات محذوفة: {int(stats.get('files', 0) or 0)}\n"
+                f"📂 مجلدات محذوفة: {int(stats.get('dirs', 0) or 0)}\n"
+                f"🧠 تنظيف الذاكرة: {'تم' if stats.get('memory') else 'لا يوجد ما يحتاج تنظيفاً'}\n"
+                "🔒 بيانات البوت الدائمة لم يتم لمسها."
+            )
+            return True
+
+        # Protection status: report actual persisted room protection switches.
+        if low in ("حالة الحماية", "حاله الحمايه", "حالة حماية", "حاله حماية"):
+            target_room = str(room or self.room or "").strip()
+            if not target_room:
+                self.send_private_text(sender, "⚠️ لا توجد غرفة محددة لفحص الحماية.")
+                return True
+            if not (_is_master_name(sender) or _room_manager(self, target_room, sender)):
+                return True
+            pcfg = _room_protection_cfg(target_room)
+            mcfg = _room_moderation_config(target_room)
+            bot_prot = bool(getattr(self, "bot_protection_enabled", _bot_protection_enabled()))
+            self.send_private_text(
+                sender,
+                f"🛡️ حالة الحماية — {target_room}\n"
+                f"• حماية الغرفة: {'🟢 شغالة' if mcfg.get('enabled') else '🔴 متوقفة'}\n"
+                f"• فلتر الكلمات: {'🟢 شغال' if pcfg.get('swear') else '🔴 متوقف'}\n"
+                f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('repeat') else '🔴 متوقفة'}\n"
+                f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
+                f"• حد التكرار: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
+                f"• حماية البوت الداخلية: {'🟢 شغالة' if bot_prot else '🔴 متوقفة'}"
+            )
+            return True
+
+        # Overall bot health/status for the master. This is diagnostic, not a
+        # generic success message, and reports the live state the bot knows.
+        if low in ("حالة البوت", "حاله البوت", "status", "bot status"):
+            ws_state = "🟢 متصل" if getattr(self, "ws", None) is not None and getattr(self.ws, "sock", None) is not None else "🔴 غير متصل"
+            master_state = "🟢 مشغل" if _master_process_running() else "🔴 متوقف"
+            db_state = "🟢 متصل" if getattr(self, "db", None) is not None and getattr(self.db, "client", None) is not None else "🔴 غير متاح"
+            self.send_private_text(sender, f"📊 حالة البوت\n• WebSocket: {ws_state}\n• خدمة الماستر: {master_state}\n• قاعدة البيانات: {db_state}\n• تنظيف تلقائي: {'🟢 شغال' if CLEANUP_MEMORY_ENABLED else '🔴 متوقف'}\n• حماية البوت: {'🟢 شغالة' if getattr(self, 'bot_protection_enabled', False) else '🔴 متوقفة'}")
+            return True
 
         # Master-only room broadcast: رسالهغرف@النص / رسالةغرف@النص.
         m_room_broadcast = re.fullmatch(r"(?:رسالهغرف|رسالةغرف|رساله\s+غرفه|رسالة\s+غرفه)@(.+)", text, re.I | re.S)
@@ -12205,17 +12504,50 @@ class TalkinBot:
         m=re.match(r"^bl@(.+)$", text, re.I)
         if m:
             target=m.group(1).strip().lstrip("@")
-            active_rooms={str(r).strip() for r in self.known_rooms if str(r).strip()}
-            if self.room: active_rooms.add(str(self.room).strip())
-            active_rooms.discard("")
+            if not target:
+                self.send_private_text(sender,"❌ الصيغة: bl@اسم المستخدم")
+                return True
+
+            # IMPORTANT: use only rooms that are actually connected in the
+            # current WebSocket session. ``known_rooms`` may contain old/stale
+            # rooms; sending moderation packets to those rooms can make the
+            # server close the socket and trigger the reconnect loop.
+            active_rooms={str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()}
+            if self.room:
+                active_rooms.add(str(self.room).strip())
+            active_rooms=sorted({r for r in active_rooms if r})
             if not active_rooms:
-                self.send_private_text(sender,"❌ البوت غير موجود في أي غرفة حالياً."); return True
-            for active_room in sorted(active_rooms):
-                # The master command is authoritative: announce immediately
-                # in every room, without waiting for a server role_changed
-                # event or confirmation timeout.
-                self.send_room_text(active_room, f"🚫 @{target} تم حظره بسبب الإساءة.")
-                self.request_admin_action(active_room, target, "ban", sender)
+                self.send_private_text(sender,"❌ البوت غير موجود في أي غرفة حالياً.")
+                return True
+
+            # Do not flood one WebSocket with ban requests for every room at
+            # once. Talkin accepts the same operation, but rapid back-to-back
+            # moderation packets can cause the server to disconnect the bot.
+            # Process them serially with a small configurable delay.
+            delay=max(0.25, float(os.getenv("GLOBAL_BAN_DELAY_SECONDS", "0.8") or 0.8))
+
+            def _ban_all_rooms():
+                total=len(active_rooms)
+                self.log(f"[MOD-ALL] starting global ban target=@{target} rooms={total} delay={delay}s")
+                for index, active_room in enumerate(active_rooms, 1):
+                    try:
+                        # Keep the room announcement small and separate from the
+                        # native moderation request so a large combined payload
+                        # cannot be produced.
+                        self.send_room_text(active_room, f"🚫 @{target} تم حظره بسبب الإساءة.")
+                        self.request_admin_action(active_room, target, "ban", sender)
+                        self.log(f"[MOD-ALL] ban sent {index}/{total}: {active_room} -> @{target}")
+                    except Exception as exc:
+                        self.log(f"[MOD-ALL] ban failed room={active_room} target=@{target}: {exc!r}")
+                    if index < total:
+                        time.sleep(delay)
+                self.log(f"[MOD-ALL] global ban finished target=@{target} rooms={total}")
+
+            threading.Thread(
+                target=_ban_all_rooms,
+                daemon=True,
+                name="global-ban-all-rooms",
+            ).start()
             return True
         if low == ".u":
             if not _is_master_name(sender):
@@ -13006,6 +13338,9 @@ class TalkinBot:
                     self.send_room_text(room, level_welcome)
         elif event_type == "user_left" and username:
             self.room_users[room].pop(username, None)
+            if _norm_user(username) == _norm_user(BOT_ID):
+                self.log(f"[USER_LEFT_DETECTED] Bot left {room}; rejoining automatically...")
+                self._schedule_auto_rejoin(room)
             if _norm_user(username) == _norm_user(BOT_MASTER):
                 self._master_online_rooms.discard(_norm_room(room))
                 self.master_online = bool(self._master_online_rooms)
@@ -13017,6 +13352,9 @@ class TalkinBot:
             if changed_user and changed_role:
                 if changed_role in ("kicked", "outcast"):
                     self.room_users[room].pop(changed_user, None)
+                    if _norm_user(changed_user) == _norm_user(BOT_ID):
+                        self.log(f"[KICK_DETECTED] Bot was removed from {room}; rejoining automatically...")
+                        self._schedule_auto_rejoin(room)
                 else:
                     self.room_users[room][changed_user] = changed_role
                 key = (room.casefold(), changed_user.casefold(), changed_role)
@@ -13940,23 +14278,26 @@ class TalkinBot:
                             self._pending_reconnect_reason = ""
                             reconnect_command = self._pending_reconnect_command
                             self._pending_reconnect_command = None
-                            should_notify = bool(reason and "1009" in reason) or (
-                                now - self._last_connection_notice >= self._connection_notice_cooldown
-                            )
-                            if should_notify:
-                                if reason:
-                                    reconnect_notice = "✅ عاد اتصال البوت بنجاح بعد انقطاع مؤقت. تم تقسيم الرسائل الكبيرة تلقائياً."
-                                    if isinstance(reconnect_command, dict) and reconnect_command.get("command"):
-                                        reconnect_notice += (
-                                            "\n\n⚠️ الأمر الذي كان قيد التنفيذ عند حدوث الخطأ:"
-                                            f"\n📌 الأمر: {reconnect_command['command']}"
-                                            f"\n🏠 الغرفة: {reconnect_command.get('room') or 'خاص'}"
-                                            f"\n👤 المرسل: @{reconnect_command.get('sender') or 'غير معروف'}"
-                                            "\n🔎 أعد تجربة الأمر لتحديد سبب المشكلة."
-                                        )
-                                    self.send_private_text(BOT_MASTER, reconnect_notice)
-                                elif not self._had_connection:
-                                    self.send_private_text(BOT_MASTER, "✅ تم الدخول والاتصال بنجاح.")
+                            # Do not spam the master for normal reconnects.
+                            # A visible diagnostic is emitted only for the specific
+                            # WebSocket 1009 (message too large) condition.
+                            should_notify = bool(reason and "1009" in reason)
+                            if should_notify and now - self._last_connection_notice >= 30.0:
+                                reconnect_notice = (
+                                    "⚠️ انقطع WebSocket بسبب حجم رسالة أكبر من الحد المسموح (1009)."
+                                    "\n🛠️ تم تعديل الإرسال لتقسيم الرسائل الكبيرة تلقائياً قبل الإرسال."
+                                )
+                                cmd_age = now - float(reconnect_command.get("created_at", 0)) if isinstance(reconnect_command, dict) else 999999
+                                if isinstance(reconnect_command, dict) and reconnect_command.get("command") and cmd_age <= 45.0:
+                                    reconnect_notice += (
+                                        "\n\n📌 الأمر الفعلي الذي كان قيد التنفيذ:"
+                                        f"\n• الأمر: {reconnect_command['command']}"
+                                        f"\n• الغرفة: {reconnect_command.get('room') or 'خاص'}"
+                                        f"\n• المرسل: @{reconnect_command.get('sender') or 'غير معروف'}"
+                                    )
+                                else:
+                                    reconnect_notice += "\n📌 لم يكن هناك أمر قيد التنفيذ لحظة الانقطاع (أو انقضت مدته)."
+                                self.send_private_text(BOT_MASTER, reconnect_notice)
                                 self._last_connection_notice = now
                         self._had_connection = True
 
@@ -14011,7 +14352,7 @@ class TalkinBot:
             threading.Thread(target=self._telegram_poll_loop, name="telegram-poll", daemon=True).start()
         else:
             self.log("[TELEGRAM] TELEGRAM_BOT_TOKEN is not configured; Telegram log upload disabled")
-        self._cleanup_thread = start_runtime_cleanup(self.stop_event)
+        self._cleanup_thread = start_runtime_cleanup(self.stop_event, self)
         self.asset_server = start_asset_server()
         while not self.stop_event.is_set():
             try:
