@@ -1394,7 +1394,11 @@ def _save_local_json(path, data):
         with _STATE_DB_CONDITION:
             _STATE_DB_PENDING[str(path)] = copy.deepcopy(data)
             _STATE_DB_CONDITION.notify()
-    _github_sync_after_local_save(path, data)
+    # During startup restore, the GitHub worker function is defined later in
+    # this module; local/database restoration must not emit a NameError.
+    github_save = globals().get("_github_sync_after_local_save")
+    if github_save:
+        github_save(path, data)
 
 # GitHub-backed persistent state. Runtime stays in Talkin1; durable state is
 # backed up to Talkin4 asynchronously so message handling is not blocked by
