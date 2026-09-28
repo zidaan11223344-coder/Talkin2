@@ -13909,7 +13909,13 @@ class TalkinBot:
         # معالجة الصورة داخل خيط خلفي.
         if getattr(self, "publish_pending", {}):
             if media_url or event_type in {"image", "photo", "picture", "media", "file"}:
-                if media_url and self._try_publish_pending_media(room, media_url, media_senders):
+                self.log("[PUBLISH] incoming image event",
+                         "room=", room, "url=", media_url[:180] if media_url else "<missing>",
+                         "pending=", list(getattr(self, "publish_pending", {}).keys()))
+                handled = bool(media_url and self._try_publish_pending_media(room, media_url, media_senders))
+                self.log("[PUBLISH] image event handled=", handled,
+                         "remaining_pending=", list(getattr(self, "publish_pending", {}).keys()))
+                if handled:
                     return
                 if not media_url:
                     self.log("[PUBLISH] image event received without a usable media URL", event)
