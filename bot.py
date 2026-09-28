@@ -13878,8 +13878,22 @@ class TalkinBot:
             except Exception as e:
                 self.log("[ACK] failed:", e)
 
-        # استخراج رابط الصورة الشامل
-        media_url = _extract_media_url_universal(event, body)
+        # استخراج رابط الصورة من حقول RoomEvent كما يفعل تطبيق Talkin1.
+        media_url = next(
+            (str(event.get(key, "") or "").strip()
+             for key in (7, 6, 9, 10, 11, 12, 13, 14, 15,
+                         "url", "media_url", "image_url", "file_url",
+                         "photo", "attachment")
+             if str(event.get(key, "") or "").strip().startswith(("http://", "https://"))),
+            "",
+        ) or _extract_media_url_universal(event, body) or first_http_url(event) or first_http_url(body)
+        if not media_url and body and ("http://" in body or "https://" in body):
+            image_match = re.search(
+                r"https?://\S+\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?",
+                body, re.I,
+            )
+            if image_match:
+                media_url = image_match.group(0).rstrip(",.;)]}")
 
         media_senders = []
         for candidate in (frm, event.get(22, ""), event.get(17, ""), event.get(2, ""),
@@ -13888,15 +13902,19 @@ class TalkinBot:
             if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
                 media_senders.append(candidate)
 
-        # إذا كان هناك طلب نشر معلق وتم استلام أي صورة، نفّذ النشر في خيط منفصل فوراً دون تجميد البوت
+        # استخدم المسار المباشر نفسه الموجود في Talkin1 حتى لا تضيع أخطاء
+        # معالجة الصورة داخل خيط خلفي.
         if getattr(self, "publish_pending", {}):
-            if media_url:
-                threading.Thread(target=self._try_publish_pending_media, args=(room, media_url, media_senders), daemon=True).start()
+            if media_url or event_type in {"image", "photo", "picture", "media", "file"}:
+                if media_url and self._try_publish_pending_media(room, media_url, media_senders):
+                    return
+                if not media_url:
+                    self.log("[PUBLISH] image event received without a usable media URL", event)
                 return
 
         if event_type in {"image", "photo", "picture", "media", "file"} or (media_url and event_type not in {"text", "user_joined", "user_left"}):
             if media_url:
-                threading.Thread(target=self._try_publish_pending_media, args=(room, media_url, media_senders), daemon=True).start()
+                self._try_publish_pending_media(room, media_url, media_senders)
             return
 
         if event_type != "text" or not body:
