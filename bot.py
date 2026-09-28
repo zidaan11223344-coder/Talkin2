@@ -4306,6 +4306,11 @@ class TalkinBot:
         # username(casefold) -> public photo URL.
         self.user_photos = {}
         self.last_joined_room = None
+        # Members who enter AFTER the bot enters/re-enters a room.
+        # This is separate from room_users/room_users.json because those are
+        # roster/settings snapshots and can refresh last_seen for everyone.
+        self._room_entry_times = {}
+        self._room_entry_users = defaultdict(dict)
         # Moderation commands are confirmed only after the server emits a
         # matching role_changed event.  Sending a packet is not proof that it
         # was accepted by the room server.
@@ -4357,7 +4362,7 @@ class TalkinBot:
         self.invite_sent = set()
         self.invite_thread = None
         self.invite_lock = threading.Lock()
-        self.invite_message_template = "📩 دعاك @{sender} إلى غرفة: {room}"
+        self.invite_message_template = "يوجد معجب مخفي في {room}"
         self.known_rooms = set(_persistent_rooms())
         # Live rooms are session-only: unlike known_rooms (history on disk),
         # this set contains only rooms for which the current WebSocket session
@@ -4450,7 +4455,7 @@ class TalkinBot:
         self.custom_welcomes = {}
         self._load_social_features()
         threading.Thread(target=self._crop_worker, name="crop-worker", daemon=True).start()
-        self.invite_message_template = _message_template("invite", "default", "📩 دعاك @{sender} إلى غرفة: {room}")
+        self.invite_message_template = _message_template("invite", "default", "يوجد معجب مخفي في {room}")
 
     def _load_social_features(self):
         self.auto_replies_file = REPLIES_FILE
@@ -4977,16 +4982,11 @@ class TalkinBot:
             f"\n📍 النوع: {context}{location}"
             f"\n❌ التفاصيل: {detail}"
         )
+        # Keep this diagnostic in the bot log only. Do not send the verbose
+        # "تم تجاهل إرسال رسالة كبيرة..." notice to Telegram. For oversized
+        # text messages, send the original message itself to Telegram from
+        # send_query/_send_text_packets instead.
         self.log("[WS_OVERSIZE_HANDLED]", master_msg.replace("\n", " | "))
-
-        # Also send the diagnostic to the configured Telegram chat.
-        if TELEGRAM_BOT_TOKEN:
-            chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
-            if chat_id:
-                try:
-                    self._telegram_api("sendMessage", chat_id=chat_id, text=master_msg)
-                except Exception as exc:
-                    self.log("[WS_OVERSIZE] Telegram notification failed:", repr(exc))
 
     def send_query(self, payload: bytes):
         if not self.ws:
@@ -5010,10 +5010,17 @@ class TalkinBot:
             except Exception as exc:
                 self.log("[WS_OVERSIZE] decode failed:", repr(exc))
 
-            # If the oversized packet is a real text message, send the ORIGINAL
-            # message to Telegram instead of sending only an error/diagnostic.
-            # The WebSocket packet is still blocked so the server cannot close
-            # the bot with code 1009.
+            media_type = ""
+            media_url = ""
+            try:
+                media_type = as_text((fields.get(2) or [b""])[0]).strip().lower()
+                media_url = as_text((fields.get(7) or [b""])[0]).strip()
+                if not media_url:
+                    media_url = _extract_media_url_universal(fields, body)
+            except Exception as exc:
+                self.log("[WS_OVERSIZE] media extraction failed:", repr(exc))
+
+            # Text: send the ORIGINAL complete text to Telegram.
             if packet_type in {"chat_message", "room_message"} and body:
                 telegram_title = "رسالة طويلة من البوت"
                 if packet_type == "room_message" and room:
@@ -5024,9 +5031,9 @@ class TalkinBot:
                     telegram_sent = bool(self._send_long_text_to_telegram(body, title=telegram_title))
                 except Exception as exc:
                     telegram_sent = False
-                    self.log("[TELEGRAM] oversized packet routing failed:", repr(exc))
+                    self.log("[TELEGRAM] oversized text routing failed:", repr(exc))
                 if telegram_sent:
-                    self.log("[WS_OVERSIZE] long message routed to Telegram")
+                    self.log("[WS_OVERSIZE] long text routed to Telegram")
                 else:
                     self._report_oversize_delivery(
                         packet_type, target, room, len(payload),
@@ -5034,8 +5041,37 @@ class TalkinBot:
                     )
                 return False
 
-            # No recoverable text body (for example a non-text packet): keep the
-            # old diagnostic path.
+            # Media/file: the WebSocket packet itself may be oversized even
+            # though the actual file is referenced by a URL. Download that
+            # original file and send it to Telegram as a document. This keeps
+            # the full file intact and prevents Talkin from receiving a packet
+            # large enough to close the connection.
+            if packet_type in {"chat_message", "room_message"} and media_url and media_type in {
+                "file", "image", "photo", "picture", "video", "audio", "voice", "document", "media"
+            }:
+                telegram_title = "ملف كبير من البوت"
+                if packet_type == "room_message" and room:
+                    telegram_title = f"ملف كبير من غرفة: {room}"
+                elif packet_type == "chat_message" and target:
+                    telegram_title = f"ملف كبير إلى: @{target}"
+                try:
+                    telegram_sent = bool(self._send_long_media_to_telegram(
+                        media_url, title=telegram_title, media_type=media_type
+                    ))
+                except Exception as exc:
+                    telegram_sent = False
+                    self.log("[TELEGRAM] oversized media routing failed:", repr(exc))
+                if telegram_sent:
+                    self.log("[WS_OVERSIZE] media/file routed to Telegram")
+                else:
+                    self._report_oversize_delivery(
+                        packet_type, target, room, len(payload),
+                        "تعذر إرسال الملف الكبير إلى Telegram"
+                    )
+                return False
+
+            # No recoverable text/media body. Keep only a local diagnostic;
+            # never send the old verbose oversized-packet notice to Telegram.
             self._report_oversize_delivery(packet_type, target, room, len(payload), "حزمة WebSocket تجاوزت 1008 بايت")
             return False
 
@@ -5142,6 +5178,9 @@ class TalkinBot:
         def _rejoin_worker():
             time.sleep(delay)
             try:
+                if any(_norm_room(r) == _norm_room(room) for r in getattr(self, "connected_rooms", set())):
+                    self.log(f"[AUTO_REJOIN] already connected; skip {room}")
+                    return
                 self.log(f"[AUTO_REJOIN] Attempting to rejoin {room}...")
                 self.join_room(room, force=True)
             except Exception as e:
@@ -5177,8 +5216,11 @@ class TalkinBot:
         already_known = _norm_room(room) in known_norm
         already_connected = _norm_room(room) in connected_norm
         # Being saved in tracked_rooms.json alone must never block a fresh join.
-        if already_connected and not force:
-            self.log("[ROOM] already connected:", room)
+        # A forced join is used after an actual disconnect/kick. It must NOT
+        # send a second room_join while the server already confirms us inside
+        # the room; doing so can produce the visible enter/leave loop.
+        if already_connected:
+            self.log("[ROOM] already connected; duplicate join suppressed:", room)
             return False
         now = time.time()
         with self._join_lock:
@@ -5264,6 +5306,9 @@ class TalkinBot:
         room = str(room or "").strip()
         if not room:
             return False
+        if not hasattr(self, "_intentional_leaves"):
+            self._intentional_leaves = set()
+        self._intentional_leaves.add(_norm_room(room))
         if _norm_room(room) in getattr(self, "blocked_rooms", set()):
             self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
             self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
@@ -5294,6 +5339,76 @@ class TalkinBot:
         """Compatibility helper: command menus use their own <=300 splitter."""
         text = str(text or "")
         return [text] if text else [""]
+
+    def _send_long_media_to_telegram(self, media_url: str, title="ملف كبير من البوت", media_type="file"):
+        """Download an oversized Talkin media URL and upload the complete file to Telegram."""
+        if not TELEGRAM_LONG_TEXT_ENABLED or not TELEGRAM_BOT_TOKEN:
+            return False
+        chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
+        if not chat_id:
+            return False
+        media_url = str(media_url or "").strip()
+        if not media_url:
+            return False
+        try:
+            title = str(title or "ملف كبير من البوت").strip()[:900]
+            parsed = urllib.parse.urlparse(media_url)
+            suffix = Path(parsed.path).suffix.lower() or ".bin"
+            safe_type = re.sub(r"[^a-z0-9_-]+", "", str(media_type or "file").lower()) or "file"
+            filename = f"talkin_{safe_type}_{int(time.time())}{suffix}"
+
+            # Local file paths are supported too.
+            local = Path(media_url).expanduser()
+            if local.is_file():
+                with local.open("rb") as fh:
+                    response = requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                        data={"chat_id": chat_id, "caption": title},
+                        files={"document": (local.name, fh, "application/octet-stream")},
+                        timeout=120,
+                    )
+                data = response.json()
+                if bool(data.get("ok")):
+                    self.log(f"[TELEGRAM] oversized local file sent ({local.name})")
+                    return True
+                self.log("[TELEGRAM] local file upload failed:", str(data)[:1200])
+                return False
+
+            # Stream the remote file without sending it through Talkin again.
+            with requests.get(
+                media_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                stream=True,
+                timeout=(15, 120),
+            ) as source:
+                source.raise_for_status()
+                content_type = str(source.headers.get("Content-Type") or "application/octet-stream").split(";", 1)[0]
+                content = io.BytesIO()
+                total = 0
+                max_upload = 49 * 1024 * 1024
+                for chunk in source.iter_content(chunk_size=1024 * 256):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_upload:
+                        self.log("[TELEGRAM] oversized media exceeds Telegram upload safety limit:", total)
+                        return False
+                    content.write(chunk)
+                content.seek(0)
+                response = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                    data={"chat_id": chat_id, "caption": title},
+                    files={"document": (filename, content, content_type)},
+                    timeout=120,
+                )
+                data = response.json()
+                if bool(data.get("ok")):
+                    self.log(f"[TELEGRAM] oversized media sent as file ({total} bytes)")
+                    return True
+                self.log("[TELEGRAM] media upload failed:", str(data)[:1200])
+        except Exception as exc:
+            self.log("[TELEGRAM] media download/upload failed:", repr(exc))
+        return False
 
     def _send_long_text_to_telegram(self, text: str, title="رسالة طويلة من البوت"):
         """Send the complete oversized Talkin message to Telegram.
@@ -7648,35 +7763,40 @@ class TalkinBot:
         except Exception as e:
             self.log("[INV] progress message failed:", repr(e))
 
-        # Prefer the complete room_members roster from the room settings DB.
-        # It contains owners, moderators and ordinary members even when they
-        # are offline.  The live occupants response is only a fallback for
-        # deployments where the DB connector is unavailable.
+        # INV uses the COMPLETE room-settings roster, not only currently online users.
+        # This is intentional: the room settings/member list contains offline
+        # members as well, and the native invitation can be sent to those users.
+        settings_users = []
         try:
-            configured_users = self.db.room_users(command_room) if getattr(self, "db", None) else []
+            # Primary source: room settings roster (owners + admins + members),
+            # including offline users. _settings_room_users() falls back to the
+            # saved members file when room settings are unavailable.
+            settings_rows = self._settings_room_users(command_room)
+            seen_settings = set()
+            for item in (settings_rows or []):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("username") or "").strip().lstrip("@")
+                key = _norm_user(name)
+                if name and key and key != _norm_user(BOT_ID) and key not in seen_settings:
+                    seen_settings.add(key)
+                    settings_users.append(name)
         except Exception as exc:
-            configured_users = []
-            self.log("[INV] settings roster lookup failed:", repr(exc))
-        configured_names = []
-        configured_seen = set()
-        for item in configured_users or []:
-            username = str(item.get("username") if isinstance(item, dict) else item or "").strip().lstrip("@")
-            key = _norm_user(username)
-            if username and key and key != _norm_user(BOT_ID) and key not in configured_seen:
-                configured_seen.add(key)
-                configured_names.append(username)
-        if configured_names:
-            self.log("[INV] using room settings roster:", command_room, len(configured_names))
+            self.log("[INV] room settings/member-file roster failed:", command_room, repr(exc))
+
+        if settings_users:
+            self.log("[INV] using COMPLETE ROOM SETTINGS roster:", command_room, len(settings_users))
             threading.Thread(
                 target=self._finish_invites,
-                args=(command_room, configured_names),
-                name="talkin-settings-invites",
+                args=(command_room, settings_users),
+                name="talkin-room-settings-invites",
                 daemon=True,
             ).start()
             return
 
-        # Fallback: ask Talkin for the room settings roster when the database
-        # connector is absent or returned no profiles.
+        # Database roster unavailable: ask the server for the room-settings
+        # occupants list. Do NOT filter by online/presence; offline members
+        # returned by room settings are valid invitation targets.
         self._inv_expected_rooms = set(active_rooms)
         self._inv_live_users = []
         self._inv_live_seen = set()
@@ -7758,11 +7878,13 @@ class TalkinBot:
 
         # IMPORTANT: normal TalkinChat private message, deliberately NOT
         # room_invite_username / native system invitation.
-        text = self.invite_message_template
+        text = self.invite_message_template or "يوجد معجب مخفي في {room}"
+        if "{room}" not in text:
+            text = text.rstrip() + " {room}"
         try:
             text = text.format(sender=(inviter or INVITE_SENDER_NAME), room=room, username=username)
         except Exception:
-            text = f"🎁 لديك معجب مجهول 👥 في غرفة: {room}"
+            text = f"يوجد معجب مخفي في {room}"
         self.send_query(encode_query("chat_message", type_="text", to=username, body=text))
 
         with self.invite_lock:
@@ -7875,6 +7997,45 @@ class TalkinBot:
                 self.invite_pending = False
                 self.invite_silent_master = False
 
+    def _cache_stream_member_event(self, stream_event):
+        """Persist member identity carried by Talkin STREAM events.
+
+        Some Talkin builds do not return the complete room roster through
+        RoomAdmin. Instead, STREAM records contain the member identity in
+        fields 2/8/13/14/42: username, role, room, user_id and presence.
+        These records are safe to merge into the append/update-only roster.
+        They are NOT treated as the complete roster by themselves.
+        """
+        if not isinstance(stream_event, dict):
+            return False
+        try:
+            username = str(stream_event.get(2, "") or "").strip()
+            room = str(stream_event.get(13, "") or stream_event.get("room", "") or "").strip()
+            role = str(stream_event.get(8, "") or stream_event.get("role", "") or "none").strip().lower() or "none"
+            user_id = str(stream_event.get(14, "") or stream_event.get("user_id", "") or "").strip()
+            online = stream_event.get(42, stream_event.get("online", stream_event.get("is_present")))
+            if not username or not room or _norm_user(username) == _norm_user(BOT_ID):
+                return False
+            # Only accept the known STREAM member shape. This prevents an
+            # unrelated StreamEvent from being mistaken for a room member.
+            if not user_id or not user_id.isdigit():
+                return False
+            if role not in {"owner", "admin", "moderator", "mod", "member", "user", "none"}:
+                return False
+            item = {
+                "username": username,
+                "role": role,
+                "user_id": user_id,
+                "online": online,
+                "is_present": online,
+            }
+            self.room_users[room][username] = role
+            _remember_roster(room, [item])
+            return True
+        except Exception as exc:
+            self.log("[ROSTER] STREAM member cache failed:", repr(exc))
+            return False
+
     def _cache_user_photos_from_result(self, result):
         """Cache Talkin profile photo URLs from any occupants/users response."""
         try:
@@ -7946,16 +8107,19 @@ class TalkinBot:
         if source_room and hasattr(self, "_inv_expected_rooms"):
             for u in self._users_from_room_admin(result.get("room_admin") or {}):
                 username = str(u.get("username") or "").strip()
-                if username and username != BOT_ID and username.casefold() not in getattr(self, "_inv_live_seen", set()):
-                    self._inv_live_seen.add(username.casefold())
+                # Room settings is the source of truth for inv. Include offline
+                # members too; only exclude the bot itself and duplicates.
+                if (username and _norm_user(username) != _norm_user(BOT_ID)
+                        and _norm_user(username) not in getattr(self, "_inv_live_seen", set())):
+                    self._inv_live_seen.add(_norm_user(username))
                     self._inv_live_users.append(username)
             self._inv_expected_rooms.discard(source_room)
             if self._inv_expected_rooms:
                 return
             result = {"db_users": [{"username": u} for u in self._inv_live_users]}
 
-        # `inv` is intentionally live-only. A db_users payload is accepted only
-        # for compatibility with older callers, never generated by request_occupants.
+        # `inv` uses the complete room-settings roster. A db_users payload may
+        # therefore contain offline members and must not be filtered by presence.
         users_info = []
         for user in (result.get("db_users") or []):
             if isinstance(user, dict):
@@ -8592,7 +8756,7 @@ class TalkinBot:
                         music_published = True
                 elif live_stream:
                     if live_started:
-                        self.send_room_text(room, f"✅ تم تشغيل {title} في البث الحي.")
+                        self.send_room_text(room, f"تم تشغيل الاغنيه في البث\nالغرفة: {room}")
                     elif getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed") == "queued":
                         self.send_room_text(room, "📡 جاري صعود البوت للبث وتشغيل الأغنية تلقائياً...")
                     else:
@@ -8967,8 +9131,13 @@ class TalkinBot:
         if winner_name and game_key:
             self._send_game_winner_card(game_key, winner_name, target_rooms or [room])
 
-    def _send_game_winner_card(self, game_key, winner_name, target_rooms):
-        """Render the existing game artwork with winner name/avatar and send it."""
+    def _send_game_winner_card(self, game_key, winner_name, target_rooms, send_delay=0.0):
+        """Render the existing game artwork and send it safely room-by-room.
+
+        ``send_delay`` is used by multi-room game broadcasts to avoid a burst
+        of media packets that can trigger the TalkinChat server to close the
+        WebSocket. Existing callers keep the original zero-delay behaviour.
+        """
         base = _public_base_url()
         if not base:
             self.log("[GAME] winner card skipped: public media URL is not configured")
@@ -8993,8 +9162,16 @@ class TalkinBot:
                 k = r.casefold()
                 if r and k not in seen:
                     seen.add(k); rooms.append(r)
-            for r in rooms:
-                self.send_room_media(r, url, "image")
+            for index, r in enumerate(rooms):
+                # Send sequentially. A short pause is important for an image
+                # broadcast: the server may close the realtime socket when
+                # several room-media packets arrive back-to-back.
+                try:
+                    self.send_room_media(r, url, "image")
+                except Exception as exc:
+                    self.log("[GAME] winner card room send failed:", r, repr(exc))
+                if send_delay > 0 and index + 1 < len(rooms):
+                    time.sleep(float(send_delay))
             self.log("[GAME] winner card sent", game_key, winner_name, len(rooms))
             return bool(rooms)
         except Exception as exc:
@@ -10219,10 +10396,27 @@ class TalkinBot:
         self._game_award(sender_name, reward)
         winner_photo = self.user_photos.get(_norm_user(sender_name), "") or self._lookup_profile_photo(sender_name)
         winner_text = f"🏆✨ مبروك! فاز بنك مليون ✨🏆\n━━━━━━━━━━━━━━━━\n👑 الفائز: @{sender_name}\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n💸 مبلغ الخسارة: 0 نقطة\n━━━━━━━━━━━━━━━━"
-        target_rooms = self._active_rooms() or [room]
-        for target_room in target_rooms:
-            self.send_room_text(target_room, winner_text)
-        self._send_game_winner_card("بنك مليون", sender_name, target_rooms)
+
+        # IMPORTANT: for the bank-win broadcast use only rooms confirmed as
+        # connected in THIS WebSocket session. ``_active_rooms()`` also contains
+        # historical/persisted rooms and can make the bot send to stale rooms.
+        connected = {str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()}
+        if room and str(room).strip():
+            connected.add(str(room).strip())
+        target_rooms = sorted(connected, key=str.casefold) or [str(room).strip()]
+
+        # Do not burst all room packets at once. The short pacing keeps the
+        # realtime connection alive while preserving the existing all-room
+        # winner announcement and image behaviour.
+        for index, target_room in enumerate(target_rooms):
+            try:
+                self.send_room_text(target_room, winner_text)
+            except Exception as exc:
+                self.log("[GAME] bank winner text send failed:", target_room, repr(exc))
+            if index + 1 < len(target_rooms):
+                time.sleep(0.35)
+
+        self._send_game_winner_card("بنك مليون", sender_name, target_rooms, send_delay=0.35)
         return True
 
     def _handle_pending_bot_choice(self, room, text, sender_name):
@@ -11901,9 +12095,24 @@ class TalkinBot:
         if len(current) > 1:
             pages.append("\n".join(current))
         total=len(pages)
-        for page_no, page in enumerate(pages, 1):
-            page_text=f"{title} ({len(rows)})\n📄 القائمة {page_no}/{total}\n" + "\n".join(page.splitlines()[1:])
-            self.send_private_text(sender, page_text)
+        # Send only the first page. The generic `ns` command advances through
+        # the remaining pages one at a time. Keep the state in the private-chat
+        # result bucket because these room-list commands reply privately.
+        result_pages = getattr(self, "_result_pages", {})
+        result_key = ("chat_message", "", str(sender or ""))
+        result_pages[result_key] = {
+            "pages": [
+                f"{title} ({len(rows)})\n📄 القائمة {page_no}/{total}\n" + "\n".join(page.splitlines()[1:])
+                for page_no, page in enumerate(pages, 1)
+            ],
+            "part": 1,
+            "kwargs": {"to": str(sender or "")}
+        }
+        self._result_pages = result_pages
+        first = result_pages[result_key]["pages"][0]
+        if total > 1:
+            first += "\n\n📌 للقائمة التالية اكتب Ns"
+        self.send_private_text(sender, first)
 
     def _room_list_commands(self, room, text, sender, is_private):
         match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
@@ -11911,9 +12120,9 @@ class TalkinBot:
             if not room:
                 self.send_private_text(sender, "⚠️ نفّذ الأمر داخل الغرفة المطلوبة."); return True
             code=match.group(1).lower()
-            if not getattr(getattr(self, "db", None), "client", None):
-                if self._request_room_list_via_ws(room, code, sender):
-                    return True
+            # l@a / l@o / l@m must come from the room-settings roster.
+            # Do not fall back to the live WebSocket occupants list because
+            # that list can contain only currently online users.
             users=self._settings_room_users(room)
             if code == "a": users=[u for u in users if str(u.get("role") or "").lower() in {"admin","moderator","mod"}]
             elif code == "o": users=[u for u in users if str(u.get("role") or "").lower() in {"owner","creator","room_owner","room_creator","host"}]
@@ -11925,12 +12134,25 @@ class TalkinBot:
             if not _is_master_name(sender):
                 self.send_private_text(sender, "🔒 قائمة حظر البوت مخصصة للماستر.")
                 return True
-            rows=_bot_ban_rows() + [dict(r, banned_by=r.get("banned_by") or "فلتر البوت") for r in _filter_bans_list()]
-            if not rows: self.send_private_text(sender, "📭 لا يوجد مستخدمون محظورون من البوت.")
+            # l@b = users banned by the bot in THIS room only.
+            # Never mix this with the word-filter ban history and never use
+            # the room member roster as the source of the list.
+            room_key = _norm_room(room)
+            rows = [
+                r for r in _bot_ban_rows()
+                if isinstance(r, dict) and _norm_room(r.get("room")) == room_key
+            ]
+            if not rows:
+                self.send_private_text(sender, f"📭 لا يوجد مستخدمون حظرهم البوت في غرفة {room}.")
             else:
-                lines=[f"🚫 المحظورون من البوت ({len(rows)}):"]
-                for i,r in enumerate(rows[-200:],1):
-                    lines.append(f"{i}. @{r.get('username','')} | حظره: @{r.get('banned_by') or 'البوت'} | الغرفة: {r.get('room','')}" )
+                lines = [f"🚫 المحظورون بواسطة البوت — {room} ({len(rows)}):"]
+                for i, r in enumerate(rows[-200:], 1):
+                    username = str(r.get("username") or "").strip().lstrip("@")
+                    banned_by = str(r.get("banned_by") or "البوت").strip().lstrip("@")
+                    reason = str(r.get("reason") or "غير محدد").strip()
+                    lines.append(
+                        f"{i}. المحظور: @{username} | الحاظر: @{banned_by} | السبب: {reason}"
+                    )
                 self.send_private_text(sender, "\n".join(lines))
             return True
         m=re.fullmatch(r"is@(.+)", str(text or "").strip(), re.I)
@@ -12955,6 +13177,41 @@ class TalkinBot:
                 self.send_private_text(sender,"❌ لا توجد غرفة لتنفيذ الحظر فيها."); return True
             self.request_admin_action(room,target,"ban",sender)
             return True
+        # Global ban: حظر بكل الغرف @username / حظر بكل الغرف username
+        m_global_ban = re.fullmatch(r"حظر\s+بكل\s+الغرف\s+@?([^\s@]+)", text.strip(), re.I)
+        if m_global_ban:
+            target = m_global_ban.group(1).strip()
+            if not _is_master_name(sender):
+                return True
+            if not target:
+                self.send_private_text(sender, "❌ الصيغة: حظر بكل الغرف @اسم المستخدم")
+                return True
+            active_rooms = sorted({str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()})
+            if self.room and str(self.room).strip() not in active_rooms:
+                active_rooms.append(str(self.room).strip())
+            active_rooms = sorted(set(active_rooms))
+            if not active_rooms:
+                self.send_private_text(sender, "❌ البوت غير موجود في أي غرفة حالياً.")
+                return True
+            delay = max(0.25, float(os.getenv("GLOBAL_BAN_DELAY_SECONDS", "0.8") or 0.8))
+
+            def _ban_all_rooms_ar():
+                total = len(active_rooms)
+                self.log(f"[MOD-ALL] starting Arabic global ban target=@{target} rooms={total}")
+                for index, active_room in enumerate(active_rooms, 1):
+                    try:
+                        self.request_admin_action(active_room, target, "ban", sender)
+                        self.log(f"[MOD-ALL] ban sent {index}/{total}: {active_room} -> @{target}")
+                    except Exception as exc:
+                        self.log(f"[MOD-ALL] ban failed room={active_room} target=@{target}: {exc!r}")
+                    if index < total:
+                        time.sleep(delay)
+                self.log(f"[MOD-ALL] global ban finished target=@{target} rooms={total}")
+                self.send_private_text(sender, f"✅ تم تنفيذ حظر @{target} في {total} غرفة بدون خروج البوت من أي غرفة.")
+
+            threading.Thread(target=_ban_all_rooms_ar, daemon=True, name="global-ban-all-rooms-ar").start()
+            return True
+
         m=re.match(r"^bl@(.+)$", text, re.I)
         if m:
             target=m.group(1).strip().lstrip("@")
@@ -13089,9 +13346,69 @@ class TalkinBot:
                 self.send_private_text(sender,f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
             return True
         if low.startswith("invmsg") or low.startswith("رسالةدعوة"):
-            parts=text.split(None,1); template=parts[1].strip() if len(parts)==2 else "📩 دعاك @{sender} إلى غرفة: {room}"
+            parts=text.split(None,1); template=parts[1].strip() if len(parts)==2 else "يوجد معجب مخفي في {room}"
+            if "{room}" not in template:
+                template = template.rstrip() + " {room}"
             self.invite_message_template=template
             self.send_private_text(sender,f"✅ تم تغيير نص الدعوة إلى: {template}"); return True
+        # .r = historical room entrants.
+        # The persistent room roster is append/update-only, so users who
+        # entered the room and later left remain visible in this list.
+        if low == ".r":
+            if not room:
+                self.send_private_text(sender, "⚠️ نفّذ .r داخل الغرفة المطلوبة.")
+                return True
+            # IMPORTANT: .r must use the dedicated entry history, not the
+            # general room roster. occupants_list/room_users refreshes can touch
+            # last_seen for every member and would incorrectly make old members
+            # appear as if they entered after the bot.
+            entry_room = _norm_room(room)
+            entry_times = getattr(self, "_room_entry_times", {})
+            entry_ts = float(entry_times.get(entry_room, 0) or 0)
+            entry_map = getattr(self, "_room_entry_users", {}).get(entry_room, {})
+            users = list(entry_map.values()) if isinstance(entry_map, dict) else []
+            if not entry_ts:
+                users = []
+            # .r is a paginated result: send ONLY the first page now.
+            # The next page is delivered when the same user sends `ns`.
+            rows=[]; seen=set()
+            for u in users or []:
+                name=str(u or "").strip().lstrip("@")
+                key=_norm_user(name)
+                if name and key and key != _norm_user(BOT_ID) and key not in seen:
+                    seen.add(key); rows.append(name)
+            rows.sort(key=_norm_user)
+            if not rows:
+                self.send_private_text(sender, f"📭 لا توجد أسماء محفوظة لأعضاء دخلوا الغرفة {room}.")
+                return True
+            limit=int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+            title=f"👥 الأعضاء الذين دخلوا الغرفة — {room} ({len(rows)})"
+            pages=[]; current=[title]
+            for index,name in enumerate(rows,1):
+                line=f"{index}. @{name}"
+                candidate="\n".join(current+[line])
+                probe=encode_query("chat_message", type_="text", to=str(sender or ""), body=candidate)
+                if len(probe)>max(120,limit-80) and len(current)>1:
+                    pages.append("\n".join(current)); current=[title,line]
+                else:
+                    current.append(line)
+            if len(current)>1:
+                pages.append("\n".join(current))
+            total=len(pages)
+            # Store under a private-chat key so the generic `ns` handler can
+            # continue this list even though .r was issued from a room.
+            result_pages=getattr(self,"_result_pages",{})
+            result_key=("chat_message","",str(sender or ""))
+            result_pages[result_key]={
+                "pages": pages, "part": 1,
+                "kwargs": {"to": str(sender or "")}
+            }
+            self._result_pages=result_pages
+            first=pages[0]
+            if total>1:
+                first += "\n\n📌 للقائمة التالية اكتب Ns"
+            self.send_private_text(sender, first)
+            return True
         if low == "inv" or low.startswith("inv ") or low in ("دعوات","invite") or low.startswith(("دعوات ","invite ")):
             if not getattr(self, "invites_enabled", True):
                 self.send_private_text(sender, "🛑 الدعوات متوقفة حالياً. أرسل: تشغيل الدعوات")
@@ -13411,9 +13728,8 @@ class TalkinBot:
         if not pending:
             return False
         tried = set()
-        ordered = list(candidates or [])
-        ordered.extend(list(pending.keys()))
-        for sender in ordered:
+        # فقط صاحب طلب النشر من يتم قبول صورته، وتجاهل أي صورة يرسلها شخص آخر بالغرفة
+        for sender in (candidates or []):
             sender = str(sender or "").strip()
             key = _norm_user(sender)
             if not key or key in tried:
@@ -13422,17 +13738,6 @@ class TalkinBot:
             if key in pending:
                 if self._handle_publish_media(room, sender, media_url):
                     return True
-
-        # Fallback to the latest pending publish
-        now = time.time()
-        for sender_key, item in list(pending.items()):
-            try:
-                if now - float(item.get("created_at", 0) or 0) <= 300:
-                    if self._handle_publish_media(room, sender_key, media_url):
-                        self.log("[PUBLISH] consumed image using active fallback for:", sender_key)
-                        return True
-            except Exception as exc:
-                self.log("[PUBLISH] pending fallback error:", repr(exc))
         return False
 
     def _ocr_publish_image(self, media_url):
@@ -13584,29 +13889,22 @@ class TalkinBot:
             return True
         try:
             tried = set()
-            ordered = list(candidates or [])
-            ordered.extend(list(getattr(self, "publish_pending", {}).keys()))
-            for sender in ordered:
+            # فقط من يرسل الصورة ويكون لديه طلب نشر معلق هو من تنشر صورته
+            pending = getattr(self, "publish_pending", {})
+            for sender in (candidates or []):
                 sender = str(sender or "").strip()
                 key = _norm_user(sender)
                 if not key or key in tried:
                     continue
                 tried.add(key)
-                try:
-                    if self._handle_publish_media(room, sender, media_url):
-                        return True
-                except Exception as exc:
-                    self.log("[PUBLISH] media handling failed:", repr(exc))
-            pending = getattr(self, "publish_pending", {})
-            now = time.time()
-            for sender_key, item in list(pending.items()):
-                try:
-                    if now - float(item.get("created_at", 0) or 0) <= 180:
-                        if self._handle_publish_media(room, sender_key, media_url):
-                            self.log("[PUBLISH] consumed image using pending fallback:", sender_key)
+                if key in pending:
+                    try:
+                        if self._handle_publish_media(room, sender, media_url):
                             return True
-                except Exception as exc:
-                    self.log("[PUBLISH] pending fallback error:", repr(exc))
+                    except Exception as exc:
+                        self.log("[PUBLISH] media handling failed:", repr(exc))
+            # Never consume another user's pending publish request. The image
+            # must belong to the same account that issued انشر/انشر@الوصف.
             return False
         finally:
             lock.release()
@@ -13768,6 +14066,13 @@ class TalkinBot:
                     return
             self.room_users[room][username] = role or "none"
             _remember_roster(room, [{"username": username, "role": role or "none"}])
+            # Keep a separate history for .r. Only events received after the
+            # bot's own you_joined/you_rejoined timestamp are recorded.
+            entry_room = _norm_room(room)
+            entry_ts = float(getattr(self, "_room_entry_times", {}).get(entry_room, 0) or 0)
+            if entry_ts and _norm_user(username) != _norm_user(BOT_ID) and time.time() >= entry_ts:
+                entry_map = getattr(self, "_room_entry_users", {}).setdefault(entry_room, {})
+                entry_map.setdefault(_norm_user(username), username)
             self.last_joined_room = room
             if _norm_user(username) == _norm_user(BOT_MASTER):
                 self._master_online_rooms.add(_norm_room(room))
@@ -13798,11 +14103,23 @@ class TalkinBot:
                                          .replace("{username}", username)
                                          .replace("{room}", room) + "\n\n" + level_welcome)
                     self.send_room_text(room, level_welcome)
+        if event_type in ("you_joined", "you_rejoined"):
+            if room:
+                entry_room = _norm_room(room)
+                entry_time = time.time()
+                getattr(self, "_room_entry_times", {}).update({entry_room: entry_time})
+                # Start a fresh history for this bot entry/re-entry. Members
+                # who were already in the room are NOT part of .r.
+                getattr(self, "_room_entry_users", {}).pop(entry_room, None)
+
         elif event_type == "user_left" and username:
             self.room_users[room].pop(username, None)
             if _norm_user(username) == _norm_user(BOT_ID):
-                self.log(f"[USER_LEFT_DETECTED] Bot left {room}; rejoining automatically...")
-                self._schedule_auto_rejoin(room)
+                if getattr(self, "_intentional_leaves", None) and _norm_room(room) in self._intentional_leaves:
+                    self.log(f"[USER_LEFT_DETECTED] Bot left {room} intentionally; skipping auto-rejoin.")
+                else:
+                    self.log(f"[USER_LEFT_DETECTED] Bot left {room}; rejoining automatically...")
+                    self._schedule_auto_rejoin(room)
             if _norm_user(username) == _norm_user(BOT_MASTER):
                 self._master_online_rooms.discard(_norm_room(room))
                 self.master_online = bool(self._master_online_rooms)
@@ -13851,7 +14168,7 @@ class TalkinBot:
                     # native event only for state synchronization and logging.
                     # Keep master moderation silent; confirmation is logged only.
                     self.log(f"[MOD] server confirmed room={room} target=@{changed_user} role={changed_role}")
-        elif event_type in ("you_joined", "you_rejoined"):
+        if event_type in ("you_joined", "you_rejoined"):
             # The server's join acknowledgement is the source of truth for
             # the session-only connected-room list.
             if room:
@@ -14229,9 +14546,11 @@ class TalkinBot:
             # .تشغيل remains local to the room where it was requested.
             if self.handle_music_command(
                     room, command, frm,
-                    broadcast_all=not is_room_broadcast,
+                    # .تشغيل = this room only.
+                    # بث = explicit global/live broadcast.
+                    broadcast_all=is_room_broadcast,
                     with_reactions=False,
-                    room_output=not is_room_broadcast,
+                    room_output=True,
                     live_stream=is_room_broadcast):
                 if not getattr(self, "_replaying_bot_action", False):
                     self._remember_bot_action(room, body, frm, is_private=False)
@@ -14355,6 +14674,10 @@ class TalkinBot:
                     x for x in (result.get("stream_event"), result.get("call_info"), result.get("room_event"))
                     if isinstance(x, dict)):
                 self.log("[STREAM]", stream_event)
+                # Some deployments expose member identity in STREAM records
+                # rather than the RoomAdmin roster. Persist that identity so
+                # inv/.r can use it even when the member is currently offline.
+                self._cache_stream_member_event(stream_event)
                 self._handle_stream_event(stream_event)
             # The native app sends publish_stream after the invitation is
             # accepted. It is the authoritative success signal and may be
