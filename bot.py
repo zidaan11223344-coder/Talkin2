@@ -63,6 +63,14 @@ except Exception:
     Image = ImageDraw = ImageFont = None
     PIL_AVAILABLE = False
 try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except Exception:
+    # OCR is optional. Image publishing must continue when Tesseract is not
+    # installed on the hosting platform.
+    pytesseract = None
+    TESSERACT_AVAILABLE = False
+try:
     import arabic_reshaper
     from bidi.algorithm import get_display
 except Exception:
