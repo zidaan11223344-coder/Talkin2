@@ -4547,10 +4547,13 @@ class TalkinBot:
                         handle.flush()
             except Exception:
                 pass
-            if DEBUG:
+            # Riven displays stdout as the runtime log. When QUIET_MODE=0,
+            # diagnostics must be visible even if DEBUG remains 0; DEBUG is
+            # reserved for the extra raw/protocol traces.
+            if DEBUG or not QUIET_MODE:
                 print(*args, flush=True)
         except Exception:
-            if DEBUG:
+            if DEBUG or not QUIET_MODE:
                 try:
                     print(*args, flush=True)
                 except Exception:
