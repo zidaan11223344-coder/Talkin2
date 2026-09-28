@@ -4314,6 +4314,7 @@ class TalkinBot:
         _ensure_replies_file()
         self.db = DatabaseBridge(self.log)
         self.db.sign_in()
+        self._db_success_notice_pending = bool(_STATE_DB_ENABLED and _STATE_DB and BOT_MASTER)
         self.music_last = defaultdict(float)
         self.music_current = {}
         self._profile_status_lock = threading.Lock()
@@ -14646,6 +14647,13 @@ class TalkinBot:
                         self.log("[WS] CONNECTED:", url)
                         self.log("[WS] custom headers:", [x.split(":",1)[0] + ": <redacted>" if x.lower().startswith(("username:","password:")) else x for x in header_lines])
                         self.bootstrap_after_connect()
+                        if self._db_success_notice_pending and BOT_MASTER:
+                            notice_sent = self.send_private_text(
+                                BOT_MASTER,
+                                f"✅ تم ربط قاعدة البيانات PostgreSQL بنجاح.\n🗄️ قاعدة البيانات: {RIVEN_DATABASE_NAME}",
+                            )
+                            if notice_sent:
+                                self._db_success_notice_pending = False
                         # Publish the profile status once after the first fully
                         # established connection. A reconnect restores the
                         # base status only when no temporary gift is active.
