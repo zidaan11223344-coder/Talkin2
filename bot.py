@@ -234,6 +234,10 @@ BOT_BASE_STATUS = os.getenv("BOT_BASE_STATUS", DEFAULT_BOT_BASE_STATUS).strip()
 BOT_FIRST_CONNECTION_STATUS = os.getenv("BOT_FIRST_CONNECTION_STATUS", BOT_BASE_STATUS).strip()
 PROFILE_STATUS_MAX_CHARS = max(500, int(os.getenv("PROFILE_STATUS_MAX_CHARS", "700")))
 GIFT_STATUS_SECONDS = 2 * 60
+# Last source variant used per gift. This prevents two consecutive sends of
+# the same gift from selecting the identical artwork when random.choice repeats.
+_GIFT_LAST_VARIANT = {}
+_GIFT_VARIANT_LOCK = threading.Lock()
 
 # Master account process control. The primary bot can start/stop master_bot.py
 # from the private chat, but only the configured BOT_MASTER is authorized.
@@ -3222,9 +3226,15 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
     if not files:
         raise FileNotFoundError("صور الهدية غير موجودة داخل assets")
 
-    # Always use one of the ORIGINAL gift assets from assets/.
-    # Pick randomly so repeated gifts do not keep using the same variant.
-    gift_path = random.choice(files)
+    # Always use one of the ORIGINAL gift assets from assets/. Pick a random
+    # variant, but exclude the one used immediately before for this gift so
+    # repeated sends visibly rotate instead of occasionally duplicating.
+    gift_key = str(gift_id)
+    with _GIFT_VARIANT_LOCK:
+        previous = _GIFT_LAST_VARIANT.get(gift_key)
+        choices = [path for path in files if path != previous] or files
+        gift_path = random.choice(choices)
+        _GIFT_LAST_VARIANT[gift_key] = gift_path
 
     # Clean old generated gift cards from the project before creating the
     # current one.  The source artwork itself is NEVER generated or replaced.
