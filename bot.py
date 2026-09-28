@@ -5186,7 +5186,8 @@ class TalkinBot:
                     self.log(f"[AUTO_REJOIN] already connected; skip {room}")
                     return
                 self.log(f"[AUTO_REJOIN] Attempting to rejoin {room}...")
-                self.join_room(room, force=True)
+                with self._room_bulk_lock:
+                    self.join_room(room, force=True)
             except Exception as e:
                 self.log(f"[AUTO_REJOIN] Rejoin failed for {room}:", repr(e))
         threading.Thread(target=_rejoin_worker, name=f"auto-rejoin-{room}", daemon=True).start()
@@ -12904,24 +12905,21 @@ class TalkinBot:
             _save_persistent_rooms(self.known_rooms)
             response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
             
-            # قبول الطلب فوراً من أي عضو والدخول مباشرة بلغة عربية افتراضية
+            # Accept immediately, but send one room_join at a time.
             if not hasattr(self, "room_languages"):
                 self.room_languages = {}
             for target in rooms:
                 self.room_languages[_norm_room(target)] = "ar"
-                try:
-                    self.join_room(target, force=True, requested_by=sender)
-                except Exception as exc:
-                    self.log("[ROOM] join error:", target, repr(exc))
-            
-            confirm_msg = f"✅ تم قبول طلب دخول الغرفة: {', '.join(rooms)}\n⏳ جاري الانضمام إلى الغرفة..."
+            threading.Thread(
+                target=self._join_rooms_serially, args=(rooms, sender),
+                daemon=True, name="serial-room-join-command",
+            ).start()
+            confirm_msg = f"✅ تم قبول طلب دخول الغرفة: {', '.join(rooms)}\n⏳ جاري الانضمام بالتتابع وانتظار تأكيد الخادم لكل غرفة..."
             if response_room and not is_private:
                 self.send_room_text(response_room, confirm_msg)
             else:
                 self.send_private_text(sender, confirm_msg)
                 
-            # حفظ الطلب المعلق لاختيار اللغة (1 عربي / 2 إنجليزي) بدون تعطيل الدخول
-            self._begin_join_rooms_language(sender, rooms, response_room=response_room, is_private=is_private)
             return True
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
         if m_transfer and _is_verified_user(sender):
@@ -13345,17 +13343,12 @@ class TalkinBot:
             if not saved_rooms:
                 self.send_private_text(sender, "📭 ملف الغرف المحفوظة فارغ حالياً.\n📌 أضف غرفة أولاً عبر دخول@اسم_الغرفة.")
                 return True
-            sent = 0
+            threading.Thread(
+                target=self._join_rooms_serially, args=(saved_rooms, sender),
+                daemon=True, name="serial-room-join-all-private",
+            ).start()
+            sent = len(saved_rooms)
             skipped = 0
-            for target_room in saved_rooms:
-                try:
-                    if self.join_room(target_room, force=True, requested_by=sender):
-                        sent += 1
-                    else:
-                        skipped += 1
-                except Exception as exc:
-                    skipped += 1
-                    self.log("[ROOM] دخول الكل failed:", target_room, repr(exc))
             self.send_private_text(
                 sender,
                 f"🏠 دخول الكل\n━━━━━━━━━━━━\n📋 الغرف المحفوظة: {len(saved_rooms)}\n"
@@ -15099,9 +15092,12 @@ class TalkinBot:
         }
         if self.room and not MASTER_SERVICE_ENABLED:
             rooms_to_restore.add(str(self.room).strip())
-        for room in sorted(rooms_to_restore):
-            self.join_room(room, force=True)
-
+        if rooms_to_restore:
+            threading.Thread(
+                target=self._join_rooms_serially,
+                args=(sorted(rooms_to_restore), ""),
+                daemon=True, name="serial-room-restore",
+            ).start()
     def run_once(self):
         # Start a fresh live-room view for this WebSocket session.
         self.connected_rooms.clear()
