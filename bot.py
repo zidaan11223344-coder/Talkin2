@@ -390,6 +390,7 @@ VERIFIED_FILE = DATA_DIR / "verified_users.json"
 POINTS_FILE = DATA_DIR / "points.json"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 PUBLISHED_FILE = DATA_DIR / "published_posts.json"
+MEDIA_STATS_FILE = DATA_DIR / "media_stats.json"
 GAME_STATS_FILE = DATA_DIR / "game_stats.json"
 GAME_LEVELS_FILE = DATA_DIR / "game_levels.json"
 GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
@@ -416,7 +417,7 @@ MVIP_MASTERS_FILE = DATA_DIR / "mvip_masters.json"
 # NEVER deletes the old files, so replacing bot.py cannot destroy the old data.
 _STATE_FILE_NAMES = (
     "masters.json", "vip_users.json", "verified_users.json", "points.json",
-    "messages.json", "published_posts.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
+    "messages.json", "published_posts.json", "media_stats.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
     "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
     "custom_commands.json", "repair_state.json", "wager_state.json", "last_action.json", "backup_manifest.json",
@@ -2213,6 +2214,34 @@ def _is_vip_user(name):
 _GAME_STATE_LOCK = threading.RLock()
 _GAME_STATS_CACHE = None
 _POINTS_CACHE = None
+_MEDIA_STATS_LOCK = threading.RLock()
+_MEDIA_STATS_CACHE = None
+
+def _media_stats_data():
+    """Persistent counters for successful image and music publications."""
+    global _MEDIA_STATS_CACHE
+    with _MEDIA_STATS_LOCK:
+        if _MEDIA_STATS_CACHE is None:
+            data = _load_local_json(MEDIA_STATS_FILE, {})
+            if not isinstance(data, dict):
+                data = {}
+            data.setdefault("published_images", 0)
+            data.setdefault("published_songs", 0)
+            _MEDIA_STATS_CACHE = data
+        return _MEDIA_STATS_CACHE
+
+def _record_media_publication(kind, title="", publisher="", room=""):
+    key = "published_images" if str(kind).lower() in {"image", "publish", "photo"} else "published_songs"
+    with _MEDIA_STATS_LOCK:
+        data = _media_stats_data()
+        data[key] = int(data.get(key, 0) or 0) + 1
+        data["last"] = {
+            "kind": "image" if key == "published_images" else "music",
+            "title": str(title or ""), "publisher": str(publisher or ""),
+            "room": str(room or ""), "at": time.time(),
+        }
+        _queue_local_json_save(MEDIA_STATS_FILE, copy.deepcopy(data))
+        return int(data[key])
 
 def _game_stats_data():
     """Return the in-memory game statistics cache; disk is loaded once."""
@@ -8527,13 +8556,10 @@ class TalkinBot:
                     "url": url, "duration": duration, "created_at": time.time(),
                 }
                 if with_reactions:
-                    music_codes = {
-                        "like": uuid.uuid4().hex[:4],
-                        "love": uuid.uuid4().hex[:4],
-                        "dislike": uuid.uuid4().hex[:4],
-                        "comment": uuid.uuid4().hex[:4],
-                        "report": uuid.uuid4().hex[:4],
-                    }
+                    # One code identifies this whole song; lk/lv/dl/cm/report
+                    # still distinguish the requested reaction.
+                    music_code = uuid.uuid4().hex[:4]
+                    music_codes = {kind: music_code for kind in ("like", "love", "dislike", "comment", "report")}
                     caption=_message_template(
                         "music", "broadcast",
                         "🎵 تشغيل الأغنية\n👤 الناشر: @{requester_name}\n🎶 اسم الأغنية: {title}\n🏠 الغرفة: {room}\n━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
@@ -8543,11 +8569,10 @@ class TalkinBot:
                         dislike=music_codes["dislike"], comment=music_codes["comment"],
                         report=music_codes["report"], url=url, duration=duration
                     )
-                    for reaction_kind, reaction_code in music_codes.items():
-                        self.reaction_targets[reaction_code] = {
-                            "publisher": requester, "kind": "music", "reaction": reaction_kind,
-                            "title": title, "description": title, "created_at": time.time(),
-                        }
+                    self.reaction_targets[music_code] = {
+                        "publisher": requester, "kind": "music",
+                        "title": title, "description": title, "created_at": time.time(),
+                    }
                 else:
                     caption=(f"🎶 تم تشغيل الأغنية\n━━━━━━━━━━━━\n"
                              f"🎵 العنوان: {title}\n🎤 الطلب: @{requester}\n"
@@ -8557,12 +8582,14 @@ class TalkinBot:
                 # لا نرفع الأغنية إلى PUBLIC_BASE_URL عندما يكون المصدر Audius.
                 live_source = url if (live_stream and path is None) else (str(path) if live_stream else url)
                 live_started = self._play_music_in_live_room(room, live_source, duration) if live_stream else False
+                music_published = False
                 if room_output:
                     target_rooms=self._active_rooms() if broadcast_all else [room]
                     for target_room in target_rooms:
                         if not live_started and not live_stream:
                             self.send_room_media(target_room,url,"audio",duration)
                         self.send_room_text(target_room,caption)
+                        music_published = True
                 elif live_stream:
                     if live_started:
                         self.send_room_text(room, f"✅ تم تشغيل {title} في البث الحي.")
@@ -8570,6 +8597,9 @@ class TalkinBot:
                         self.send_room_text(room, "📡 جاري صعود البوت للبث وتشغيل الأغنية تلقائياً...")
                     else:
                         self.send_room_text(room, "❌ تعذر تشغيل الأغنية في البث؛ تم استخدام المصدر الاحتياطي إن توفر.")
+                    music_published = live_started or getattr(self, "_last_live_play_status_by_room", {}).get(room) == "queued"
+                if music_published:
+                    _record_media_publication("music", title, requester, room)
             except Exception as e:
                 self.report_master_error("تشغيل الأغنية", e, room)
                 if room_output:
@@ -13309,16 +13339,14 @@ class TalkinBot:
         rooms=self._active_rooms()
         # In rooms, the successful publish message contains ONLY the reaction
         # controls. The publish status/result is sent privately to the master.
+        # One code identifies the whole image publication. The command prefix
+        # (lk/lv/dl/cm/report) selects the reaction type.
         base_code=uuid.uuid4().hex[:4]
-        reaction_codes={
-            "like": base_code,
-            "love": uuid.uuid4().hex[:4],
-            "dislike": uuid.uuid4().hex[:4],
-            "comment": uuid.uuid4().hex[:4],
-            "report": uuid.uuid4().hex[:4],
+        reaction_codes={kind: base_code for kind in ("like", "love", "dislike", "comment", "report")}
+        self.reaction_targets[base_code]={
+            "publisher": sender, "kind": "image",
+            "description": desc or "منشور صورة", "created_at": time.time(),
         }
-        for kind,code in reaction_codes.items():
-            self.reaction_targets[code]={"publisher": sender, "kind": kind, "description": desc or "منشور صورة", "created_at": time.time()}
         caption=_message_template(
             "publish", "broadcast",
             "🖼️ منشور صورة\n👤 {publisher}\n📝 {description}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
@@ -13359,6 +13387,9 @@ class TalkinBot:
             except Exception as e:
                 errors.append((target,str(e)))
                 self.log("[PUBLISH] failed",target,repr(e))
+        # Count one publication, not one copy per room, and persist it.
+        if ok:
+            _record_media_publication("image", desc or "منشور صورة", sender, source_room or room)
         # إشعار بنجاح النشر في الروم وفي الخاص
         confirm_text = f"✅ تم نشر الصورة بنجاح في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else "")
         if source_room:
@@ -13477,16 +13508,14 @@ class TalkinBot:
         rooms=self._active_rooms()
         # In rooms, the successful publish message contains ONLY the reaction
         # controls. The publish status/result is sent privately to the master.
+        # One code identifies the whole image publication. The command prefix
+        # (lk/lv/dl/cm/report) selects the reaction type.
         base_code=uuid.uuid4().hex[:4]
-        reaction_codes={
-            "like": base_code,
-            "love": uuid.uuid4().hex[:4],
-            "dislike": uuid.uuid4().hex[:4],
-            "comment": uuid.uuid4().hex[:4],
-            "report": uuid.uuid4().hex[:4],
+        reaction_codes={kind: base_code for kind in ("like", "love", "dislike", "comment", "report")}
+        self.reaction_targets[base_code]={
+            "publisher": sender, "kind": "image",
+            "description": desc or "منشور صورة", "created_at": time.time(),
         }
-        for kind,code in reaction_codes.items():
-            self.reaction_targets[code]={"publisher": sender, "kind": kind, "description": desc or "منشور صورة", "created_at": time.time()}
         caption=_message_template(
             "publish", "broadcast",
             "🖼️ منشور صورة\n👤 {publisher}\n📝 {description}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
@@ -13527,6 +13556,9 @@ class TalkinBot:
             except Exception as e:
                 errors.append((target,str(e)))
                 self.log("[PUBLISH] failed",target,repr(e))
+        # Count one publication, not one copy per room, and persist it.
+        if ok:
+            _record_media_publication("image", desc or "منشور صورة", sender, source_room or room)
         # إشعار بنجاح النشر في الروم وفي الخاص
         confirm_text = f"✅ تم نشر الصورة بنجاح في {ok} غرفة." + (f"\n❌ أخطاء: {len(errors)}" if errors else "")
         if source_room:
