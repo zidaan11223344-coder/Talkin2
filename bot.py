@@ -5331,13 +5331,37 @@ class TalkinBot:
         return True
 
     def leave_all_rooms(self):
-        """Leave every currently tracked room; no room is automatically rejoined."""
-        rooms = [r for r in self.known_rooms if str(r).strip()]
+        """Leave all rooms temporarily while preserving the saved room list.
+
+        The command خروج is a session pause, not deletion.  The names remain
+        in known_rooms/tracked_rooms.json so bootstrap_after_connect() restores
+        them after the process is restarted.
+        """
+        rooms = [str(r).strip() for r in self.known_rooms if str(r).strip()]
+        if not hasattr(self, "_intentional_leaves"):
+            self._intentional_leaves = set()
         for room in rooms:
             try:
-                self.leave_room(room)
+                room_key = _norm_room(room)
+                self._intentional_leaves.add(room_key)
+                pending = self._pending_room_joins.pop(room_key, None)
+                if pending and pending.get("timer"):
+                    try:
+                        pending["timer"].cancel()
+                    except Exception:
+                        pass
+                with self._room_bulk_lock:
+                    self.send_query(encode_query("room_leave", room=room))
+                    self.connected_rooms.discard(room)
+                    self.room_users.pop(room, None)
+                    self._last_join_sent.pop(room, None)
+                self.log("[ROOM] left temporarily; preserved for restart:", room)
+                if room != rooms[-1]:
+                    time.sleep(max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5)))
             except Exception as e:
                 self.log("[ROOM] leave failed", room, repr(e))
+        # Deliberately do not call _save_persistent_rooms with a reduced set.
+        # known_rooms remains the source used by reconnect/bootstrap.
         return rooms
 
     def _split_talkin_text(self, text: str, limit: int = None):
