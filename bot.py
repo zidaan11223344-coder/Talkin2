@@ -4051,6 +4051,8 @@ class TalkinBot:
         self.room_users = defaultdict(dict)
         self.bot_room_roles = {}
         self._pending_inv_role_check = {}
+        # Private list requests waiting for the native occupants_list response.
+        self._pending_room_lists = {}
         # Live profile photos learned from Talkin UserItem field 3.
         # username(casefold) -> public photo URL.
         self.user_photos = {}
@@ -11540,6 +11542,52 @@ class TalkinBot:
         )
         return True
 
+    def _request_room_list_via_ws(self, room, code, sender):
+        room = str(room or "").strip()
+        if not room or not getattr(self, "ws", None):
+            return False
+        try:
+            self._pending_room_lists[_norm_room(room)] = {
+                "room": room, "code": code, "sender": str(sender or "").strip(),
+                "requested_at": time.time(),
+            }
+            self.send_query(encode_query(
+                "room_admin", type_="occupants_list", room=room,
+                to=BOT_ID, value="none"
+            ))
+            self.send_private_text(sender, f"⏳ جارٍ جلب إعدادات أعضاء الغرفة {room}...")
+            return True
+        except Exception as exc:
+            self._pending_room_lists.pop(_norm_room(room), None)
+            self.log("[ROOM-LIST] native occupants request failed", room, repr(exc))
+            return False
+
+    def _complete_pending_room_list(self, result):
+        source_room = str(result.get("_occupants_room") or "").strip()
+        if not source_room:
+            return False
+        pending = self._pending_room_lists.pop(_norm_room(source_room), None)
+        if not isinstance(pending, dict):
+            return False
+        users = self._users_from_room_admin(result.get("room_admin") or {})
+        if not users and result.get("users"):
+            for item in result.get("users") or []:
+                if isinstance(item, dict):
+                    users.append({"username": str(item.get(1) or "").strip(),
+                                  "role": str(item.get(6) or "none").strip().lower() or "none",
+                                  "online": item.get(5)})
+        users = [u for u in users if _norm_user(u.get("username")) != _norm_user(BOT_ID)]
+        if users:
+            self.room_users[source_room] = {u.get("username"): u.get("role", "none") for u in users if u.get("username")}
+            _remember_roster(source_room, users)
+        code = str(pending.get("code") or "").lower()
+        if code == "a": users = [u for u in users if str(u.get("role") or "").lower() in {"admin", "moderator", "mod"}]
+        elif code == "o": users = [u for u in users if str(u.get("role") or "").lower() in {"owner", "creator", "room_owner", "room_creator", "host"}]
+        elif code == "m": users = [u for u in users if str(u.get("role") or "").lower() not in {"owner", "creator", "room_owner", "room_creator", "host", "admin", "moderator", "mod"}]
+        titles = {"a": "🛡️ قائمة المشرفين", "m": "👥 قائمة الأعضاء", "o": "👑 قائمة الأونرات"}
+        self._send_private_list(pending.get("sender"), f"{titles.get(code, '📋 قائمة الغرفة')} — {source_room}", users, "📭 لا توجد أسماء مطابقة في إعدادات الغرفة.")
+        return True
+
     def _settings_room_users(self, room):
         """Return the room-settings roster, including offline members."""
         room = str(room or "").strip()
@@ -11574,8 +11622,11 @@ class TalkinBot:
         if match:
             if not room:
                 self.send_private_text(sender, "⚠️ نفّذ الأمر داخل الغرفة المطلوبة."); return True
-            users=self._settings_room_users(room)
             code=match.group(1).lower()
+            if not getattr(getattr(self, "db", None), "client", None):
+                if self._request_room_list_via_ws(room, code, sender):
+                    return True
+            users=self._settings_room_users(room)
             if code == "a": users=[u for u in users if str(u.get("role") or "").lower() in {"admin","moderator","mod"}]
             elif code == "o": users=[u for u in users if str(u.get("role") or "").lower() in {"owner","creator","room_owner","room_creator","host"}]
             elif code == "m": users=[u for u in users if str(u.get("role") or "").lower() not in {"owner","creator","room_owner","room_creator","host","admin","moderator","mod"}]
@@ -13961,7 +14012,14 @@ class TalkinBot:
             if result.get("rooms"):
                 self._process_room_list(result.get("rooms"))
             if result.get("users") or result.get("room_admin"):
+                # RoomAdmin responses do not always echo the room name. When a
+                # single native list request is pending, bind this response to it.
+                if result.get("room_admin") and not result.get("_occupants_room"):
+                    pending_rooms = list(getattr(self, "_pending_room_lists", {}).keys())
+                    if len(pending_rooms) == 1:
+                        result["_occupants_room"] = pending_rooms[0]
                 self.process_occupants_for_invite(result)
+                self._complete_pending_room_list(result)
             # Different Talkin builds wrap the live invitation as StreamEvent,
             # CallInfo, or (less commonly) a RoomEvent. Try all wrappers.
             for stream_event in tuple(
