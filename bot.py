@@ -39,6 +39,10 @@ try:
     import psycopg
 except Exception:
     psycopg = None
+try:
+    import pymysql
+except Exception:
+    pymysql = None
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1283,13 +1287,18 @@ RIVEN_DB_PORT = (os.getenv("RIVEN_DB_PORT") or os.getenv("DB_PORT") or os.getenv
 RIVEN_DB_USER = (os.getenv("RIVEN_DB_USER") or os.getenv("DB_USER") or os.getenv("PGUSER") or "").strip()
 RIVEN_DB_PASSWORD = os.getenv("RIVEN_DB_PASSWORD") or os.getenv("DB_PASSWORD") or os.getenv("PGPASSWORD") or ""
 RIVEN_DATABASE_URL = (os.getenv("RIVEN_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+RIVEN_DATABASE_KIND = (os.getenv("RIVEN_DATABASE_KIND") or os.getenv("DB_TYPE") or
+                       ("mysql" if RIVEN_DB_PORT == "3306" else "postgres")).strip().lower()
 if not RIVEN_DATABASE_URL and RIVEN_DB_HOST and RIVEN_DB_USER and RIVEN_DB_PASSWORD:
     from urllib.parse import quote as _url_quote
+    _db_scheme = "mysql" if RIVEN_DATABASE_KIND in {"mysql", "mariadb"} else "postgresql"
     RIVEN_DATABASE_URL = (
-        f"postgresql://{_url_quote(RIVEN_DB_USER, safe='')}:{_url_quote(RIVEN_DB_PASSWORD, safe='')}"
+        f"{_db_scheme}://{_url_quote(RIVEN_DB_USER, safe='')}:{_url_quote(RIVEN_DB_PASSWORD, safe='')}"
         f"@{RIVEN_DB_HOST}:{RIVEN_DB_PORT}/{_url_quote(RIVEN_DATABASE_NAME, safe='')}"
     )
-_STATE_DB_ENABLED = bool(RIVEN_DATABASE_URL and psycopg)
+_STATE_DB_ENABLED = bool(RIVEN_DATABASE_URL and (
+    pymysql if RIVEN_DATABASE_KIND in {"mysql", "mariadb"} else psycopg
+))
 _STATE_DB = None
 _STATE_DB_CONDITION = threading.Condition()
 _STATE_DB_PENDING = {}
@@ -1297,18 +1306,24 @@ _STATE_DB_WORKER_STARTED = False
 _STATE_DB_HAS_DATA = False
 
 class PersistentStateDatabase:
-    """JSONB state store: one row per local bot state file."""
+    """JSON state store for one row per local bot state file."""
     def __init__(self, url, log=print):
         self.url, self.log = str(url or "").strip(), log
         self._ensure_schema()
     def _connect(self):
+        if RIVEN_DATABASE_KIND in {"mysql", "mariadb"}:
+            return pymysql.connect(host=RIVEN_DB_HOST, port=int(RIVEN_DB_PORT or 3306),
+                                   user=RIVEN_DB_USER, password=RIVEN_DB_PASSWORD,
+                                   database=RIVEN_DATABASE_NAME, connect_timeout=8,
+                                   charset="utf8mb4", autocommit=False)
         return psycopg.connect(self.url, connect_timeout=8) if psycopg and self.url else None
     def _ensure_schema(self):
         conn=self._connect()
         if not conn: return
         try:
             with conn.cursor() as cur:
-                cur.execute("CREATE TABLE IF NOT EXISTS bot_state (state_key TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+                payload_type = "JSON" if RIVEN_DATABASE_KIND in {"mysql", "mariadb"} else "JSONB"
+                cur.execute(f"CREATE TABLE IF NOT EXISTS bot_state (state_key VARCHAR(255) PRIMARY KEY, payload {payload_type} NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)")
             conn.commit()
         except Exception:
             conn.rollback(); raise
@@ -1319,14 +1334,24 @@ class PersistentStateDatabase:
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT payload FROM bot_state WHERE state_key=%s", (str(key),))
-                row=cur.fetchone(); return row[0] if row else None
+                row=cur.fetchone()
+                if not row: return None
+                value = row[0]
+                if isinstance(value, str):
+                    try: return json.loads(value)
+                    except Exception: pass
+                return value
         finally: conn.close()
     def save(self, key, payload):
         conn=self._connect()
         if not conn: return False
         try:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO bot_state(state_key,payload,updated_at) VALUES (%s,%s::jsonb,NOW()) ON CONFLICT(state_key) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()", (str(key), json.dumps(payload, ensure_ascii=False)))
+                raw = json.dumps(payload, ensure_ascii=False)
+                if RIVEN_DATABASE_KIND in {"mysql", "mariadb"}:
+                    cur.execute("INSERT INTO bot_state(state_key,payload,updated_at) VALUES (%s,%s,NOW()) ON DUPLICATE KEY UPDATE payload=VALUES(payload), updated_at=NOW()", (str(key), raw))
+                else:
+                    cur.execute("INSERT INTO bot_state(state_key,payload,updated_at) VALUES (%s,%s::jsonb,NOW()) ON CONFLICT(state_key) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()", (str(key), raw))
             conn.commit(); return True
         except Exception:
             conn.rollback(); raise

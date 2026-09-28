@@ -15,9 +15,10 @@ talkin_bot_db
 ```text
 RIVEN_DATABASE_NAME=talkin_bot_db
 RIVEN_DB_HOST=<عنوان PostgreSQL من Riven>
-RIVEN_DB_PORT=<البورت من Riven>
-RIVEN_DB_USER=<اسم مستخدم PostgreSQL من Riven>
-RIVEN_DB_PASSWORD=<كلمة سر PostgreSQL من Riven>
+RIVEN_DB_PORT=3306
+RIVEN_DB_USER=<اسم مستخدم MySQL من Riven>
+RIVEN_DB_PASSWORD=<كلمة سر MySQL من Riven>
+RIVEN_DATABASE_KIND=mysql
 # اختياري فقط إذا أعطاك Riven رابط اتصال جاهزاً:
 RIVEN_DATABASE_URL=
 GITHUB_SYNC=1
@@ -29,7 +30,7 @@ DATABASE_BACKUP_INTERVAL_SECONDS=21600
 GITHUB_JSON_MIRROR=0
 ```
 
-إذا كان Riven يضيف المتغير `DATABASE_URL` تلقائياً، يمكن ترك الحقول المنفصلة و`RIVEN_DATABASE_URL` فارغة؛ البوت يستخدم `DATABASE_URL` كبديل. عند توفر الحقول المنفصلة، يبني البوت رابط PostgreSQL تلقائياً ويشفّر الرموز الخاصة في اسم المستخدم وكلمة السر.
+بما أن البورت `3306` فهو MySQL/MariaDB، لذلك استخدم `RIVEN_DATABASE_KIND=mysql`. يبني البوت اتصال MySQL تلقائياً ويشفّر الرموز الخاصة في اسم المستخدم وكلمة السر. إذا كان Riven يضيف المتغير `DATABASE_URL` تلقائياً، يمكن ترك الحقول المنفصلة و`RIVEN_DATABASE_URL` فارغة؛ البوت يستخدم `DATABASE_URL` كبديل.
 
 البوت يستدعي `load_dotenv()` عند التشغيل، لذلك يقرأ ملف `.env` تلقائياً. بعد حفظ الملف أعد تشغيل الخدمة أو نفّذ Redeploy.
 

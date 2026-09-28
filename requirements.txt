@@ -12,3 +12,4 @@ supabase>=2.0
 pytesseract>=0.3.13
 
 psycopg[binary]>=3.2
+pymysql>=1.1
