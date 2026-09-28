@@ -4386,6 +4386,10 @@ class TalkinBot:
             self.known_rooms.add(_norm_room(self.room))
         _save_persistent_rooms(self.known_rooms)
         self._join_lock = threading.Lock()
+        # All room-wide operations share one queue. Sending joins, moderation
+        # packets and media broadcasts concurrently can make the gateway
+        # replay room_join/room_leave events or close the WebSocket.
+        self._room_bulk_lock = threading.Lock()
         self._last_join_sent = {}
         self._rejoin_attempts = defaultdict(int)
         self._last_reconnect = 0.0
@@ -5550,14 +5554,19 @@ class TalkinBot:
         return sorted(rooms)
 
     def broadcast_all_rooms(self, text: str):
-        """Send one public game announcement to every room currently tracked by the bot."""
+        """Send a room-wide announcement serially without disturbing joins."""
         sent = 0
-        for target_room in self._active_rooms():
-            try:
-                self.send_room_text(target_room, text)
-                sent += 1
-            except Exception as exc:
-                self.log("[BROADCAST] failed", target_room, repr(exc))
+        rooms=self._active_rooms()
+        delay=max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
+        with self._room_bulk_lock:
+            for index, target_room in enumerate(rooms):
+                try:
+                    self.send_room_text(target_room, text)
+                    sent += 1
+                except Exception as exc:
+                    self.log("[BROADCAST] failed", target_room, repr(exc))
+                if index+1 < len(rooms):
+                    time.sleep(delay)
         return sent
 
     def send_room_text(self, room: str, text: str):
@@ -8749,11 +8758,15 @@ class TalkinBot:
                 music_published = False
                 if room_output:
                     target_rooms=self._active_rooms() if broadcast_all else [room]
-                    for target_room in target_rooms:
-                        if not live_started and not live_stream:
-                            self.send_room_media(target_room,url,"audio",duration)
-                        self.send_room_text(target_room,caption)
-                        music_published = True
+                    room_delay=max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
+                    with self._room_bulk_lock:
+                        for room_index, target_room in enumerate(target_rooms):
+                            if not live_started and not live_stream:
+                                self.send_room_media(target_room,url,"audio",duration)
+                            self.send_room_text(target_room,caption)
+                            music_published = True
+                            if room_index + 1 < len(target_rooms):
+                                time.sleep(room_delay)
                 elif live_stream:
                     if live_started:
                         self.send_room_text(room, f"تم تشغيل الاغنيه في البث\nالغرفة: {room}")
@@ -11828,6 +11841,47 @@ class TalkinBot:
                 return pkey, value
         return None, None
 
+    def _join_rooms_serially(self, rooms, sender=""):
+        """Join rooms one at a time and wait for each server acknowledgement.
+
+        Talkin's gateway is sensitive to a burst of room_join packets.  More
+        importantly, sending the next join before the previous result arrives
+        can look like an enter/leave loop.
+        """
+        cleaned=[]; seen=set()
+        for value in rooms or []:
+            room_name=str(value or "").strip()
+            key=_norm_room(room_name)
+            if room_name and key not in seen:
+                seen.add(key); cleaned.append(room_name)
+        if not cleaned:
+            return {"sent": 0, "skipped": 0}
+        sent=0; skipped=0
+        gap=max(0.8, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
+        timeout=max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20") or 20))
+        with self._room_bulk_lock:
+            for target in cleaned:
+                key=_norm_room(target)
+                if any(_norm_room(r)==key for r in getattr(self, "connected_rooms", set())):
+                    skipped += 1
+                    continue
+                try:
+                    if self.join_room(target, force=False, requested_by=sender):
+                        sent += 1
+                        # Wait for you_joined/you_rejoined (or the normal
+                        # timeout) before sending another room_join packet.
+                        deadline=time.time()+timeout+1.0
+                        while time.time() < deadline and key in getattr(self, "_pending_room_joins", {}):
+                            time.sleep(0.25)
+                    else:
+                        skipped += 1
+                except Exception as exc:
+                    skipped += 1
+                    self.log("[ROOM] serial join failed:", target, repr(exc))
+                if target != cleaned[-1]:
+                    time.sleep(gap)
+        return {"sent": sent, "skipped": skipped}
+
     def _begin_join_rooms_language(self, sender, rooms, response_room="", is_private=True):
         """Ask once for language, then join all requested rooms.
 
@@ -11888,18 +11942,16 @@ class TalkinBot:
         self._pending_room_language.pop(pending_key or self._room_language_pending_key(sender),None)
         if not hasattr(self,"room_languages"):
             self.room_languages={}
-        sent=0
-        skipped=0
         for target in rooms:
             self.room_languages[_norm_room(target)]=lang
-            try:
-                if self.join_room(target,force=True,requested_by=sender):
-                    sent+=1
-                else:
-                    skipped+=1
-            except Exception as exc:
-                skipped+=1
-                self.log("[ROOM] multi join failed:", target, repr(exc))
+        # Run in the background so the WebSocket reader remains responsive;
+        # the worker itself serializes every join and waits for its ACK.
+        threading.Thread(
+            target=self._join_rooms_serially, args=(rooms, sender),
+            daemon=True, name="serial-room-join",
+        ).start()
+        sent=len(rooms)
+        skipped=0
         label="العربية" if lang=="ar" else "English"
         saved_room = str(pending.get("response_room") or "").strip()
         target_room = str(response_room or saved_room).strip()
@@ -12754,17 +12806,14 @@ class TalkinBot:
             if not saved_rooms:
                 self.send_private_text(sender, "📭 ملف الغرف المحفوظة فارغ حالياً.\n📌 أضف غرفة أولاً عبر دخول@اسم_الغرفة.")
                 return True
-            sent = 0
+            # Do not burst all room_join packets. The serial worker waits for
+            # each server ACK and prevents the visible enter/leave loop.
+            threading.Thread(
+                target=self._join_rooms_serially, args=(saved_rooms, sender),
+                daemon=True, name="serial-room-join-all",
+            ).start()
+            sent = len(saved_rooms)
             skipped = 0
-            for target_room in saved_rooms:
-                try:
-                    if self.join_room(target_room, force=True, requested_by=sender):
-                        sent += 1
-                    else:
-                        skipped += 1
-                except Exception as exc:
-                    skipped += 1
-                    self.log("[ROOM] دخول الكل failed:", target_room, repr(exc))
             self.send_private_text(
                 sender,
                 f"🏠 دخول الكل\n━━━━━━━━━━━━\n📋 الغرف المحفوظة: {len(saved_rooms)}\n"
@@ -13198,16 +13247,17 @@ class TalkinBot:
             def _ban_all_rooms_ar():
                 total = len(active_rooms)
                 self.log(f"[MOD-ALL] starting Arabic global ban target=@{target} rooms={total}")
-                for index, active_room in enumerate(active_rooms, 1):
-                    try:
-                        self.request_admin_action(active_room, target, "ban", sender)
-                        self.log(f"[MOD-ALL] ban sent {index}/{total}: {active_room} -> @{target}")
-                    except Exception as exc:
-                        self.log(f"[MOD-ALL] ban failed room={active_room} target=@{target}: {exc!r}")
-                    if index < total:
-                        time.sleep(delay)
-                self.log(f"[MOD-ALL] global ban finished target=@{target} rooms={total}")
-                self.send_private_text(sender, f"✅ تم تنفيذ حظر @{target} في {total} غرفة بدون خروج البوت من أي غرفة.")
+                with self._room_bulk_lock:
+                    for index, active_room in enumerate(active_rooms, 1):
+                        try:
+                            self.request_admin_action(active_room, target, "ban", sender)
+                            self.log(f"[MOD-ALL] ban sent {index}/{total}: {active_room} -> @{target}")
+                        except Exception as exc:
+                            self.log(f"[MOD-ALL] ban failed room={active_room} target=@{target}: {exc!r}")
+                        if index < total:
+                            time.sleep(delay)
+                    self.log(f"[MOD-ALL] global ban finished target=@{target} rooms={total}")
+                    self.send_private_text(sender, f"✅ تم تنفيذ حظر @{target} في {total} غرفة بدون خروج البوت من أي غرفة.")
 
             threading.Thread(target=_ban_all_rooms_ar, daemon=True, name="global-ban-all-rooms-ar").start()
             return True
@@ -13240,19 +13290,20 @@ class TalkinBot:
             def _ban_all_rooms():
                 total=len(active_rooms)
                 self.log(f"[MOD-ALL] starting global ban target=@{target} rooms={total} delay={delay}s")
-                for index, active_room in enumerate(active_rooms, 1):
-                    try:
-                        # Keep the room announcement small and separate from the
-                        # native moderation request so a large combined payload
-                        # cannot be produced.
-                        self.send_room_text(active_room, f"🚫 @{target} تم حظره بسبب الإساءة.")
-                        self.request_admin_action(active_room, target, "ban", sender)
-                        self.log(f"[MOD-ALL] ban sent {index}/{total}: {active_room} -> @{target}")
-                    except Exception as exc:
-                        self.log(f"[MOD-ALL] ban failed room={active_room} target=@{target}: {exc!r}")
-                    if index < total:
-                        time.sleep(delay)
-                self.log(f"[MOD-ALL] global ban finished target=@{target} rooms={total}")
+                with self._room_bulk_lock:
+                    for index, active_room in enumerate(active_rooms, 1):
+                        try:
+                            # Keep the room announcement small and separate from the
+                            # native moderation request so a large combined payload
+                            # cannot be produced.
+                            self.send_room_text(active_room, f"🚫 @{target} تم حظره بسبب الإساءة.")
+                            self.request_admin_action(active_room, target, "ban", sender)
+                            self.log(f"[MOD-ALL] ban sent {index}/{total}: {active_room} -> @{target}")
+                        except Exception as exc:
+                            self.log(f"[MOD-ALL] ban failed room={active_room} target=@{target}: {exc!r}")
+                        if index < total:
+                            time.sleep(delay)
+                    self.log(f"[MOD-ALL] global ban finished target=@{target} rooms={total}")
 
             threading.Thread(
                 target=_ban_all_rooms,
@@ -13850,17 +13901,21 @@ class TalkinBot:
 
         ok=0
         errors=[]
-        for target in rooms:
-            try:
-                media_result = self.send_room_media(target,publish_url,"image")
-                if media_result is False:
-                    errors.append((target, "تم رفض حزمة الصورة أو تجاوزت الحد المسموح"))
-                    continue
-                self.send_room_text(target,caption)
-                ok+=1
-            except Exception as e:
-                errors.append((target,str(e)))
-                self.log("[PUBLISH] failed",target,repr(e))
+        room_delay=max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
+        with self._room_bulk_lock:
+            for room_index, target in enumerate(rooms):
+                try:
+                    media_result = self.send_room_media(target,publish_url,"image")
+                    if media_result is False:
+                        errors.append((target, "تم رفض حزمة الصورة أو تجاوزت الحد المسموح"))
+                        continue
+                    self.send_room_text(target,caption)
+                    ok+=1
+                except Exception as e:
+                    errors.append((target,str(e)))
+                    self.log("[PUBLISH] failed",target,repr(e))
+                if room_index + 1 < len(rooms):
+                    time.sleep(room_delay)
         # Count one publication, not one copy per room, and persist it.
         if ok:
             _record_media_publication("image", desc or "منشور صورة", sender, source_room or room)
