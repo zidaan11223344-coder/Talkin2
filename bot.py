@@ -35,6 +35,10 @@ try:
     from supabase import create_client
 except Exception:
     create_client = None
+try:
+    import psycopg
+except Exception:
+    psycopg = None
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1270,6 +1274,51 @@ class DatabaseBridge:
             return []
 
 # ----------------------- Giant-style local data -----------------------
+RIVEN_DATABASE_NAME = os.getenv("RIVEN_DATABASE_NAME", "talkin_bot_db").strip() or "talkin_bot_db"
+RIVEN_DATABASE_URL = (os.getenv("RIVEN_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+_STATE_DB_ENABLED = bool(RIVEN_DATABASE_URL and psycopg)
+_STATE_DB = None
+_STATE_DB_CONDITION = threading.Condition()
+_STATE_DB_PENDING = {}
+_STATE_DB_WORKER_STARTED = False
+_STATE_DB_HAS_DATA = False
+
+class PersistentStateDatabase:
+    """JSONB state store: one row per local bot state file."""
+    def __init__(self, url, log=print):
+        self.url, self.log = str(url or "").strip(), log
+        self._ensure_schema()
+    def _connect(self):
+        return psycopg.connect(self.url, connect_timeout=8) if psycopg and self.url else None
+    def _ensure_schema(self):
+        conn=self._connect()
+        if not conn: return
+        try:
+            with conn.cursor() as cur:
+                cur.execute("CREATE TABLE IF NOT EXISTS bot_state (state_key TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+            conn.commit()
+        except Exception:
+            conn.rollback(); raise
+        finally: conn.close()
+    def load(self, key):
+        conn=self._connect()
+        if not conn: return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT payload FROM bot_state WHERE state_key=%s", (str(key),))
+                row=cur.fetchone(); return row[0] if row else None
+        finally: conn.close()
+    def save(self, key, payload):
+        conn=self._connect()
+        if not conn: return False
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO bot_state(state_key,payload,updated_at) VALUES (%s,%s::jsonb,NOW()) ON CONFLICT(state_key) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()", (str(key), json.dumps(payload, ensure_ascii=False)))
+            conn.commit(); return True
+        except Exception:
+            conn.rollback(); raise
+        finally: conn.close()
+
 def _load_local_json(path, default):
     try:
         if Path(path).is_file():
@@ -1303,6 +1352,10 @@ def _save_local_json(path, data):
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
+    if _STATE_DB_ENABLED:
+        with _STATE_DB_CONDITION:
+            _STATE_DB_PENDING[str(path)] = copy.deepcopy(data)
+            _STATE_DB_CONDITION.notify()
     _github_sync_after_local_save(path, data)
 
 # GitHub-backed persistent state. Runtime stays in Talkin1; durable state is
@@ -1566,12 +1619,42 @@ def _github_restore_or_seed_state():
     finally:
         _GITHUB_RESTORING = False
 
-# Restore persistent state only after the GitHub restore function has been defined.
-_github_restore_or_seed_state()
+def _state_has_data(value):
+    return bool(value) if isinstance(value, (dict, list)) else value not in (None, "", 0, False)
+
+def _restore_or_seed_postgres_state():
+    global _STATE_DB_HAS_DATA
+    if not _STATE_DB_ENABLED or not _STATE_DB: return
+    names=set(_STATE_FILE_NAMES) | {x.name for x in DATA_DIR.glob("*.json")}
+    for name in sorted(names):
+        path=DATA_DIR/name
+        try:
+            remote, local = _STATE_DB.load(name), _load_local_json(path, None)
+            if _state_has_data(remote):
+                _STATE_DB_HAS_DATA = True
+                _save_local_json(path, remote)
+            elif _state_has_data(local): _STATE_DB.save(name, local)
+        except Exception as exc: print(f"[STATE-DB] startup state failed for {name}: {exc}", flush=True)
+
+if _STATE_DB_ENABLED:
+    try:
+        _STATE_DB=PersistentStateDatabase(RIVEN_DATABASE_URL)
+        _restore_or_seed_postgres_state()
+        print(f"[STATE-DB] PostgreSQL enabled: {RIVEN_DATABASE_NAME}", flush=True)
+    except Exception as exc:
+        _STATE_DB, _STATE_DB_ENABLED = None, False
+        print(f"[STATE-DB] disabled after connection failure: {exc}", flush=True)
+
+# On a populated PostgreSQL store, it is authoritative and GitHub is used
+# only for scheduled/manual backups. On first setup, GitHub can seed the DB.
+if not _STATE_DB_HAS_DATA:
+    _github_restore_or_seed_state()
 
 
-def _github_sync_after_local_save(path, data):
+def _github_sync_after_local_save(path, data, force=False):
     if not GITHUB_SYNC_ENABLED or _GITHUB_RESTORING:
+        return
+    if _STATE_DB_ENABLED and not force and os.getenv("GITHUB_JSON_MIRROR", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return
     # Never serialize/copy a potentially large roster or points dictionary in
     # the WebSocket/event handler. The local atomic save already completed;
@@ -1595,7 +1678,7 @@ def _queue_github_full_backup():
         path = DATA_DIR / name
         data = _load_local_json(path, None)
         if path.is_file() and data is not None:
-            _github_sync_after_local_save(path, data)
+            _github_sync_after_local_save(path, data, force=True)
             queued += 1
             raw = path.read_bytes()
             manifest["files"][name] = {
@@ -1604,6 +1687,7 @@ def _queue_github_full_backup():
             }
     manifest_path = DATA_DIR / "backup_manifest.json"
     _save_local_json(manifest_path, manifest)
+    _github_sync_after_local_save(manifest_path, manifest, force=True)
     queued += 1
     return queued
 
@@ -1624,6 +1708,25 @@ def _request_github_full_backup(bot, sender):
             _GITHUB_PENDING_CONDITION.notify()
     return queued
 
+
+def _state_db_worker():
+    while True:
+        with _STATE_DB_CONDITION:
+            while not _STATE_DB_PENDING: _STATE_DB_CONDITION.wait()
+            _STATE_DB_CONDITION.wait(timeout=0.15)
+            pending=dict(_STATE_DB_PENDING); _STATE_DB_PENDING.clear()
+        for path,data in pending.items():
+            try:
+                if _STATE_DB: _STATE_DB.save(Path(path).name, data)
+            except Exception as exc: print(f"[STATE-DB] background save failed: {exc}", flush=True)
+
+def _database_backup_worker():
+    interval=max(900.0,float(os.getenv("DATABASE_BACKUP_INTERVAL_SECONDS","21600") or 21600))
+    while True:
+        time.sleep(interval)
+        if _STATE_DB_ENABLED and GITHUB_SYNC_ENABLED:
+            try: print(f"[BACKUP] queued snapshot: {_queue_github_full_backup()} files", flush=True)
+            except Exception as exc: print("[BACKUP] periodic backup failed:", repr(exc), flush=True)
 
 def _github_sync_worker():
     while True:
@@ -1665,6 +1768,11 @@ if not _LOCAL_BG_WORKER_STARTED:
     threading.Thread(target=_local_persistence_worker, name="local-persistence", daemon=True).start()
     _LOCAL_BG_WORKER_STARTED = True
 
+if _STATE_DB_ENABLED and not _STATE_DB_WORKER_STARTED:
+    threading.Thread(target=_state_db_worker, name="state-db-worker", daemon=True).start()
+    _STATE_DB_WORKER_STARTED = True
+    if GITHUB_SYNC_ENABLED:
+        threading.Thread(target=_database_backup_worker, name="database-backup", daemon=True).start()
 if GITHUB_SYNC_ENABLED and not _GITHUB_WORKER_STARTED:
     threading.Thread(target=_github_sync_worker, name="github-sync", daemon=True).start()
     _GITHUB_WORKER_STARTED = True

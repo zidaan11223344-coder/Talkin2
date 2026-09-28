@@ -10,3 +10,5 @@ fonttools>=4.50
 supabase>=2.0
 
 pytesseract>=0.3.13
+
+psycopg[binary]>=3.2
