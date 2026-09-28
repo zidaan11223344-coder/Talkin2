@@ -3770,13 +3770,7 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
     return out
 
 def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
-    """Create a fresh publish card from the submitted image, like the billion card.
-
-    The submitted artwork is kept at its original dimensions. A fresh bottom
-    panel is added containing the publisher avatar and username. A new file is
-    generated for every publication so different posts never share one cached
-    image.
-    """
+    """Create a card with the submitted image and sender name in a side panel."""
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبت")
     if not source_url:
@@ -3786,33 +3780,27 @@ def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
     r.raise_for_status()
     if len(r.content) > 10 * 1024 * 1024:
         raise ValueError("صورة النشر كبيرة جداً")
-    image = Image.open(BytesIO(r.content)).convert("RGBA")
+    image = Image.open(BytesIO(r.content)).convert("RGB")
     w, h = image.size
-    overlay = Image.new("RGBA", image.size, (0,0,0,0))
-    d = ImageDraw.Draw(overlay)
-    panel_h = max(130, int(h * 0.22))
-    panel_y = max(0, h - panel_h - max(10, int(h * 0.03)))
-    margin = max(14, int(w * 0.04))
-    panel = (margin, panel_y, w - margin, h - max(10, int(h * 0.03)))
-    d.rounded_rectangle(panel, radius=max(14, int(w * 0.022)),
-                        fill=(8,12,24,225), outline=(244,196,92,255),
-                        width=max(2, int(w * 0.005)))
-    avatar = _load_sender_avatar(publisher_photo_url, max(72, int(h * 0.13)))
-    if avatar is not None:
-        ax = panel[0] + max(10, int(w * 0.022))
-        ay = panel_y + (panel_h - avatar.height)//2
-        overlay.alpha_composite(avatar, (ax, ay))
-        left = ax + avatar.width + max(12, int(w * 0.022))
-    else:
-        left = panel[0] + max(14, int(w * 0.03))
-    right = panel[2] - max(14, int(w * 0.03))
-    center = (left + right) / 2
-    _draw_centered(d, (center, panel_y + panel_h*0.32), "🖼️ منشور جديد",
-                   max(20, int(h*0.05)), (255,224,145,255), max(80, right-left))
-    _draw_name_centered(d, (center, panel_y + panel_h*0.70),
-                        "@" + str(publisher_name or ""), max(22, int(h*0.06)),
-                        (255,255,255,255), max(80, right-left))
-    image = Image.alpha_composite(image, overlay).convert("RGB")
+    # Keep the original image untouched and place one clean name rectangle
+    # beside it, matching the single-name style used by gift cards.
+    panel_w = max(240, min(420, int(max(h, w) * 0.34)))
+    gap = max(10, int(min(w, h) * 0.025))
+    canvas = Image.new("RGB", (w + gap + panel_w, h), (8, 12, 24))
+    canvas.paste(image, (0, 0))
+    d = ImageDraw.Draw(canvas)
+    panel = (w + gap, max(gap, int(h * 0.18)),
+             w + gap + panel_w - gap, h - max(gap, int(h * 0.18)))
+    d.rounded_rectangle(panel, radius=max(14, int(panel_w * 0.08)),
+                        fill=(8, 12, 24), outline=(244, 196, 92),
+                        width=max(2, int(panel_w * 0.018)))
+    left, top, right, bottom = panel
+    _draw_name_centered(
+        d, ((left + right) / 2, (top + bottom) / 2),
+        "@" + str(publisher_name or ""), max(22, int(h * 0.06)),
+        (255, 255, 255), max(80, right - left - gap * 2),
+    )
+    image = canvas
     out_dir = BASE_DIR / "generated_publish"
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -13889,15 +13877,18 @@ class TalkinBot:
             except Exception as e:
                 self.log("[ACK] failed:", e)
 
-        # استخراج رابط الصورة من حقول RoomEvent كما يفعل تطبيق Talkin1.
-        media_url = next(
-            (str(event.get(key, "") or "").strip()
-             for key in (7, 6, 9, 10, 11, 12, 13, 14, 15,
-                         "url", "media_url", "image_url", "file_url",
-                         "photo", "attachment")
-             if str(event.get(key, "") or "").strip().startswith(("http://", "https://"))),
-            "",
-        ) or _extract_media_url_universal(event, body) or first_http_url(event) or first_http_url(body)
+        # لا نعتبر صورة الحساب في field 10 صورة نشر. هذا الحقل موجود أيضاً
+        # في أحداث النص، ولذلك كان أمر «انشر» ينشر صورة صاحب الأمر فوراً.
+        media_url = ""
+        if event_type in {"image", "photo", "picture", "media", "file"}:
+            media_url = next(
+                (str(event.get(key, "") or "").strip()
+                 for key in (7, 6, 9, 11, 12, 13, 14, 15,
+                             "url", "media_url", "image_url", "file_url",
+                             "photo", "attachment")
+                 if str(event.get(key, "") or "").strip().startswith(("http://", "https://"))),
+                "",
+            ) or _extract_media_url_universal(event, body) or first_http_url(event)
         if not media_url and body and ("http://" in body or "https://" in body):
             image_match = re.search(
                 r"https?://\S+\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?",
