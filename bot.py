@@ -3267,8 +3267,21 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
     # The gift itself remains proportional.  Since the supplied gift artwork
     # is square, a center crop into the nearly-square card preserves its
     # important details instead of squeezing it.
+    # Place the artwork inside the large transparent center while preserving
+    # its aspect ratio. The frame remains above it, so the replacement image
+    # is clearly visible and the lower template decorations stay unobstructed.
     gift_src = Image.open(gift_path).convert("RGBA")
-    image = _fit_crop(gift_src, (target_w, target_h)).convert("RGBA")
+    gift_area = (120, 125, target_w - 120, int(target_h * 0.635))
+    area_w = gift_area[2] - gift_area[0]
+    area_h = gift_area[3] - gift_area[1]
+    scale = min(area_w / max(1, gift_src.width), area_h / max(1, gift_src.height))
+    gift_w = max(1, int(round(gift_src.width * scale)))
+    gift_h = max(1, int(round(gift_src.height * scale)))
+    gift_src = gift_src.resize((gift_w, gift_h), Image.Resampling.LANCZOS)
+    image = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+    gift_x = gift_area[0] + (area_w - gift_w) // 2
+    gift_y = gift_area[1] + (area_h - gift_h) // 2
+    image.alpha_composite(gift_src, (gift_x, gift_y))
     image.alpha_composite(template)
 
     d = ImageDraw.Draw(image)
