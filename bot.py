@@ -4053,6 +4053,7 @@ class TalkinBot:
         self._pending_inv_role_check = {}
         # Private list requests waiting for the native occupants_list response.
         self._pending_room_lists = {}
+        self._pending_presence = {}
         # Live profile photos learned from Talkin UserItem field 3.
         # username(casefold) -> public photo URL.
         self.user_photos = {}
@@ -11562,6 +11563,44 @@ class TalkinBot:
             self.log("[ROOM-LIST] native occupants request failed", room, repr(exc))
             return False
 
+    def _start_presence_native(self, target, sender, current_room=""):
+        rooms=[]; seen=set()
+        candidates=list(self._active_rooms() or [])
+        if current_room: candidates.insert(0, current_room)
+        for room in candidates:
+            room=str(room or "").strip()
+            key=_norm_room(room)
+            if room and key not in seen:
+                seen.add(key); rooms.append(room)
+        if not rooms or not getattr(self, "ws", None):
+            return False
+        token=f"{_norm_user(sender)}:{time.time_ns()}"
+        self._pending_presence[token]={"target":str(target).strip().lstrip("@"), "sender":str(sender or "").strip(), "rooms":rooms, "results":[]}
+        return self._request_next_presence(token)
+
+    def _request_next_presence(self, token):
+        state=self._pending_presence.get(token)
+        if not isinstance(state, dict): return False
+        rooms=state.get("rooms") or []
+        if not rooms:
+            target=state.get("target"); lines=[f"📍 حالة @{target} ({len(state.get('results') or [])} غرفة):"]
+            for room,user in state.get("results") or []:
+                present=user.get("is_present", user.get("online"))
+                state_text="🟢 متصل" if present is True or str(present).lower() in {"true","1","online"} else "⚪ غير متصل"
+                lines.append(f"• {room}: {state_text}")
+            if len(lines)==1: lines=[f"📭 @{target} غير موجود في قوائم الغرف المحفوظة."]
+            self.send_private_text(state.get("sender"), "\n".join(lines))
+            self._pending_presence.pop(token, None)
+            return True
+        room=rooms.pop(0)
+        self._pending_room_lists[_norm_room(room)]={"room":room,"code":"is","sender":state.get("sender"),"target":state.get("target"),"presence_token":token,"requested_at":time.time()}
+        try:
+            self.send_query(encode_query("room_admin", type_="occupants_list", room=room, to=BOT_ID, value="none"))
+            return True
+        except Exception as exc:
+            self.log("[ROOM-PRESENCE] native request failed", room, repr(exc))
+            return self._request_next_presence(token)
+
     def _complete_pending_room_list(self, result):
         source_room = str(result.get("_occupants_room") or "").strip()
         if not source_room:
@@ -11569,6 +11608,17 @@ class TalkinBot:
         pending = self._pending_room_lists.pop(_norm_room(source_room), None)
         if not isinstance(pending, dict):
             return False
+        if pending.get("code") == "is":
+            users = self._users_from_room_admin(result.get("room_admin") or {})
+            if not users and result.get("users"):
+                users = [{"username": str(u.get(1) or "").strip(), "role": str(u.get(6) or "none"), "online": u.get(5)} for u in result.get("users") if isinstance(u, dict)]
+            target=_norm_user(pending.get("target"))
+            for user in users:
+                if _norm_user(user.get("username")) == target:
+                    token=pending.get("presence_token"); state=self._pending_presence.get(token)
+                    if isinstance(state, dict): state.setdefault("results", []).append((pending.get("room"), user))
+                    break
+            return self._request_next_presence(pending.get("presence_token"))
         users = self._users_from_room_admin(result.get("room_admin") or {})
         if not users and result.get("users"):
             for item in result.get("users") or []:
@@ -11647,7 +11697,12 @@ class TalkinBot:
             return True
         m=re.fullmatch(r"is@(.+)", str(text or "").strip(), re.I)
         if m:
-            target=m.group(1).strip().lstrip("@"); rows=[]
+            target=m.group(1).strip().lstrip("@")
+            if not getattr(getattr(self, "db", None), "client", None):
+                if self._start_presence_native(target, sender, room):
+                    self.send_private_text(sender, f"⏳ جارٍ فحص وجود @{target} في الغرف...")
+                    return True
+            rows=[]
             for r in self._settings_room_users(room) if room else []:
                 if _norm_user(r.get("username")) == _norm_user(target): rows.append((room, r))
             for candidate in self._active_rooms():
