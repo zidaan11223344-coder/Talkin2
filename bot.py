@@ -757,6 +757,41 @@ def as_text(v):
 
 def _extract_media_url_universal(event, body=""):
     """Robustly extract image or media URL from any field or body text."""
+    def find_url(value, depth=0):
+        if depth > 4 or value is None:
+            return ""
+        if isinstance(value, bytes):
+            try:
+                text = value.decode("utf-8", "ignore")
+            except Exception:
+                text = ""
+            found = find_url(text, depth + 1)
+            if found:
+                return found
+            # A URL may be inside a nested protobuf field.
+            try:
+                nested = decode_message(value)
+                return find_url(nested, depth + 1)
+            except Exception:
+                return ""
+        if isinstance(value, dict):
+            for item in value.values():
+                found = find_url(item, depth + 1)
+                if found:
+                    return found
+            return ""
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                found = find_url(item, depth + 1)
+                if found:
+                    return found
+            return ""
+        text = str(value or "").strip().replace("\\/", "/")
+        if text.startswith("//"):
+            return "https:" + text
+        match = re.search(r"https?://[^\s<>\"']+", text, re.I)
+        return match.group(0).rstrip(",.;)]}") if match else ""
+
     if not isinstance(event, dict):
         event = {}
     # Talkin server builds place the image URL in different RoomEvent/UserMessage
@@ -765,6 +800,9 @@ def _extract_media_url_universal(event, body=""):
     preferred = (7, 6, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url", "photo", "attachment")
     keys = list(preferred) + [key for key in event.keys() if key not in preferred]
     for key in keys:
+        found = find_url(event.get(key, ""))
+        if found:
+            return found
         val = as_text(event.get(key, "") or "").strip()
         if val.startswith(("http://", "https://")):
             return val
@@ -784,7 +822,7 @@ def _extract_media_url_universal(event, body=""):
         val = as_text(v or "").strip()
         if val.startswith(("http://", "https://")):
             return val
-    return first_http_url(event) or first_http_url(body) or ""
+    return find_url(event) or find_url(body) or first_http_url(event) or first_http_url(body) or ""
 
 def first_http_url(value):
     """Find the first public HTTP(S) URL in a decoded Talkin payload."""
@@ -13295,7 +13333,10 @@ class TalkinBot:
         errors=[]
         for target in rooms:
             try:
-                self.send_room_media(target,publish_url,"image")
+                media_result = self.send_room_media(target,publish_url,"image")
+                if media_result is False:
+                    errors.append((target, "تم رفض حزمة الصورة أو تجاوزت الحد المسموح"))
+                    continue
                 self.send_room_text(target,caption)
                 ok+=1
             except Exception as e:
@@ -13460,7 +13501,10 @@ class TalkinBot:
         errors=[]
         for target in rooms:
             try:
-                self.send_room_media(target,publish_url,"image")
+                media_result = self.send_room_media(target,publish_url,"image")
+                if media_result is False:
+                    errors.append((target, "تم رفض حزمة الصورة أو تجاوزت الحد المسموح"))
+                    continue
                 self.send_room_text(target,caption)
                 ok+=1
             except Exception as e:
@@ -14261,7 +14305,7 @@ class TalkinBot:
                         (str(cm.get(key, "") or "").strip() for key in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url")
                          if str(cm.get(key, "") or "").strip().startswith(("http://", "https://"))),
                         "",
-                    ) or first_http_url(cm) or first_http_url(body)
+                    ) or _extract_media_url_universal(cm, body) or first_http_url(cm) or first_http_url(body)
                     if not media_url and body and ("http://" in body or "https://" in body):
                         img_m = re.search(r'https?://\S+(?:\?\S*)?', body, re.I)
                         if img_m:
