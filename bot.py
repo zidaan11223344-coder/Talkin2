@@ -1678,7 +1678,7 @@ if _STATE_DB_ENABLED:
     try:
         _STATE_DB=PersistentStateDatabase(RIVEN_DATABASE_URL)
         _restore_or_seed_postgres_state()
-        print(f"[STATE-DB] PostgreSQL enabled: {RIVEN_DATABASE_NAME}", flush=True)
+        print(f"[STATE-DB] {RIVEN_DATABASE_KIND.upper()} enabled: {RIVEN_DATABASE_NAME}", flush=True)
     except Exception as exc:
         _STATE_DB, _STATE_DB_ENABLED = None, False
         print(f"[STATE-DB] disabled after connection failure: {exc}", flush=True)
@@ -14675,7 +14675,7 @@ class TalkinBot:
                         if self._db_success_notice_pending and BOT_MASTER:
                             notice_sent = self.send_private_text(
                                 BOT_MASTER,
-                                f"✅ تم ربط قاعدة البيانات PostgreSQL بنجاح.\n🗄️ قاعدة البيانات: {RIVEN_DATABASE_NAME}",
+                                f"✅ تم ربط قاعدة البيانات {RIVEN_DATABASE_KIND.upper()} بنجاح.\n🗄️ قاعدة البيانات: {RIVEN_DATABASE_NAME}",
                             )
                             if notice_sent:
                                 self._db_success_notice_pending = False
