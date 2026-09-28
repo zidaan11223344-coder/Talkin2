@@ -384,6 +384,7 @@ MODERATION_FILE = DATA_DIR / "moderation.json"
 MF_FILE = DATA_DIR / "mf.json"
 FILTER_EXCEPTIONS_FILE = DATA_DIR / "filter_exceptions.json"
 FILTER_BANS_FILE = DATA_DIR / "filter_bans.json"
+BOT_BANS_FILE = DATA_DIR / "bot_bans.json"
 PUBLISH_BANS_FILE = DATA_DIR / "publish_bans.json"
 PROTECTION_FILE = DATA_DIR / "room_protection.json"
 SNAKE_FILE = DATA_DIR / "snake_games.json"
@@ -397,7 +398,7 @@ _STATE_FILE_NAMES = (
     "masters.json", "vip_users.json", "verified_users.json", "points.json",
     "messages.json", "published_posts.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
-    "moderation.json", "mf.json", "filter_bans.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
+    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
     "custom_commands.json", "repair_state.json", "wager_state.json", "last_action.json", "backup_manifest.json",
 )
 
@@ -1208,7 +1209,12 @@ class DatabaseBridge:
                 for row in (getattr(pr, "data", None) or []):
                     u = str(row.get("username") or "").strip()
                     if u:
-                        out.append({"username": u, "user_id": str(row.get("id") or "")})
+                        member = next((m for m in members if str(m.get("user_id") or "") == str(row.get("id") or "")), {})
+                        rank = str(member.get("rank") or "none").strip().lower() or "none"
+                        present = member.get("is_present")
+                        out.append({"username": u, "user_id": str(row.get("id") or ""),
+                                    "role": rank, "online": bool(present) if present is not None else None,
+                                    "is_present": present})
             seen = set()
             final = []
             for u in out:
@@ -1814,6 +1820,8 @@ def _remember_roster(room, users):
             "username": username,
             "role": str(user.get("role") or "none").strip().lower() or "none",
             "user_id": str(user.get("user_id") or ""),
+            "online": user.get("online", user.get("is_present")),
+            "is_present": user.get("is_present", user.get("online")),
             "last_seen": now,
         }
     rosters[room] = current
@@ -1911,7 +1919,7 @@ def _looks_like_bot_command(text):
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "دخول@", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "نشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
-        "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
+        "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
     )
     prefixes = prefixes + ("bl@",)
     normalized_low = low.replace("ة", "ه")
@@ -1975,7 +1983,7 @@ def _looks_like_admin_command(text):
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "mas@", "umas@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "انشر", "نشر", "+sr@", "sr@",
-        "swc", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify",
+        "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify",
     )
     return low.startswith(prefixes)
 
@@ -2396,6 +2404,26 @@ def _record_filter_ban(username, room, reason, word=""):
 def _filter_bans_list():
     data = _filter_bans_data(); rows=data.get("bans", [])
     return rows if isinstance(rows,list) else []
+
+def _bot_bans_data():
+    data = _load_local_json(BOT_BANS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+def _record_bot_ban(username, room, banned_by, reason=""):
+    data = _bot_bans_data()
+    rows = data.get("bans", [])
+    if not isinstance(rows, list): rows = []
+    key = _norm_user(username)
+    rows = [r for r in rows if _norm_user(r.get("username") if isinstance(r, dict) else r) != key]
+    rows.append({"username": str(username).strip().lstrip("@"), "room": str(room or ""),
+                 "banned_by": str(banned_by or ""), "reason": str(reason or ""),
+                 "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+    data["bans"] = rows[-1000:]
+    _save_local_json(BOT_BANS_FILE, data)
+
+def _bot_ban_rows():
+    rows = _bot_bans_data().get("bans", [])
+    return rows if isinstance(rows, list) else []
 
 
 def _publish_bans_data():
@@ -4078,7 +4106,7 @@ class TalkinBot:
         self.invite_sent = set()
         self.invite_thread = None
         self.invite_lock = threading.Lock()
-        self.invite_message_template = "🎁 لديك معجب مجهول 👥 في غرفة: {room}"
+        self.invite_message_template = "📩 دعاك @{sender} إلى غرفة: {room}"
         self.known_rooms = set(_persistent_rooms())
         # Live rooms are session-only: unlike known_rooms (history on disk),
         # this set contains only rooms for which the current WebSocket session
@@ -4170,7 +4198,7 @@ class TalkinBot:
         self.custom_welcomes = {}
         self._load_social_features()
         threading.Thread(target=self._crop_worker, name="crop-worker", daemon=True).start()
-        self.invite_message_template = _message_template("invite", "default", "🎁 لديك معجب مجهول 👥 في غرفة: {room}")
+        self.invite_message_template = _message_template("invite", "default", "📩 دعاك @{sender} إلى غرفة: {room}")
 
     def _load_social_features(self):
         self.auto_replies_file = REPLIES_FILE
@@ -4721,9 +4749,9 @@ class TalkinBot:
                         self.ws.send_binary(payload)
                 return
             if packet_type == "room_message" and room:
-                payload = encode_query("room_message", type_="text", room=room, body=notice)
-                if len(payload) <= int(os.getenv("WS_MAX_MESSAGE_BYTES", "950")):
-                    self.ws.send_binary(payload)
+                # Never send the generic oversize error back to a room.
+                # The original long content is routed to Telegram instead.
+                return
         except Exception as exc:
             self.log("[WS_OVERSIZE] user notice failed:", repr(exc))
 
@@ -5525,6 +5553,8 @@ class TalkinBot:
         requester = str(requester or "").strip()
         try:
             self.send_admin(room, target, operation)
+            if operation == "ban":
+                _record_bot_ban(target, room, requester, "حظر إداري")
         except Exception as exc:
             self.log(f"[MOD] request failed room={room} target=@{target}: {exc!r}")
             if requester and not _is_master_name(requester):
@@ -8687,7 +8717,7 @@ class TalkinBot:
             self.game_cooldown[key] = now
         return True, 0
 
-    def _game_cooldown_notice(self, room, username, cooldown=40.0, game_name=""):
+    def _game_cooldown_notice(self, room, username, cooldown=40.0, game_name="", private_to=""):
         # مرر مدة اللعبة كما هي؛ لا تستبدلها افتراضياً بـ40 ثانية.
         try:
             cooldown = max(0.0, float(cooldown))
@@ -8701,11 +8731,14 @@ class TalkinBot:
                 interval = f"{minutes} دقائق" if minutes != 1 else "دقيقة واحدة"
             else:
                 interval = f"{int(cooldown)} ثانية"
-            self.send_room_text(
-                room,
+            message = (
                 f"⏳ @{username} انتظر {left} ثانية قبل إعادة لعبة {label}.\n"
                 f"🎮 الفاصل {interval} لنفس اللعبة فقط، ويمكنك لعب لعبة أخرى الآن."
             )
+            if private_to:
+                self.send_private_text(private_to, message)
+            else:
+                self.send_room_text(room, message)
         return ok
 
     def _send_game_result(self, room, text, game_key, winner_name="", target_rooms=None):
@@ -9121,9 +9154,7 @@ class TalkinBot:
                         f"💳 رصيدك الآن: {_fmt_points(balance)}\n"
                         f"🌟 زرع جديد عندما تريد!"
                     )
-                    origin_room = str(plot.get("room") or "").strip() if isinstance(plot, dict) else ""
-                    if origin_room:
-                        self.send_room_text(origin_room, result_text)
+                    # Crop results are private-only; do not announce harvests in rooms.
                     self.send_private_text(username, result_text)
             self.stop_event.wait(2.0)
 
@@ -9135,7 +9166,7 @@ class TalkinBot:
         }
         if raw.casefold()=="زرع":
             self.send_room_text(
-                room,
+                    room,
                 "╔════════════════════╗\n"
                 "║      قائمة الزرع      ║\n"
                 "╠════════════════════╣\n"
@@ -9219,7 +9250,7 @@ class TalkinBot:
             }
         self._save_crop_plots()
         self.send_room_text(
-            room,
+                    room,
             f"🌱 تم زرع {crop} بنجاح!\n"
             f"⏱️ الانتظار: {minutes} دقيقة\n"
             f"🎁 المكافأة: {reward} نقطة\n"
@@ -11261,6 +11292,8 @@ class TalkinBot:
             or str(body or "").strip().casefold() in {"حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "l@mfb"}
             or re.match(r"^(?:amf|[-+]amf)@.+$", str(body or "").strip(), re.I)
             or re.match(r"^l@mfb$", str(body or "").strip(), re.I)
+            or re.match(r"^l@[amob]$", str(body or "").strip(), re.I)
+            or re.match(r"^is@.+", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
         )
         # A pending room-join language choice belongs to the user who started
@@ -11507,10 +11540,87 @@ class TalkinBot:
         )
         return True
 
+    def _settings_room_users(self, room):
+        """Return the room-settings roster, including offline members."""
+        room = str(room or "").strip()
+        users = []
+        try:
+            users = self.db.room_users(room) if getattr(self, "db", None) else []
+        except Exception as exc:
+            self.log("[ROOM-LIST] settings roster failed", room, repr(exc))
+        if users:
+            return [u for u in users if isinstance(u, dict) and _norm_user(u.get("username")) != _norm_user(BOT_ID)]
+        data = _persistent_rosters().get("rooms", {})
+        saved = data.get(room, {}) if isinstance(data, dict) else {}
+        out=[]
+        for value in (saved.values() if isinstance(saved, dict) else []):
+            if isinstance(value, dict):
+                item=dict(value)
+                if _norm_user(item.get("username")) != _norm_user(BOT_ID): out.append(item)
+        return out
+
+    def _send_private_list(self, sender, title, users, empty="📭 لا توجد بيانات."):
+        rows=[]; seen=set()
+        for item in users or []:
+            name = str(item.get("username") if isinstance(item, dict) else item or "").strip().lstrip("@")
+            if name and _norm_user(name) not in seen and _norm_user(name) != _norm_user(BOT_ID):
+                seen.add(_norm_user(name)); rows.append(name)
+        rows.sort(key=_norm_user)
+        text = empty if not rows else f"{title} ({len(rows)}):\n" + "\n".join(f"{i}. @{n}" for i,n in enumerate(rows,1))
+        self.send_private_text(sender, text)
+
+    def _room_list_commands(self, room, text, sender, is_private):
+        match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
+        if match:
+            if not room:
+                self.send_private_text(sender, "⚠️ نفّذ الأمر داخل الغرفة المطلوبة."); return True
+            users=self._settings_room_users(room)
+            code=match.group(1).lower()
+            if code == "a": users=[u for u in users if str(u.get("role") or "").lower() in {"admin","moderator","mod"}]
+            elif code == "o": users=[u for u in users if str(u.get("role") or "").lower() in {"owner","creator","room_owner","room_creator","host"}]
+            elif code == "m": users=[u for u in users if str(u.get("role") or "").lower() not in {"owner","creator","room_owner","room_creator","host","admin","moderator","mod"}]
+            titles={"a":"🛡️ قائمة المشرفين", "m":"👥 قائمة الأعضاء", "o":"👑 قائمة الأونرات"}
+            self._send_private_list(sender, f"{titles[code]} — {room}", users, f"📭 لا توجد أسماء في {titles[code]} بغرفة {room}.")
+            return True
+        if str(text or "").strip().casefold() == "l@b":
+            if not _is_master_name(sender):
+                self.send_private_text(sender, "🔒 قائمة حظر البوت مخصصة للماستر.")
+                return True
+            rows=_bot_ban_rows() + [dict(r, banned_by=r.get("banned_by") or "فلتر البوت") for r in _filter_bans_list()]
+            if not rows: self.send_private_text(sender, "📭 لا يوجد مستخدمون محظورون من البوت.")
+            else:
+                lines=[f"🚫 المحظورون من البوت ({len(rows)}):"]
+                for i,r in enumerate(rows[-200:],1):
+                    lines.append(f"{i}. @{r.get('username','')} | حظره: @{r.get('banned_by') or 'البوت'} | الغرفة: {r.get('room','')}" )
+                self.send_private_text(sender, "\n".join(lines))
+            return True
+        m=re.fullmatch(r"is@(.+)", str(text or "").strip(), re.I)
+        if m:
+            target=m.group(1).strip().lstrip("@"); rows=[]
+            for r in self._settings_room_users(room) if room else []:
+                if _norm_user(r.get("username")) == _norm_user(target): rows.append((room, r))
+            for candidate in self._active_rooms():
+                if _norm_room(candidate).casefold() == _norm_room(room).casefold(): continue
+                for r in self._settings_room_users(candidate):
+                    if _norm_user(r.get("username")) == _norm_user(target): rows.append((candidate,r))
+            if not rows:
+                self.send_private_text(sender, f"📭 @{target} غير موجود في قوائم الغرف المحفوظة.")
+            else:
+                lines=[f"📍 حالة @{target} ({len(rows)} غرفة):"]
+                for name,r in rows:
+                    present=r.get("is_present", r.get("online"))
+                    state="🟢 متصل" if present is True or str(present).lower() in {"true","1","online"} else "⚪ غير متصل"
+                    lines.append(f"• {name}: {state}")
+                self.send_private_text(sender,"\n".join(lines))
+            return True
+        return False
+
     def _handle_management_command_impl(self, room, body, sender, is_private=False):
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
+        if self._room_list_commands(room, text, sender, is_private):
+            return True
 
         # Master runtime cleanup: تنضيف / تنظيف. This never deletes persistent
         # JSON state; it only removes disposable files and prunes memory caches.
@@ -12635,7 +12745,7 @@ class TalkinBot:
                 self.send_private_text(sender,f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
             return True
         if low.startswith("invmsg") or low.startswith("رسالةدعوة"):
-            parts=text.split(None,1); template=parts[1].strip() if len(parts)==2 else "🎁 لديك معجب مجهول 👥 في غرفة: {room}"
+            parts=text.split(None,1); template=parts[1].strip() if len(parts)==2 else "📩 دعاك @{sender} إلى غرفة: {room}"
             self.invite_message_template=template
             self.send_private_text(sender,f"✅ تم تغيير نص الدعوة إلى: {template}"); return True
         if low == "inv" or low.startswith("inv ") or low in ("دعوات","invite") or low.startswith(("دعوات ","invite ")):
