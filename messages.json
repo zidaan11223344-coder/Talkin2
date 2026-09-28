@@ -1,13 +1,13 @@
 {
   "music": {
-    "broadcast": "🎵 {title}\n🎤 {requester_name}\n🎶 {title}\n📡 المصدر: {source_label}\n🏠 الغرفة الأصلية: {room}\n━━━━━━━━━━━━━\n👍 lk@{code}\n❤️ lv@{code}\n👎 dl@{code}\n💬 cm@{code} msg\n🚨 report@{code} msg",
+    "broadcast": "🎵 تشغيل الأغنية\\n👤 الناشر: @{requester_name}\\n🎶 اسم الأغنية: {title}\\n🏠 الغرفة: {room}\\n━━━━━━━━━━━━\\n👍 lk@{like}\\n❤️ lv@{love}\\n👎 dl@{dislike}\\n💬 cm@{comment} msg\\n🚨 report@{report} msg",
     "playing": "▶️ تشغيل | {title}",
     "request_started": "🎵 @{requester_name} — جاري تنفيذ طلبك من {source}\n🏠 الغرفة: {room}",
     "direct_link": "🎵 @{requester_name} — جاري تشغيل: {title}\n🏠 الغرفة: {room}\n▶️ {url}",
     "local": "🎵 @{requester_name} — تشغيل: {title}\n🎤 {artist}\n🏠 الغرفة: {room}"
   },
   "publish": {
-    "broadcast": "🖼️ {description}\n👤 {publisher}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
+    "broadcast": "🖼️ منشور صورة\\n👤 {publisher}\\n📝 {description}\\n━━━━━━━━━━━━━\\n👍 lk@{like}\\n❤️ lv@{love}\\n👎 dl@{dislike}\\n💬 cm@{comment} msg\\n🚨 report@{report} msg",
     "reaction_hint": "❤️ إعجاب | 👎 عدم إعجاب | ↩️ رد على الصورة",
     "reaction_only": "🆔 {code}\n👍 lk@{code}\n❤️ lv@{code}\n👎 dl@{code}\n💬 cm@{code} msg\n🚨 report@{code} msg"
   },

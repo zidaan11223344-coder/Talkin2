@@ -2790,6 +2790,12 @@ def _norm_filter_text(text):
 def _message_template(section,key,default,**kwargs):
     data=_load_local_json(MESSAGES_FILE,{})
     value=((data.get(section) or {}).get(key)) if isinstance(data,dict) else None
+    # The requested publish/music formats are authoritative. Ignore an older
+    # restored template from Talkin4 if it still uses the previous layout.
+    if section == "publish" and key == "broadcast" and isinstance(value, str) and "🖼️ {description}" in value:
+        value = None
+    if section == "music" and key == "broadcast" and isinstance(value, str) and "{code}" in value:
+        value = None
     text=value if isinstance(value,str) else default
     try: return text.format(**kwargs)
     except Exception: return text
@@ -8521,15 +8527,27 @@ class TalkinBot:
                     "url": url, "duration": duration, "created_at": time.time(),
                 }
                 if with_reactions:
-                    code=uuid.uuid4().hex[:4]
+                    music_codes = {
+                        "like": uuid.uuid4().hex[:4],
+                        "love": uuid.uuid4().hex[:4],
+                        "dislike": uuid.uuid4().hex[:4],
+                        "comment": uuid.uuid4().hex[:4],
+                        "report": uuid.uuid4().hex[:4],
+                    }
                     caption=_message_template(
                         "music", "broadcast",
-                        "🎶✨ تم تشغيل الأغنية بنجاح ✨🎶\n━━━━━━━━━━━━\n🎵 العنوان: {title}\n🎤 الطلب: @{requester_name}\n📡 المصدر: {source_label}\n🏠 الغرفة: {room}\n━━━━━━━━━━━━\n👍 lk@{code}   ❤️ lv@{code}\n💬 cm@{code} msg   🚨 report@{code} msg",
+                        "🎵 تشغيل الأغنية\n👤 الناشر: @{requester_name}\n🎶 اسم الأغنية: {title}\n🏠 الغرفة: {room}\n━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
                         requester_name=requester, title=title, artist=artist,
-                        source_label=artist or "Music", room=room, code=code,
-                        url=url, duration=duration
+                        source_label=artist or "Music", room=room,
+                        like=music_codes["like"], love=music_codes["love"],
+                        dislike=music_codes["dislike"], comment=music_codes["comment"],
+                        report=music_codes["report"], url=url, duration=duration
                     )
-                    self.reaction_targets[code] = {"publisher": requester, "kind": "music", "title": title, "description": title, "created_at": time.time()}
+                    for reaction_kind, reaction_code in music_codes.items():
+                        self.reaction_targets[reaction_code] = {
+                            "publisher": requester, "kind": "music", "reaction": reaction_kind,
+                            "title": title, "description": title, "created_at": time.time(),
+                        }
                 else:
                     caption=(f"🎶 تم تشغيل الأغنية\n━━━━━━━━━━━━\n"
                              f"🎵 العنوان: {title}\n🎤 الطلب: @{requester}\n"
@@ -13303,8 +13321,8 @@ class TalkinBot:
             self.reaction_targets[code]={"publisher": sender, "kind": kind, "description": desc or "منشور صورة", "created_at": time.time()}
         caption=_message_template(
             "publish", "broadcast",
-            "🖼️ {description}\n👤 {publisher}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
-            publisher=sender, description=desc or "منشور صورة",
+            "🖼️ منشور صورة\n👤 {publisher}\n📝 {description}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
+            publisher=sender, description=desc or "بدون وصف",
             source_label=source_room, code=base_code,
             like=reaction_codes["like"], love=reaction_codes["love"], dislike=reaction_codes["dislike"],
             comment=reaction_codes["comment"], report=reaction_codes["report"], room=source_room
@@ -13471,8 +13489,8 @@ class TalkinBot:
             self.reaction_targets[code]={"publisher": sender, "kind": kind, "description": desc or "منشور صورة", "created_at": time.time()}
         caption=_message_template(
             "publish", "broadcast",
-            "🖼️ {description}\n👤 {publisher}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
-            publisher=sender, description=desc or "منشور صورة",
+            "🖼️ منشور صورة\n👤 {publisher}\n📝 {description}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
+            publisher=sender, description=desc or "بدون وصف",
             source_label=source_room, code=base_code,
             like=reaction_codes["like"], love=reaction_codes["love"], dislike=reaction_codes["dislike"],
             comment=reaction_codes["comment"], report=reaction_codes["report"], room=source_room
