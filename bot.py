@@ -747,14 +747,20 @@ def _extract_media_url_universal(event, body=""):
     """Robustly extract image or media URL from any field or body text."""
     if not isinstance(event, dict):
         event = {}
-    for key in (7, 6, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url", "photo", "attachment"):
-        # URL fields may be decoded as bytes by the protobuf reader.
-        # str(bytes) adds a b'' wrapper and hides the image from the handler.
+    # Talkin server builds place the image URL in different RoomEvent/UserMessage
+    # fields (usually 7, but some builds use 3/5/8/12). Inspect every decoded
+    # field instead of assuming the text-message layout.
+    preferred = (7, 6, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url", "photo", "attachment")
+    keys = list(preferred) + [key for key in event.keys() if key not in preferred]
+    for key in keys:
         val = as_text(event.get(key, "") or "").strip()
         if val.startswith(("http://", "https://")):
             return val
         if val.startswith("//"):
             return "https:" + val
+        embedded = re.search(r"https?://[^\s<>\"']+", val, re.I)
+        if embedded:
+            return embedded.group(0).rstrip(",.;)]}")
     if body:
         m = re.search(r"https?://\S+\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?", str(body), re.I)
         if m:
@@ -14109,9 +14115,19 @@ class TalkinBot:
                         "",
                     ) or first_http_url(cm) or first_http_url(body)
                     if not media_url and body and ("http://" in body or "https://" in body):
-                        img_m = re.search(r'https?://\S+\.(?:png|jpg|jpeg|webp|gif)(?:\?\S*)?', body, re.I)
+                        img_m = re.search(r'https?://\S+(?:\?\S*)?', body, re.I)
                         if img_m:
-                            media_url = img_m.group(0)
+                            media_url = img_m.group(0).rstrip(",.;)]}")
+                    # Some deployments deliver a room image as ChatMessage rather
+                    # than RoomEvent. Use the room field when it matches a room
+                    # currently tracked by the bot, then consume the pending publish.
+                    message_room = str(cm.get(4, "") or cm.get(13, "") or "").strip()
+                    tracked_rooms = {_norm_room(r) for r in self._active_rooms()}
+                    media_room = message_room if _norm_room(message_room) in tracked_rooms else self.room
+                    if media_url and getattr(self, "publish_pending", {}):
+                        media_candidates = [frm, cm.get(22, ""), cm.get("sender", ""), cm.get("username", "")]
+                        if self._try_publish_pending_media(media_room, media_url, media_candidates):
+                            return
                     if body and self._handle_telegram_log_command(body, frm):
                         return
                     # Every NS is a fresh navigation request. Do not suppress
