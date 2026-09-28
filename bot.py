@@ -1274,8 +1274,21 @@ class DatabaseBridge:
             return []
 
 # ----------------------- Giant-style local data -----------------------
-RIVEN_DATABASE_NAME = os.getenv("RIVEN_DATABASE_NAME", "talkin_bot_db").strip() or "talkin_bot_db"
+# Riven may provide separate PostgreSQL fields instead of DATABASE_URL.
+# Accept both Riven-specific names and standard PG names for portability.
+RIVEN_DATABASE_NAME = (os.getenv("RIVEN_DATABASE_NAME") or os.getenv("RIVEN_DB_NAME") or
+                       os.getenv("DB_NAME") or os.getenv("PGDATABASE") or "talkin_bot_db").strip() or "talkin_bot_db"
+RIVEN_DB_HOST = (os.getenv("RIVEN_DB_HOST") or os.getenv("DB_HOST") or os.getenv("PGHOST") or "").strip()
+RIVEN_DB_PORT = (os.getenv("RIVEN_DB_PORT") or os.getenv("DB_PORT") or os.getenv("PGPORT") or "5432").strip()
+RIVEN_DB_USER = (os.getenv("RIVEN_DB_USER") or os.getenv("DB_USER") or os.getenv("PGUSER") or "").strip()
+RIVEN_DB_PASSWORD = os.getenv("RIVEN_DB_PASSWORD") or os.getenv("DB_PASSWORD") or os.getenv("PGPASSWORD") or ""
 RIVEN_DATABASE_URL = (os.getenv("RIVEN_DATABASE_URL") or os.getenv("DATABASE_URL") or "").strip()
+if not RIVEN_DATABASE_URL and RIVEN_DB_HOST and RIVEN_DB_USER and RIVEN_DB_PASSWORD:
+    from urllib.parse import quote as _url_quote
+    RIVEN_DATABASE_URL = (
+        f"postgresql://{_url_quote(RIVEN_DB_USER, safe='')}:{_url_quote(RIVEN_DB_PASSWORD, safe='')}"
+        f"@{RIVEN_DB_HOST}:{RIVEN_DB_PORT}/{_url_quote(RIVEN_DATABASE_NAME, safe='')}"
+    )
 _STATE_DB_ENABLED = bool(RIVEN_DATABASE_URL and psycopg)
 _STATE_DB = None
 _STATE_DB_CONDITION = threading.Condition()

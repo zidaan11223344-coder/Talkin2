@@ -14,7 +14,12 @@ talkin_bot_db
 
 ```text
 RIVEN_DATABASE_NAME=talkin_bot_db
-RIVEN_DATABASE_URL=<رابط اتصال PostgreSQL الذي يعرضه Riven>
+RIVEN_DB_HOST=<عنوان PostgreSQL من Riven>
+RIVEN_DB_PORT=<البورت من Riven>
+RIVEN_DB_USER=<اسم مستخدم PostgreSQL من Riven>
+RIVEN_DB_PASSWORD=<كلمة سر PostgreSQL من Riven>
+# اختياري فقط إذا أعطاك Riven رابط اتصال جاهزاً:
+RIVEN_DATABASE_URL=
 GITHUB_SYNC=1
 GITHUB_REPO=zidaan11223344-coder/Talkin4
 GITHUB_BRANCH=main
@@ -24,7 +29,7 @@ DATABASE_BACKUP_INTERVAL_SECONDS=21600
 GITHUB_JSON_MIRROR=0
 ```
 
-إذا كان Riven يضيف المتغير `DATABASE_URL` تلقائياً، يمكن ترك `RIVEN_DATABASE_URL` فارغاً؛ البوت يستخدم `DATABASE_URL` كبديل.
+إذا كان Riven يضيف المتغير `DATABASE_URL` تلقائياً، يمكن ترك الحقول المنفصلة و`RIVEN_DATABASE_URL` فارغة؛ البوت يستخدم `DATABASE_URL` كبديل. عند توفر الحقول المنفصلة، يبني البوت رابط PostgreSQL تلقائياً ويشفّر الرموز الخاصة في اسم المستخدم وكلمة السر.
 
 البوت يستدعي `load_dotenv()` عند التشغيل، لذلك يقرأ ملف `.env` تلقائياً. بعد حفظ الملف أعد تشغيل الخدمة أو نفّذ Redeploy.
 
@@ -45,17 +50,16 @@ GITHUB_JSON_MIRROR=0
 ## أول تشغيل
 
 1. أنشئ قاعدة PostgreSQL باسم `talkin_bot_db` في Riven.
-2. انسخ رابط اتصال PostgreSQL الذي يعرضه Riven إلى `RIVEN_DATABASE_URL` داخل `.env`.
-3. إذا كان Riven يضع الرابط في `DATABASE_URL` تلقائياً، لا تحتاج إلى `RIVEN_DATABASE_URL`.
-4. أضف `GITHUB_TOKEN` بصلاحية الكتابة إلى مستودع Talkin4 الخاص داخل `.env`.
-5. أعد تشغيل الخدمة.
-6. ابحث في سجل التشغيل عن:
+2. انسخ `Host` إلى `RIVEN_DB_HOST`، و`Port` إلى `RIVEN_DB_PORT`، و`Database` إلى `RIVEN_DATABASE_NAME`، و`Username` إلى `RIVEN_DB_USER`، و`Password` إلى `RIVEN_DB_PASSWORD` داخل `.env`.
+3. أضف `GITHUB_TOKEN` بصلاحية الكتابة إلى مستودع Talkin4 الخاص داخل `.env`.
+4. أعد تشغيل الخدمة.
+5. ابحث في سجل التشغيل عن:
 
 ```text
 [STATE-DB] PostgreSQL enabled: talkin_bot_db
 ```
 
-7. نفّذ `نسخ احتياطي` بعد التأكد من اتصال القاعدة.
+6. نفّذ `نسخ احتياطي` بعد التأكد من اتصال القاعدة.
 
 ## ملاحظات أمان
 
