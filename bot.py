@@ -1042,7 +1042,7 @@ class RawWebSocket:
 
     def send_binary(self, payload):
         payload = bytes(payload)
-        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "950"))
+        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
         if len(payload) > max_bytes:
             print(f"[WS_DROP_OVERSIZE] تم تجاهل إرسال حزمة WebSocket بحجم {len(payload)} بايت لتجاوزها الحد الآمن ({max_bytes} بايت) لمنع فصل الخادم برمز 1009.", flush=True)
             return
@@ -4519,10 +4519,13 @@ class TalkinBot:
                     pass
 
     def _load_telegram_chat_id(self):
+        configured = str(os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+        if configured:
+            self._telegram_chat_id = configured
         try:
             if TELEGRAM_CHAT_FILE.exists():
                 obj = json.loads(TELEGRAM_CHAT_FILE.read_text(encoding="utf-8"))
-                self._telegram_chat_id = str(obj.get("chat_id", "") or "").strip()
+                self._telegram_chat_id = str(obj.get("chat_id", "") or self._telegram_chat_id).strip()
         except Exception as exc:
             self.log("[TELEGRAM] chat id load failed:", repr(exc))
 
@@ -4901,16 +4904,8 @@ class TalkinBot:
             f"\n📦 الحجم: {size} بايت"
             f"\n📍 النوع: {context}{location}"
             f"\n❌ التفاصيل: {detail}"
-            "\n📨 تم إرسال للمستخدم: غير قادر على إرسال الرسالة."
         )
         self.log("[WS_OVERSIZE_HANDLED]", master_msg.replace("\n", " | "))
-
-        # Send the real diagnostic to the configured master privately.
-        if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
-            try:
-                self.send_private_text(BOT_MASTER, master_msg)
-            except Exception as exc:
-                self.log("[WS_OVERSIZE] master notification failed:", repr(exc))
 
         # Also send the diagnostic to the configured Telegram chat.
         if TELEGRAM_BOT_TOKEN:
@@ -4921,30 +4916,13 @@ class TalkinBot:
                 except Exception as exc:
                     self.log("[WS_OVERSIZE] Telegram notification failed:", repr(exc))
 
-    def _send_oversize_user_notice(self, packet_type, target, room):
-        """Best-effort small user-facing message; never raises."""
-        notice = "❌ غير قادر على إرسال الرسالة، حجمها أكبر من الحد المسموح."
-        try:
-            if packet_type == "chat_message" and target:
-                if _norm_user(target) != _norm_user(BOT_ID):
-                    payload = encode_query("chat_message", type_="text", to=target, body=notice)
-                    if len(payload) <= int(os.getenv("WS_MAX_MESSAGE_BYTES", "950")):
-                        self.ws.send_binary(payload)
-                return
-            if packet_type == "room_message" and room:
-                # Never send the generic oversize error back to a room.
-                # The original long content is routed to Telegram instead.
-                return
-        except Exception as exc:
-            self.log("[WS_OVERSIZE] user notice failed:", repr(exc))
-
     def send_query(self, payload: bytes):
         if not self.ws:
             raise RuntimeError("WebSocket is not connected")
 
         # Never pass an oversized protobuf packet to RawWebSocket. The server
         # closes the whole connection with 1009, so handle it locally instead.
-        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "950"))
+        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
         payload = bytes(payload)
         if len(payload) > max_bytes:
             packet_type = ""
@@ -4976,25 +4954,17 @@ class TalkinBot:
                     telegram_sent = False
                     self.log("[TELEGRAM] oversized packet routing failed:", repr(exc))
                 if telegram_sent:
-                    # Master gets only a short confirmation, never the long diagnostic.
-                    if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
-                        try:
-                            self.send_private_text(BOT_MASTER, "📨 تم إرسال الرسالة الطويلة كاملة إلى Telegram.")
-                        except Exception as exc:
-                            self.log("[WS_OVERSIZE] master short notification failed:", repr(exc))
+                    self.log("[WS_OVERSIZE] long message routed to Telegram")
                 else:
                     self._report_oversize_delivery(
                         packet_type, target, room, len(payload),
                         "تعذر إرسال الرسالة الطويلة إلى Telegram"
                     )
-                self._send_oversize_user_notice(packet_type, target, room)
                 return False
 
             # No recoverable text body (for example a non-text packet): keep the
             # old diagnostic path.
-            self._report_oversize_delivery(packet_type, target, room, len(payload), "حزمة WebSocket تجاوزت 950 بايت")
-            if packet_type in {"chat_message", "room_message"}:
-                self._send_oversize_user_notice(packet_type, target, room)
+            self._report_oversize_delivery(packet_type, target, room, len(payload), "حزمة WebSocket تجاوزت 1008 بايت")
             return False
 
         # Keep a compact trace of the live protocol. This is intentionally
@@ -5327,12 +5297,12 @@ class TalkinBot:
             return False
 
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
-        """Send one text message unless the actual protobuf packet exceeds 950 bytes."""
+        """Send text safely; oversized packets are ignored and routed to Telegram."""
         text = str(text or "")
         if not text:
             return True
 
-        limit = int(os.getenv("WS_MAX_MESSAGE_BYTES", "950"))
+        limit = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
 
         def make_payload(value):
             payload = dict(kwargs)
@@ -5340,18 +5310,15 @@ class TalkinBot:
             payload["body"] = value
             return encode_query(packet_type, **payload)
 
-        # Important: measure the COMPLETE WebSocket/protobuf payload, not just
-        # the text bytes. This prevents a 950-byte text from becoming e.g. a
-        # 990-byte protobuf packet and triggering server close code 1009.
+        # Measure the COMPLETE WebSocket/protobuf payload, not just text bytes.
         if len(make_payload(text)) <= limit:
             self.send_query(make_payload(text))
             return True
 
         # The complete message is too large for Talkin/WebSocket. Do NOT
         # split it into visible Talkin messages. Route the original full text
-        # to Telegram instead, then tell the master privately that delivery
-        # was redirected successfully. This keeps the WebSocket connection
-        # safe from close code 1009.
+        # to Telegram instead. This keeps the WebSocket connection safe from
+        # close code 1009 without sending an error message to Talkin users.
         telegram_title = "رسالة طويلة من البوت"
         if packet_type == "room_message":
             room_name = str(kwargs.get("room") or "").strip()
@@ -5369,17 +5336,7 @@ class TalkinBot:
             self.log("[TELEGRAM] oversized message routing failed:", repr(exc))
 
         if telegram_sent:
-            master_notice = (
-                "📨 تم إرسال الرسالة الطويلة إلى Telegram بنجاح."
-                f"\n📦 الحجم: {len(make_payload(text))} بايت"
-                f"\n📍 {telegram_title}"
-            )
             self.log("[WS_OVERSIZE] long message routed to Telegram")
-            if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
-                try:
-                    self.send_private_text(BOT_MASTER, master_notice)
-                except Exception as exc:
-                    self.log("[WS_OVERSIZE] master Telegram-routing notice failed:", repr(exc))
         else:
             # Telegram was unavailable/failed; report the failure to the master
             # and keep the bot alive without sending an oversized WebSocket packet.
@@ -5391,11 +5348,6 @@ class TalkinBot:
                 "تعذر إرسال الرسالة الطويلة إلى Telegram"
             )
 
-        self._send_oversize_user_notice(
-            packet_type,
-            str(kwargs.get("to") or ""),
-            str(kwargs.get("room") or "")
-        )
         return False
 
     def _send_help_chunks(self, packet_type: str, text: str, limit: int = 320, **kwargs):
@@ -11844,8 +11796,29 @@ class TalkinBot:
             if name and _norm_user(name) not in seen and _norm_user(name) != _norm_user(BOT_ID):
                 seen.add(_norm_user(name)); rows.append(name)
         rows.sort(key=_norm_user)
-        text = empty if not rows else f"{title} ({len(rows)}):\n" + "\n".join(f"{i}. @{n}" for i,n in enumerate(rows,1))
-        self.send_private_text(sender, text)
+        if not rows:
+            self.send_private_text(sender, empty)
+            return
+        limit = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+        header = f"{title} ({len(rows)}):"
+        pages=[]; current=[header]
+        for index, name in enumerate(rows, 1):
+            line=f"{index}. @{name}"
+            candidate="\n".join(current + [line])
+            probe=encode_query("chat_message", type_="text", to=str(sender or ""), body=candidate)
+            # Reserve room for the page marker and protobuf envelope added
+            # after the page count is known.
+            if len(probe) > max(120, limit - 80) and len(current) > 1:
+                pages.append("\n".join(current))
+                current=[header, line]
+            else:
+                current.append(line)
+        if len(current) > 1:
+            pages.append("\n".join(current))
+        total=len(pages)
+        for page_no, page in enumerate(pages, 1):
+            page_text=f"{title} ({len(rows)})\n📄 القائمة {page_no}/{total}\n" + "\n".join(page.splitlines()[1:])
+            self.send_private_text(sender, page_text)
 
     def _room_list_commands(self, room, text, sender, is_private):
         match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
@@ -14247,9 +14220,10 @@ class TalkinBot:
             if result.get("rooms"):
                 self._process_room_list(result.get("rooms"))
             if result.get("users") or result.get("room_admin"):
-                # RoomAdmin responses do not always echo the room name. When a
-                # single native list request is pending, bind this response to it.
-                if result.get("room_admin") and not result.get("_occupants_room"):
+                # Occupants responses do not always echo the room name. When a
+                # single native list request is pending, bind either users or
+                # RoomAdmin responses to that requested room.
+                if not result.get("_occupants_room"):
                     pending_rooms = list(getattr(self, "_pending_room_lists", {}).keys())
                     if len(pending_rooms) == 1:
                         result["_occupants_room"] = pending_rooms[0]
