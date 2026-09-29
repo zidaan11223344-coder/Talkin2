@@ -1882,9 +1882,9 @@ def _is_ns_command(text):
 
 
 def _is_publish_command(text):
-    """Recognize both publish spellings: نشر / نشر@الوصف / انشر / انشر@الوصف."""
+    """Recognize only the current publish commands: بوست / انشر."""
     value = str(text or "").strip()
-    return bool(re.fullmatch(r"(?:انشر|نشر)(?:@.*)?", value, re.I | re.S))
+    return bool(re.fullmatch(r"(?:بوست|انشر)(?:@.*)?", value, re.I | re.S))
 
 
 def _publish_description(text):
@@ -2128,7 +2128,7 @@ def _looks_like_bot_command(text):
         ".u", "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "دخول@", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
-        "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "انشر", "نشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
+        "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
     )
     prefixes = prefixes + ("bl@",)
@@ -2192,7 +2192,7 @@ def _looks_like_admin_command(text):
     prefixes = (
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "mas@", "umas@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
-        "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "انشر", "نشر", "+sr@", "sr@",
+        "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify",
     )
     return low.startswith(prefixes)
@@ -2883,7 +2883,7 @@ def _default_help_sections():
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
-            '📢 النشر — 2\n━━━━━━━━━━━━\nانشر — تجهيز ونشر صورة\nانشر@وصف — نشر صورة مع وصف\n📌 الوصف يمر عبر فلتر الكلمات المسيئة، ومن يخالفه يُمنع من النشر حتى mbp@اسم\n\n📌 أرسل الصورة بعد أمر انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
+            '📢 النشر — 2\n━━━━━━━━━━━━\nبوست أو انشر — تجهيز ونشر صورة\nبوست@وصف أو انشر@وصف — نشر صورة مع وصف\n📌 الوصف يمر عبر فلتر الكلمات المسيئة، ومن يخالفه يُمنع من النشر حتى mbp@اسم\n\n📌 أرسل الصورة بعد أمر بوست أو انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
         ],
         5: [
             '💰 النقاط — 1\n━━━━━━━━━━━━\nنقاطي — عرض الرصيد والمستوى وإحصاءات اللعب\npoints — عرض النقاط\nتوب — المتصدرين العام\ntop — المتصدرين العام\n\nتوب رهان — متصدروا الرهان\nتوب مضاربة — متصدروا المضاربة\nتوب حظي — متصدروا حظي\nتوب استثمار — متصدروا الاستثمار',
@@ -13785,7 +13785,7 @@ class TalkinBot:
         key=_norm_user(sender); pending=self.publish_pending.get(key)
         if not pending: return False
         if time.time()-pending.get("created_at",0)>120:
-            self.publish_pending.pop(key,None); self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد."); return True
+            self.publish_pending.pop(key,None); self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر بوست أو انشر من جديد."); return True
         desc=pending.get("description",description or "")
         if _is_publish_banned(sender):
             self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
@@ -13859,7 +13859,7 @@ class TalkinBot:
                 ok+=1
             except Exception as e:
                 errors.append((target,str(e)))
-                self.log("[PUBLISH] failed",target,repr(e))
+                self.log("[PUBLISH] room delivery failed")
         # Count one publication, not one copy per room, and persist it.
         if ok:
             _record_media_publication("image", desc or "منشور صورة", sender, source_room or room)
@@ -13942,7 +13942,7 @@ class TalkinBot:
         pending=self.publish_pending.pop(key, None)
         if not pending: return False
         if time.time()-pending.get("created_at",0)>120:
-            self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر انشر من جديد."); return True
+            self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر بوست أو انشر من جديد."); return True
         desc=pending.get("description",description or "")
         if _is_publish_banned(sender):
             self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
@@ -14018,7 +14018,7 @@ class TalkinBot:
                     ok+=1
                 except Exception as e:
                     errors.append((target,str(e)))
-                    self.log("[PUBLISH] failed",target,repr(e))
+                    self.log("[PUBLISH] room delivery failed")
                 if room_index + 1 < len(rooms):
                     time.sleep(room_delay)
         # Count one publication, not one copy per room, and persist it.
@@ -14049,9 +14049,15 @@ class TalkinBot:
             return True
         try:
             tried = set()
-            # فقط من يرسل الصورة ويكون لديه طلب نشر معلق هو من تنشر صورته
+            # The first candidate is the authoritative event sender (field 2 / frm).
+            # Never fall through to other event fields: they may contain metadata
+            # usernames and could let another user claim the pending publication.
             pending = getattr(self, "publish_pending", {})
-            for sender in (candidates or []):
+            authoritative_sender = next(
+                (str(item or "").strip() for item in (candidates or []) if str(item or "").strip()),
+                "",
+            )
+            for sender in ((authoritative_sender,) if authoritative_sender else ()):
                 sender = str(sender or "").strip()
                 key = _norm_user(sender)
                 if not key or key in tried:
@@ -14064,7 +14070,7 @@ class TalkinBot:
                     except Exception as exc:
                         self.log("[PUBLISH] media handling failed:", repr(exc))
             # Never consume another user's pending publish request. The image
-            # must belong to the same account that issued انشر/انشر@الوصف.
+            # must belong to the same account that issued بوست/انشر.
             return False
         finally:
             lock.release()
@@ -14441,16 +14447,11 @@ class TalkinBot:
         # معالجة الصورة داخل خيط خلفي.
         if getattr(self, "publish_pending", {}):
             if media_url or event_type in {"image", "photo", "picture", "media", "file"}:
-                self.log("[PUBLISH] incoming image event",
-                         "room=", room, "url=", media_url[:180] if media_url else "<missing>",
-                         "pending=", list(getattr(self, "publish_pending", {}).keys()))
                 handled = bool(media_url and self._try_publish_pending_media(room, media_url, media_senders))
-                self.log("[PUBLISH] image event handled=", handled,
-                         "remaining_pending=", list(getattr(self, "publish_pending", {}).keys()))
                 if handled:
                     return
                 if not media_url:
-                    self.log("[PUBLISH] image event received without a usable media URL", event)
+                    self.log("[PUBLISH] image event ignored: no usable media")
                 return
 
         if event_type in {"image", "photo", "picture", "media", "file"} or (media_url and event_type not in {"text", "user_joined", "user_left"}):
