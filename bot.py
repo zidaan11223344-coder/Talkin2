@@ -280,7 +280,7 @@ def _start_master_process():
         return False, "❌ ملف master_bot.py غير موجود بجانب البوت."
     with MASTER_PROCESS_LOCK:
         if MASTER_PROCESS is not None and MASTER_PROCESS.poll() is None:
-            return True, "ℹ️ الخدمة مشغلة مسبقاً."
+            return True, "ℹ️ الماستر مفعل مسبقاً."
         env = os.environ.copy()
         env["MASTER_ID"] = master_id
         env["MASTER_PWD"] = master_pwd
@@ -314,7 +314,7 @@ def _start_master_process():
         code = MASTER_PROCESS.returncode
         MASTER_PROCESS = None
         return False, f"❌ توقفت خدمة الماستر مباشرة (رمز الخروج: {code}). راجع سجل الاستضافة."
-    return True, "✅ تم تشغيل الخدمة."
+    return True, "✅ تم تشغيل الماستر."
 
 def _stop_master_process():
     """Stop only the master_bot.py process started by this primary bot."""
@@ -323,7 +323,7 @@ def _stop_master_process():
         proc = MASTER_PROCESS
         MASTER_PROCESS = None
     if proc is None or proc.poll() is not None:
-        return True, "ℹ️ الخدمة متوقفة مسبقاً."
+        return True, "ℹ️ الماستر متوقف مسبقاً."
     try:
         proc.terminate()
         try:
@@ -331,7 +331,7 @@ def _stop_master_process():
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=3)
-        return True, "✅ تم إيقاف الخدمة."
+        return True, "✅ تم إيقاف الماستر."
     except Exception as exc:
         return False, f"❌ تعذر إيقاف الماستر: {exc}"
 
@@ -3998,6 +3998,38 @@ def _download_lookalike_image(image_url, target_name):
         return out if out.is_file() else None
     except Exception:
         return None
+
+# ------------------------- Runtime resource/cleanup -----------------
+def _runtime_resource_status():
+    """Return lightweight host metrics without psutil or blocking probes."""
+    total_kb = available_kb = 0
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            key, _, value = line.partition(":")
+            if key == "MemTotal":
+                total_kb = int(value.strip().split()[0])
+            elif key == "MemAvailable":
+                available_kb = int(value.strip().split()[0])
+    except Exception:
+        pass
+    used_kb = max(0, total_kb - available_kb) if total_kb else 0
+    used_pct = (used_kb * 100.0 / total_kb) if total_kb else 0.0
+    try:
+        load_1, load_5, load_15 = os.getloadavg()
+    except (AttributeError, OSError):
+        load_1 = load_5 = load_15 = 0.0
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    return {
+        "ram_total_mb": total_kb / 1024.0,
+        "ram_used_mb": used_kb / 1024.0,
+        "ram_available_mb": available_kb / 1024.0,
+        "ram_used_pct": used_pct,
+        "cpu_count": cpu_count,
+        "load_1": load_1,
+        "load_5": load_5,
+        "load_15": load_15,
+        "load_pct_per_core": load_1 * 100.0 / cpu_count,
+    }
 
 # ------------------------- Runtime cleanup -------------------------
 _CLEANUP_LOCK = threading.Lock()
@@ -7729,6 +7761,20 @@ class TalkinBot:
                 return str(value or "").casefold().strip()
         return ""
 
+    def _bot_is_room_owner(self, room):
+        """Return True only when the cached role is an actual room Owner.
+
+        Live broadcast is intentionally stricter than ordinary room actions:
+        unknown, member, admin, or moderator roles must not start audio.  The
+        occupants response populates ``bot_room_roles`` after joining, so this
+        check stays local and does not add a roster request to every command.
+        """
+        role = self._bot_room_role(room)
+        return role in {
+            "owner", "creator", "room_owner", "room_creator", "host",
+            "مالك", "اونر", "أونر", "صانع", "صانع_الغرفة",
+        }
+
     def _inv_bot_owner_allowed(self, room):
         """Validate the bot's room privilege without blocking a valid owner.
 
@@ -8692,6 +8738,15 @@ class TalkinBot:
         if not raw.lower().startswith(".sa "): return False
         query=raw[4:].strip()
         if not query: self.send_room_text(room,"❌ اكتب: .sa اسم الأغنية"); return True
+        if live_stream and not self._bot_is_room_owner(room):
+            role = self._bot_room_role(room) or "غير معروفة"
+            self.send_room_text(
+                room,
+                "⚠️ لم يتم تشغيل البث.\n"
+                "👑 يجب أن تكون رتبة البوت Owner في الغرفة قبل تشغيل البث.\n"
+                f"📌 الرتبة الحالية: {role}"
+            )
+            return True
         now=time.time(); last=self.music_last.get(requester,0)
         if now-last<MUSIC_COOLDOWN: self.send_room_text(room,f"⏳ انتظر {int(MUSIC_COOLDOWN-(now-last))+1} ثانية."); return True
         self.music_last[requester]=now
@@ -8805,9 +8860,12 @@ class TalkinBot:
                                 time.sleep(room_delay)
                 elif live_stream:
                     if live_started:
-                        self.send_room_text(room, f"تم تشغيل الاغنيه في البث\nالغرفة: {room}")
+                        self.send_room_text(
+                            room,
+                            f"✅ تم تشغيل البث\n🎵 اسم الأغنية: {title}\n🏠 الغرفة: {room}"
+                        )
                     elif getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed") == "queued":
-                        self.send_room_text(room, "📡 جاري صعود البوت للبث وتشغيل الأغنية تلقائياً...")
+                        self.send_room_text(room, f"📡 جاري صعود البوت للبث وتشغيل الأغنية تلقائياً...\n🎵 {title}\n🏠 الغرفة: {room}")
                     else:
                         self.send_room_text(room, "❌ تعذر تشغيل الأغنية في البث؛ تم استخدام المصدر الاحتياطي إن توفر.")
                     music_published = live_started or getattr(self, "_last_live_play_status_by_room", {}).get(room) == "queued"
@@ -12325,6 +12383,20 @@ class TalkinBot:
             self.send_private_text(sender, f"📊 حالة البوت\n• WebSocket: {ws_state}\n• خدمة الماستر: {master_state}\n• قاعدة البيانات: {db_state}\n• تنظيف تلقائي: {'🟢 شغال' if CLEANUP_MEMORY_ENABLED else '🔴 متوقف'}\n• حماية البوت: {'🟢 شغالة' if getattr(self, 'bot_protection_enabled', False) else '🔴 متوقفة'}")
             return True
 
+        if low in ("رام", "ram", "cpu", "الموارد", "حالة الموارد", "حاله الموارد", "resource status"):
+            metrics = _runtime_resource_status()
+            self.send_private_text(
+                sender,
+                "🖥️ موارد المنصة\n"
+                f"• RAM الكلية: {metrics['ram_total_mb']:.0f} MB\n"
+                f"• RAM المستخدمة: {metrics['ram_used_mb']:.0f} MB ({metrics['ram_used_pct']:.1f}%)\n"
+                f"• RAM المتاحة: {metrics['ram_available_mb']:.0f} MB\n"
+                f"• CPU: {metrics['cpu_count']} نواة\n"
+                f"• الحمل الحالي: {metrics['load_1']:.2f} / {metrics['load_5']:.2f} / {metrics['load_15']:.2f}\n"
+                f"• الحمل لكل نواة: {metrics['load_pct_per_core']:.1f}%"
+            )
+            return True
+
         # Master-only room broadcast: رسالهغرف@النص / رسالةغرف@النص.
         m_room_broadcast = re.fullmatch(r"(?:رسالهغرف|رسالةغرف|رساله\s+غرفه|رسالة\s+غرفه)@(.+)", text, re.I | re.S)
         if m_room_broadcast:
@@ -12557,8 +12629,13 @@ class TalkinBot:
             return True
         # Master-only self restart. The reply stays in the same channel where
         # the master issued the command, then the current Python process is replaced.
-        if low in ("اعاده تشغيل البوت", "اعادة تشغيل البوت", "إعاده تشغيل البوت", "إعادة تشغيل البوت", "restart bot", "restart"):
-            reply = "🔄 جاري إعادة تشغيل البوت..."
+        if low in (
+            "اعاده تشغيل البوت", "اعادة تشغيل البوت", "إعاده تشغيل البوت", "إعادة تشغيل البوت",
+            "اعاده تشغيل المنصه", "اعادة تشغيل المنصه", "إعاده تشغيل المنصه", "إعادة تشغيل المنصة",
+            "restart bot", "restart", "restart platform",
+        ):
+            platform_restart = "منصه" in low or "منصة" in low or low == "restart platform"
+            reply = "🔄 جاري إعادة تشغيل المنصة..." if platform_restart else "🔄 جاري إعادة تشغيل البوت..."
             if is_private:
                 self.send_private_text(sender, reply)
             elif room:
