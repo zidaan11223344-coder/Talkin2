@@ -187,110 +187,6 @@ GIFT_CATALOG = {
 BOT_ID = (os.getenv("BOT_ID") or os.getenv("BOT_USERNAME") or "").strip()
 BOT_PWD = os.getenv("BOT_PWD") or os.getenv("BOT_PASSWORD") or ""
 BOT_MASTER = (os.getenv("BOT_MASTER") or os.getenv("MASTER_USERNAME") or "").strip()
-# TalkinChat Bot Entry Server: the primary deployment accepts commands
-# to launch managed controller and silent bot processes. Child processes set
-# ADMIN_SERVER_MODE=0 and behave as managed bots.
-SERVER_ADMIN_NAME = os.getenv(
-    "SERVER_ADMIN_NAME",
-    "ۦاݪــۛـسـ𓆩♛𓆪ـۧۦـ۫ـفـيــ۫ـۧ𝁤𝆬𝃛",
-).strip()
-ADMIN_SERVER_MODE = os.getenv("ADMIN_SERVER_MODE", "1").strip().casefold() not in {"0", "false", "no", "off"}
-BOT_ENTRY_TYPE = os.getenv("BOT_ENTRY_TYPE", "controller").strip().lower() or "controller"
-BOT_ENTRY_MASTER = (os.getenv("BOT_ENTRY_MASTER") or BOT_MASTER).strip()
-BOT_SERVER_STATE_PATH = Path(os.getenv("BOT_SERVER_STATE_PATH", str(Path(__file__).resolve().parent / "data" / "talkin_bot_server.json")))
-BOT_SERVER_STATE_LOCK = threading.RLock()
-
-def _bot_server_state_load():
-    try:
-        if BOT_SERVER_STATE_PATH.exists():
-            data = json.loads(BOT_SERVER_STATE_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data.setdefault("bots", {})
-                data.setdefault("masters", {})
-                return data
-    except Exception:
-        pass
-    return {"bots": {}, "masters": {}}
-
-def _bot_server_state_save(data):
-    try:
-        BOT_SERVER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = BOT_SERVER_STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(BOT_SERVER_STATE_PATH)
-        return True
-    except Exception:
-        return False
-
-def _bot_server_key(bot, room):
-    return f"{_norm_user(bot)}|{_norm_room(room)}"
-
-def _bot_server_is_master(sender, room):
-    sender = _norm_user(sender)
-    room = _norm_room(room)
-    if not sender or not room:
-        return False
-    with BOT_SERVER_STATE_LOCK:
-        data = _bot_server_state_load()
-        masters = data.get("masters", {}).get(room, [])
-        return sender in {_norm_user(x) for x in masters}
-
-def _bot_server_add_master(user, room, primary=False):
-    user = str(user or "").strip().lstrip("@"); room = str(room or "").strip()
-    if not user or not room: return False
-    with BOT_SERVER_STATE_LOCK:
-        data = _bot_server_state_load(); rk = _norm_room(room)
-        arr = data.setdefault("masters", {}).setdefault(rk, [])
-        if primary:
-            arr = [user] + [x for x in arr if _norm_user(x) != _norm_user(user)]
-            data["masters"][rk] = arr
-        elif _norm_user(user) not in {_norm_user(x) for x in arr}:
-            arr.append(user)
-        return _bot_server_state_save(data)
-
-def _bot_server_register(bot, room, kind, master, pid=0, status="starting"):
-    bot = str(bot or "").strip().lstrip("@"); room = str(room or "").strip(); kind = str(kind or "").strip().lower()
-    with BOT_SERVER_STATE_LOCK:
-        data = _bot_server_state_load(); key = _bot_server_key(bot, room)
-        data["bots"][key] = {
-            "bot": bot, "type": kind, "room": room, "master": str(master or "").strip().lstrip("@"),
-            "server_admin": SERVER_ADMIN_NAME, "pid": int(pid or 0), "status": status, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
-        _bot_server_state_save(data)
-        return data["bots"][key]
-
-def _bot_server_update_status(bot, room, status, pid=None):
-    with BOT_SERVER_STATE_LOCK:
-        data = _bot_server_state_load(); row = data.get("bots", {}).get(_bot_server_key(bot, room))
-        if not isinstance(row, dict): return False
-        row["status"] = status; row["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        if pid is not None: row["pid"] = int(pid or 0)
-        return _bot_server_state_save(data)
-
-def _bot_server_rows(room=""):
-    with BOT_SERVER_STATE_LOCK:
-        data = _bot_server_state_load(); rows = list(data.get("bots", {}).values())
-    if room:
-        rows = [r for r in rows if _norm_room(r.get("room")) == _norm_room(room)]
-    for r in rows:
-        pid = int(r.get("pid") or 0)
-        if pid and r.get("status") == "online":
-            try: os.kill(pid, 0)
-            except Exception: r["status"] = "offline"
-    return rows
-
-def _bot_server_remove(room="", bot=""):
-    with BOT_SERVER_STATE_LOCK:
-        data = _bot_server_state_load(); removed = []
-        for key,row in list(data.get("bots", {}).items()):
-            if room and _norm_room(row.get("room")) != _norm_room(room): continue
-            if bot and _norm_user(row.get("bot")) != _norm_user(bot): continue
-            pid = int(row.get("pid") or 0)
-            if pid:
-                try: os.kill(pid, 15)
-                except Exception: pass
-            removed.append(row); data["bots"].pop(key, None)
-        _bot_server_state_save(data); return removed
 PRIMARY_BOT_ID = (os.getenv("PRIMARY_BOT_ID") or "").strip()
 INVITE_SENDER_NAME = os.getenv("INVITE_SENDER_NAME", "السفير").strip() or "السفير"
 GROUP_TO_JOIN = (os.getenv("GROUP_TO_JOIN") or os.getenv("FIRST_ROOM") or "").strip()
@@ -3003,7 +2899,7 @@ def _default_help_sections():
             '📋 أوامر الإدارة — 3 | التوثيق وVIP\n━━━━━━━━━━━━\nvi@اسم — توثيق مستخدم\nuns@اسم — سحب التوثيق\nسحب التوثيق@اسم — سحب التوثيق\nإزالة توثيق@اسم — سحب التوثيق\nتوثيق الكل — توثيق كل الأعضاء\nvi — عدد الموثقين\nvip@اسم — منح VIP\nunvip@اسم — سحب VIP\nvip — عدد أعضاء VIP\nmvip@اسم — إضافة ماستر توثيق\numvip@اسم — سحب ماستر توثيق\nl@mvip — عرض ماسترات التوثيق',
             '📋 أوامر الإدارة — 4 | التوثيق والحماية\n━━━━━━━━━━━━\nتشغيل التوثيق — تشغيل نظام التوثيق\nإيقاف التوثيق — إيقاف نظام التوثيق\nحماية — إعداد حماية الغرفة\nتشغيل الحماية — تشغيل حماية الغرفة\nإيقاف الحماية — إيقاف حماية الغرفة\nحالة الحماية — عرض حالة الحماية\nحمايه البوت — حماية داخلية للبوت\nالمحظورين — عرض المحظورين داخل البوت',
             '📋 أوامر الإدارة — 5 | الفلتر والنشر\n━━━━━━━━━━━━\nmf@on — تشغيل فلتر الكلمات\nmf@off — إيقاف فلتر الكلمات\n+mf@كلمة — إضافة كلمة للفلتر\n-mf@كلمة — حذف كلمة من الفلتر\nl@mf — عرض كلمات الفلتر\nclear@mf — مسح كلمات الفلتر\nl@mfb — عرض المحظورين بسبب الفلتر\nl@mbp — عرض الممنوعين من النشر\nmbp@اسم — فك منع النشر\namf@اسم — استثناء مستخدم من حظر الفلتر',
-            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال والخدمات\nرام / cpu — حالة موارد البوت\nتنضيف / تنظيف — تنظيف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة احتياطية\nإعادة تشغيل البوت — إعادة التشغيل\nتشغيل الدعوات / إيقاف الدعوات — التحكم بالدعوات\nتشغيل الألعاب / إيقاف الألعاب — التحكم بالألعاب\nغرفي / myrooms — عرض الغرف المتصلة\nدخول الكل / دخولكل — دخول كل الغرف المحفوظة\n.دخول غرفي — دخول كل الغرف المحفوظة\nاضف لملف الغرف — إضافة غرف للملف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم — البحث عن وجود مستخدم في الغرف\nis@اسم — فحص وجود مستخدم\nl@a — المشرفون\nl@m — الأعضاء\nl@o — الأونرات\nl@b — المحظورون',
+            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال والخدمات\nرام / cpu — حالة موارد البوت\nتنضيف / تنظيف — تنظيف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة احتياطية\nإعادة تشغيل البوت — إعادة التشغيل\nتشغيل الدعوات / إيقاف الدعوات — التحكم بالدعوات\nتشغيل الألعاب / إيقاف الألعاب — التحكم بالألعاب\nغرفي / myrooms — عرض الغرف المتصلة\nدخول الكل / دخولكل — دخول كل الغرف المحفوظة\n.دخول غرفي — دخول كل الغرف المحفوظة\nاضف لملف الغرف — إضافة غرف للملف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم — البحث عن وجود مستخدم في الغرف\nis@اسم — فحص وجود مستخدم\nl@a — المشرفون\nl@m — الأعضاء\nl@o — الأونرات\nl@b — المحظورون', 
         ],
         2: [
             '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال: .sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
@@ -6409,7 +6305,7 @@ class TalkinBot:
                 lk_ws = getattr(self, f"_livekit_ws_{room}", None)
                 socket_healthy = bool(lk_ws and getattr(lk_ws, "sock", None))
                 self.log(f"[STREAM_VERIFY] فحص جاهزية البث في {room}: audio_sent={audio_sent}, livekit_active={lk_active}, socket_ok={socket_healthy}")
-
+                
                 # دورة إدارة تشغيل الأغنية في خيط مستقل لضمان استمرار البث حتى انتهاء الملف
                 # وتوقف الصوت بأمان دون مغادرة البوت أو إغلاق LiveKit
                 def _playback_lifecycle(target_room, r_id, s_id, track_len):
@@ -11307,7 +11203,7 @@ class TalkinBot:
             if final>=100:
                 photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender); win_img=self._render_snake_board(game,winner_name=sender)
                 new_points = _add_points(sender, self.SNAKE_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,"");
+                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.snake_games.pop(key,None)
@@ -11551,7 +11447,7 @@ class TalkinBot:
             if new>=58:
                 win_img=self._render_ludo_board(game,winner_name=sender); photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
                 new_points = _add_points(sender, self.LUDO_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,"");
+                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.ludo_games.pop(key,None); return True
@@ -11957,125 +11853,7 @@ class TalkinBot:
     def _send_help(self, room=None, private_to=None, page=1, game_part=1):
         self._send_help_section(room=room, private_to=private_to, page=page, part=game_part)
 
-    def _handle_bot_entry_server_command(self, room, body, sender, is_private=False):
-        if not ADMIN_SERVER_MODE:
-            return False
-        text = str(body or "").strip()
-        # Add main/controller bot: user@password@room
-        m = re.fullmatch(r"([^@\s]+)@([^@\s]+)@(.+)", text, re.S)
-        if m and not text.lower().startswith(("hb@", "master@", "delmaster@")):
-            bot_user, bot_pwd, target_room = m.group(1).strip(), m.group(2), m.group(3).strip()
-            if not bot_user or not bot_pwd or not target_room:
-                return True
-            if _norm_user(bot_user) == _norm_user(BOT_ID):
-                self.send_private_text(sender, "❌ هذا هو بوت السيرفر نفسه ولا يمكن إدخاله كبوت متحكم آخر.")
-                return True
-            if _bot_server_rows(target_room) and any(str(r.get("type")) == "controller" for r in _bot_server_rows(target_room)):
-                self.send_private_text(sender, f"❌ يوجد بوت متحكم بالفعل في الغرفة: {target_room}")
-                return True
-            if not _bot_server_is_master(sender, target_room):
-                existing = _bot_server_rows(target_room)
-                if existing and any(r.get("type") == "controller" for r in existing):
-                    self.send_private_text(sender, "❌ هذه الغرفة لها ماستر. لا يمكنك إدخال بوت متحكم.")
-                    return True
-            # First successful entry establishes the primary master.
-            _bot_server_add_master(sender, target_room, primary=not _bot_server_is_master(sender, target_room) and not _bot_server_rows(target_room))
-            env = os.environ.copy()
-            env.update({"BOT_ID": bot_user, "BOT_USERNAME": bot_user, "BOT_PWD": bot_pwd, "BOT_PASSWORD": bot_pwd,
-                        "GROUP_TO_JOIN": target_room, "FIRST_ROOM": target_room, "BOT_MASTER": sender, "MASTER_USERNAME": sender,
-                        "ADMIN_ONLY_MODE": "1", "ADMIN_SERVER_MODE": "0", "BOT_ENTRY_TYPE": "controller",
-                        "BOT_ENTRY_MASTER": sender, "SERVER_ADMIN_NAME": SERVER_ADMIN_NAME,
-                        "BOT_SERVER_STATE_PATH": str(BOT_SERVER_STATE_PATH)})
-            try:
-                proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve())], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-                _bot_server_register(bot_user, target_room, "controller", sender, proc.pid, "starting")
-                msg = (f"⏳ جاري إدخال البوت المتحكم...\n🤖 البوت: @{bot_user}\n"
-                       f"🏠 الغرفة: {target_room}\n👑 الماستر: @{sender}")
-                if is_private: self.send_private_text(sender, msg)
-                else: self.send_room_text(room or target_room, msg)
-            except Exception as exc:
-                self.send_private_text(sender, f"❌ فشل تشغيل البوت المتحكم: {str(exc)[:180]}")
-            return True
-
-        # Add silent bot: hb@user@password@room
-        m = re.fullmatch(r"hb@([^@\s]+)@([^@\s]+)@(.+)", text, re.S | re.I)
-        if m:
-            bot_user, bot_pwd, target_room = m.group(1).strip(), m.group(2), m.group(3).strip()
-            if _norm_user(bot_user) == _norm_user(BOT_ID):
-                self.send_private_text(sender, "❌ لا يمكن إدخال بوت السيرفر نفسه كبوت صامت."); return True
-            all_rows = _bot_server_rows()
-            if any(_norm_user(r.get("bot")) == _norm_user(bot_user) and r.get("type") == "controller" for r in all_rows):
-                self.send_private_text(sender, "❌ هذا البوت مسجل كبوت متحكم ولا يمكن إدخاله كبوت صامت."); return True
-            if not _bot_server_is_master(sender, target_room):
-                self.send_private_text(sender, "❌ هذا الأمر للماستر فقط. أضف البوت المتحكم أولاً أو أضفك كـ master."); return True
-            env = os.environ.copy()
-            env.update({"BOT_ID": bot_user, "BOT_USERNAME": bot_user, "BOT_PWD": bot_pwd, "BOT_PASSWORD": bot_pwd,
-                        "GROUP_TO_JOIN": target_room, "FIRST_ROOM": target_room, "BOT_MASTER": sender, "MASTER_USERNAME": sender,
-                        "ADMIN_ONLY_MODE": "1", "ADMIN_SERVER_MODE": "0", "BOT_ENTRY_TYPE": "silent",
-                        "BOT_ENTRY_MASTER": sender, "SERVER_ADMIN_NAME": SERVER_ADMIN_NAME,
-                        "BOT_SERVER_STATE_PATH": str(BOT_SERVER_STATE_PATH)})
-            try:
-                proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve())], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-                _bot_server_register(bot_user, target_room, "silent", sender, proc.pid, "starting")
-                self.send_private_text(sender, f"⏳ جاري إدخال البوت الصامت @{bot_user} إلى {target_room}...")
-            except Exception as exc:
-                self.send_private_text(sender, f"❌ فشل تشغيل البوت الصامت: {str(exc)[:180]}")
-            return True
-
-        low = text.casefold()
-        if low == "bots":
-            rows = _bot_server_rows(room if not is_private else "")
-            if not rows:
-                self.send_private_text(sender, "📭 لا توجد بوتات مسجلة." if is_private else "📭 لا توجد بوتات مسجلة في هذه الغرفة."); return True
-            lines = ["🤖 بوتات السيرفر"]
-            for r in rows:
-                icon = "🤖" if r.get("type") == "controller" else "🤫"
-                lines.append(f"{icon} @{r.get('bot')} | {r.get('type')} | 🏠 {r.get('room')} | 👑 @{r.get('master')} | {r.get('status')}")
-            msg = "\n".join(lines)
-            if is_private: self.send_private_text(sender, msg)
-            else: self.send_room_text(room, msg)
-            return True
-        if low.startswith("delall"):
-            if not _bot_server_is_master(sender, room): self.send_private_text(sender, "❌ للماستر فقط."); return True
-            removed = _bot_server_remove(); self.send_private_text(sender, f"✅ تم إيقاف وحذف {len(removed)} بوت."); return True
-        m = re.fullmatch(r"del@(.+)", text, re.I | re.S)
-        if m:
-            target_room = m.group(1).strip()
-            if not _bot_server_is_master(sender, target_room): self.send_private_text(sender, "❌ للماستر فقط."); return True
-            removed = _bot_server_remove(target_room); self.send_private_text(sender, f"✅ تم إيقاف بوتات غرفة {target_room}: {len(removed)}"); return True
-        if low == "clean":
-            with BOT_SERVER_STATE_LOCK:
-                data = _bot_server_state_load(); before=len(data.get("bots", {}))
-                for key,row in list(data.get("bots", {}).items()):
-                    pid=int(row.get("pid") or 0); alive=False
-                    if pid:
-                        try: os.kill(pid,0); alive=True
-                        except Exception: pass
-                    if not alive: data["bots"].pop(key,None)
-                _bot_server_state_save(data)
-            self.send_private_text(sender, f"🧹 تم تنظيف السجلات. المحذوف: {before-len(data.get('bots',{}))}"); return True
-        m = re.fullmatch(r"master@([^@]+)@(.+)", text, re.I | re.S)
-        if m:
-            target, target_room = m.group(1).strip(), m.group(2).strip()
-            if not _bot_server_is_master(sender,target_room): self.send_private_text(sender,"❌ للماستر فقط."); return True
-            _bot_server_add_master(target,target_room); self.send_private_text(sender,f"✅ تمت إضافة @{target} كـ master في {target_room}"); return True
-        m = re.fullmatch(r"delmaster@([^@]+)@(.+)", text, re.I | re.S)
-        if m:
-            target, target_room = m.group(1).strip(), m.group(2).strip()
-            if not _bot_server_is_master(sender,target_room): self.send_private_text(sender,"❌ للماستر فقط."); return True
-            with BOT_SERVER_STATE_LOCK:
-                data=_bot_server_state_load(); rk=_norm_room(target_room); arr=data.get("masters",{}).get(rk,[]); data["masters"][rk]=[x for x in arr if _norm_user(x)!=_norm_user(target)]; _bot_server_state_save(data)
-            self.send_private_text(sender,f"✅ تم حذف @{target} من masters في {target_room}"); return True
-        m = re.fullmatch(r"masters@(.+)", text, re.I | re.S)
-        if m:
-            target_room=m.group(1).strip();
-            with BOT_SERVER_STATE_LOCK: masters=_bot_server_state_load().get("masters",{}).get(_norm_room(target_room),[])
-            self.send_private_text(sender, "👑 Masters: " + (" ".join("@"+str(x) for x in masters) if masters else "لا يوجد")); return True
-        return False
-
     def _handle_management_command(self, room, body, sender, is_private=False):
-        if ADMIN_SERVER_MODE and self._handle_bot_entry_server_command(room, body, sender, is_private=is_private):
-            return True
         # Management commands are accepted only from the master. Keep normal
         # response routing enabled so the master receives the result privately
         # (or in the command room when the command is public by design).
@@ -13840,7 +13618,7 @@ class TalkinBot:
             self._save_blocked_rooms()
             _save_persistent_rooms(self.known_rooms)
             response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
-
+            
             # Accept immediately, but send one room_join at a time.
             if not hasattr(self, "room_languages"):
                 self.room_languages = {}
@@ -13855,7 +13633,7 @@ class TalkinBot:
                 self.send_room_text(response_room, confirm_msg)
             else:
                 self.send_private_text(sender, confirm_msg)
-
+                
             return True
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
         if m_transfer and _is_verified_user(sender):
@@ -14112,7 +13890,7 @@ class TalkinBot:
             self.send_private_text(target, f"✅ تم توثيق حسابك @{target} بنجاح.\n🎉 يمكنك الآن استخدام أوامر البوت.")
             self.send_private_text(sender, f"✅ تم توثيق @{target}.")
             return True
-        if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("سحب التوثيق@") or low.startswith("uns@"):
+        if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("سحب التوثيق@") or low.startswith("uns@"): 
             if not _is_verification_manager(sender):
                 return True
             prefix = "uns@" if low.startswith("uns@") else ("سحب التوثيق@" if low.startswith("سحب التوثيق@") else text.split("@",1)[0]+"@")
@@ -15035,7 +14813,7 @@ class TalkinBot:
                         self.send_room_text(room, f"🚫 تم حظر @{username} (حظر IP) بسبب تكرار الدخول والخروج.")
                     except Exception as exc:
                         self.log("[JOINLEAVE] ban failed", repr(exc))
-
+        
         if event_type == "user_joined" and username:
             # Optional room protection: reject accounts with no profile photo.
             # Field 3 is the native UserItem photo field; the cache is used as
@@ -15094,17 +14872,6 @@ class TalkinBot:
                     self.send_room_text(room, level_welcome)
         if event_type in ("you_joined", "you_rejoined"):
             if room:
-                if BOT_ENTRY_TYPE in ("controller", "silent"):
-                    _bot_server_register(
-                        BOT_ID, room, BOT_ENTRY_TYPE, BOT_ENTRY_MASTER or BOT_MASTER,
-                        os.getpid(), "online"
-                    )
-                    role_title = "🤖 بوت متحكم" if BOT_ENTRY_TYPE == "controller" else "🤫 بوت صامت"
-                    self.send_room_text(
-                        room,
-                        f"{role_title}\n👑 ادمن السيرفر: {SERVER_ADMIN_NAME}\n"
-                        f"🏠 الغرفة: {room}\n👑 الماستر: @{BOT_ENTRY_MASTER or BOT_MASTER}"
-                    )
                 entry_room = _norm_room(room)
                 entry_time = time.time()
                 getattr(self, "_room_entry_times", {}).update({entry_room: entry_time})
