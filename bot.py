@@ -123,7 +123,7 @@ GIFT_IMAGE_FILES = {
         for path in [ASSETS_DIR / f"gift_{i:02d}_{variant}.{ext}"]
         if path.is_file()
     ]
-    for i in range(1, 15)
+    for i in range(1, 18)
 }
 # الألعاب وصورها معطلة بناءً على إعداد البوت المطلوب؛ لا تُرسل صور ألعاب.
 GAME_IMAGE_FILES = {
@@ -174,6 +174,7 @@ GIFT_CATALOG = {
     "7": ("⚡", "برق"), "8": ("👑", "تاج"), "9": ("👸", "أميرة"),
     "10": ("🏎️", "سيارة"), "11": ("✈️", "طائرة"), "12": ("🐉", "تنين"),
     "13": ("🚀", "سفينة فضاء"), "14": ("🏰", "قصر"),
+    "15": ("☕", "قهوة"), "16": ("🫖", "دلة"), "17": ("🐓", "ديك"),
 }
 
 # ============================================================
@@ -477,7 +478,7 @@ _migrate_legacy_state_files()
 # Restore state from GitHub after the data directory and legacy migration are ready.
 
 # Giant Chat gift costs/labels; images remain the local Giant assets.
-GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500}
+GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500,"15":525,"16":550,"17":575}
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://chatp.net/api?").rstrip("?") + "?"
@@ -3839,7 +3840,7 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
     return out
 
 def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
-    """Create a card with the submitted image and sender name in a side panel."""
+    """Render the post image with the publisher avatar above a compact name plate."""
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبت")
     if not source_url:
@@ -3851,23 +3852,50 @@ def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
         raise ValueError("صورة النشر كبيرة جداً")
     image = Image.open(BytesIO(r.content)).convert("RGB")
     w, h = image.size
-    # Keep the original image untouched and place one clean name rectangle
-    # beside it, matching the single-name style used by gift cards.
-    panel_w = max(240, min(420, int(max(h, w) * 0.34)))
-    gap = max(10, int(min(w, h) * 0.025))
-    canvas = Image.new("RGB", (w + gap + panel_w, h), (8, 12, 24))
-    canvas.paste(image, (0, 0))
+    # Preserve the submitted image at the top. Beneath it, center the small
+    # circular publisher avatar above a compact rounded username rectangle.
+    canvas_w = max(w, 320)
+    avatar_size = max(64, min(136, int(min(canvas_w, 850) * 0.16)))
+    margin = max(16, int(avatar_size * 0.18))
+    pill_h = max(48, int(avatar_size * 0.52))
+    footer_h = margin + avatar_size + max(10, int(avatar_size * 0.12)) + pill_h + margin
+    canvas = Image.new("RGB", (canvas_w, h + footer_h), (8, 12, 24))
+    canvas.paste(image, ((canvas_w - w) // 2, 0))
     d = ImageDraw.Draw(canvas)
-    panel = (w + gap, max(gap, int(h * 0.18)),
-             w + gap + panel_w - gap, h - max(gap, int(h * 0.18)))
-    d.rounded_rectangle(panel, radius=max(14, int(panel_w * 0.08)),
-                        fill=(8, 12, 24), outline=(244, 196, 92),
-                        width=max(2, int(panel_w * 0.018)))
-    left, top, right, bottom = panel
+    avatar = _load_sender_avatar(publisher_photo_url, avatar_size)
+    if avatar is None:
+        # Keep the layout complete if the profile photo cannot be retrieved.
+        avatar = Image.new("RGBA", (avatar_size, avatar_size), (0, 0, 0, 0))
+        ad = ImageDraw.Draw(avatar)
+        ad.ellipse((3, 3, avatar_size - 3, avatar_size - 3),
+                   fill=(33, 47, 67, 255), outline=(248, 202, 91, 255), width=5)
+        cx = avatar_size / 2
+        ad.ellipse((cx - avatar_size * .15, avatar_size * .22,
+                    cx + avatar_size * .15, avatar_size * .52), fill=(220, 230, 240, 255))
+        ad.rounded_rectangle((cx - avatar_size * .29, avatar_size * .53,
+                              cx + avatar_size * .29, avatar_size * .87),
+                             radius=max(8, int(avatar_size * .14)), fill=(220, 230, 240, 255))
+    avatar_x = (canvas_w - avatar_size) // 2
+    avatar_y = h + margin
+    _paste_avatar_safe(canvas, avatar, (avatar_x, avatar_y))
+
+    name = "@" + str(publisher_name or "").strip().lstrip("@")
+    font_size = max(18, int(avatar_size * .30))
+    try:
+        measured = int(_visual_text_width(d, name, font_size))
+    except Exception:
+        measured = len(name) * font_size
+    pill_w = min(canvas_w - 24, max(164, measured + avatar_size // 2))
+    pill_x = (canvas_w - pill_w) // 2
+    pill_y = avatar_y + avatar_size + max(10, int(avatar_size * .12))
+    d.rounded_rectangle(
+        (pill_x, pill_y, pill_x + pill_w, pill_y + pill_h),
+        radius=max(14, pill_h // 2), fill=(18, 27, 43),
+        outline=(244, 196, 92), width=max(2, avatar_size // 42),
+    )
     _draw_name_centered(
-        d, ((left + right) / 2, (top + bottom) / 2),
-        "@" + str(publisher_name or ""), max(22, int(h * 0.06)),
-        (255, 255, 255), max(80, right - left - gap * 2),
+        d, (canvas_w / 2, pill_y + pill_h / 2), name, font_size,
+        (255, 255, 255), max(80, pill_w - 24),
     )
     image = canvas
     out_dir = BASE_DIR / "generated_publish"
@@ -12537,16 +12565,6 @@ class TalkinBot:
                     "role": role,
                     "user_id": str(u.get("user_id") or ""),
                 }
-                state["bot_is_owner"] = bool(bot_key and bot_key in bot_names)
-                if not state["bot_is_owner"]:
-                    self.log("[INV] owner verification failed:", source_room,
-                             "bot=", BOT_ID, "owners=", sorted(bot_names))
-                    self.send_room_text(source_room, "❌ ارفع البوت أونر أولاً.")
-                    with self.invite_lock:
-                        self.invite_pending = False
-                        self.invite_silent_master = False
-                    self._inv_roster_pending = None
-                    return True
             return self._request_next_inv_roster_category()
 
         # Presence (is@...) keeps its old private behavior.
