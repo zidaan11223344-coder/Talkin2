@@ -8883,8 +8883,10 @@ class TalkinBot:
                 "quiet": True, "no_warnings": True, "noplaylist": True,
                 "format": "bestaudio[ext=m4a][abr<=192]/bestaudio[ext=mp3]/bestaudio[abr<=192]/bestaudio/best",
                 "outtmpl": template,
-                "socket_timeout": 12, "retries": 1, "fragment_retries": 1,
-                "extractor_retries": 1, "file_access_retries": 1,
+                # Brief resolver/API hiccups (including transient DNS errors)
+                # were failing the request on its first network attempt.
+                "socket_timeout": 20, "retries": 3, "fragment_retries": 3,
+                "extractor_retries": 3, "file_access_retries": 3,
                 "cachedir": False, "overwrites": True,
                 "continuedl": True,
                 "concurrent_fragment_downloads": 8,
@@ -8992,37 +8994,18 @@ class TalkinBot:
                 path = None
                 url = ""
 
-                # للبث فقط: جرّب Audius أولاً لأنه يعطينا رابط MP3 مباشر
-                # ويمكن لـ ffmpeg قراءته تدريجياً، فلا ننتظر تنزيل الأغنية كاملة.
+                # البث المباشر يستخدم Audius كمصدر وحيد؛ لا ينتقل إلى
+                # YouTube أو SoundCloud أو تنزيل ملف احتياطي.
                 if live_stream:
                     audius = self._audius_live_source(query)
-                    if audius:
-                        info = audius
-                        url = str(audius.get("url") or "")
-                        duration = int(audius.get("duration") or 0)
-                        title = str(audius.get("title") or query)
-                        artist = str(audius.get("uploader") or "Audius")
-                        self.log("[MUSIC] live source=Audius title=", title, "room=", room)
-                    else:
-                        # Fast fallback: resolve a DIRECT audio URL, so live
-                        # playback can start without waiting for a full download.
-                        direct = self._music_live_source(query)
-                        if direct:
-                            info = direct
-                            url = str(direct.get("url") or "")
-                            duration = int(direct.get("duration") or 0)
-                            title = str(direct.get("title") or query)
-                            artist = str(direct.get("uploader") or "Music")
-                            self.log("[MUSIC] live source=direct title=", title, "room=", room)
-                        else:
-                            if not public_base:
-                                raise RuntimeError("لا يوجد رابط عام للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
-                            info, path = self._music_download(query)
-                            title=str(info.get("title") or query)
-                            artist=str(info.get("uploader") or info.get("channel") or "YouTube")
-                            duration=int(info.get("duration") or 0)
-                            url=public_base+"/media/"+path.name
-                            self.log("[MUSIC] live source=legacy fallback title=", title, "room=", room)
+                    if not audius or not str(audius.get("url") or "").strip():
+                        raise RuntimeError("تعذر العثور على الأغنية في مصدر البث الوحيد Audius أو أن المصدر غير متاح حالياً.")
+                    info = audius
+                    url = str(audius.get("url") or "")
+                    duration = int(audius.get("duration") or 0)
+                    title = str(audius.get("title") or query)
+                    artist = str(audius.get("uploader") or "Audius")
+                    self.log("[MUSIC] live source=Audius title=", title, "room=", room)
                 else:
                     # Normal `.sa` playback: use the old/stable local-MP3 path.
                     # A direct YouTube/SoundCloud URL can be a long signed URL;
@@ -10404,13 +10387,21 @@ class TalkinBot:
         excluded = {_norm_user(exclude_username), _norm_user(BOT_ID)}
         candidates = []
         seen = set()
-        live = self.room_users.get(room, {}) if room else {}
-        if not isinstance(live, dict):
-            return candidates
-        for username in live.keys():
+        room_key = _norm_room(room).casefold()
+        live = {}
+        for cached_room, cached_users in getattr(self, "room_users", {}).items():
+            if _norm_room(cached_room).casefold() != room_key:
+                continue
+            if isinstance(cached_users, dict):
+                live.update(cached_users)
+            elif isinstance(cached_users, (list, tuple, set)):
+                live.update({str(name): "member" for name in cached_users})
+        for username, role in live.items():
             u = str(username or "").strip().lstrip("@").strip()
             key = _norm_user(u)
             if not u or not key or key in excluded or key in seen:
+                continue
+            if str(role or "").casefold().strip() in {"outcast", "banned", "ban", "blocked"}:
                 continue
             # Do not allow stealing from the configured master.
             if _is_master_name(u):
@@ -10578,7 +10569,7 @@ class TalkinBot:
         if not self._game_cooldown_notice(room, sender, 40.0, "عملة"):
             return True
         choice = str(choice or "").strip()
-        key = (("__private__" if is_private else str(room)), _norm_user(sender))
+        key = (str(room), _norm_user(sender))
         if choice in ("وجه", "كتابة"):
             result = secrets.choice(("وجه", "كتابة"))
             won = choice == result
@@ -10612,7 +10603,7 @@ class TalkinBot:
         m = re.fullmatch(r"صندوق[@ ]([1-3])", raw, re.I)
         if not self._game_cooldown_notice(room, sender, 40.0, "صندوق"):
             return True
-        key = (("__private__" if is_private else str(room)), _norm_user(sender))
+        key = (str(room), _norm_user(sender))
         chosen = int(m.group(1)) if m else None
         if chosen is None:
             self.pending_bot_choices[key] = {
@@ -12614,7 +12605,9 @@ class TalkinBot:
             users = [u for u in users if role_norm(u) in {"outcast", "banned", "ban", "blocked"}]
 
         if users:
-            self.room_users[source_room] = {u.get("username"): u.get("role", "none") for u in users if u.get("username")}
+            # Category-specific lists are not complete room snapshots.
+            # Merge them so L@m cannot erase owners/admins from the cache.
+            self.room_users[source_room].update({u.get("username"): u.get("role", "none") for u in users if u.get("username")})
             _remember_roster(source_room, users)
 
         titles = {
