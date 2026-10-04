@@ -90,6 +90,9 @@ class CricketIntegration:
         sender = str(sender or "").strip().lstrip("@")
 
         if low in self.START_COMMANDS:
+            if not self.is_master(sender):
+                self.send_room_text(room, "🔒 تشغيل الكركيت للماستر فقط.")
+                return True
             result = self.game.set_enabled(room, True)
             self._reply_error(room, result if result.startswith("❌") or result.startswith("⛔") else None)
             if not result.startswith(("❌", "⛔")):
@@ -98,6 +101,9 @@ class CricketIntegration:
             return True
 
         if low in self.STOP_COMMANDS:
+            if not self.is_master(sender):
+                self.send_room_text(room, "🔒 إيقاف الكركيت للماستر فقط.")
+                return True
             result = self.game.set_enabled(room, False)
             self._reply_error(room, result if result.startswith("❌") else None)
             if result and not result.startswith("❌"):

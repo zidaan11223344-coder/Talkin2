@@ -37,7 +37,7 @@ def test_master_toggle_and_player_count_are_persistent(tmp_path: Path):
     assert restarted.game.current()["target_players"] == 2
 
 
-def test_any_player_can_toggle_cricket(tmp_path: Path):
+def test_only_master_can_toggle_cricket(tmp_path: Path):
     messages = []
     integration = CricketIntegration(
         tmp_path,
@@ -48,7 +48,12 @@ def test_any_player_can_toggle_cricket(tmp_path: Path):
     )
 
     assert integration.handle("Room A", "player", ".cr 1") is True
+    assert integration.game.enabled("Room A") is False
+    assert "للماستر" in messages[-1][1]
+    assert integration.handle("Room A", "master", ".cr 1") is True
     assert integration.game.enabled("Room A") is True
     assert integration.game.current()["stage"] == "setup"
     assert integration.handle("Room A", "player", ".ct 0") is True
+    assert integration.game.enabled("Room A") is True
+    assert integration.handle("Room A", "master", ".ct 0") is True
     assert integration.game.enabled("Room A") is False
