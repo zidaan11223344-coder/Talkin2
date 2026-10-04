@@ -45,6 +45,7 @@ try:
 except Exception:
     pymysql = None
 from dotenv import load_dotenv
+from cricket_integration import CricketIntegration
 
 load_dotenv()
 
@@ -438,7 +439,7 @@ _STATE_FILE_NAMES = (
     "messages.json", "published_posts.json", "media_stats.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
     "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
-    "custom_commands.json", "repair_state.json", "wager_state.json", "last_action.json", "backup_manifest.json",
+    "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "backup_manifest.json",
 )
 
 def _json_has_real_data(path):
@@ -4281,6 +4282,8 @@ class _MediaHandler(SimpleHTTPRequestHandler):
         path=unquote(urlparse(self.path).path)
         if path.startswith("/assets/"):
             rel=path[len("/assets/"):].lstrip("/"); root=ASSETS_DIR.resolve(); target=(ASSETS_DIR/rel).resolve()
+        elif path.startswith("/cricket-media/"):
+            rel=path[len("/cricket-media/"):].lstrip("/"); root=(DATA_DIR/"cricket_media").resolve(); target=(DATA_DIR/"cricket_media"/rel).resolve()
         elif path.startswith("/gifts/"):
             rel=path[len("/gifts/"):].lstrip("/"); root=(BASE_DIR/"generated_gifts").resolve(); target=(BASE_DIR/"generated_gifts"/rel).resolve()
         elif path.startswith("/billion/"):
@@ -4350,7 +4353,7 @@ class _MediaHandler(SimpleHTTPRequestHandler):
 def start_asset_server():
     if not ASSET_HTTP_ENABLED: return None
     try:
-        (BASE_DIR/"generated_gifts").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_music").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_publish").mkdir(parents=True,exist_ok=True); LOOKALIKE_DIR.mkdir(parents=True,exist_ok=True)
+        (BASE_DIR/"generated_gifts").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_music").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_publish").mkdir(parents=True,exist_ok=True); (DATA_DIR/"cricket_media").mkdir(parents=True,exist_ok=True); LOOKALIKE_DIR.mkdir(parents=True,exist_ok=True)
         server=ThreadingHTTPServer(("0.0.0.0",ASSET_HTTP_PORT),_MediaHandler)
         threading.Thread(target=server.serve_forever,name="media-http",daemon=True).start()
         if DEBUG and not QUIET_MODE:
@@ -4380,6 +4383,16 @@ class TalkinBot:
         self.http = requests.Session()
         self.port = DEFAULT_PORT
         self.room = GROUP_TO_JOIN
+        self._cricket = CricketIntegration(
+            DATA_DIR,
+            persist=_save_local_json,
+            is_master=_is_master_name,
+            send_room_text=self.send_room_text,
+            send_room_media=self.send_room_media,
+            public_base=_public_base_url,
+            reward=lambda username, amount: _add_points(username, amount),
+            log=print,
+        )
         self.auth = None
         self.last_error = None
         # The last inbound command being processed when the WebSocket failed.
@@ -15238,6 +15251,11 @@ class TalkinBot:
                 self._remember_bot_action(room, body, frm, is_private=False)
             return
 
+        # Cricket has its own Join/number flow and must be checked before the
+        # normal verification gate so ordinary room members can play.
+        if self._cricket.handle(room, frm, body, is_private=False):
+            return
+
         # Verified users may use normal bot commands; administration remains
         # restricted to masters. Unverified command attempts receive one clear
         # notice instead of being silently ignored.
@@ -15602,6 +15620,13 @@ class TalkinBot:
                         self.master_online = True
                         self.master_last_seen = time.time()
                     if body and self._handle_master_process_command(frm, body, is_private=True):
+                        return
+                    cricket_room = (
+                        self.room
+                        or getattr(self, "last_joined_room", "")
+                        or next(iter(getattr(self, "connected_rooms", set())), "")
+                    )
+                    if body and self._cricket.handle(cricket_room, frm, body, is_private=True):
                         return
                     if body and self._monitor_command(frm, body):
                         return
