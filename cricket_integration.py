@@ -303,6 +303,16 @@ class CricketIntegration:
                 return self._private_toggle(room, sender, control in self.PRIVATE_START_COMMANDS)
             if control in self.PRIVATE_START_COMMANDS and control in {".cr 1", ".cr1"}:
                 return self._verified_room_setup(room, sender)
+            if control in self.PRIVATE_STOP_COMMANDS and control in {".cr 0", ".cr0"}:
+                if not self.is_verified(sender):
+                    self.send_room_text(room, "🔒 إيقاف مباراة الكركيت متاح للأعضاء الموثقين فقط.")
+                    return True
+                previous_match = self.game.current()
+                result = self.game.cancel_match(room)
+                self._reply_error(room, result)
+                if not str(result or "").startswith(("❌", "⛔", "📭")):
+                    self._deliver_transition(previous_match, room)
+                return True
             else:
                 self.send_room_text(room, "🔒 أرسل أمر تشغيل/إيقاف الكركيت في خاص البوت؛ الأمر مخصص للماستر المحدد في المتغيرات.")
                 return True

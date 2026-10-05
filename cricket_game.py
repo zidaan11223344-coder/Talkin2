@@ -144,6 +144,23 @@ class CricketGame:
 
         return self.state.mutate(mutate)
 
+    def cancel_match(self, room: str) -> str:
+        """Cancel the open match from one of its participating rooms."""
+        room_key = _key(room)
+
+        def mutate(data: dict[str, Any]) -> str:
+            match = data.get("match")
+            if not isinstance(match, dict):
+                return "📭 لا توجد مباراة كركيت مفتوحة لإيقافها."
+            participants = self._participants(match)
+            if room_key not in {str(item.get("key") or "") for item in participants}:
+                return "⛔ لا يمكنك إيقاف مباراة من غرفة غير مشاركة فيها."
+            self._emit(data, participants, "⛔ تم إيقاف مباراة الكركيت الحالية من أحد الأعضاء.")
+            data["match"] = None
+            return "✅ تم إيقاف مباراة الكركيت الحالية."
+
+        return self.state.mutate(mutate)
+
     @staticmethod
     def _new_match(room_name: str, room_key: str, stage: str, player_count: int | None = None) -> dict[str, Any]:
         match: dict[str, Any] = {

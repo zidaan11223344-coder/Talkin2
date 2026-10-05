@@ -46,7 +46,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertIn("فعّل اللعبة", room_messages[-1][1])
             integration.handle("North", "Master", ".cr 0")
             self.assertFalse(integration.game.enabled())
-            self.assertIn("خاص البوت", room_messages[-1][1])
+            self.assertIn("لا توجد مباراة", room_messages[-1][1])
             integration.handle("North", "Master", "cricket on")
             self.assertFalse(integration.game.enabled())
             self.assertIn("خاص البوت", room_messages[-1][1])
@@ -134,6 +134,24 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual(second.game.current()["stage"], "teams")
             self.assertEqual(second_media, [])
             self.assertFalse(any("مباراة قديمة" in text for _, text in second_messages))
+
+    def test_verified_member_can_stop_current_room_match_with_cr0(self):
+        with tempfile.TemporaryDirectory() as temp:
+            messages, private_messages, media = [], [], []
+            integration = self.make_integration(Path(temp), messages, private_messages, media)
+            integration.handle("North", "Master", ".cr 1", is_private=True)
+            integration.handle("North", "N1", ".cr 1")
+            integration.handle("North", "N1", "1")
+            integration.handle("North", "N1", "Join")
+            self.assertIsNotNone(integration.game.current())
+            integration.handle("North", "N1", ".cr 0")
+            self.assertIsNone(integration.game.current())
+            self.assertTrue(integration.game.enabled())
+            self.assertIn("تم إيقاف مباراة الكركيت", messages[-1][1])
+
+            integration.handle("North", "N2", ".cr 0")
+            self.assertIsNone(integration.game.current())
+            self.assertIn("لا توجد مباراة", messages[-1][1])
 
     def test_restart_resumes_a_saved_batting_choice_without_replaying_old_events(self):
         with tempfile.TemporaryDirectory() as temp:
