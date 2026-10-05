@@ -123,9 +123,16 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual(integration.game.current()["mode"], "solo")
             self.assertTrue(integration.handle("Hall", "Player", "Join"))
             self.assertEqual(integration.game.current()["stage"], "live")
-            self.assertTrue(integration.handle("Hall", "Player", "6"))
+            deliveries = 0
+            while integration.game.current() is not None:
+                self.assertTrue(integration.handle("Hall", "Player", "6"))
+                deliveries += 1
+                self.assertLess(deliveries, 13)
+            self.assertGreaterEqual(deliveries, 1)
             self.assertTrue(any("الكرة 1/6" in text for _, text in messages))
-            self.assertTrue(media, "the solo bot match should resolve and deliver a ball result")
+            self.assertTrue(any("انتهت مباراة الكركيت" in text for _, text in messages))
+            self.assertTrue(any("cricket_number_6.png" in url for _, url, _ in media))
+            self.assertTrue(any("cricket_result_" in url for _, url, _ in media))
 
     def test_each_player_gets_six_balls_in_both_innings_and_lead_does_not_end_match_early(self):
         with tempfile.TemporaryDirectory() as temp:
