@@ -43,7 +43,7 @@ class CricketGame:
     MIN_PLAYERS = 1
     MAX_PLAYERS = 4
     ROOM_TEAMS = 2
-    BALLS_PER_INNINGS = 6
+    BALLS_PER_PLAYER = 6
     EVENT_HISTORY = 5000
 
     def __init__(self, root: str | Path, persist=None, reward=None):
@@ -332,12 +332,13 @@ class CricketGame:
                         match["teams"] = {room_key: "attack", BOT_TEAM_KEY: "defense"}
                         self._start_live(data, match, participants)
                     else:
-                        # The first team has completed: announce once to every
-                        # controller room in the server. After the second room
-                        # joins, all further events remain room-scoped.
-                        self._emit_broadcast(
+                        # The first team is only a lobby until the opposing room
+                        # joins and a captain chooses attack or defense.
+                        self._emit(
                             data,
-                            f"🏏 بدأت لعبة الكركيت\n👥 عدد الفريق: {target}\n🔗 للانضمام أرسل Join",
+                            [participant],
+                            f"✅ اكتمل الفريق الأول: {target} لاعبين.\n"
+                            "⏳ بانتظار انضمام لاعبي الغرفة الثانية عبر Join؛ بعدها يُختار الهجوم أو الدفاع.",
                         )
             elif len(participants) == self.ROOM_TEAMS:
                 full = all(len(item.get("players", [])) >= target for item in participants)
@@ -509,22 +510,42 @@ class CricketGame:
             for player in item.get("players", [])
             if str(player).strip()
         }
-        start_text = "🏏 بدأت الكركيت\n" + self._team_label(match["batting_team"]) + " تبدأ الهجوم."
-        if match.get("mode") == "solo":
-            start_text += "\n🤖 بوت Talkin2"
-        self._emit(data, participants, start_text)
+        start_text = (
+            "🏏 بدأت لعبة الكركيت\n"
+            + self._team_summary(match, "attack") + "\n"
+            + self._team_summary(match, "defense") + "\n"
+            + f"🎯 يبدأ الهجوم: {self._team_label(match['batting_team'])}. لكل لاعب 6 كرات في كل دور."
+        )
+        self._emit_broadcast(data, start_text)
         self._emit_room_messages(data, self._turn_messages(match))
 
     def _team_player_count(self, match: dict[str, Any], team: str) -> int:
         if team == BOT_TEAM_KEY:
             return 1
+        if match.get("mode") == "solo" and (match.get("teams") or {}).get(BOT_TEAM_KEY) == team:
+            return 1
         participant = self._room_for_team(match, team)
         if participant:
             return max(1, len(participant.get("players", [])))
-        if match.get("mode") == "solo":
-            rooms = self._participants(match)
-            return max(1, len(rooms[0].get("players", []))) if rooms else 1
         return 1
+
+    def _balls_per_innings(self, match: dict[str, Any]) -> int:
+        """Give every player six turns; equal-sized rooms therefore share 6 × N balls."""
+        players_per_side = max(
+            self._team_player_count(match, "attack"),
+            self._team_player_count(match, "defense"),
+        )
+        return self.BALLS_PER_PLAYER * max(1, players_per_side)
+
+    def _team_summary(self, match: dict[str, Any], team: str) -> str:
+        participant = self._room_for_team(match, team)
+        if participant:
+            players = [str(player).strip().lstrip("@") for player in participant.get("players", []) if str(player).strip()]
+            names = "، ".join(f"@{player}" for player in players) or "لاعبون قيد الانضمام"
+            return f"👥 {self._team_label(team)} — {participant['name']} ({len(players)} لاعبين): {names}"
+        if match.get("mode") == "solo" and (match.get("teams") or {}).get(BOT_TEAM_KEY) == team:
+            return f"🤖 {self._team_label(team)} — Talkin2 (1 لاعب)"
+        return f"👥 {self._team_label(team)} — الفريق"
 
     def _finish(self, data: dict[str, Any], match: dict[str, Any], participants: list[dict[str, Any]]) -> None:
         scores = match.get("scores") or {}
@@ -737,24 +758,18 @@ class CricketGame:
         turns = match.setdefault("turns", {"attack": 0, "defense": 0})
         turns[batting] = int(turns.get(batting, 0)) + 1
         turns[bowling] = int(turns.get(bowling, 0)) + 1
-        team_size = max(1, int(match.get("target_players") or 1))
+        balls_limit = self._balls_per_innings(match)
         current_wickets = int(wickets.get(batting, 0))
         total = int(scores.get(batting, 0))
 
         # One compact result message, with the batter's number image delivered first.
-        result_text = f"{outcome}\n📊 {total} نقطة • الكرة {ball_no}/{self.BALLS_PER_INNINGS}"
+        result_text = f"{outcome}\n📊 {total} نقطة • الكرة {ball_no}/{balls_limit} لهذا الشوط"
         attack_room = self._room_for_team(match, batting)
         defense_room = self._room_for_team(match, bowling)
         result_rooms = [item for item in (attack_room, defense_room) if item]
 
         attack_score = int(scores.get("attack", 0))
-        defense_score = int(scores.get("defense", 0))
-        if int(match.get("innings", 1)) == 2 and defense_score > attack_score:
-            self._emit(data, result_rooms, result_text, tuple(images))
-            self._finish(data, match, participants)
-            return None
-
-        innings_over = ball_no >= self.BALLS_PER_INNINGS or current_wickets >= self._team_player_count(match, batting)
+        innings_over = ball_no >= balls_limit or current_wickets >= self._team_player_count(match, batting)
         if innings_over:
             self._emit(data, result_rooms, result_text, tuple(images))
             if int(match.get("innings", 1)) == 1:

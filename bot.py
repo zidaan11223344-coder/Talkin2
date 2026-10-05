@@ -2242,6 +2242,11 @@ def _is_verified_user(name):
     key = _norm_user(name)
     return bool(key and (key in _verified_data() or key in _vip_data() or _is_master_name(name)))
 
+def _is_cricket_verified_member(name):
+    """Cricket participation always requires a saved verified/VIP identity."""
+    key = _norm_user(name)
+    return bool(key and (key in _verified_data() or key in _vip_data() or _is_master_name(name)))
+
 def _is_vip_user(name):
     key = _norm_user(name)
     return bool(key and (key in _vip_data() or _is_master_name(name)))
@@ -2918,7 +2923,7 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n\u206619.\u2069 بنك أو بنك مليون\n\u206620.\u2069 مليار\n\u206621.\u2069 زرع@رمز\n\u206622.\u2069 فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n\u206623.\u2069 ثعبان / snake — السلم والثعبان\n\u206624.\u2069 لودو / ludo — لودو\n\u206625.\u2069 سنارة أو سناره\n\u206626.\u2069 برق\n\u206627.\u2069 ياقوت\n\u206628.\u2069 صدام\n\u206629.\u2069 كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
             '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n\u206628.\u2069 اسرق أو اسرق@اسم\n\u206629.\u2069 شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 للقائمة التالية اكتب ns — لعبة الكركيت.',
-            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في خاص البوت:\n.cr 1 / start cricket game — تشغيل اللعبة وفتح الإعداد\n.cr 0 / stop cricket game — إيقافها وإلغاء المباراة\n\nبعد التفعيل، كل الأعضاء يشاركون. اختر 1 إلى 4 لاعبين ثم أرسل Join.\nغرفة ثانية ترسل Join للعب الجماعي؛ تختار غرفة البداية 1 للهجوم أو 2 للدفاع، ويُعيّن دور الغرفة الثانية تلقائيًا.\nأرسل دورك رقمًا من 0 إلى 6.\nأرسل bot في الغرفة للعب ضد البوت؛ أو cricket 1..4 لفتح مباراة فردية في غرفة واحدة.\nالجائزة 200,000 نقطة تُقسّم على الفائزين؛ صور الكرات والبطّة والهتريك تلقائية.',
+            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في خاص البوت:\nتشغيل لعبه الكركيت / start cricket game أو .cr 1 — تفعيل اللعبة وفتح الإعداد\n.cr 0 / stop cricket game — إيقافها وإلغاء المباراة\n\nللأعضاء الموثقين داخل الغرفة: أرسل .cr 1 إلى .cr 4 لاختيار عدد اللاعبين وبدء المباراة، ثم Join.\nغرفة ثانية ترسل Join؛ تختار غرفة البداية 1 للهجوم أو 2 للدفاع.\nبعد اكتمال الفريقين، يعلن البوت أسماء الفريقين وعدد وأسماء اللاعبين في كل الغرف التي فيها البوت؛ الأدوار والنتائج تظل في غرفتي المباراة فقط.\nلكل لاعب 6 كرات للهجوم و6 للدفاع؛ لا ينتهي اللعب بسبب تقدم مبكر. أرسل دورك رقمًا من 0 إلى 6.\nأرسل bot للعب ضد البوت؛ أو cricket 1..4 لمباراة فردية.\nالجائزة 200,000 نقطة تُقسّم على الفائزين؛ صور الكرات والبطّة والهتريك تلقائية.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -4394,8 +4399,10 @@ class TalkinBot:
             persist=_save_local_json,
             is_master=_is_master_name,
             is_configured_master=_is_primary_master,
+            is_verified=_is_cricket_verified_member,
             send_room_text=self.send_room_text,
             send_room_media=self.send_room_media,
+            send_all_rooms_text=self.broadcast_all_rooms,
             send_private_text=self.send_private_text,
             public_base=_public_base_url,
             reward=lambda username, amount: _add_points(username, amount),
@@ -15310,8 +15317,8 @@ class TalkinBot:
                 self._remember_bot_action(room, body, frm, is_private=False)
             return
 
-        # Cricket has its own Join/number flow and must be checked before the
-        # normal verification gate so ordinary room members can play.
+        # Cricket handles its own verified-member gate and turn flow before the
+        # normal bot-command verification gate.
         if self._cricket.handle(room, frm, body, is_private=False):
             return
 
