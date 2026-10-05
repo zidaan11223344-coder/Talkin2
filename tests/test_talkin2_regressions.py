@@ -110,6 +110,31 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual(fresh["rooms"][0]["players"], [])
             self.assertIn("إعداد مباراة الكركيت", room_messages[-1][1])
 
+    def test_join_from_second_room_skips_old_match_images(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first_messages, private_messages, first_media = [], [], []
+            first = self.make_integration(root, first_messages, private_messages, first_media)
+            first.handle("North", "Master", ".cr 1", is_private=True)
+            first.handle("North", "N1", ".cr 1")
+            first.handle("North", "N1", "1")
+            first.handle("North", "N1", "Join")
+            self.assertEqual(first.game.current()["stage"], "lobby")
+
+            def add_stale_image(data):
+                first.game._emit(
+                    data, [{"key": "south", "name": "South"}],
+                    "صورة من مباراة قديمة", ("cricket_number_4.png",),
+                )
+            first.game.state.mutate(add_stale_image)
+
+            second_messages, second_media = [], []
+            second = self.make_integration(root, second_messages, [], second_media)
+            second.handle("South", "S1", "Join")
+            self.assertEqual(second.game.current()["stage"], "teams")
+            self.assertEqual(second_media, [])
+            self.assertFalse(any("مباراة قديمة" in text for _, text in second_messages))
+
     def test_restart_resumes_a_saved_batting_choice_without_replaying_old_events(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

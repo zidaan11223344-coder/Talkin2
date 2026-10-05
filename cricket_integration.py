@@ -152,6 +152,18 @@ class CricketIntegration:
                 sent.add(key)
                 self.deliver(name)
 
+    def _prime_new_room_cursor(self, room: str, match: dict | None) -> None:
+        """Skip historical events when a room joins an already-open match."""
+        room_key = self._room_key(room)
+        if not room_key or not isinstance(match, dict):
+            return
+        current_rooms = {self._room_key(item) for item in self._match_rooms(match)}
+        if room_key not in current_rooms and room_key not in self._cursors:
+            # The Join action will create fresh events for this room. Starting
+            # at the current high-water mark prevents old match images from
+            # being replayed before those new events are delivered.
+            self._cursors[room_key] = self.game.latest_event_id(room)
+
     def _deliver_transition(self, previous_match: dict | None, fallback_room: str = "") -> None:
         # Events are generated independently for both room keys. Deliver them
         # together after each action so the opposing team receives its prompt.
@@ -346,6 +358,7 @@ class CricketIntegration:
         previous_match = match
         result: str | None = None
         if low in {"join", "انضمام"}:
+            self._prime_new_room_cursor(room, previous_match)
             result = self.game.join(room, sender)
         elif match.get("stage") == "setup" and low in {"1", "2", "3", "4"}:
             result = self.game.select_player_count(room, int(low))
