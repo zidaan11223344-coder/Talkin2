@@ -574,6 +574,16 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot_module._is_cricket_verified_member("Master"))
             self.assertFalse(bot_module._is_cricket_verified_member("Guest"))
 
+    def test_cricket_verification_matches_saved_username_record_and_at_prefix(self):
+        with patch.object(bot_module, "_verified_data", return_value={
+            "legacy-key": {"username": "Verified_Player"},
+        }), patch.object(bot_module, "_vip_data", return_value={}), patch.object(
+            bot_module, "_is_master_name", return_value=False
+        ):
+            self.assertTrue(bot_module._is_cricket_verified_member("@verified_player"))
+            self.assertTrue(bot_module._is_verified_user(" Verified_Player "))
+            self.assertFalse(bot_module._is_cricket_verified_member("other_player"))
+
     def test_winner_awards_are_split_exactly_and_passed_to_result_card(self):
         with tempfile.TemporaryDirectory() as temp:
             awarded = []

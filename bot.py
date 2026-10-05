@@ -2272,18 +2272,35 @@ def _vip_data():
     data=_load_local_json(VIP_FILE,{})
     return data if isinstance(data,dict) else {}
 
+def _saved_identity_matches(data, name):
+    """Match a sender against legacy and current verification record shapes."""
+    target = _norm_user(name)
+    if not target or not isinstance(data, dict):
+        return False
+    for stored_key, record in data.items():
+        candidates = [stored_key]
+        if isinstance(record, dict):
+            candidates.append(record.get("username", ""))
+        elif isinstance(record, str):
+            candidates.append(record)
+        if any(_norm_user(candidate) == target for candidate in candidates):
+            return True
+    return False
+
 def _is_verified_user(name):
     # When verification is disabled, treat users as passing the verification
     # gate without deleting or changing the saved verification/VIP records.
     if not VERIFICATION_ENABLED:
         return True
-    key = _norm_user(name)
-    return bool(key and (key in _verified_data() or key in _vip_data() or _is_master_name(name)))
+    return bool(_saved_identity_matches(_verified_data(), name)
+                or _saved_identity_matches(_vip_data(), name)
+                or _is_master_name(name))
 
 def _is_cricket_verified_member(name):
     """Cricket participation always requires a saved verified/VIP identity."""
-    key = _norm_user(name)
-    return bool(key and (key in _verified_data() or key in _vip_data() or _is_master_name(name)))
+    return bool(_saved_identity_matches(_verified_data(), name)
+                or _saved_identity_matches(_vip_data(), name)
+                or _is_master_name(name))
 
 def _is_vip_user(name):
     key = _norm_user(name)
