@@ -279,6 +279,56 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertLess(media_index, caption_index)
         self.assertEqual(sent[media_index][1:4], ("Room A", "https://cdn.example/track.mp3", "audio"))
 
+    def test_normal_song_request_broadcasts_to_all_active_rooms(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append(("text", room, text))
+        bot.send_room_media = lambda room, url, kind, duration=0: sent.append(("media", room, url, kind, duration)) or True
+        bot._audius_live_source = lambda _query: {
+            "url": "https://cdn.example/track.mp3", "duration": 42,
+            "title": "Fast Track", "uploader": "Artist",
+        }
+        bot._music_download = lambda _query: (_ for _ in ()).throw(AssertionError("full download should not be used"))
+        bot._active_rooms = lambda: ["Room A", "Room B", "Room C"]
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: None
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_public_base_url", lambda: "https://bot.example"), patch.object(
+            bot_module, "_record_media_publication", lambda *_args: None
+        ), patch.object(bot_module.threading, "Thread", ImmediateThread):
+            self.assertTrue(bot.handle_music_command(
+                "Room A", ".sa Fast Track", "Tester",
+                broadcast_all=True, with_reactions=False,
+            ))
+
+        media_rooms = [item[1] for item in sent if item[0] == "media"]
+        self.assertEqual(media_rooms, ["Room A", "Room B", "Room C"])
+
+    def test_room_protection_exempts_owner_and_moderator_but_not_member(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {
+            "Room": {
+                "Owner": "owner",
+                "Moderator": "moderator",
+                "Member": "member",
+            }
+        }
+        with patch.object(bot_module, "_is_master_name", return_value=False), patch.object(
+            bot_module, "_is_room_creator", return_value=False
+        ):
+            self.assertTrue(bot_module._room_manager(bot, "Room", "Owner"))
+            self.assertTrue(bot_module._room_manager(bot, "Room", "Moderator"))
+            self.assertFalse(bot_module._room_manager(bot, "Room", "Member"))
+
     def test_cricket_help_has_sixth_page_and_hides_bl_at_alias(self):
         sections = bot_module._default_help_sections()
         self.assertEqual(len(sections[3]), 6)

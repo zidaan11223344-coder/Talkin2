@@ -2848,7 +2848,15 @@ def _room_manager(bot, room, sender):
     role = str(users.get(sender, "") or "").casefold()
     if not role and isinstance(users, dict):
         role = next((str(v or "").casefold() for k, v in users.items() if _norm_user(k) == _norm_user(sender)), "")
-    return role in {"owner", "creator", "room_owner", "room_creator", "host", "صانع", "صانع_الغرفة", "مالك"}
+    # Protection may ban ordinary members and unknown roles, but never the
+    # room owner or a moderator/admin. These aliases cover the role values
+    # returned by the different Talkin protocol versions.
+    return role in {
+        "owner", "creator", "room_owner", "room_creator", "host",
+        "admin", "administrator", "moderator", "moder", "mod",
+        "مشرف", "مشرفين", "ادمن", "إداري",
+        "صانع", "صانع_الغرفة", "مالك",
+    }
 
 def _norm_filter_text(text):
     value = str(text or "").casefold()
@@ -9128,20 +9136,14 @@ class TalkinBot:
                     # The previous normal `.sa` path prepared a URL and a
                     # caption but never sent the audio media packet itself.
                     if broadcast_all:
-                        connected = {
+                        # `.sa` is global: use the complete active-room union
+                        # instead of only connected_rooms, which can be stale
+                        # or incomplete after reconnecting the bot.
+                        target_rooms = [
                             str(item).strip()
-                            for item in getattr(self, "connected_rooms", set())
+                            for item in (self._active_rooms() or [])
                             if str(item).strip()
-                        }
-                        if not connected:
-                            connected = {
-                                str(item).strip()
-                                for item in (self._active_rooms() or [])
-                                if str(item).strip()
-                            }
-                        if room:
-                            connected.add(str(room).strip())
-                        target_rooms = sorted(connected, key=str.casefold)
+                        ]
                         if room:
                             room_name = str(room).strip()
                             target_rooms = [room_name] + [
