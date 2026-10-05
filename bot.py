@@ -2673,7 +2673,32 @@ def _game_welcome(username, room):
             f"{label}\n"
             f"🏠 الغرفة: {room}\n"
             f"🏅 مستوى الألعاب: {level}\n"
-            f"🎯 جولاتك: {plays}{star_line}")
+                f"🎯 جولاتك: {plays}{star_line}")
+
+
+def _join_welcome_message(username, room, custom_welcome_enabled=True, custom_welcome=None):
+    """Build the automatic join welcome without mixing VIP and game levels."""
+    _level, _label, plays = _game_level_info(username)
+    is_vip = _is_vip_user(username)
+    if plays < 50:
+        if not is_vip:
+            return None
+        custom_welcome = {"message": "👑 عضو Vip\n👤 {username}\n🏠 الغرفة: {room}"}
+    elif not custom_welcome_enabled:
+        custom_welcome = None
+    if plays >= 50:
+        level_welcome = _game_welcome(username, room)
+        if (isinstance(custom_welcome, dict) and custom_welcome.get("message")
+                and not is_vip):
+            level_welcome = (str(custom_welcome["message"])
+                             .replace("{username}", username)
+                             .replace("{room}", room) + "\n\n" + level_welcome)
+        return level_welcome
+    if isinstance(custom_welcome, dict) and custom_welcome.get("message"):
+        return (str(custom_welcome["message"])
+                .replace("{username}", username)
+                .replace("{room}", room))
+    return None
 
 
 def _record_game(username, game_key, points_delta=0, stake=0):
@@ -3287,7 +3312,7 @@ def _default_help_sections():
         ],
         5: [
             '💰 النقاط — 1\n━━━━━━━━━━━━\nنقاطي — عرض الرصيد والمستوى وإحصاءات اللعب\npoints — عرض النقاط\nتوب — المتصدرين العام\ntop — المتصدرين العام\n\nتوب رهان — متصدروا الرهان\nتوب مضاربة — متصدروا المضاربة\nتوب حظي — متصدروا حظي\nتوب استثمار — متصدروا الاستثمار',
-            '💸 النقاط — 2: التحويل\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل نقاط لمستخدم\n\nمثال:\nsb@ahmd555@1000\n\n📌 التحويل متاح للمستخدم الموثق، ويُخصم من رصيد المرسل ويُضاف للمستلم.\n\nللاطلاع على الرصيد استخدم: نقاطي',
+            '💸 النقاط — 2: التحويل\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل نقاط من الماستر\n\nمثال:\nsb@ahmd555@1000\n\n📌 يعمل الأمر من خاص البوت فقط للماستر المحدد، ويمكنه تحويل أي عدد موجب دون خصم من رصيده.\n\nللاطلاع على الرصيد استخدم: نقاطي',
         ],
         6: [
             '🚪 الغرف — 1\n━━━━━━━━━━━━\nدخول@اسم_الغرفة — دخول غرفة\nمثال: دخول@مشاعر\nخروج — الخروج من الغرفة الحالية\nخروج اسم_الغرفة — الخروج من غرفة محددة\nغرفي — عرض الغرف التي يتواجد بها البوت\nmyrooms — نفس الأمر\n\ninv — دعوة أعضاء الغرفة الحالية\ninv اسم_الغرفة — دعوة أعضاء غرفة محددة\nدعوات — نفس أمر inv\ninvite — نفس أمر inv\ninvmsg نص — تغيير رسالة الدعوة\ni@اسم — دعوة مستخدم واحد',
@@ -12499,6 +12524,13 @@ class TalkinBot:
         join_all_command = str(body or "").strip().casefold() in {"دخول الكل", "دخولكل", "join all"}
         verification_manager_command = _is_verification_manager_command(body)
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
+        if points_transfer_command and not (is_private and _is_primary_master(sender)):
+            message = "🚫 أمر تحويل النقاط للماستر المحدد ومن خاص البوت فقط." if is_private else "🚫 أرسل أمر تحويل النقاط في خاص البوت، وهو متاح للماستر المحدد فقط."
+            if is_private:
+                self.send_private_text(sender, message)
+            elif room:
+                self.send_room_text(room, message)
+            return True
         public_top_command = str(body or "").strip().casefold() in {
             "توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"
         }
@@ -12511,7 +12543,6 @@ class TalkinBot:
         if (not _is_master_name(sender)
                 and not public_top_command
                 and not (verification_manager_command and _is_mvip_master(sender))
-                and not (points_transfer_command and _is_verified_user(sender))
                 and not (is_publish and _is_verified_user(sender))
                 and not join_command
                 and not join_all_command
@@ -14138,7 +14169,7 @@ class TalkinBot:
                 
             return True
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
-        if m_transfer and _is_verified_user(sender):
+        if m_transfer and is_private and _is_primary_master(sender):
             target, amount = m_transfer.group(1).strip().lstrip("@"), int(m_transfer.group(2))
             if not target or amount <= 0:
                 self.send_private_text(sender, "❌ الصيغة: sb@اسم المستخدم@عدد النقاط")
@@ -15362,25 +15393,11 @@ class TalkinBot:
             if _norm_user(username) == _norm_user(BOT_MASTER):
                 self.send_room_text(room, f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}")
             elif username and _norm_user(username) != _norm_user(BOT_ID):
-                level, _label, _plays = _game_level_info(username)
                 welcomes_enabled = bool(getattr(self, "custom_welcome_enabled", True))
                 cw = self.custom_welcomes.get(_norm_user(username)) if welcomes_enabled else None
-                if _is_vip_user(username):
-                    cw = {"message": "👑 عضو Vip\n👤 {username}\n🏠 الغرفة: {room}"}
-                # VIP keeps the original welcome at level 1. Once the player
-                # earns a higher game level, the level welcome replaces VIP.
-                if _is_vip_user(username) and level == 1 and isinstance(cw, dict) and cw.get("message"):
-                    self.send_room_text(
-                        room,
-                        str(cw["message"]).replace("{username}", username).replace("{room}", room),
-                    )
-                else:
-                    level_welcome = _game_welcome(username, room)
-                    if isinstance(cw, dict) and cw.get("message") and not _is_vip_user(username):
-                        level_welcome = (str(cw["message"])
-                                         .replace("{username}", username)
-                                         .replace("{room}", room) + "\n\n" + level_welcome)
-                    self.send_room_text(room, level_welcome)
+                welcome = _join_welcome_message(username, room, welcomes_enabled, cw)
+                if welcome:
+                    self.send_room_text(room, welcome)
         if event_type in ("you_joined", "you_rejoined"):
             if room:
                 entry_room = _norm_room(room)

@@ -501,6 +501,34 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertNotIn("🏅 مستوى الألعاب", before)
         self.assertIn("🏅 مستوى الألعاب", after)
 
+    def test_join_welcome_uses_vip_only_before_50_games(self):
+        with patch.object(bot_module, "_is_vip_user", side_effect=lambda name: name == "vip"):
+            with patch.object(bot_module, "_game_stats_data", return_value={}):
+                self.assertIsNone(bot_module._join_welcome_message("regular", "North"))
+                vip_welcome = bot_module._join_welcome_message("vip", "North")
+            self.assertIn("عضو Vip", vip_welcome)
+
+    def test_join_welcome_uses_game_level_at_50_games(self):
+        records = {"regular": {"username": "regular", "games": {"star": {"plays": 50}}}}
+        with patch.object(bot_module, "_is_vip_user", return_value=False), patch.object(
+            bot_module, "_game_stats_data", return_value=records
+        ):
+            welcome = bot_module._join_welcome_message("regular", "North")
+        self.assertIn("🏅 مستوى الألعاب", welcome)
+
+    def test_points_transfer_is_private_primary_master_only(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        room_replies = []
+        private_replies = []
+        bot.send_room_text = lambda room, text: room_replies.append((room, text))
+        bot.send_private_text = lambda user, text: private_replies.append((user, text))
+        with patch.object(bot_module, "_is_primary_master", return_value=False):
+            self.assertTrue(bot._handle_management_command("North", "sb@target@100", "member"))
+            self.assertTrue(bot._handle_management_command("", "sb@target@100", "member", is_private=True))
+        self.assertTrue(room_replies)
+        self.assertTrue(private_replies)
+        self.assertTrue(all("خاص البوت" in text or "الماستر" in text for _, text in room_replies + private_replies))
+
     def test_box_number_reply_uses_normalized_room_key(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.pending_bot_choices = {}
