@@ -168,14 +168,21 @@ class CricketGame:
         }
         return match
 
-    def begin_setup(self, room: str) -> str | None:
+    def begin_setup(self, room: str, *, reset_existing: bool = False) -> str | None:
         room_name, room_key = str(room or "").strip(), _key(room)
 
         def mutate(data: dict[str, Any]) -> str | None:
             if not data.get("enabled"):
                 return "⛔ فعّل اللعبة أولاً من خاص الماستر: تشغيل لعبه الكركيت."
             if isinstance(data.get("match"), dict):
-                return "⏳ توجد مباراة/قائمة انتظار مفتوحة بالفعل. أرسل Join للانضمام أو انتظر انتهائها."
+                if not reset_existing:
+                    return "⏳ توجد مباراة/قائمة انتظار مفتوحة بالفعل. أرسل Join للانضمام أو انتظر انتهائها."
+                # `.cr 1` is an explicit request for a fresh room game. Do not
+                # resume a stale setup/live match left in the persistent state.
+                # Keep points and wins, but discard old events so they cannot
+                # be replayed together with the new match setup.
+                data["match"] = None
+                data["events"] = []
             match = self._new_match(room_name, room_key, "setup")
             data["match"] = match
             self._emit(

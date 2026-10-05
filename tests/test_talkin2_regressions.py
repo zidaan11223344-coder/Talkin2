@@ -93,6 +93,23 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertFalse(integration.game.enabled())
             self.assertIsNone(integration.game.current())
 
+    def test_cr1_starts_fresh_setup_instead_of_resuming_persisted_match(self):
+        with tempfile.TemporaryDirectory() as temp:
+            room_messages, private_messages, media_messages = [], [], []
+            integration = self.make_integration(Path(temp), room_messages, private_messages, media_messages)
+            integration.handle("North", "Master", ".cr 1", is_private=True)
+            integration.handle("North", "N1", ".cr 1")
+            integration.handle("North", "N1", "2")
+            integration.handle("North", "N1", "Join")
+            self.assertEqual(integration.game.current()["stage"], "lobby")
+            old_match_id = integration.game.current()["id"]
+            integration.handle("North", "N1", ".cr 1")
+            fresh = integration.game.current()
+            self.assertEqual(fresh["stage"], "setup")
+            self.assertNotEqual(fresh["id"], old_match_id)
+            self.assertEqual(fresh["rooms"][0]["players"], [])
+            self.assertIn("إعداد مباراة الكركيت", room_messages[-1][1])
+
     def test_restart_resumes_a_saved_batting_choice_without_replaying_old_events(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -256,7 +256,7 @@ class CricketIntegration:
             self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
             return True
         previous_match = self.game.current()
-        result = self.game.begin_setup(room)
+        result = self.game.begin_setup(room, reset_existing=True)
         self._reply_error(room, result)
         self._deliver_transition(previous_match, room)
         return True
