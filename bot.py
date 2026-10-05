@@ -2448,6 +2448,49 @@ def _game_item_for_username(data, username):
     return _merged_game_item(data, username)
 
 
+def _game_aggregate_map(data):
+    """Aggregate equivalent usernames in one pass for rankings/snapshots."""
+    aggregates = {}
+    for key, item in (data.items() if isinstance(data, dict) else ()):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("username") or key).strip().lstrip("@")
+        canonical = _game_name_key(name)
+        if not canonical:
+            continue
+        games = item.get("games") if isinstance(item.get("games"), dict) else {}
+        current = aggregates.get(canonical)
+        if current is None:
+            current = {"username": name, "games": {}}
+            aggregates[canonical] = current
+        current_games = current["games"]
+        for game_key, values in games.items():
+            if not isinstance(values, dict):
+                continue
+            target = current_games.setdefault(game_key, {"plays": 0, "points": 0, "staked": 0})
+            for field in ("plays", "points", "staked"):
+                target[field] = max(
+                    int(target.get(field, 0) or 0),
+                    int(values.get(field, 0) or 0),
+                )
+        old_total = sum(int((v or {}).get("plays", 0) or 0) for v in current_games.values())
+        new_total = sum(int((v or {}).get("plays", 0) or 0) for v in games.values())
+        if new_total > old_total:
+            current["username"] = name
+    return aggregates
+
+
+def _game_level_from_item(item):
+    games = item.get("games", {}) if isinstance(item, dict) else {}
+    plays = sum(int((value or {}).get("plays", 0) or 0)
+                for value in games.values()) if isinstance(games, dict) else 0
+    level_number, label = 1, GAME_LEVELS[0][1]
+    for number, (threshold, current_label) in enumerate(GAME_LEVELS, 1):
+        if plays >= threshold:
+            level_number, label = number, current_label
+    return level_number, label, plays
+
+
 def _game_level_info(username):
     data = _game_stats_data()
     _key, item = _game_item_for_username(data, username)
@@ -2475,13 +2518,11 @@ def _game_level_info(username):
 
 def _game_star_rank(username):
     rows = []
-    for key, item in _game_stats_data().items():
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("username") or key).strip().lstrip("@")
-        level, _label, plays = _game_level_info(name)
+    for canonical, item in _game_aggregate_map(_game_stats_data()).items():
+        level, _label, plays = _game_level_from_item(item)
+        name = str(item.get("username") or canonical).strip().lstrip("@")
         if plays:
-            rows.append((level, plays, _game_name_key(name), name))
+            rows.append((level, plays, canonical, name))
     rows.sort(key=lambda row: (-row[0], -row[1], row[2]))
     for rank, row in enumerate(rows[:10], 1):
         if row[2] == _game_name_key(username):
@@ -2491,24 +2532,14 @@ def _game_star_rank(username):
 
 def _game_top10():
     rows_by_name = {}
-    data = _game_stats_data()
-    for key, item in data.items():
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("username") or key).strip().lstrip("@")
-        canonical = _game_name_key(name)
-        if not canonical:
-            continue
-        # Build the row from the merged view, not the individual record. This
-        # prevents SOUREA/sourea/decorated-SOUREA from occupying three ranks.
-        merged_key, merged = _merged_game_item(data, name)
-        level, label, plays = _game_level_info(name)
+    for canonical, merged in _game_aggregate_map(_game_stats_data()).items():
+        level, label, plays = _game_level_from_item(merged)
         if not plays:
             continue
-        existing = rows_by_name.get(canonical)
-        candidate = (level, label, plays, str(merged.get("username") or name).strip().lstrip("@"))
-        if existing is None or candidate[2] > existing[2]:
-            rows_by_name[canonical] = candidate
+        rows_by_name[canonical] = (
+            level, label, plays,
+            str(merged.get("username") or canonical).strip().lstrip("@"),
+        )
     rows = list(rows_by_name.values())
     rows.sort(key=lambda row: (-row[0], -row[2], _norm_user(row[3])))
     return rows[:10]
@@ -2527,18 +2558,26 @@ def _game_top10_message():
 
 def _save_game_levels_snapshot():
     players = {}
-    for key, item in _game_stats_data().items():
-        if not isinstance(item, dict):
-            continue
-        username = str(item.get("username") or key).strip().lstrip("@")
-        level, label, plays = _game_level_info(username)
+    aggregates = _game_aggregate_map(_game_stats_data())
+    ranked = []
+    for canonical, item in aggregates.items():
+        level, label, plays = _game_level_from_item(item)
         if plays:
+            username = str(item.get("username") or canonical).strip().lstrip("@")
+            ranked.append((level, plays, canonical, username))
+    ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    ranks = {canonical: index for index, (_level, _plays, canonical, _name)
+             in enumerate(ranked[:10], 1)}
+    for canonical, item in aggregates.items():
+        level, label, plays = _game_level_from_item(item)
+        if plays:
+            username = str(item.get("username") or canonical).strip().lstrip("@")
             players[_norm_user(username)] = {
                 "username": username,
                 "level": level,
                 "label": label,
                 "plays": plays,
-                "star_rank": _game_star_rank(username),
+                "star_rank": ranks.get(canonical),
             }
     _queue_local_json_save(GAME_LEVELS_FILE, {"version": 1, "players": players})
 
