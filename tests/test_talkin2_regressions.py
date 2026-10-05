@@ -316,6 +316,30 @@ class CricketIntegrationRegressions(unittest.TestCase):
 
 
 class BotGameAndMusicRegressions(unittest.TestCase):
+    def test_decorated_username_matches_game_stats_and_keeps_display_name(self):
+        decorated = "♥☼هـــــ☼ـــادي☼♥اا"
+        with patch.object(bot_module, "_game_stats_data", return_value={
+            "هادياا": {
+                "username": "هادياا",
+                "games": {"star": {"plays": 21}},
+            }
+        }):
+            level, label, plays = bot_module._game_level_info(decorated)
+            welcome = bot_module._game_welcome(decorated, "North")
+            self.assertEqual(level, 2)
+            self.assertEqual(plays, 21)
+            self.assertIn(label, welcome)
+            self.assertIn(decorated, welcome)
+            self.assertIn("🏅 مستوى الألعاب: 2", welcome)
+
+    def test_new_player_gets_level_and_star_welcome(self):
+        decorated = "♥☼هـــــ☼ـــادي☼♥اا"
+        with patch.object(bot_module, "_game_stats_data", return_value={}):
+            welcome = bot_module._game_welcome(decorated, "North")
+            self.assertIn(decorated, welcome)
+            self.assertIn("🏅 مستوى الألعاب: 1", welcome)
+            self.assertIn("⭐ ترتيب النجوم", welcome)
+
     def test_box_number_reply_uses_normalized_room_key(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.pending_bot_choices = {}

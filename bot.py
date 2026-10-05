@@ -2372,15 +2372,19 @@ GAME_LEVELS = (
 def _game_name_key(name):
     """Compare decorated usernames without changing their displayed form."""
     raw = unicodedata.normalize("NFKC", str(name or "")).strip().lstrip("@")
+    # Talkin names commonly contain ornamental symbols, tatweel, zero-width
+    # joiners, and Arabic combining marks. Ignore those only for lookup; keep
+    # the original spelling for the welcome text.
     compact = "".join(char for char in raw
                        if not unicodedata.category(char).startswith(("M", "P", "S", "C", "Z")))
+    compact = compact.replace("ـ", "")
     return (compact or raw).casefold()
 
 
 def _game_level_info(username):
     data = _game_stats_data()
     item = data.get(_norm_user(username), {})
-    if not isinstance(item, dict):
+    if not isinstance(item, dict) or not item:
         wanted = _game_name_key(username)
         item = next((candidate for key, candidate in data.items()
                      if isinstance(candidate, dict)
@@ -15057,8 +15061,6 @@ class TalkinBot:
                 self.send_room_text(room, f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}")
             elif username and _norm_user(username) != _norm_user(BOT_ID):
                 level, _label, _plays = _game_level_info(username)
-                if _plays <= 0 or _game_star_rank(username) is None:
-                    return
                 welcomes_enabled = bool(getattr(self, "custom_welcome_enabled", True))
                 cw = self.custom_welcomes.get(_norm_user(username)) if welcomes_enabled else None
                 if _is_vip_user(username):
