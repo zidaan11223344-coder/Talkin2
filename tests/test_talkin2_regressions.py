@@ -432,6 +432,38 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertIn("لعب 3927", rendered)
         self.assertEqual(rendered.count("3927"), 1)
 
+    def test_persisted_game_files_are_deduped_with_backup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stats_file = root / "game_stats.json"
+            levels_file = root / "game_levels.json"
+            stats_backup = root / "game_stats.duplicates-backup.json"
+            levels_backup = root / "game_levels.duplicates-backup.json"
+            stats = {
+                "sourea": {"username": "sourea", "games": {"star": {"plays": 3927}}},
+                "sou☀rea": {"username": "𝐒𝐎𝐔☀𝐑𝐄𝐀", "games": {"star": {"plays": 3927}}},
+            }
+            levels = {"version": 1, "players": {
+                "sourea": {"username": "sourea", "plays": 3927},
+                "sou☀rea": {"username": "𝐒𝐎𝐔☀𝐑𝐄𝐀", "plays": 3927},
+            }}
+            stats_file.write_text(__import__("json").dumps(stats), encoding="utf-8")
+            levels_file.write_text(__import__("json").dumps(levels), encoding="utf-8")
+            with patch.object(bot_module, "_GAME_STATS_CACHE", stats), patch.object(
+                bot_module, "GAME_STATS_FILE", stats_file
+            ), patch.object(bot_module, "GAME_LEVELS_FILE", levels_file), patch.object(
+                bot_module, "GAME_STATS_DEDUPE_BACKUP_FILE", stats_backup
+            ), patch.object(bot_module, "GAME_LEVELS_DEDUPE_BACKUP_FILE", levels_backup
+            ):
+                bot_module._dedupe_persisted_game_files()
+            saved_stats = __import__("json").loads(stats_file.read_text(encoding="utf-8"))
+            saved_levels = __import__("json").loads(levels_file.read_text(encoding="utf-8"))
+            self.assertEqual(len(saved_stats), 1)
+            self.assertEqual(len(saved_levels["players"]), 1)
+            self.assertTrue(stats_backup.is_file())
+            self.assertTrue(levels_backup.is_file())
+            self.assertEqual(saved_stats["sourea"]["games"]["star"]["plays"], 3927)
+
     def test_decorated_username_matches_game_stats_and_keeps_display_name(self):
         decorated = "♥☼هـــــ☼ـــادي☼♥اا"
         with patch.object(bot_module, "_game_stats_data", return_value={

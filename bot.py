@@ -450,6 +450,8 @@ PUBLISHED_FILE = DATA_DIR / "published_posts.json"
 MEDIA_STATS_FILE = DATA_DIR / "media_stats.json"
 GAME_STATS_FILE = DATA_DIR / "game_stats.json"
 GAME_LEVELS_FILE = DATA_DIR / "game_levels.json"
+GAME_STATS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_stats.duplicates-backup.json"
+GAME_LEVELS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_levels.duplicates-backup.json"
 GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
 CROP_PLOTS_FILE = DATA_DIR / "crop_plots.json"
 TRACKED_ROOMS_FILE = DATA_DIR / "tracked_rooms.json"
@@ -2317,6 +2319,7 @@ def _is_vip_user(name):
 
 _GAME_STATE_LOCK = threading.RLock()
 _GAME_STATS_CACHE = None
+_GAME_STATS_MIGRATION_DONE = False
 _POINTS_CACHE = None
 _MEDIA_STATS_LOCK = threading.RLock()
 _MEDIA_STATS_CACHE = None
@@ -2349,11 +2352,14 @@ def _record_media_publication(kind, title="", publisher="", room=""):
 
 def _game_stats_data():
     """Return the in-memory game statistics cache; disk is loaded once."""
-    global _GAME_STATS_CACHE
+    global _GAME_STATS_CACHE, _GAME_STATS_MIGRATION_DONE
     with _GAME_STATE_LOCK:
         if _GAME_STATS_CACHE is None:
             data = _load_local_json(GAME_STATS_FILE, {})
             _GAME_STATS_CACHE = data if isinstance(data, dict) else {}
+        if not _GAME_STATS_MIGRATION_DONE:
+            _dedupe_persisted_game_files()
+            _GAME_STATS_MIGRATION_DONE = True
         return _GAME_STATS_CACHE
 
 
@@ -2480,6 +2486,56 @@ def _game_aggregate_map(data):
     return aggregates
 
 
+def _backup_before_dedupe(path, backup_path):
+    path, backup_path = Path(path), Path(backup_path)
+    if path.is_file() and not backup_path.is_file():
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup_path)
+
+
+def _dedupe_persisted_game_files():
+    """Persist one canonical record per decorated username, losslessly."""
+    data = _GAME_STATS_CACHE if isinstance(_GAME_STATS_CACHE, dict) else {}
+    aggregates = _game_aggregate_map(data)
+    canonical_data = {
+        canonical: dict(item)
+        for canonical, item in aggregates.items()
+    }
+    # Preserve unexpected non-player metadata rather than deleting unknown
+    # data during migration.
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            canonical_data.setdefault(key, value)
+    if json.dumps(data, ensure_ascii=False, sort_keys=True) != json.dumps(
+        canonical_data, ensure_ascii=False, sort_keys=True
+    ):
+        _backup_before_dedupe(GAME_STATS_FILE, GAME_STATS_DEDUPE_BACKUP_FILE)
+        data.clear()
+        data.update(canonical_data)
+        _save_local_json(GAME_STATS_FILE, copy.deepcopy(data))
+
+    levels = _load_local_json(GAME_LEVELS_FILE, {})
+    players = levels.get("players", {}) if isinstance(levels, dict) else {}
+    if isinstance(players, dict):
+        merged_players = {}
+        for key, item in players.items():
+            if not isinstance(item, dict):
+                continue
+            username = str(item.get("username") or key).strip().lstrip("@")
+            canonical = _game_name_key(username)
+            if not canonical:
+                continue
+            current = merged_players.get(canonical)
+            if current is None or int(item.get("plays", 0) or 0) > int(current.get("plays", 0) or 0):
+                merged_players[canonical] = copy.deepcopy(item)
+        canonical_levels = {"version": 1, "players": merged_players}
+        if json.dumps(levels, ensure_ascii=False, sort_keys=True) != json.dumps(
+            canonical_levels, ensure_ascii=False, sort_keys=True
+        ):
+            _backup_before_dedupe(GAME_LEVELS_FILE, GAME_LEVELS_DEDUPE_BACKUP_FILE)
+            _save_local_json(GAME_LEVELS_FILE, canonical_levels)
+
+
 def _game_level_from_item(item):
     games = item.get("games", {}) if isinstance(item, dict) else {}
     plays = sum(int((value or {}).get("plays", 0) or 0)
@@ -2572,7 +2628,7 @@ def _save_game_levels_snapshot():
         level, label, plays = _game_level_from_item(item)
         if plays:
             username = str(item.get("username") or canonical).strip().lstrip("@")
-            players[_norm_user(username)] = {
+            players[canonical] = {
                 "username": username,
                 "level": level,
                 "label": label,
