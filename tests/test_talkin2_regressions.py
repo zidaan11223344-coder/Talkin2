@@ -285,6 +285,52 @@ class CricketIntegrationRegressions(unittest.TestCase):
                 self.assertEqual(batting_counts[(2, player)], 6)
             self.assertEqual(integration.game.get_points("S1") + integration.game.get_points("S2"), 200_000)
 
+    def test_first_team_attacks_then_roles_switch_and_same_bowler_gets_hattrick(self):
+        with tempfile.TemporaryDirectory() as temp:
+            messages, private, media = [], [], []
+            integration = self.make_integration(Path(temp), messages, private, media)
+            integration.handle("North", "Master", ".cr 1", is_private=True)
+            integration.handle("North", "N1", ".cr 1")
+            integration.handle("North", "N1", "4")
+            for player in ("N1", "N2", "N3", "N4"):
+                integration.handle("North", player, "Join")
+            for player in ("S1", "S2", "S3", "S4"):
+                integration.handle("South", player, "Join")
+            integration.handle("North", "N1", "1")
+            match = integration.game.current()
+            self.assertEqual(match["batting_team"], "attack")
+            self.assertEqual(match["teams"]["north"], "attack")
+            self.assertEqual(match["teams"]["south"], "defense")
+
+            def resolve_wicket(batter):
+                def mutate(data):
+                    current = data["match"]
+                    integration.game._resolve_ball(
+                        data, current, integration.game._participants(current),
+                        {"value": 4, "room_key": "north", "room": "North", "sender": batter},
+                        {"value": 4, "room_key": "south", "room": "South", "sender": "S1"},
+                    )
+                integration.game.state.mutate(mutate)
+
+            for batter in ("N1", "N2"):
+                resolve_wicket(batter)
+            # Talkin2's rule: the same defender dismissing two batters in a
+            # row earns the hat-trick. Finish the remaining innings ball so
+            # the role switch is also verified.
+            hattrick_events = integration.game.events_after("North", 0)
+            self.assertTrue(any("هاتريك" in str(event.get("text")) for event in hattrick_events))
+            resolve_wicket("N3")
+            resolve_wicket("N4")
+
+            transition = [event.get("text", "") for event in integration.game.state.load().get("events", [])
+                          if "الشوط الأول انتهى" in str(event.get("text", ""))]
+            self.assertTrue(transition)
+            match = integration.game.current()
+            self.assertIsNotNone(match)
+            self.assertEqual(match["innings"], 2)
+            self.assertEqual(match["batting_team"], "defense")
+            self.assertTrue(any("cricket_hattrick.png" in image for event in hattrick_events for image in event.get("images", [])))
+
     def test_only_verified_members_can_start_or_join_cricket(self):
         with tempfile.TemporaryDirectory() as temp:
             room_messages, private_messages, media_messages = [], [], []
