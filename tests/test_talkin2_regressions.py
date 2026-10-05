@@ -286,7 +286,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot_module._looks_like_bot_command(command), command)
         self.assertEqual(bot_module._normalize_game_command_text("coin@tails"), "عملة@كتابة")
 
-    def test_auto_ban_candidate_only_allows_known_members_and_unranked_users(self):
+    def test_auto_ban_candidate_allows_known_non_supervision_roles_only(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {"North": {
             "Owner": "owner", "Admin": "admin", "Moderator": "moderator",
@@ -295,10 +295,11 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.object(bot_module, "_is_master_name", side_effect=lambda name: str(name).casefold() == "master"), patch.object(
             bot_module, "_is_room_creator", return_value=False
         ):
-            for ranked in ("Owner", "Admin", "Moderator", "OtherRank", "Master"):
-                self.assertFalse(bot_module._auto_ban_candidate(bot, "North", ranked), ranked)
+            for protected in ("Owner", "Admin", "Moderator", "Master"):
+                self.assertFalse(bot_module._auto_ban_candidate(bot, "North", protected), protected)
             self.assertTrue(bot_module._auto_ban_candidate(bot, "North", "Member"))
             self.assertTrue(bot_module._auto_ban_candidate(bot, "North", "NoRank"))
+            self.assertTrue(bot_module._auto_ban_candidate(bot, "North", "OtherRank"))
             # A blank event field must not erase a known moderator/owner rank.
             self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "Admin", ""))
             self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "UnknownUser", ""))

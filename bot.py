@@ -2911,19 +2911,20 @@ def _room_role(bot, room, sender, event_role=None):
     return "", False
 
 def _auto_ban_candidate(bot, room, sender, event_role=None):
-    """Auto-ban only known unranked/member accounts; fail closed for any other role."""
+    """Auto-ban every known role except room owners and supervision roles."""
     if not sender or _is_master_name(sender) or _is_room_creator(room, sender):
         return False
     role, known = _room_role(bot, room, sender, event_role)
     if not known:
         return False
     role_key = re.sub(r"[\s_-]+", "", role.casefold())
-    allowed = {
-        "", "none", "null", "0", "member", "members", "user", "users", "guest", "visitor",
-        "regular", "normal", "unranked", "norank", "rankless",
-        "عضو", "اعضاء", "أعضاء", "مستخدم", "زائر", "ضيف", "بدونرتبة", "بدونرتبه", "بلارتبة", "بلارتبه",
+    protected_roles = {
+        "owner", "creator", "roomowner", "roomcreator", "host",
+        "admin", "administrator", "moderator", "moder", "mod",
+        "مشرف", "مشرفين", "ادمن", "إداري", "صانع", "صانعي",
+        "صانعالغرفة", "صانعالغرفه", "مالك",
     }
-    return role_key in allowed
+    return role_key not in protected_roles
 
 def _norm_filter_text(text):
     value = str(text or "").casefold()
