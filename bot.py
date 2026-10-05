@@ -2393,7 +2393,12 @@ def _game_record_matches(data, username):
 
 
 def _merged_game_item(data, username):
-    """Return a lossless aggregate view of all equivalent name records."""
+    """Return a lossless aggregate view of equivalent name records.
+
+    Different game keys are additive; repeated copies of the same game key
+    are snapshots of one counter, so the maximum is used to avoid inflating a
+    player's history when an old migration duplicated a record.
+    """
     exact_key = _norm_user(username)
     matches = _game_record_matches(data, username)
     if not matches:
@@ -2418,13 +2423,16 @@ def _merged_game_item(data, username):
                 continue
             target = merged_games.setdefault(game_key, {"plays": 0, "points": 0, "staked": 0})
             for field in ("plays", "points", "staked"):
-                target[field] = int(target.get(field, 0) or 0) + int(values.get(field, 0) or 0)
+                target[field] = max(
+                    int(target.get(field, 0) or 0),
+                    int(values.get(field, 0) or 0),
+                )
     merged["games"] = merged_games
     return canonical_key, merged
 
 
 def _coalesce_game_records(data, username):
-    """Merge equivalent records in-place, summing every stored metric."""
+    """Merge equivalent records in-place without inflating duplicate counters."""
     key, merged = _merged_game_item(data, username)
     if not merged:
         return _norm_user(username), {}
@@ -2482,14 +2490,26 @@ def _game_star_rank(username):
 
 
 def _game_top10():
-    rows = []
-    for key, item in _game_stats_data().items():
+    rows_by_name = {}
+    data = _game_stats_data()
+    for key, item in data.items():
         if not isinstance(item, dict):
             continue
         name = str(item.get("username") or key).strip().lstrip("@")
+        canonical = _game_name_key(name)
+        if not canonical:
+            continue
+        # Build the row from the merged view, not the individual record. This
+        # prevents SOUREA/sourea/decorated-SOUREA from occupying three ranks.
+        merged_key, merged = _merged_game_item(data, name)
         level, label, plays = _game_level_info(name)
-        if plays:
-            rows.append((level, label, plays, name))
+        if not plays:
+            continue
+        existing = rows_by_name.get(canonical)
+        candidate = (level, label, plays, str(merged.get("username") or name).strip().lstrip("@"))
+        if existing is None or candidate[2] > existing[2]:
+            rows_by_name[canonical] = candidate
+    rows = list(rows_by_name.values())
     rows.sort(key=lambda row: (-row[0], -row[2], _norm_user(row[3])))
     return rows[:10]
 

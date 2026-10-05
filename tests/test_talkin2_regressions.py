@@ -418,6 +418,20 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             ))
         self.assertIn("مخصص للماستر", replies[-1][1])
 
+    def test_game_top10_collapses_decorated_duplicate_records(self):
+        data = {
+            "sourea": {"username": "sourea", "games": {"star": {"plays": 3927}}},
+            "sou☀rea": {"username": "𝐒𝐎𝐔☀𝐑𝐄𝐀", "games": {"star": {"plays": 3927}}},
+            "𝐬𝐨𝐮𝐫𝐞𝐚": {"username": "𝐒𝐎𝐔𝐑𝐄𝐀", "games": {"star": {"plays": 3927}}},
+            "other": {"username": "other", "games": {"star": {"plays": 4246}}},
+        }
+        with patch.object(bot_module, "_game_stats_data", return_value=data):
+            rows = bot_module._game_top10()
+            rendered = bot_module._game_top10_message()
+        self.assertEqual(sum(1 for row in rows if bot_module._game_name_key(row[3]) == "sourea"), 1)
+        self.assertIn("لعب 3927", rendered)
+        self.assertEqual(rendered.count("3927"), 1)
+
     def test_decorated_username_matches_game_stats_and_keeps_display_name(self):
         decorated = "♥☼هـــــ☼ـــادي☼♥اا"
         with patch.object(bot_module, "_game_stats_data", return_value={
