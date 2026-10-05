@@ -469,24 +469,37 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.object(bot_module, "_game_stats_data", return_value={
             "هادياا": {
                 "username": "هادياا",
-                "games": {"star": {"plays": 21}},
+                "games": {"star": {"plays": 50}},
             }
         }):
             level, label, plays = bot_module._game_level_info(decorated)
             welcome = bot_module._game_welcome(decorated, "North")
-            self.assertEqual(level, 2)
-            self.assertEqual(plays, 21)
+            self.assertEqual(level, 3)
+            self.assertEqual(plays, 50)
             self.assertIn(label, welcome)
             self.assertIn(decorated, welcome)
-            self.assertIn("🏅 مستوى الألعاب: 2", welcome)
+            self.assertIn("🏅 مستوى الألعاب: 3", welcome)
 
     def test_new_player_gets_level_and_star_welcome(self):
         decorated = "♥☼هـــــ☼ـــادي☼♥اا"
         with patch.object(bot_module, "_game_stats_data", return_value={}):
             welcome = bot_module._game_welcome(decorated, "North")
             self.assertIn(decorated, welcome)
-            self.assertIn("🏅 مستوى الألعاب: 1", welcome)
-            self.assertIn("⭐ ترتيب النجوم", welcome)
+            self.assertNotIn("🏅 مستوى الألعاب", welcome)
+            self.assertNotIn("⭐ ترتيب النجوم", welcome)
+            self.assertIn("🎯 جولاتك: 0", welcome)
+
+    def test_game_level_welcome_starts_at_exactly_50_games(self):
+        with patch.object(bot_module, "_game_stats_data", return_value={
+            "player": {"username": "player", "games": {"star": {"plays": 49}}}
+        }):
+            before = bot_module._game_welcome("player", "North")
+        with patch.object(bot_module, "_game_stats_data", return_value={
+            "player": {"username": "player", "games": {"star": {"plays": 50}}}
+        }):
+            after = bot_module._game_welcome("player", "North")
+        self.assertNotIn("🏅 مستوى الألعاب", before)
+        self.assertIn("🏅 مستوى الألعاب", after)
 
     def test_box_number_reply_uses_normalized_room_key(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

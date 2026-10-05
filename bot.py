@@ -2664,6 +2664,10 @@ def _schedule_game_levels_snapshot():
 
 def _game_welcome(username, room):
     level, label, plays = _game_level_info(username)
+    if plays < 50:
+        return (f"🎮 دخل @{username}\n"
+                f"🏠 الغرفة: {room}\n"
+                f"🎯 جولاتك: {plays}")
     star_line = f"\n⭐ ترتيب النجوم\n       {'⭐' * level}"
     return (f"🎮 دخل @{username}\n"
             f"{label}\n"
