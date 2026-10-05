@@ -134,12 +134,21 @@ class CricketIntegrationRegressions(unittest.TestCase):
             integration.handle("North", "N1", ".cr 2")
             for player in ("N1", "N2"):
                 integration.handle("North", player, "Join")
+            first_team_announcements = [
+                (room, text) for room, text in room_messages if "اكتمل الفريق الأول" in text
+            ]
+            self.assertEqual({room for room, _ in first_team_announcements}, {"North", "South", "Lobby"})
+            self.assertEqual(len(first_team_announcements), 3)
+            for _, text in first_team_announcements:
+                self.assertIn("North (2 لاعبين): @N1، @N2", text)
+            self.assertEqual(integration.game.current()["stage"], "lobby")
+
             for player in ("S1", "S2"):
                 integration.handle("South", player, "Join")
             integration.handle("North", "N1", "1")
 
             started = [(room, text) for room, text in room_messages if "بدأت لعبة الكركيت" in text]
-            self.assertEqual({room for room, _ in started}, {"North", "South", "Lobby"})
+            self.assertEqual({room for room, _ in started}, {"North", "South"})
             for _, text in started:
                 self.assertIn("North (2 لاعبين): @N1، @N2", text)
                 self.assertIn("South (2 لاعبين): @S1، @S2", text)
