@@ -1,4 +1,4 @@
-"""Persistent cross-room cricket with player rosters and an optional S-Boot opponent."""
+"""Persistent cross-room cricket with player rosters and an optional Talkin2 opponent."""
 from __future__ import annotations
 
 import random
@@ -173,7 +173,7 @@ class CricketGame:
 
         def mutate(data: dict[str, Any]) -> str | None:
             if not data.get("enabled"):
-                return "⛔ شغّل اللعبة أولاً بالأمر .cr 1."
+                return "⛔ فعّل اللعبة أولاً من خاص الماستر: تشغيل لعبه الكركيت."
             if isinstance(data.get("match"), dict):
                 return "⏳ توجد مباراة/قائمة انتظار مفتوحة بالفعل. أرسل Join للانضمام أو انتظر انتهائها."
             match = self._new_match(room_name, room_key, "setup")
@@ -185,7 +185,7 @@ class CricketGame:
                 "اختر عدد اللاعبين داخل هذه الغرفة فقط:\n"
                 "1️⃣ لاعب واحد\n2️⃣ لاعبان\n3️⃣ ثلاثة لاعبين\n4️⃣ أربعة لاعبين\n"
                 "أرسل الرقم فقط، وبعدها كل لاعب يرسل Join في نفس الغرفة.\n"
-                "🤖 عند اكتمال العدد يبدأ اللعب تلقائيًا ضد بوت S-Boot.",
+                "🤖 عند اكتمال العدد يبدأ اللعب تلقائيًا ضد بوت Talkin2.",
             )
             return None
 
@@ -232,7 +232,7 @@ class CricketGame:
 
         def mutate(data: dict[str, Any]) -> str | None:
             if not bool(data.get("enabled", bool(data.get("enabled_rooms") or {}))):
-                return "⛔ اللعبة متوقفة على مستوى السيرفر. شغّلها بالأمر .cr 1 أولاً."
+                return "⛔ اللعبة متوقفة على مستوى السيرفر. فعّلها من خاص الماستر: تشغيل لعبه الكركيت."
             if isinstance(data.get("match"), dict):
                 return "⏳ توجد مباراة مفتوحة بالفعل؛ أرسل Join للانضمام أو انتظر انتهائها."
             match = self._new_match(room_name, room_key, "lobby", count)
@@ -243,7 +243,7 @@ class CricketGame:
                 self._participants(match),
                 f"🏏 فُتحت مباراة الكركيت في {room_name} — المطلوب {count} لاعب(ين).\n"
                 "👤 كل اللاعبين ينضمون من هذه الغرفة فقط بإرسال Join.\n"
-                "🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد S-Boot.",
+                "🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد Talkin2.",
             )
             return None
 
@@ -258,7 +258,7 @@ class CricketGame:
                 self._emit(
                     data,
                     rooms,
-                    "🤖 انضم بوت S-Boot خصمًا لك. اختر دورك: 1 للهجوم أو 2 للدفاع؛ "
+                    "🤖 انضم بوت Talkin2 خصمًا لك. اختر دورك: 1 للهجوم أو 2 للدفاع؛ "
                     "والبوت يأخذ الدور الآخر تلقائيًا.",
                 )
                 return True
@@ -285,7 +285,7 @@ class CricketGame:
 
         def mutate(data: dict[str, Any]) -> str | None:
             if not data.get("enabled"):
-                return "⛔ شغّل الكركيت على مستوى السيرفر بالأمر .cr 1 أولاً."
+                return "⛔ فعّل الكركيت من خاص الماستر: تشغيل لعبه الكركيت."
             match = data.get("match")
             if not isinstance(match, dict) or match.get("stage") != "lobby":
                 return "📭 لا توجد قائمة لاعبين مفتوحة الآن."
@@ -323,11 +323,11 @@ class CricketGame:
                     self._emit(
                         data, [participant],
                         f"✅ انضم @{username}.\n👥 اكتمل {len(players)}/{target} لاعب في الغرفة.\n"
-                        "🔗 للمباراة الجماعية: اجعل الغرفة الثانية ترسل Join، أو أكمل العدد هنا للعب ضد S-Boot.",
+                        "🔗 للمباراة الجماعية: اجعل الغرفة الثانية ترسل Join، أو أكمل العدد هنا للعب ضد Talkin2.",
                     )
                 else:
                     if match.get("mode") == "solo":
-                        # Direct `cricket N` keeps the original one-room vs S-Boot flow.
+                        # Direct `cricket N` keeps the original one-room vs Talkin2 flow.
                         match["mode"] = "solo"
                         match["teams"] = {room_key: "attack", BOT_TEAM_KEY: "defense"}
                         self._start_live(data, match, participants)
@@ -368,7 +368,7 @@ class CricketGame:
         def mutate(data: dict[str, Any]) -> str | None:
             match = data.get("match")
             if not data.get("enabled"):
-                return "⛔ شغّل الكركيت أولاً بالأمر .cr 1."
+                return "⛔ فعّل الكركيت أولاً من خاص الماستر: تشغيل لعبه الكركيت."
             if not isinstance(match, dict) or match.get("stage") != "lobby":
                 return "📭 لا توجد مباراة تنتظر خصم البوت."
             if int(match.get("target_players") or 0) != 1:
@@ -443,7 +443,7 @@ class CricketGame:
     def _next_player(self, match: dict[str, Any], team: str, batting: bool) -> str:
         participant = self._room_for_team(match, team)
         if participant is None:
-            return "🤖 بوت S-Boot"
+            return "🤖 بوت Talkin2"
         players = [str(item) for item in participant.get("players", []) if str(item).strip()]
         if not players:
             return participant["name"]
@@ -511,7 +511,7 @@ class CricketGame:
         }
         start_text = "🏏 بدأت الكركيت\n" + self._team_label(match["batting_team"]) + " تبدأ الهجوم."
         if match.get("mode") == "solo":
-            start_text += "\n🤖 بوت S-Boot"
+            start_text += "\n🤖 بوت Talkin2"
         self._emit(data, participants, start_text)
         self._emit_room_messages(data, self._turn_messages(match))
 
@@ -543,10 +543,10 @@ class CricketGame:
             human_team = next((value for key, value in teams.items() if key != BOT_TEAM_KEY), "attack")
             human_room = team_rooms.get(human_team)
             human_players = [str(p).lstrip("@") for p in (human_room or {}).get("players", []) if str(p).strip()]
-            bot_players = ["بوت S-Boot"]
-            winner = "تعادل" if winner_team == "tie" else ("الفريق البشري" if winner_team == human_team else "بوت S-Boot")
+            bot_players = ["بوت Talkin2"]
+            winner = "تعادل" if winner_team == "tie" else ("الفريق البشري" if winner_team == human_team else "بوت Talkin2")
             winning_players = human_players if winner_team == human_team else []
-            team1_name, team2_name = "الفريق البشري", "S-Boot"
+            team1_name, team2_name = "الفريق البشري", "Talkin2"
             team1_players, team2_players = human_players, bot_players
             team1_score = attack_score if human_team == "attack" else defense_score
             team2_score = defense_score if human_team == "attack" else attack_score
@@ -562,6 +562,7 @@ class CricketGame:
             winner = "تعادل" if winner_team == "tie" else team1_name if winner_team == "attack" else team2_name
 
         reward_lines = []
+        player_awards: dict[str, int] = {}
         if winning_players:
             base, remainder = divmod(prize, len(winning_players))
             points = data.setdefault("points", {})
@@ -571,6 +572,7 @@ class CricketGame:
                 key = _user_key(player)
                 points[key] = int(points.get(key, 0)) + amount
                 wins[key] = int(wins.get(key, 0)) + 1
+                player_awards[str(player).lstrip("@")] = amount
                 if self.reward:
                     self.reward(player, amount)
                 reward_lines.append(f"💰 @{player} +{amount:,} نقطة")
@@ -580,7 +582,7 @@ class CricketGame:
             team1_name=team1_name, team1_players=team1_players,
             team1_score=team1_score, team2_name=team2_name,
             team2_players=team2_players, team2_score=team2_score,
-            player_scores=player_scores, winner=winner,
+            player_scores=player_scores, player_awards=player_awards, winner=winner,
             prize=prize if winning_players else 0,
         )
         images = (result_image,) if result_image else ()
@@ -600,7 +602,7 @@ class CricketGame:
         match: dict[str, Any],
         team1_name: str, team1_players: list[str], team1_score: int,
         team2_name: str, team2_players: list[str], team2_score: int,
-        player_scores: dict[str, int], winner: str, prize: int,
+        player_scores: dict[str, int], player_awards: dict[str, int], winner: str, prize: int,
     ) -> str | None:
         try:
             from cricket_result import render_result_image
@@ -608,7 +610,8 @@ class CricketGame:
                 match_id=str(match.get("id") or uuid.uuid4().hex),
                 team1_name=team1_name, team1_players=team1_players, team1_score=team1_score,
                 team2_name=team2_name, team2_players=team2_players, team2_score=team2_score,
-                player_scores=player_scores, winner=winner, prize=prize,
+                player_scores=player_scores, player_awards=player_awards,
+                winner=winner, prize=prize,
                 output_dir=self.state.path.parent / "cricket_media",
             )
         except Exception:
@@ -648,13 +651,13 @@ class CricketGame:
             bowler = self._next_player(match, bowling, batting=False)
             choices = match.setdefault("choices", {})
 
-            # In solo mode S-Boot chooses automatically whenever it is batting.
+            # In solo mode Talkin2 chooses automatically whenever it is batting.
             if match.get("mode") == "solo" and batting == (teams.get(BOT_TEAM_KEY) or "") and not choices.get("bat"):
                 choices["bat"] = {
                     "value": random.randint(0, 6),
                     "room_key": BOT_TEAM_KEY,
-                    "room": "بوت S-Boot",
-                    "sender": "بوت S-Boot",
+                    "room": "بوت Talkin2",
+                    "sender": "بوت Talkin2",
                 }
 
             if not choices.get("bat"):
@@ -666,7 +669,7 @@ class CricketGame:
                 }
                 if match.get("mode") == "solo":
                     bot_value = random.randint(0, 6)
-                    bot_choice = {"value": bot_value, "room_key": BOT_TEAM_KEY, "room": "بوت S-Boot", "sender": "بوت S-Boot"}
+                    bot_choice = {"value": bot_value, "room_key": BOT_TEAM_KEY, "room": "بوت Talkin2", "sender": "بوت Talkin2"}
                     bat_choice, bowl_choice = (choices["bat"], bot_choice) if batting == team else (bot_choice, choices["bat"])
                     return self._resolve_ball(data, match, participants, bat_choice, bowl_choice)
 

@@ -5,3 +5,6 @@
 __pycache__/
 *.py[cod]
 media/
+data/
+generated_games/
+generated_music/

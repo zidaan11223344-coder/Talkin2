@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = Path(os.getenv("CRICKET_MEDIA_DIR", str(ROOT / "generated_games")))
 FONT_CANDIDATES = (
     os.getenv("CRICKET_FONT", "").strip(),
+    str(ROOT / "assets" / "NotoSansArabic-SemiBold.ttf"),
+    str(ROOT / "assets" / "NotoSansArabic-Regular.ttf"),
     str(ROOT / "vendor" / "assets" / "NotoSansArabic-CondensedSemiBold.ttf"),
     "/usr/share/fonts/truetype/noto/NotoSansArabic-SemiCondensedMedium.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansArabic-CondensedSemiBold.ttf",
@@ -62,11 +64,17 @@ def _text(draw: ImageDraw.ImageDraw, xy, value: str, font, anchor="la", fill=(24
         rtl = _has_arabic(value)
     try:
         if rtl:
-            draw.text(xy, _shape_rtl(value), font=font, fill=fill, anchor=anchor)
+            # Pillow's RAQM engine shapes Arabic and resolves bidirectional text
+            # when given the original string and explicit RTL direction. Do not
+            # pass a pre-reordered string to Pillow: that reverses it a second time.
+            draw.text(xy, str(value), font=font, fill=fill, anchor=anchor, direction="rtl", language="ar")
         else:
             draw.text(xy, value, font=font, fill=fill, anchor=anchor)
     except Exception:
-        draw.text(xy, value, font=font, fill=fill, anchor=anchor)
+        if rtl:
+            draw.text(xy, _shape_rtl(value), font=font, fill=fill, anchor=anchor)
+        else:
+            draw.text(xy, value, font=font, fill=fill, anchor=anchor)
 
 
 def render_result_image(
@@ -79,6 +87,7 @@ def render_result_image(
     team2_players: Iterable[str] = (),
     team2_score: int = 0,
     player_scores: dict[str, int] | None = None,
+    player_awards: dict[str, int] | None = None,
     winner: str = "تعادل",
     prize: int = 0,
     output_dir: str | Path | None = None,
@@ -104,6 +113,7 @@ def render_result_image(
     p1 = [str(p).lstrip("@") for p in team1_players if str(p).strip()]
     p2 = [str(p).lstrip("@") for p in team2_players if str(p).strip()]
     scores = {str(k).lstrip("@"): int(v) for k, v in (player_scores or {}).items()}
+    awards = {str(k).lstrip("@"): int(v) for k, v in (player_awards or {}).items()}
 
     W, H = 1500, 900
     img = Image.new("RGB", (W, H), (13, 18, 28))
@@ -130,6 +140,8 @@ def render_result_image(
         draw.text((cx - 12, 320), f"{int(total):,}", font=score, fill=(245, 247, 250), anchor="rm")
         _text(draw, (cx + 12, 320), "نقطة", score, anchor="lm", rtl=True)
         y = 390
+        _text(draw, (box[0] + 82, y - 25), "اللاعب", small, anchor="lm", rtl=True)
+        _text(draw, (box[2] - 38, y - 25), "النقاط والجائزة", small, anchor="rm", rtl=True)
         if not players_list:
             _text(draw, (cx, y), "لا يوجد لاعبين", small, anchor="mm", rtl=True)
         for index, player in enumerate(players_list, 1):
@@ -141,7 +153,9 @@ def render_result_image(
             # reversed or with punctuation in the wrong place.
             draw.text((box[0] + 38, y), f"{index}.", font=_latin_font(25), fill=(245, 247, 250), anchor="lm")
             _text(draw, (box[0] + 82, y), player_text, player_font, anchor="lm", rtl=_has_arabic(player_text))
-            _text(draw, (box[2] - 38, y), f"{value}", score, anchor="rm", rtl=False)
+            award = int(awards.get(player, 0))
+            metric = f"{value} / {award:,}"
+            _text(draw, (box[2] - 38, y), metric, _latin_font(23), anchor="rm", rtl=False)
             y += 65
 
     panel(left, str(team1_name), p1, team1_score, _has_arabic(str(team1_name)))
@@ -150,7 +164,7 @@ def render_result_image(
     draw.line((W // 2, 225, W // 2, H - 75), fill=(115, 125, 145), width=2)
     if prize:
         draw.rounded_rectangle((W // 2 - 205, H - 125, W // 2 + 205, H - 65), radius=18, fill=(31, 67, 51), outline=(102, 170, 119), width=2)
-        _text(draw, (W // 2, H - 95), f"🎁 الجائزة: {prize:,} نقطة", small, anchor="mm", rtl=True)
+        _text(draw, (W // 2, H - 95), f"الجائزة: {prize:,} نقطة", small, anchor="mm", rtl=True)
 
     img.save(path, "PNG", optimize=True)
     return filename
