@@ -39,8 +39,10 @@ class CricketIntegration:
         persist: Callable | None = None,
         is_master: Callable[[str], bool],
         is_configured_master: Callable[[str], bool] | None = None,
+        is_verified: Callable[[str], bool] | None = None,
         send_room_text: Callable[[str, str], object],
         send_room_media: Callable[[str, str, str], object],
+        send_all_rooms_text: Callable[[str], object] | None = None,
         send_private_text: Callable[[str, str], object] | None = None,
         public_base: Callable[[], str],
         reward: Callable[[str, int], object] | None = None,
@@ -49,13 +51,16 @@ class CricketIntegration:
         self.game = CricketGame(Path(data_dir) / "cricket_state.json", persist=persist, reward=reward)
         self.is_master = is_master
         self.is_configured_master = is_configured_master or is_master
+        self.is_verified = is_verified or (lambda _username: True)
         self.send_room_text = send_room_text
         self.send_room_media = send_room_media
+        self.send_all_rooms_text = send_all_rooms_text
         self.send_private_text = send_private_text
         self.public_base = public_base
         self.log = log
         self._cursors: dict[str, int] = {}
         self._resume_pending = False
+        self._broadcast_cursor = self.game.latest_event_id("")
 
         # Start from the last persisted room events so a restart does not replay
         # an entire match. The live match itself is re-prompted on first contact.
@@ -123,9 +128,17 @@ class CricketIntegration:
                         except Exception as exc:
                             self.log("[CRICKET] image delivery failed", room, repr(exc))
                 text = str(event.get("text") or "").strip()
-                if text:
+                event_id = int(event.get("id", cursor) or cursor)
+                if event.get("broadcast"):
+                    if text and event_id > self._broadcast_cursor:
+                        if self.send_all_rooms_text:
+                            self.send_all_rooms_text(text)
+                        else:
+                            self.send_room_text(room, text)
+                        self._broadcast_cursor = event_id
+                elif text:
                     self.send_room_text(room, text)
-                cursor = max(cursor, int(event.get("id", cursor) or cursor))
+                cursor = max(cursor, event_id)
             self._cursors[room_key] = cursor
         except Exception as exc:
             self.log("[CRICKET] event delivery failed", room, repr(exc))
@@ -246,6 +259,19 @@ class CricketIntegration:
         if result:
             self.send_room_text(room, str(result))
 
+    def _verified_room_start(self, room: str, sender: str, player_count: int) -> bool:
+        if not self.is_verified(sender):
+            self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
+            return True
+        previous_match = self.game.current()
+        if isinstance(previous_match, dict) and previous_match.get("stage") == "setup":
+            result = self.game.select_player_count(room, player_count)
+        else:
+            result = self.game.start(room, player_count)
+        self._reply_error(room, result)
+        self._deliver_transition(previous_match, room)
+        return True
+
     def handle(self, room: str, sender: str, text: str, *, is_private: bool = False) -> bool:
         """Return True when the message belongs to cricket."""
         low = self._low(text)
@@ -255,10 +281,13 @@ class CricketIntegration:
         self._resume_after_restart()
 
         if control in self.PRIVATE_START_COMMANDS | self.PRIVATE_STOP_COMMANDS:
-            if not is_private:
+            if is_private:
+                return self._private_toggle(room, sender, control in self.PRIVATE_START_COMMANDS)
+            if control in self.PRIVATE_START_COMMANDS and control in {".cr 1", ".cr1"}:
+                return self._verified_room_start(room, sender, 1)
+            else:
                 self.send_room_text(room, "🔒 أرسل أمر تشغيل/إيقاف الكركيت في خاص البوت؛ الأمر مخصص للماستر المحدد في المتغيرات.")
                 return True
-            return self._private_toggle(room, sender, control in self.PRIVATE_START_COMMANDS)
 
         if is_private and (low in self.START_COMMANDS or low in self.STOP_COMMANDS):
             self._send_private(sender, room, "📌 استخدم «.cr 1» للتشغيل أو «.cr 0» للإيقاف من الخاص للماستر.")
@@ -280,10 +309,11 @@ class CricketIntegration:
             if is_private:
                 self._send_private(sender, room, "📌 افتح مباراة cricket 1..4 داخل الغرفة، وليس في الخاص.")
                 return True
-            previous_match = self.game.current()
-            self._reply_error(room, self.game.start(room, int(solo_start.group(1))))
-            self._deliver_transition(previous_match, room)
-            return True
+            return self._verified_room_start(room, sender, int(solo_start.group(1)))
+
+        room_count = re.fullmatch(r"\.cr\s*([1-4])", low)
+        if room_count and not is_private:
+            return self._verified_room_start(room, sender, int(room_count.group(1)))
 
         # Private messages can toggle the service only. Player actions remain room-scoped.
         if is_private:
@@ -292,6 +322,20 @@ class CricketIntegration:
         match = self.game.current()
         if not isinstance(match, dict):
             return False
+
+        stage = str(match.get("stage") or "")
+        is_action = (
+            low in {"join", "انضمام"}
+            or (stage == "setup" and low in {"1", "2", "3", "4"})
+            or (stage == "lobby" and low in {"bot", "بوت", "ضد البوت", "solo", "vs bot"})
+            or (stage == "teams" and low in {"1", "2"})
+            or (stage == "live" and re.fullmatch(r"[0-6]", low) is not None)
+        )
+        if not is_action:
+            return False
+        if not self.is_verified(sender):
+            self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
+            return True
 
         previous_match = match
         result: str | None = None

@@ -12,11 +12,13 @@ from cricket_result import render_result_image
 
 
 class CricketIntegrationRegressions(unittest.TestCase):
-    def make_integration(self, root, room_messages, private_messages, media_messages):
+    def make_integration(self, root, room_messages, private_messages, media_messages, is_verified=None, send_all_rooms_text=None):
         return CricketIntegration(
             root,
             is_master=lambda name: str(name).casefold() == "master",
             is_configured_master=lambda name: str(name).casefold() == "master",
+            is_verified=is_verified or (lambda _name: True),
+            send_all_rooms_text=send_all_rooms_text,
             send_room_text=lambda room, text: room_messages.append((room, text)),
             send_room_media=lambda room, url, kind: media_messages.append((room, url, kind)),
             send_private_text=lambda user, text: private_messages.append((user, text)),
@@ -37,10 +39,10 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertFalse(integration.game.enabled())
             self.assertIn("للماستر المحدد", private_messages[-1][1])
 
-            # The master-only switches must not work in a room.
+            # `.cr 1` in a room is a player action, not a service toggle.
             integration.handle("North", "Master", ".cr 1")
             self.assertFalse(integration.game.enabled())
-            self.assertIn("خاص البوت", room_messages[-1][1])
+            self.assertIn("فعّلها", room_messages[-1][1])
             integration.handle("North", "Master", ".cr 0")
             self.assertFalse(integration.game.enabled())
             self.assertIn("خاص البوت", room_messages[-1][1])
@@ -119,6 +121,101 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertTrue(any("الكرة 1/6" in text for _, text in messages))
             self.assertTrue(media, "the solo bot match should resolve and deliver a ball result")
 
+    def test_each_player_gets_six_balls_in_both_innings_and_lead_does_not_end_match_early(self):
+        with tempfile.TemporaryDirectory() as temp:
+            room_messages, private_messages, media_messages = [], [], []
+            integration = self.make_integration(
+                Path(temp), room_messages, private_messages, media_messages,
+                send_all_rooms_text=lambda text: [
+                    room_messages.append((room, text)) for room in ("North", "South", "Lobby")
+                ],
+            )
+            integration.handle("North", "Master", ".cr 1", is_private=True)
+            integration.handle("North", "N1", ".cr 2")
+            for player in ("N1", "N2"):
+                integration.handle("North", player, "Join")
+            for player in ("S1", "S2"):
+                integration.handle("South", player, "Join")
+            integration.handle("North", "N1", "1")
+
+            started = [(room, text) for room, text in room_messages if "بدأت لعبة الكركيت" in text]
+            self.assertEqual({room for room, _ in started}, {"North", "South", "Lobby"})
+            for _, text in started:
+                self.assertIn("North (2 لاعبين): @N1، @N2", text)
+                self.assertIn("South (2 لاعبين): @S1، @S2", text)
+
+            batting_counts, bowling_counts = {}, {}
+
+            def play_delivery(bat_value, bowl_value):
+                match = integration.game.current()
+                self.assertIsNotNone(match)
+                innings = int(match["innings"])
+                batting = match["batting_team"]
+                bowling = "defense" if batting == "attack" else "attack"
+                batter = integration.game._next_player(match, batting, batting=True)
+                bowler = integration.game._next_player(match, bowling, batting=False)
+                bat_room = integration.game._room_for_team(match, batting)
+                bowl_room = integration.game._room_for_team(match, bowling)
+                batting_counts[(innings, batter)] = batting_counts.get((innings, batter), 0) + 1
+                bowling_counts[(innings, bowler)] = bowling_counts.get((innings, bowler), 0) + 1
+                integration.handle(bat_room["name"], batter, str(bat_value))
+                integration.handle(bowl_room["name"], bowler, str(bowl_value))
+
+            for ball_index in range(6):
+                room_messages.clear()
+                play_delivery(1, 2)
+                if ball_index == 0:
+                    self.assertTrue(room_messages)
+                    self.assertTrue(all(room in {"North", "South"} for room, _ in room_messages))
+            match = integration.game.current()
+            self.assertEqual((match["innings"], match["balls"]), (1, 6))
+
+            for _ in range(6):
+                play_delivery(1, 2)
+            match = integration.game.current()
+            self.assertEqual((match["innings"], match["balls"]), (2, 0))
+
+            for _ in range(3):
+                play_delivery(6, 1)
+            match = integration.game.current()
+            self.assertEqual(match["innings"], 2)
+            self.assertGreater(match["scores"]["defense"], match["scores"]["attack"])
+            self.assertEqual(match["balls"], 3, "a target lead must not end the defense innings early")
+
+            for _ in range(9):
+                play_delivery(6, 1)
+            self.assertIsNone(integration.game.current())
+            for player in ("N1", "N2"):
+                self.assertEqual(batting_counts[(1, player)], 6)
+                self.assertEqual(bowling_counts[(2, player)], 6)
+            for player in ("S1", "S2"):
+                self.assertEqual(bowling_counts[(1, player)], 6)
+                self.assertEqual(batting_counts[(2, player)], 6)
+            self.assertEqual(integration.game.get_points("S1") + integration.game.get_points("S2"), 200_000)
+
+    def test_only_verified_members_can_start_or_join_cricket(self):
+        with tempfile.TemporaryDirectory() as temp:
+            room_messages, private_messages, media_messages = [], [], []
+            integration = self.make_integration(
+                Path(temp), room_messages, private_messages, media_messages,
+                is_verified=lambda name: str(name).casefold() in {"master", "verified"},
+            )
+            integration.handle("Room", "Master", "تشغيل لعبه الكركيت", is_private=True)
+            self.assertEqual(integration.game.current()["stage"], "setup")
+
+            integration.handle("Room", "Guest", ".cr 2")
+            self.assertEqual(integration.game.current()["stage"], "setup")
+            self.assertIn("موثقين", room_messages[-1][1])
+
+            integration.handle("Room", "Verified", ".cr 2")
+            self.assertEqual(integration.game.current()["stage"], "lobby")
+            integration.handle("Room", "Guest", "Join")
+            self.assertEqual(integration.game.current()["rooms"][0]["players"], [])
+            self.assertIn("موثقين", room_messages[-1][1])
+
+            integration.handle("Room", "Verified", "Join")
+            self.assertEqual(integration.game.current()["rooms"][0]["players"], ["Verified"])
+
 
 class BotGameAndMusicRegressions(unittest.TestCase):
     def test_box_number_reply_uses_normalized_room_key(self):
@@ -178,10 +275,22 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(len(sections[3]), 6)
         self.assertIn(".cr 1", sections[3][5])
         self.assertIn(".cr 0", sections[3][5])
-        self.assertIn("كل الأعضاء", sections[3][5])
+        self.assertIn("موثقين", sections[3][5])
+        self.assertIn(".cr 4", sections[3][5])
         self.assertIn("start cricket game", sections[3][5])
         self.assertNotIn("bl@", sections[1][0])
         self.assertNotIn("حظر بكل الغرف", sections[1][0])
+
+    def test_cricket_requires_saved_verification_even_when_global_gate_is_disabled(self):
+        with patch.object(bot_module, "VERIFICATION_ENABLED", False), patch.object(
+            bot_module, "_verified_data", lambda: {"verified": True}
+        ), patch.object(bot_module, "_vip_data", lambda: {"vip": True}), patch.object(
+            bot_module, "_is_master_name", lambda name: str(name).casefold() == "master"
+        ):
+            self.assertTrue(bot_module._is_cricket_verified_member("Verified"))
+            self.assertTrue(bot_module._is_cricket_verified_member("VIP"))
+            self.assertTrue(bot_module._is_cricket_verified_member("Master"))
+            self.assertFalse(bot_module._is_cricket_verified_member("Guest"))
 
     def test_winner_awards_are_split_exactly_and_passed_to_result_card(self):
         with tempfile.TemporaryDirectory() as temp:
