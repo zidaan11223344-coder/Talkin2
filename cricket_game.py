@@ -334,11 +334,17 @@ class CricketGame:
                     else:
                         # The first team is only a lobby until the opposing room
                         # joins and a captain chooses attack or defense.
-                        self._emit(
+                        team_players = [
+                            str(player).strip().lstrip("@")
+                            for player in participant.get("players", [])
+                            if str(player).strip()
+                        ]
+                        team_names = "، ".join(f"@{player}" for player in team_players)
+                        self._emit_broadcast(
                             data,
-                            [participant],
-                            f"✅ اكتمل الفريق الأول: {target} لاعبين.\n"
-                            "⏳ بانتظار انضمام لاعبي الغرفة الثانية عبر Join؛ بعدها يُختار الهجوم أو الدفاع.",
+                            f"🏏 اكتمل الفريق الأول — مباراة الكركيت قيد التجهيز\n"
+                            f"👥 {participant['name']} ({len(team_players)} لاعبين): {team_names}\n"
+                            "🔗 بانتظار الفريق الثاني: يرسل لاعبوه Join من الغرفة الأخرى؛ ثم يختار الفريق الأول 1 للهجوم أو 2 للدفاع.",
                         )
             elif len(participants) == self.ROOM_TEAMS:
                 full = all(len(item.get("players", [])) >= target for item in participants)
@@ -516,7 +522,7 @@ class CricketGame:
             + self._team_summary(match, "defense") + "\n"
             + f"🎯 يبدأ الهجوم: {self._team_label(match['batting_team'])}. لكل لاعب 6 كرات في كل دور."
         )
-        self._emit_broadcast(data, start_text)
+        self._emit(data, participants, start_text)
         self._emit_room_messages(data, self._turn_messages(match))
 
     def _team_player_count(self, match: dict[str, Any], team: str) -> int:
