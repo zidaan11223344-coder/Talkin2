@@ -150,7 +150,45 @@ GAME_IMAGE_FILES = {
     "snake_ladders": "game_snake_ladders.jpg",
     "ludo": "game_ludo.jpg",
 }
-GAME_COMMANDS = {}
+GAME_COMMANDS = {
+    "rock": "حجر", "stone": "حجر", "paper": "ورق", "scissors": "مقص",
+    "investment": "استثمار", "invest": "استثمار", "luck": "حظ", "chance": "حظ",
+    "coin": "عملة", "coinflip": "عملة", "flip": "عملة", "wheel": "عجلة", "roulette": "عجلة",
+    "box": "صندوق", "chest": "صندوق", "cup": "كوب", "goblet": "كوب",
+    "monster": "وحش", "volcano": "بركان", "bird": "طائر", "star": "نجم", "table": "طاولة", "tavla": "طاولة", "uno": "اونو",
+    "bet": "رهان", "wager": "رهان", "gamble": "رهان", "duel": "مضاربة", "my luck": "حظي", "myluck": "حظي",
+    "marriage": "زواج", "wedding": "زواج", "challenge": "تحدي", "riddle": "لغز", "puzzle": "لغز", "mood": "مزاج",
+    "entertainment": "تسليه", "horse": "حصانه", "stock": "بورصة", "market": "بورصة",
+    "bank": "بنك", "million": "بنك مليون", "million bank": "بنك مليون", "bank million": "بنك مليون",
+    "billion": "مليار", "farm": "زرع", "crop": "زرع", "plant": "زرع", "face": "فيس", "fruit match": "فيس",
+    "snake": "ثعبان", "snakes and ladders": "ثعبان", "ludo": "لودو",
+    "fishing": "سنارة", "fishing rod": "سنارة", "fish": "سنارة", "snare": "سنارة", "sannara": "سنارة",
+    "lightning": "برق", "ruby": "ياقوت", "crash": "صدام", "detector": "كاشف", "guess who": "كاشف",
+    "steal": "اسرق", "rob": "اسرق", "lookalike": "شبيه", "twin": "شبيه",
+}
+
+def _normalize_game_command_text(text):
+    """Translate an English game name (and common coin choices) to its Arabic command."""
+    raw = str(text or "").strip()
+    low = raw.casefold()
+    for alias in sorted(GAME_COMMANDS, key=len, reverse=True):
+        if low == alias:
+            suffix = ""
+        elif low.startswith(alias) and len(raw) > len(alias) and raw[len(alias)] in "@ \t":
+            suffix = raw[len(alias):]
+        else:
+            continue
+        canonical = GAME_COMMANDS[alias]
+        if canonical == "عملة" and suffix:
+            choice = re.match(r"^([@\s]+)(.+)$", suffix)
+            if choice:
+                token = choice.group(2).strip().casefold()
+                translated = {"heads": "وجه", "head": "وجه", "tails": "كتابة", "tail": "كتابة", "write": "كتابة", "writing": "كتابة"}.get(token)
+                if translated:
+                    suffix = choice.group(1) + translated
+        return canonical + suffix
+    return raw
+
 # Railway exposes this service through RAILWAY_PUBLIC_DOMAIN after a public domain is generated.
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL", "").strip() or os.getenv("RAVEN_PUBLIC_URL", "").strip()).rstrip("/")
 GIFT_PUBLIC_BASE_URL = os.getenv("GIFT_PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -2148,22 +2186,22 @@ def _verification_notice():
 
 def _looks_like_bot_command(text):
     """Recognize commands before the verification gate without blocking normal chat."""
-    low = str(text or "").strip().casefold()
+    low = _normalize_game_command_text(text).strip().casefold()
     if not low:
         return False
     prefixes = (
         "sa@", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
-        ".u", "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
+        ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "دخول@", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
     )
-    prefixes = prefixes + ("bl@",)
+    prefixes = prefixes + ("bl@", "رهان ", "مضاربه ", "استثمار ", "حظي ")
     normalized_low = low.replace("ة", "ه")
     normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
-    normalized_games = {str(x).casefold().replace("ة", "ه") for x in GAME_COMMANDS}
+    normalized_games = {str(x).casefold().replace("ة", "ه") for x in (*GAME_COMMANDS, *GAME_COMMANDS.values())}
     return (
         low.startswith(prefixes)
         or normalized_low.startswith(normalized_prefixes)
@@ -2220,7 +2258,7 @@ def _looks_like_admin_command(text):
     low = str(text or "").strip().casefold()
     prefixes = (
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
-        "b@", "bl@", "k@", "u@", "ub@", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
+        "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
@@ -2850,6 +2888,35 @@ def _room_manager(bot, room, sender):
         role = next((str(v or "").casefold() for k, v in users.items() if _norm_user(k) == _norm_user(sender)), "")
     return role in {"owner", "creator", "room_owner", "room_creator", "host", "صانع", "صانع_الغرفة", "مالك"}
 
+def _room_role(bot, room, sender, event_role=None):
+    """Return a cached/event room role, without guessing when rank data is absent."""
+    if event_role is not None and str(event_role).strip():
+        return str(event_role).strip().casefold(), True
+    rosters = getattr(bot, "room_users", {}) or {}
+    room_key = _norm_room(room)
+    for roster_room, users in rosters.items():
+        if _norm_room(roster_room) != room_key or not isinstance(users, dict):
+            continue
+        for username, role in users.items():
+            if _norm_user(username) == _norm_user(sender):
+                return str(role or "none").strip().casefold(), True
+    return "", False
+
+def _auto_ban_candidate(bot, room, sender, event_role=None):
+    """Auto-ban only known unranked/member accounts; fail closed for any other role."""
+    if not sender or _is_master_name(sender) or _is_room_creator(room, sender):
+        return False
+    role, known = _room_role(bot, room, sender, event_role)
+    if not known:
+        return False
+    role_key = re.sub(r"[\s_-]+", "", role.casefold())
+    allowed = {
+        "", "none", "null", "0", "member", "members", "user", "users", "guest", "visitor",
+        "regular", "normal", "unranked", "norank", "rankless",
+        "عضو", "اعضاء", "أعضاء", "مستخدم", "زائر", "ضيف", "بدونرتبة", "بدونرتبه", "بلارتبة", "بلارتبه",
+    }
+    return role_key in allowed
+
 def _norm_filter_text(text):
     value = str(text or "").casefold()
     value = re.sub(r"[\u064b-\u065f\u0670\u0640]", "", value)
@@ -2907,23 +2974,23 @@ def _default_help_sections():
     return {
         1: [
             '📋 أوامر الإدارة — 1 | الحظر والطرد\n━━━━━━━━━━━━\nk@اسم — طرد عضو\nkick اسم — طرد عضو\nb@اسم — حظر عضو\nban اسم — حظر عضو\nub@اسم — فك الحظر\nu@اسم — فك الحظر\nunban اسم — فك الحظر\n.u — تراجع عن آخر إجراء للبوت',
-            '📋 أوامر الإدارة — 2 | الرتب\n━━━━━━━━━━━━\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك\n+صانع@اسم — إضافة صانع للغرفة\n-صانع@اسم — سحب صانع من الغرفة\nصانعي — عرض صانعي الغرفة\nl@mas — عرض ماسترات الإدارة\nmas@اسم — إضافة ماستر\nإضافة ماستر@اسم — إضافة ماستر\numas@اسم — سحب ماستر\nسحب ماستر@اسم — سحب ماستر',
+            '📋 أوامر الإدارة — 2 | الرتب\n━━━━━━━━━━━━\nm@اسم — منح عضوية\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك\n+صانع@اسم — إضافة صانع للغرفة\n-صانع@اسم — سحب صانع للغرفة\nصانعي — عرض صانعي الغرفة\nl@mas — عرض الماسترات\nmas@اسم — إضافة ماستر\numas@اسم — سحب ماستر',
             '📋 أوامر الإدارة — 3 | التوثيق وVIP\n━━━━━━━━━━━━\nvi@اسم — توثيق مستخدم\nuns@اسم — سحب التوثيق\nسحب التوثيق@اسم — سحب التوثيق\nإزالة توثيق@اسم — سحب التوثيق\nتوثيق الكل — توثيق كل الأعضاء\nvi — عدد الموثقين\nvip@اسم — منح VIP\nunvip@اسم — سحب VIP\nvip — عدد أعضاء VIP\nmvip@اسم — إضافة ماستر توثيق\numvip@اسم — سحب ماستر توثيق\nl@mvip — عرض ماسترات التوثيق',
-            '📋 أوامر الإدارة — 4 | التوثيق والحماية\n━━━━━━━━━━━━\nتشغيل التوثيق — تشغيل نظام التوثيق\nإيقاف التوثيق — إيقاف نظام التوثيق\nحماية — إعداد حماية الغرفة\nتشغيل الحماية — تشغيل حماية الغرفة\nإيقاف الحماية — إيقاف حماية الغرفة\nحالة الحماية — عرض حالة الحماية\nحمايه البوت — حماية داخلية للبوت\nالمحظورين — عرض المحظورين داخل البوت',
+            '📋 أوامر الإدارة — 4 | التوثيق والحماية\n━━━━━━━━━━━━\nتشغيل التوثيق — تشغيل نظام التوثيق\nإيقاف التوثيق — إيقاف نظام التوثيق\nحماية@اسم_الغرفة — قائمة الحماية الخاصة بالماستر\nتشغيل/إيقاف الحماية — إعداد عام للغرفة\nحالة الحماية — عرض الحالة\nحمايه البوت — حماية داخلية للبوت\nالمحظورين — المحظورون داخل البوت',
             '📋 أوامر الإدارة — 5 | الفلتر والنشر\n━━━━━━━━━━━━\nmf@on — تشغيل فلتر الكلمات\nmf@off — إيقاف فلتر الكلمات\n+mf@كلمة — إضافة كلمة للفلتر\n-mf@كلمة — حذف كلمة من الفلتر\nl@mf — عرض كلمات الفلتر\nclear@mf — مسح كلمات الفلتر\nl@mfb — عرض المحظورين بسبب الفلتر\nl@mbp — عرض الممنوعين من النشر\nmbp@اسم — فك منع النشر\namf@اسم — استثناء مستخدم من حظر الفلتر',
-            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال والخدمات\nرام / cpu — حالة موارد البوت\nتنضيف / تنظيف — تنظيف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة احتياطية\nإعادة تشغيل البوت — إعادة التشغيل\nتشغيل الدعوات / إيقاف الدعوات — التحكم بالدعوات\nتشغيل الألعاب / إيقاف الألعاب — التحكم بالألعاب\nغرفي / myrooms — عرض الغرف المتصلة\nدخول الكل / دخولكل — دخول كل الغرف المحفوظة\n.دخول غرفي — دخول كل الغرف المحفوظة\nاضف لملف الغرف — إضافة غرف للملف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم — البحث عن وجود مستخدم في الغرف\nis@اسم — فحص وجود مستخدم\nl@a — المشرفون\nl@m — الأعضاء\nl@o — الأونرات\nl@b — المحظورون', 
+            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nغرفي / myrooms — الغرف المتصلة\nدخول الكل / دخولكل / .دخول غرفي — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم / is@اسم — البحث عن مستخدم\nl@a / l@m / l@o / l@b — قوائم الرتب',
         ],
         2: [
             '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال: .sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
             '❤️ التفاعلات والصور والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي أو صورتك — بحث آمن عن صورة مناسبة لاسمك\n.صوره اسم_المستخدم — بحث آمن عن صورة المستخدم\nشبيه@اسم — بحث آمن عن الشبيه\nشبيهك@اسم — بحث آمن عن شبيهك\n\n📌 النتائج العامة من الإنترنت، مع تفعيل SafeSearch ومنع البحث عن الصور المخلة.',
         ],
         3: [
-            '🎮 A3 — الألعاب — 1: ضد البوت (نصية)\n━━━━━━━━━━━━\n1. حجر / ورق / مقص\n2. استثمار\n3. حظ\n4. عملة أو عمله@وجه/كتابة\n5. عجلة\n6. صندوق أو صندوق@1..3\n7. كوب أو كأس@1..3\n8. وحش\n9. بركان\n🔟 طائر\n11. نجم\n12. طاولة\n13. اونو\n📌 هذه الألعاب ضد البوت\n📌 نتائجها نصية فقط بدون صور\n📌 للقائمة التالية اكتب ns',
-            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n\u206614.\u2069 رهان@المبلغ\n\u206615.\u2069 مضاربة@المبلغ\n\u206616.\u2069 حظي@المبلغ\n\u206617.\u2069 استثمار@المبلغ\n\u206618.\u2069 حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
-            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n\u206619.\u2069 بنك أو بنك مليون\n\u206620.\u2069 مليار\n\u206621.\u2069 زرع@رمز\n\u206622.\u2069 فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n\u206623.\u2069 ثعبان / snake — السلم والثعبان\n\u206624.\u2069 لودو / ludo — لودو\n\u206625.\u2069 سنارة أو سناره\n\u206626.\u2069 برق\n\u206627.\u2069 ياقوت\n\u206628.\u2069 صدام\n\u206629.\u2069 كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
-            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n\u206628.\u2069 اسرق أو اسرق@اسم\n\u206629.\u2069 شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 للقائمة التالية اكتب ns — لعبة الكركيت.',
-            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في خاص البوت:\nتشغيل لعبه الكركيت / start cricket game أو .cr 1 — تفعيل اللعبة وفتح الإعداد\n.cr 0 / stop cricket game — إيقافها وإلغاء المباراة\n\nللأعضاء الموثقين داخل الغرفة: أرسل .cr 1 إلى .cr 4 لاختيار عدد اللاعبين وبدء الإعداد، ثم Join.\nعند اكتمال الفريق الأول يبث البوت اسمه وعدد وأسماء لاعبيه لكل الغرف، وينضم الفريق الثاني بـ Join. بعد اكتماله تختار غرفة البداية 1 للهجوم أو 2 للدفاع وتبدأ المباراة.\nإعلان الفريقين الكامل والأدوار والنتائج تظهر في غرفتي اللعب فقط. لكل لاعب 6 كرات للهجوم و6 للدفاع؛ لا ينتهي اللعب بسبب تقدم مبكر. أرسل دورك رقمًا من 0 إلى 6.\nأرسل bot للعب ضد البوت؛ أو cricket 1..4 لمباراة فردية.\nالجائزة 200,000 نقطة تُقسّم على الفائزين؛ صور الكرات والبطّة والهتريك تلقائية.',
+            '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📌 اكتب ns للقائمة التالية',
+            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
+            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 الأسماء العربية والإنجليزية مقبولة.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
+            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — stock/market\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n📌 اكتب ns لقائمة الكركيت.',
+            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game أو .cr 1؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين: .cr 1 إلى .cr 4 لاختيار 1–4 لاعبين، ثم Join. اكتمال الفريق الأول يعلن عالمياً الغرفة والأسماء؛ ينضم الثاني بـ Join.\nبعد اكتمال الفريقين تختار غرفة البداية 1 للهجوم أو 2 للدفاع. لكل لاعب 6 كرات؛ أرسل في دورك 0–6. bot أو cricket 1..4 لمباراة فردية.\nاللعب والنتائج في غرفتي المباراة فقط؛ إعلان الفريق الأول عام. جائزة 200,000 نقطة تُقسم بين اللاعبين الفائزين، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -8998,7 +9065,7 @@ class TalkinBot:
         detail = " | ".join(errors[-10:])
         raise RuntimeError("تعذر تنزيل ملف صوت من YouTube أو SoundCloud." + (f" تفاصيل: {detail[:1200]}" if detail else ""))
 
-    def handle_music_command(self,room,text,requester,private_to="",broadcast_all=True,with_reactions=True,room_output=True,live_stream=False):
+    def handle_music_command(self,room,text,requester,private_to="",broadcast_all=False,with_reactions=True,room_output=True,live_stream=False):
         raw=text.strip()
         if not raw.lower().startswith(".sa "): return False
         query=raw[4:].strip()
@@ -10370,7 +10437,7 @@ class TalkinBot:
         """Handle شبيه@username / شبيه username in a background worker."""
         if not room:
             return True
-        text = str(body or "").strip()
+        text = _normalize_game_command_text(body)
         m = re.fullmatch(r"(?:شبيه|شبيهك)@(.+)", text, re.I)
         if not m:
             m = re.fullmatch(r"(?:شبيه|شبيهك)\s+(.+)", text, re.I)
@@ -11612,7 +11679,7 @@ class TalkinBot:
         return True
 
     def handle_game_command(self, room, text, sender_name):
-        raw=str(text or "").strip()
+        raw=_normalize_game_command_text(text)
         if not raw or not sender_name: return False
         # Active board-game state always gets first priority.  This prevents
         # numeric Ludo choices (1-4), join and rool from being swallowed by
@@ -13153,15 +13220,22 @@ class TalkinBot:
             ).start()
             return True
 
-        # New master protection menu.
-        if low in ("حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه"):
-            if not room or not _room_manager(self, room, sender):
-                self.send_private_text(sender, "🚫 أمر الحماية مخصص لماستر الغرفة أو صانعها.")
+        # The protection menu and all of its numbered settings are private and
+        # restricted to the configured primary master.
+        protection_match = re.fullmatch(r"(?:حماية|حمايه|حماية الغرفة|حمايه الغرفه)(?:@([^@]+)|\s+(.+))?", text, re.I)
+        if protection_match:
+            if not is_private or not _is_primary_master(sender):
+                if _is_primary_master(sender):
+                    self.send_private_text(sender, "🔒 افتح قائمة الحماية من خاص البوت فقط.")
+                else:
+                    self.send_private_text(sender, "🚫 قائمة الحماية مخصصة للماستر الأساسي في الخاص.")
                 return True
-            target_room = str(room or self.room or "").strip()
+            target_room = str(protection_match.group(1) or protection_match.group(2) or
+                              getattr(self, "last_joined_room", "") or room or self.room or "").strip()
             if not target_room:
-                self.send_private_text(sender, "⚠️ أرسل أمر حماية داخل الغرفة التي تريد حمايتها.")
+                self.send_private_text(sender, "⚠️ أرسل حماية@اسم_الغرفة من خاص البوت لفتح إعداداتها.")
                 return True
+            self._pending_protection_number = getattr(self, "_pending_protection_number", {})
             self._pending_protection_number[_norm_user(sender)] = {"room":target_room,"created":time.time()}
             self.send_private_text(sender,
                 "🛡️ قائمة حماية الغرفة\n"
@@ -13187,6 +13261,8 @@ class TalkinBot:
             pending_protection = self._pending_protection_number = {}
         st=pending_protection.get(protection_key,{})
         if st.get("awaiting_number") and re.fullmatch(r"\d+",low):
+            if not is_private or not _is_primary_master(sender):
+                return True
             try:
                 limit=int(low)
             except Exception:
@@ -13203,6 +13279,10 @@ class TalkinBot:
 
         if protection_key in pending_protection and low.isdigit():
             st=pending_protection.get(protection_key,{})
+            if not is_private or not _is_primary_master(sender):
+                if _is_primary_master(sender):
+                    self.send_private_text(sender, "🔒 أرسل رقم الخيار من خاص البوت فقط.")
+                return True
             if time.time()-float(st.get("created",0))>180:
                 self._pending_protection_number.pop(protection_key,None)
             else:
@@ -14124,6 +14204,13 @@ class TalkinBot:
                 self.send_private_text(sender,"❌ لا توجد غرفة لتنفيذ فك الحظر فيها."); return True
             self.request_admin_action(room,target,"member",sender,announce_room=True)
             return True
+        m=re.match(r"^(m@|member\s+)(@?[^\s]+)$", text, re.I)
+        if m:
+            target=m.group(2).lstrip("@").strip()
+            if not room:
+                self.send_private_text(sender,"❌ لا توجد غرفة لمنح العضوية فيها."); return True
+            self.request_admin_action(room,target,"member",sender,announce_room=True)
+            return True
         m=re.match(r"^(a@|admin\s+)(@?[^\s]+)$", text, re.I)
         if m:
             target=m.group(2).lstrip("@").strip()
@@ -14835,7 +14922,8 @@ class TalkinBot:
         # immediately; do not let the transport replay/duplicate cache suppress
         # rapid NS presses.
         is_ns_navigation = event_type == "text" and _is_ns_command(body)
-        role = str(event.get(8, "") or "").strip().lower()
+        role_field_present = 8 in event or "role" in event
+        role = str(event.get(8, event.get("role", "")) or "").strip().lower()
         count = str(event.get(23, "") or "").strip()
         reconnected = str(event.get(24, "") or "").strip()
         # Do not log room message contents, usernames, room names, or media events.
@@ -14862,19 +14950,21 @@ class TalkinBot:
             norm_r = _norm_room(room)
 
             # --- حماية الفلود: كشف دخول عدد نكات غير محدود/جماعي بنفس الوقت وحظرهم IP ---
-            if event_type == "user_joined" and pcfg.get("flood") and norm_u != _norm_user(BOT_ID) and not _room_manager(self, room, username):
+            if (event_type == "user_joined" and pcfg.get("flood") and norm_u != _norm_user(BOT_ID)
+                    and _auto_ban_candidate(self, room, username, role if role_field_present else None)):
                 if not hasattr(self, "_join_flood_history"):
                     self._join_flood_history = defaultdict(list)
                 history = self._join_flood_history[norm_r]
                 # إبقاء سجل آخر 5 ثوانٍ
                 history[:] = [h for h in history if now - h[0] <= 5.0]
-                history.append((now, username))
+                history.append((now, username, role if role_field_present else None))
                 # إذا دخل 3 أو أكثر من النكات المختلفة خلال 5 ثوانٍ (هجوم فلود نكات)
                 if len(history) >= 3:
                     self.log(f"[FLOOD] كشف فلود دخول جماعي في {room}: {len(history)} نكات خلال 5 ثوانٍ")
                     banned_names = []
-                    for _, u_flood in list(history):
-                        if _norm_user(u_flood) != _norm_user(BOT_ID) and not _room_manager(self, room, u_flood):
+                    for _, u_flood, flood_role in list(history):
+                        if (_norm_user(u_flood) != _norm_user(BOT_ID)
+                                and _auto_ban_candidate(self, room, u_flood, flood_role)):
                             try:
                                 self.send_admin(room, u_flood, "ban_ip")
                                 _record_filter_ban(u_flood, room, "حماية الفلود", "دخول جماعي متزامن (حظر IP)")
@@ -14886,7 +14976,8 @@ class TalkinBot:
                         self.send_room_text(room, f"🚫 [حماية الفلود] تم حظر IP للنكات التالية لدخولها المتزامن: {' '.join(banned_names[:5])}")
 
             # --- حماية الدخول والخروج: كشف تكرار الدخول والخروج لنفس النك وحظره ---
-            if pcfg.get("joinleave") and norm_u != _norm_user(BOT_ID) and not _room_manager(self, room, username):
+            if (pcfg.get("joinleave") and norm_u != _norm_user(BOT_ID)
+                    and _auto_ban_candidate(self, room, username, role if role_field_present else None)):
                 st = self._joinleave_state[norm_r][norm_u]
                 evs = st.setdefault("events", [])
                 evs[:] = [x for x in evs if now - float(x[0]) <= 300]
@@ -14910,7 +15001,7 @@ class TalkinBot:
             # a fallback when the join event omits it.
             if (_room_protection_cfg(room).get("no_photo")
                     and _norm_user(username) != _norm_user(BOT_ID)
-                    and not _room_manager(self, room, username)):
+                    and _auto_ban_candidate(self, room, username, role if role_field_present else None)):
                 joined_photo = str(event.get(3, "") or event.get("photo", "") or "").strip()
                 joined_photo = joined_photo or str(getattr(self, "user_photos", {}).get(_norm_user(username), "") or "").strip()
                 if not joined_photo:
@@ -15217,7 +15308,7 @@ class TalkinBot:
         # room ban operation as b@, with Arabic normalization and no public reply.
         room_cfg = _room_moderation_config(room)
         protection_cfg = _room_protection_cfg(room)
-        if protection_cfg["flood"] and not _room_manager(self, room, frm):
+        if protection_cfg["flood"] and _auto_ban_candidate(self, room, frm, role if role_field_present else None):
             now = time.time()
             state = self._room_repeat_state[room]
             last_sender = str(state.get("sender", ""))
@@ -15261,14 +15352,15 @@ class TalkinBot:
                   if _norm_filter_text(w) and _norm_filter_text(w) in normalized_body), None)
             if filter_enabled else None
         )
-        if hit and not _room_manager(self, room, frm):
+        if hit and _auto_ban_candidate(self, room, frm, role if role_field_present else None):
             try:
                 exempt = _norm_user(frm) in getattr(self,"filter_exceptions",set())
                 if exempt:
                     # The exception account may report a target after @; ban only that named target.
                     mentions=re.findall(r"@([^\s@]+)", body)
                     target=mentions[-1].strip() if mentions else ""
-                    if target and _norm_user(target)!=_norm_user(frm):
+                    if (target and _norm_user(target)!=_norm_user(frm)
+                            and _auto_ban_candidate(self, room, target)):
                         self.send_admin(room,target,"ban")
                         _record_filter_ban(target,room,f"إبلاغ من @{frm}: كلمة الفلتر",hit)
                         self.send_room_text(room,f"🚫 تم حظر @{target}\nالسبب: بلاغ فلتر من @{frm}")

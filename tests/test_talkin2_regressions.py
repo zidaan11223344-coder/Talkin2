@@ -243,6 +243,129 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot._handle_pending_bot_choice(" main   room ", "2", "TESTER"))
         self.assertTrue(any("✅ ربحت" in text for _, text in output))
 
+    def test_english_game_aliases_reach_canonical_handlers(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.stock_pending = {}
+        bot.pending_bot_choices = {}
+        bot._snake_command = lambda *_args: False
+        bot._ludo_command = lambda *_args: False
+        bot._handle_pending_bot_choice = lambda *_args: False
+        bot.send_room_text = lambda *_args: None
+        routed = []
+        bot._queue_fixed_game = lambda room, sender, name, prize: routed.append((name, prize)) or True
+        bot._coin_bot_game = lambda room, sender, choice=None: routed.append(("coin", choice)) or True
+        bot._queue_wager = lambda room, sender, game, amount: routed.append((game, amount)) or True
+        with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_games_enabled_for_room", return_value=True
+        ):
+            self.assertTrue(bot.handle_game_command("Hall", "fishing", "Player"))
+            self.assertTrue(bot.handle_game_command("Hall", "coin@heads", "Player"))
+            self.assertTrue(bot.handle_game_command("Hall", "bet 25", "Player"))
+        self.assertEqual(routed, [("سنارة", 500), ("coin", "وجه"), ("رهان", 25)])
+        for command in ("fishing", "snare", "lookalike@Player", "bet 25", "investment@100"):
+            self.assertTrue(bot_module._looks_like_bot_command(command), command)
+        self.assertEqual(bot_module._normalize_game_command_text("coin@tails"), "عملة@كتابة")
+
+    def test_auto_ban_candidate_only_allows_known_members_and_unranked_users(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {"North": {
+            "Owner": "owner", "Admin": "admin", "Moderator": "moderator",
+            "Member": "member", "NoRank": "none", "OtherRank": "vip",
+        }}
+        with patch.object(bot_module, "_is_master_name", side_effect=lambda name: str(name).casefold() == "master"), patch.object(
+            bot_module, "_is_room_creator", return_value=False
+        ):
+            for ranked in ("Owner", "Admin", "Moderator", "OtherRank", "Master"):
+                self.assertFalse(bot_module._auto_ban_candidate(bot, "North", ranked), ranked)
+            self.assertTrue(bot_module._auto_ban_candidate(bot, "North", "Member"))
+            self.assertTrue(bot_module._auto_ban_candidate(bot, "North", "NoRank"))
+            # A blank event field must not erase a known moderator/owner rank.
+            self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "Admin", ""))
+            self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "UnknownUser", ""))
+            self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "NewAdmin", "admin"))
+
+    def test_private_protection_menu_has_nine_options_and_applies_only_from_master_dm(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.last_joined_room = ""
+        bot._pending_protection_number = {}
+        bot._room_list_commands = lambda *_args: False
+        private, public, saved = [], [], []
+        bot.send_private_text = lambda user, text: private.append((user, text))
+        bot.send_room_text = lambda room, text: public.append((room, text))
+        is_master = lambda name: str(name).casefold() == "master"
+        with patch.object(bot_module, "_is_primary_master", side_effect=is_master):
+            self.assertTrue(bot._handle_management_command_impl("", "حماية@North", "Master", is_private=True))
+            menu = private[-1][1]
+            options = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+            self.assertEqual(sorted(menu.index(item) for item in options), [menu.index(item) for item in options])
+            self.assertIn("حظر IP", menu)
+            self.assertIn("حظر الحسابات بلا صورة", menu)
+            self.assertIn("North", bot._pending_protection_number[bot_module._norm_user("Master")]["room"])
+
+            with patch.object(bot_module, "_save_room_protection", side_effect=lambda room, **changes: saved.append((room, changes))), patch.object(
+                bot_module, "_save_room_moderation", lambda *_args, **_kwargs: None
+            ):
+                # Numbered options from the room are rejected even while a private menu is pending.
+                self.assertTrue(bot._handle_management_command_impl("North", "3", "Master", is_private=False))
+                self.assertEqual(saved, [])
+                self.assertIn("خاص", private[-1][1])
+                self.assertTrue(bot._handle_management_command_impl("", "3", "Master", is_private=True))
+                self.assertEqual(saved, [("North", {"flood": True})])
+
+            self.assertTrue(bot._handle_management_command_impl("North", "حماية@North", "Master", is_private=False))
+            self.assertIn("خاص", private[-1][1])
+            self.assertEqual(public, [], "the protection menu must never be published in a room")
+            self.assertTrue(bot._handle_management_command_impl("", "حماية@North", "Guest", is_private=True))
+            self.assertIn("مخصصة", private[-1][1])
+
+    def test_a1_ns_advances_one_management_section_and_m_command_is_supported(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.help_pages = {}
+        bot.help_page_part = {}
+        bot.help_game_part = {}
+        bot._room_list_commands = lambda *_args: False
+        shown = []
+        bot._send_help = lambda **kwargs: shown.append(kwargs)
+        actions = []
+        bot.request_admin_action = lambda *args, **kwargs: actions.append((args, kwargs))
+        with patch.object(bot_module, "_is_primary_master", side_effect=lambda name: str(name).casefold() == "master"), patch.object(
+            bot_module, "_is_master_name", side_effect=lambda name: str(name).casefold() == "master"
+        ):
+            self.assertTrue(bot._handle_management_command_impl("", "a1", "Master", is_private=True))
+            self.assertTrue(bot._handle_management_command_impl("", "ns", "Master", is_private=True))
+            self.assertTrue(bot._handle_management_command_impl("North", "m@Guest", "Master", is_private=True))
+        self.assertEqual([(x["page"], x["game_part"]) for x in shown], [(1, 1), (1, 2)])
+        self.assertTrue(bot_module._looks_like_admin_command("m@Guest"))
+        self.assertEqual(actions[0][0][1:3], ("Guest", "member"))
+        sections = bot_module._default_help_sections()
+        rendered = []
+        bot._send_help_chunks = lambda _packet, text, **_kwargs: rendered.append(text)
+        bot._send_help_section(private_to="Master", page=1, part=1)
+        self.assertIn("m@اسم", sections[1][1])
+        self.assertNotIn("bl@", sections[1][0])
+        self.assertIn("اكتب ns", rendered[0])
+        self.assertTrue(bot_module._looks_like_admin_command("حماية@North"))
+        self.assertIn("snare", sections[3][3])
+        for page in (1, 3):
+            for idx, section in enumerate(sections[page]):
+                if page == 3:
+                    footer = "" if idx == 0 else (
+                        "\n\n📌 للقائمة التالية اكتب ns" if idx < len(sections[page]) - 1
+                        else "\n\n📌 هذه آخر قائمة في A3."
+                    )
+                else:
+                    footer = (
+                        "\n\n📌 للقائمة التالية اكتب ns" if idx < len(sections[page]) - 1
+                        else "\n\n✅ انتهت أقسام هذه القائمة."
+                    )
+                packet_type = "chat_message" if page == 1 else "room_message"
+                target = {"to": "Master"} if page == 1 else {"room": "Test"}
+                packet = bot_module.encode_query(
+                    packet_type, type_="text", body=section + footer, **target
+                )
+                self.assertLessEqual(len(packet), 1008, f"help page={page} part={idx + 1}")
+
     def test_normal_song_request_sends_audio_before_caption_without_full_download(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.music_last = {}
@@ -256,7 +379,8 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             "title": "Fast Track", "uploader": "Artist",
         }
         bot._music_download = lambda _query: (_ for _ in ()).throw(AssertionError("full download should not be used"))
-        bot._active_rooms = lambda: ["Room A"]
+        bot._active_rooms = lambda: ["Room A", "Room B"]
+        bot.connected_rooms = {"Room A", "Room B"}
         bot.log = lambda *_args: None
         bot.report_master_error = lambda *_args: None
 
@@ -271,13 +395,32 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         ), patch.object(bot_module.threading, "Thread", ImmediateThread):
             self.assertTrue(bot.handle_music_command(
                 "Room A", ".sa Fast Track", "Tester",
-                broadcast_all=False, with_reactions=False,
+                with_reactions=False,
             ))
 
         media_index = next(i for i, item in enumerate(sent) if item[0] == "media")
         caption_index = next(i for i, item in enumerate(sent) if item[0] == "text" and "تم تشغيل الأغنية" in item[2])
         self.assertLess(media_index, caption_index)
         self.assertEqual(sent[media_index][1:4], ("Room A", "https://cdn.example/track.mp3", "audio"))
+
+    def test_room_audio_packet_contains_actual_room_and_attachment_url(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.log = lambda *_args: None
+
+        class FakeWebSocket:
+            payload = None
+            def send_binary(self, payload):
+                self.payload = payload
+
+        bot.ws = FakeWebSocket()
+        self.assertTrue(bot.send_room_media("North", "https://cdn.example/song.mp3", "audio", 42))
+        fields = bot_module.decode_message(bot.ws.payload)
+        text = lambda field: fields[field][0].decode("utf-8")
+        self.assertEqual(text(1), "room_message")
+        self.assertEqual(text(2), "audio")
+        self.assertEqual(text(3), "42")
+        self.assertEqual(text(6), "North")
+        self.assertEqual(text(7), "https://cdn.example/song.mp3")
 
     def test_cricket_help_has_sixth_page_and_hides_bl_at_alias(self):
         sections = bot_module._default_help_sections()
