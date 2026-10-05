@@ -1924,6 +1924,11 @@ def _norm_user(name):
 def _norm_room(name):
     return str(name or "").strip()
 
+def _game_choice_key(room, sender):
+    """Canonical key shared by game prompts and number-only replies."""
+    room_key = " ".join(str(room or "").strip().casefold().split())
+    return room_key, _norm_user(sender)
+
 def _persistent_rooms():
     data = _load_local_json(TRACKED_ROOMS_FILE, [])
     if isinstance(data, dict):
@@ -2896,7 +2901,7 @@ def _default_help_sections():
     """Complete help catalog. ``ns`` advances only inside the opened category."""
     return {
         1: [
-            '📋 أوامر الإدارة — 1 | الحظر والطرد\n━━━━━━━━━━━━\nk@اسم — طرد عضو\nkick اسم — طرد عضو\nb@اسم — حظر عضو\nban اسم — حظر عضو\nbl@اسم — حظر عضو بكل الغرف\nub@اسم — فك الحظر\nu@اسم — فك الحظر\nunban اسم — فك الحظر\n.u — تراجع عن آخر إجراء للبوت\nحظر بكل الغرف @اسم — حظر شامل لكل الغرف',
+            '📋 أوامر الإدارة — 1 | الحظر والطرد\n━━━━━━━━━━━━\nk@اسم — طرد عضو\nkick اسم — طرد عضو\nb@اسم — حظر عضو\nban اسم — حظر عضو\nub@اسم — فك الحظر\nu@اسم — فك الحظر\nunban اسم — فك الحظر\n.u — تراجع عن آخر إجراء للبوت',
             '📋 أوامر الإدارة — 2 | الرتب\n━━━━━━━━━━━━\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك\n+صانع@اسم — إضافة صانع للغرفة\n-صانع@اسم — سحب صانع من الغرفة\nصانعي — عرض صانعي الغرفة\nl@mas — عرض ماسترات الإدارة\nmas@اسم — إضافة ماستر\nإضافة ماستر@اسم — إضافة ماستر\numas@اسم — سحب ماستر\nسحب ماستر@اسم — سحب ماستر',
             '📋 أوامر الإدارة — 3 | التوثيق وVIP\n━━━━━━━━━━━━\nvi@اسم — توثيق مستخدم\nuns@اسم — سحب التوثيق\nسحب التوثيق@اسم — سحب التوثيق\nإزالة توثيق@اسم — سحب التوثيق\nتوثيق الكل — توثيق كل الأعضاء\nvi — عدد الموثقين\nvip@اسم — منح VIP\nunvip@اسم — سحب VIP\nvip — عدد أعضاء VIP\nmvip@اسم — إضافة ماستر توثيق\numvip@اسم — سحب ماستر توثيق\nl@mvip — عرض ماسترات التوثيق',
             '📋 أوامر الإدارة — 4 | التوثيق والحماية\n━━━━━━━━━━━━\nتشغيل التوثيق — تشغيل نظام التوثيق\nإيقاف التوثيق — إيقاف نظام التوثيق\nحماية — إعداد حماية الغرفة\nتشغيل الحماية — تشغيل حماية الغرفة\nإيقاف الحماية — إيقاف حماية الغرفة\nحالة الحماية — عرض حالة الحماية\nحمايه البوت — حماية داخلية للبوت\nالمحظورين — عرض المحظورين داخل البوت',
@@ -2912,7 +2917,8 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n\u206614.\u2069 رهان@المبلغ\n\u206615.\u2069 مضاربة@المبلغ\n\u206616.\u2069 حظي@المبلغ\n\u206617.\u2069 استثمار@المبلغ\n\u206618.\u2069 حظ@المبلغ\n\n📌 ألعاب الرهان تعتمد على المبلغ الذي تحدده.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n\u206619.\u2069 بنك أو بنك مليون\n\u206620.\u2069 مليار\n\u206621.\u2069 زرع@رمز\n\u206622.\u2069 فيس@اسم\n\n📌 هذه الألعاب تستخدم أنظمتها الخاصة للجوائز والصور عند الحاجة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n\u206623.\u2069 ثعبان / snake — السلم والثعبان\n\u206624.\u2069 لودو / ludo — لودو\n\u206625.\u2069 سنارة أو سناره\n\u206626.\u2069 برق\n\u206627.\u2069 ياقوت\n\u206628.\u2069 صدام\n\u206629.\u2069 كاشف\n\n📌 هذه الألعاب تعتمد على مشاركة لاعبين من الغرف.',
-            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n\u206628.\u2069 اسرق أو اسرق@اسم\n\u206629.\u2069 شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 هذه آخر قائمة في A3.\n📌 اكتب Ns للقائمة التالية.',
+            '🎮 A3 — الألعاب — 5: التفاعل\n━━━━━━━━━━━━\n\u206628.\u2069 اسرق أو اسرق@اسم\n\u206629.\u2069 شبيه@اسم\n\n📌 شبيه يبحث عن صورة مناسبة ويرسلها في الروم.\n📌 للقائمة التالية اكتب ns — لعبة الكركيت.',
+            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في خاص البوت:\nتشغيل لعبه الكركيت / start cricket game — تشغيل اللعبة وفتح الإعداد\nايقاف لعبه الكركيت / stop cricket game — إيقافها وإلغاء المباراة\n\nفي الغرفة: اختر 1 إلى 4 لاعبين ثم أرسل Join.\nغرفة ثانية ترسل Join للعب الجماعي؛ تختار غرفة البداية 1 للهجوم أو 2 للدفاع، ويُعيّن دور الغرفة الثانية تلقائيًا.\nأرسل دورك رقمًا من 0 إلى 6.\nأرسل bot في الغرفة للعب ضد البوت؛ أو cricket 1..4 لفتح مباراة فردية في غرفة واحدة.\nالجائزة 200,000 نقطة تُقسّم على الفائزين؛ صور الكرات والبطّة والهتريك تلقائية.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -4387,8 +4393,10 @@ class TalkinBot:
             DATA_DIR,
             persist=_save_local_json,
             is_master=_is_master_name,
+            is_configured_master=_is_primary_master,
             send_room_text=self.send_room_text,
             send_room_media=self.send_room_media,
+            send_private_text=self.send_private_text,
             public_base=_public_base_url,
             reward=lambda username, amount: _add_points(username, amount),
             log=print,
@@ -9020,12 +9028,25 @@ class TalkinBot:
                     artist = str(audius.get("uploader") or "Audius")
                     self.log("[MUSIC] live source=Audius title=", title, "room=", room)
                 else:
-                    # Normal `.sa` playback: use the old/stable local-MP3 path.
-                    # A direct YouTube/SoundCloud URL can be a long signed URL;
-                    # putting that URL inside the Talkin protobuf can make the
-                    # server close the WebSocket with 1009.  The local public
-                    # media URL is short and keeps the WebSocket packet small.
-                    if public_base:
+                    # Prefer a short Audius stream URL so the room receives the
+                    # song without waiting for a full download/conversion.
+                    fast = None
+                    if not re.match(r"^https?://", query, re.I):
+                        try:
+                            fast = self._audius_live_source(query)
+                        except Exception as exc:
+                            self.log("[MUSIC] fast Audius lookup failed:", repr(exc))
+                    fast_url = str((fast or {}).get("url") or "").strip()
+                    if fast and fast_url and len(fast_url) <= 500:
+                        info = fast
+                        url = fast_url
+                        duration = int(fast.get("duration") or 0)
+                        title = str(fast.get("title") or query)
+                        artist = str(fast.get("uploader") or "Audius")
+                        self.log("[MUSIC] normal source=short-audius title=", title, "room=", room)
+                    elif public_base:
+                        # Keep the compact local URL fallback for long signed
+                        # YouTube/SoundCloud URLs that do not fit a room packet.
                         info, path = self._music_download(query)
                         title = str(info.get("title") or query)
                         artist = str(info.get("uploader") or info.get("channel") or "YouTube")
@@ -9096,6 +9117,44 @@ class TalkinBot:
                     else:
                         self.send_room_text(room, "❌ تعذر تشغيل الأغنية في البث؛ تم استخدام المصدر الاحتياطي إن توفر.")
                     music_published = live_started or getattr(self, "_last_live_play_status_by_room", {}).get(room) == "queued"
+                else:
+                    # The previous normal `.sa` path prepared a URL and a
+                    # caption but never sent the audio media packet itself.
+                    if broadcast_all:
+                        connected = {
+                            str(item).strip()
+                            for item in getattr(self, "connected_rooms", set())
+                            if str(item).strip()
+                        }
+                        if not connected:
+                            connected = {
+                                str(item).strip()
+                                for item in (self._active_rooms() or [])
+                                if str(item).strip()
+                            }
+                        if room:
+                            connected.add(str(room).strip())
+                        target_rooms = sorted(connected, key=str.casefold)
+                        if room:
+                            room_name = str(room).strip()
+                            target_rooms = [room_name] + [
+                                target for target in target_rooms
+                                if target.casefold() != room_name.casefold()
+                            ]
+                    else:
+                        target_rooms = [str(room or "").strip()] if str(room or "").strip() else []
+                    for target_room in target_rooms:
+                        try:
+                            sent = self.send_room_media(target_room, url, "audio", duration)
+                            if sent is False:
+                                raise RuntimeError("Talkin لم يقبل حزمة الصوت")
+                            music_published = True
+                            if caption:
+                                self.send_room_text(target_room, caption)
+                        except Exception as exc:
+                            self.log("[MUSIC] room audio send failed:", target_room, repr(exc))
+                    if not music_published:
+                        raise RuntimeError("تعذر إرسال الصوت إلى أي غرفة متصلة")
                 if music_published:
                     _record_media_publication("music", title, requester, room)
             except Exception as e:
@@ -10582,7 +10641,7 @@ class TalkinBot:
         if not self._game_cooldown_notice(room, sender, 40.0, "عملة"):
             return True
         choice = str(choice or "").strip()
-        key = (str(room), _norm_user(sender))
+        key = _game_choice_key(room, sender)
         if choice in ("وجه", "كتابة"):
             result = secrets.choice(("وجه", "كتابة"))
             won = choice == result
@@ -10616,7 +10675,7 @@ class TalkinBot:
         m = re.fullmatch(r"صندوق[@ ]([1-3])", raw, re.I)
         if not self._game_cooldown_notice(room, sender, 40.0, "صندوق"):
             return True
-        key = (str(room), _norm_user(sender))
+        key = _game_choice_key(room, sender)
         chosen = int(m.group(1)) if m else None
         if chosen is None:
             self.pending_bot_choices[key] = {
@@ -10770,7 +10829,7 @@ class TalkinBot:
         choice = digit_map.get(raw)
         if choice is None:
             return False
-        key = (str(room), _norm_user(sender_name))
+        key = _game_choice_key(room, sender_name)
         pending = self.pending_bot_choices.get(key)
         if not isinstance(pending, dict):
             return False
@@ -10821,7 +10880,7 @@ class TalkinBot:
         # ever reaching the reply router.
         if not _looks_like_bot_command(text):
             raw = str(text or "").strip()
-            pending_key = (_norm_room(room), _norm_user(sender_name))
+            pending_key = _game_choice_key(room, sender_name)
             ludo_game = getattr(self, "ludo_games", {}).get(f"ludo:{_norm_room(room)}")
             has_pending_choice = pending_key in getattr(self, "pending_bot_choices", {})
             has_pending_stock = pending_key in getattr(self, "stock_pending", {})
