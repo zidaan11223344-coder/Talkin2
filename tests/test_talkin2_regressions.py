@@ -30,27 +30,31 @@ class CricketIntegrationRegressions(unittest.TestCase):
             root = Path(temp)
             integration = self.make_integration(root, room_messages, private_messages, media_messages)
 
-            integration.handle("North", "intruder", "تشغيل لعبة الكركيت", is_private=True)
+            integration.handle("North", "intruder", ".cr 1", is_private=True)
             self.assertFalse(integration.game.enabled())
             self.assertIn("للماستر المحدد", private_messages[-1][1])
-            integration.handle("North", "intruder", "ايقاف لعبه الكركيت", is_private=True)
+            integration.handle("North", "intruder", ".cr 0", is_private=True)
             self.assertFalse(integration.game.enabled())
             self.assertIn("للماستر المحدد", private_messages[-1][1])
 
             # The master-only switches must not work in a room.
-            integration.handle("North", "Master", "تشغيل لعبه الكركيت")
+            integration.handle("North", "Master", ".cr 1")
+            self.assertFalse(integration.game.enabled())
+            self.assertIn("خاص البوت", room_messages[-1][1])
+            integration.handle("North", "Master", ".cr 0")
             self.assertFalse(integration.game.enabled())
             self.assertIn("خاص البوت", room_messages[-1][1])
             integration.handle("North", "Master", "cricket on")
             self.assertFalse(integration.game.enabled())
             self.assertIn("خاص البوت", room_messages[-1][1])
 
-            integration.handle("North", "Master", "تشغيل لعبة الكركيت", is_private=True)
+            integration.handle("North", "Master", ".cr 1", is_private=True)
             self.assertTrue(integration.game.enabled())
             self.assertEqual(integration.game.current()["stage"], "setup")
             self.assertIn("تشغيل لعبة الكركيت", private_messages[-1][1])
 
-            integration.handle("North", "Master", "1")
+            integration.handle("North", "N1", "1")
+            self.assertEqual(integration.game.current()["stage"], "lobby")
             integration.handle("North", "N1", "Join")
             integration.handle("South", "S1", "Join")
             self.assertEqual(integration.game.current()["stage"], "teams")
@@ -76,9 +80,9 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertTrue(any(room == "South" for room, _, _ in media_messages))
 
             # Stop is private-only and restricted to the configured master.
-            integration.handle("North", "Master", "ايقاف لعبه الكركيت")
+            integration.handle("North", "Master", ".cr 0")
             self.assertTrue(integration.game.enabled())
-            integration.handle("North", "Master", "ايقاف لعبه الكركيت", is_private=True)
+            integration.handle("North", "Master", ".cr 0", is_private=True)
             self.assertFalse(integration.game.enabled())
             self.assertIsNone(integration.game.current())
 
@@ -172,7 +176,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
     def test_cricket_help_has_sixth_page_and_hides_bl_at_alias(self):
         sections = bot_module._default_help_sections()
         self.assertEqual(len(sections[3]), 6)
-        self.assertIn("تشغيل لعبه الكركيت", sections[3][5])
+        self.assertIn(".cr 1", sections[3][5])
+        self.assertIn(".cr 0", sections[3][5])
+        self.assertIn("كل الأعضاء", sections[3][5])
         self.assertIn("start cricket game", sections[3][5])
         self.assertNotIn("bl@", sections[1][0])
         self.assertNotIn("حظر بكل الغرف", sections[1][0])

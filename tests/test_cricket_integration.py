@@ -19,9 +19,9 @@ def test_master_toggle_and_player_count_are_persistent(tmp_path: Path):
         public_base=lambda: "https://bot.example",
     )
 
-    assert integration.handle("Room A", "master", "تشغيل لعبه الكركيت", is_private=True) is True
+    assert integration.handle("Room A", "master", ".cr 1", is_private=True) is True
     assert integration.game.current()["stage"] == "setup"
-    assert integration.handle("Room A", "master", "٢") is True
+    assert integration.handle("Room A", "member", "٢") is True
     assert integration.game.current()["stage"] == "lobby"
     assert writes
 
@@ -53,12 +53,12 @@ def test_only_master_can_toggle_cricket(tmp_path: Path):
     assert integration.handle("Room A", "master", ".cr 1") is True
     assert integration.game.enabled("Room A") is False
     assert "خاص البوت" in messages[-1][1]
-    assert integration.handle("Room A", "master", "تشغيل لعبه الكركيت", is_private=True) is True
+    assert integration.handle("Room A", "master", ".cr 1", is_private=True) is True
     assert integration.game.enabled("Room A") is True
     assert integration.game.current()["stage"] == "setup"
     assert integration.handle("Room A", "player", ".ct 0") is True
     assert integration.game.enabled("Room A") is True
-    assert integration.handle("Room A", "master", ".ct 0", is_private=True) is True
+    assert integration.handle("Room A", "player", ".cr 0") is True
     assert integration.game.enabled("Room A") is True
-    assert integration.handle("Room A", "master", "ايقاف لعبه الكركيت", is_private=True) is True
+    assert integration.handle("Room A", "master", ".cr 0", is_private=True) is True
     assert integration.game.enabled("Room A") is False

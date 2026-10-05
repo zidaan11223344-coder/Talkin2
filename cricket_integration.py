@@ -25,11 +25,11 @@ class CricketIntegration:
     }
     PRIVATE_START_COMMANDS = {
         "تشغيل لعبه الكركت", "تشغيل لعبه الكركيت", "تشغيل لعبه الكريكت", "تشغيل لعبه الكريكيت",
-        "start cricket game",
+        "start cricket game", ".cr 1", ".cr1",
     }
     PRIVATE_STOP_COMMANDS = {
         "ايقاف لعبه الكركت", "ايقاف لعبه الكركيت", "ايقاف لعبه الكريكت", "ايقاف لعبه الكريكيت",
-        "stop cricket game",
+        "stop cricket game", ".cr 0", ".cr0",
     }
 
     def __init__(
@@ -261,18 +261,18 @@ class CricketIntegration:
             return self._private_toggle(room, sender, control in self.PRIVATE_START_COMMANDS)
 
         if is_private and (low in self.START_COMMANDS or low in self.STOP_COMMANDS):
-            self._send_private(sender, room, "📌 استخدم «تشغيل لعبه الكركيت» أو «ايقاف لعبه الكركيت» من الخاص للماستر.")
+            self._send_private(sender, room, "📌 استخدم «.cr 1» للتشغيل أو «.cr 0» للإيقاف من الخاص للماستر.")
             return True
 
         if low in self.START_COMMANDS:
-            self.send_room_text(room, "🔒 التشغيل والإيقاف من خاص البوت للماستر المحدد فقط: «تشغيل لعبه الكركيت» أو «ايقاف لعبه الكركيت».")
+            self.send_room_text(room, "🔒 التشغيل والإيقاف من خاص البوت للماستر المحدد فقط: «.cr 1» للتشغيل و«.cr 0» للإيقاف.")
             return True
 
         if low in self.STOP_COMMANDS:
             if not is_private:
-                self.send_room_text(room, "🔒 إيقاف الكركيت من خاص الماستر فقط: «ايقاف لعبه الكركيت».")
+                self.send_room_text(room, "🔒 إيقاف الكركيت من خاص الماستر فقط: «.cr 0».")
                 return True
-            self._send_private(sender, room, "📌 استخدم «ايقاف لعبه الكركيت» من الخاص للماستر المحدد في المتغيرات.")
+            self._send_private(sender, room, "📌 استخدم «.cr 0» من الخاص للماستر المحدد في المتغيرات.")
             return True
 
         solo_start = re.fullmatch(r"(?:\.cricket|cricket|كركيت|كريكت|كريكيت)\s+([1-4])", low)
@@ -298,9 +298,6 @@ class CricketIntegration:
         if low in {"join", "انضمام"}:
             result = self.game.join(room, sender)
         elif match.get("stage") == "setup" and low in {"1", "2", "3", "4"}:
-            if not self.is_master(sender):
-                self.send_room_text(room, "🔒 اختيار عدد لاعبي الكركيت للماستر فقط.")
-                return True
             result = self.game.select_player_count(room, int(low))
         elif match.get("stage") == "lobby" and low in {"bot", "بوت", "ضد البوت", "solo", "vs bot"}:
             result = self.game.play_bot(room, sender)
