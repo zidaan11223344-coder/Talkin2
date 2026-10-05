@@ -2381,17 +2381,50 @@ def _game_name_key(name):
     return (compact or raw).casefold()
 
 
+def _game_item_for_username(data, username):
+    """Find one player's record across old decorated-name key formats."""
+    if not isinstance(data, dict):
+        return "", {}
+    exact_key = _norm_user(username)
+    exact = data.get(exact_key)
+    if isinstance(exact, dict) and exact:
+        return exact_key, exact
+    wanted = _game_name_key(username)
+    matches = []
+    for key, candidate in data.items():
+        if not isinstance(candidate, dict):
+            continue
+        candidate_name = candidate.get("username") or key
+        if _game_name_key(candidate_name) == wanted:
+            games = candidate.get("games") if isinstance(candidate.get("games"), dict) else {}
+            plays = sum(int((value or {}).get("plays", 0) or 0) for value in games.values())
+            matches.append((plays, str(key), candidate))
+    if matches:
+        # If a previous release split a user into multiple keys, retain the
+        # richest record rather than showing the empty/new fragment.
+        _plays, key, item = max(matches, key=lambda row: row[0])
+        return key, item
+    return exact_key, {}
+
+
 def _game_level_info(username):
     data = _game_stats_data()
-    item = data.get(_norm_user(username), {})
-    if not isinstance(item, dict) or not item:
-        wanted = _game_name_key(username)
-        item = next((candidate for key, candidate in data.items()
-                     if isinstance(candidate, dict)
-                     and _game_name_key(candidate.get("username") or key) == wanted), {})
+    _key, item = _game_item_for_username(data, username)
+    if not item:
+        # Older deployments wrote the compact level snapshot before the main
+        # game-stats file was restored. Use it as a read-only recovery source.
+        snapshot = _load_local_json(GAME_LEVELS_FILE, {})
+        players = snapshot.get("players", {}) if isinstance(snapshot, dict) else {}
+        if isinstance(players, dict):
+            wanted = _game_name_key(username)
+            item = next((candidate for key, candidate in players.items()
+                         if isinstance(candidate, dict)
+                         and _game_name_key(candidate.get("username") or key) == wanted), {})
     games = item.get("games", {}) if isinstance(item, dict) else {}
-    plays = sum(int((value or {}).get("plays", 0) or 0)
-                for value in games.values()) if isinstance(games, dict) else 0
+    if isinstance(games, dict):
+        plays = sum(int((value or {}).get("plays", 0) or 0) for value in games.values())
+    else:
+        plays = int(item.get("plays", 0) or 0) if isinstance(item, dict) else 0
     level_number, label = 1, GAME_LEVELS[0][1]
     for number, (threshold, current_label) in enumerate(GAME_LEVELS, 1):
         if plays >= threshold:
@@ -2473,8 +2506,10 @@ def _record_game(username, game_key, points_delta=0, stake=0):
         return
     with _GAME_STATE_LOCK:
         data = _game_stats_data()
-        item = data.get(key, {"username": str(username).strip().lstrip("@"), "games": {}})
-        item["username"] = str(username).strip().lstrip("@")
+        existing_key, item = _game_item_for_username(data, username)
+        key = existing_key or key
+        item = item if isinstance(item, dict) else {}
+        item.setdefault("username", str(username).strip().lstrip("@"))
         games = item.get("games") if isinstance(item.get("games"), dict) else {}
         g = games.get(game_key, {"plays": 0, "points": 0, "staked": 0})
         g["plays"] = int(g.get("plays", 0) or 0) + 1
@@ -2489,7 +2524,7 @@ def _record_game(username, game_key, points_delta=0, stake=0):
 
 
 def _game_stats(username, game_key):
-    item = _game_stats_data().get(_norm_user(username), {})
+    _key, item = _game_item_for_username(_game_stats_data(), username)
     games = item.get("games", {}) if isinstance(item, dict) else {}
     g = games.get(game_key, {}) if isinstance(games, dict) else {}
     return {"plays": int(g.get("plays", 0) or 0), "points": int(g.get("points", 0) or 0), "staked": int(g.get("staked", 0) or 0)}

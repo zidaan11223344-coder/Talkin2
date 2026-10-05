@@ -362,6 +362,36 @@ class CricketIntegrationRegressions(unittest.TestCase):
 
 
 class BotGameAndMusicRegressions(unittest.TestCase):
+    def test_legacy_compact_stats_are_found_for_decorated_username(self):
+        decorated = "𝐒𝐎𝐔☀𝐑𝐄𝐀"
+        legacy = {
+            "sourea": {
+                "username": "SOUREA",
+                "games": {"star": {"plays": 3890, "points": 12}},
+            }
+        }
+        with patch.object(bot_module, "_game_stats_data", return_value=legacy):
+            level, _label, plays = bot_module._game_level_info(decorated)
+            stats = bot_module._game_stats(decorated, "star")
+        self.assertEqual(plays, 3890)
+        self.assertEqual(level, 7)
+        self.assertEqual(stats["plays"], 3890)
+
+    def test_record_game_merges_into_legacy_compact_stats(self):
+        decorated = "𝐒𝐎𝐔☀𝐑𝐄𝐀"
+        legacy = {
+            "sourea": {
+                "username": "SOUREA",
+                "games": {"star": {"plays": 3890, "points": 12, "staked": 0}},
+            }
+        }
+        with patch.object(bot_module, "_game_stats_data", return_value=legacy), patch.object(
+            bot_module, "_queue_local_json_save"
+        ), patch.object(bot_module, "_save_game_levels_snapshot"):
+            bot_module._record_game(decorated, "star", 5)
+        self.assertEqual(set(legacy), {"sourea"})
+        self.assertEqual(legacy["sourea"]["games"]["star"]["plays"], 3891)
+
     def test_decorated_username_matches_game_stats_and_keeps_display_name(self):
         decorated = "♥☼هـــــ☼ـــادي☼♥اا"
         with patch.object(bot_module, "_game_stats_data", return_value={
