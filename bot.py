@@ -1957,7 +1957,8 @@ def _publish_description(text):
 
 
 def _norm_user(name):
-    return str(name or "").strip().lstrip("@").casefold()
+    value = unicodedata.normalize("NFKC", str(name or "")).strip().lstrip("@").casefold()
+    return re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", value)
 
 def _norm_room(name):
     return str(name or "").strip()
@@ -2275,17 +2276,22 @@ def _vip_data():
 def _saved_identity_matches(data, name):
     """Match a sender against legacy and current verification record shapes."""
     target = _norm_user(name)
-    if not target or not isinstance(data, dict):
+    if not target:
         return False
-    for stored_key, record in data.items():
-        candidates = [stored_key]
-        if isinstance(record, dict):
-            candidates.append(record.get("username", ""))
-        elif isinstance(record, str):
-            candidates.append(record)
-        if any(_norm_user(candidate) == target for candidate in candidates):
-            return True
-    return False
+
+    def walk(value):
+        if isinstance(value, dict):
+            for stored_key, record in value.items():
+                if _norm_user(stored_key) == target:
+                    return True
+                if walk(record):
+                    return True
+            return False
+        if isinstance(value, (list, tuple, set)):
+            return any(walk(item) for item in value)
+        return isinstance(value, str) and _norm_user(value) == target
+
+    return walk(data)
 
 def _is_verified_user(name):
     # When verification is disabled, treat users as passing the verification
@@ -15430,8 +15436,11 @@ class TalkinBot:
             return
 
         # Cricket handles its own verified-member gate and turn flow before the
-        # normal bot-command verification gate.
-        if self._cricket.handle(room, frm, body, is_private=False):
+        # normal bot-command verification gate. Some Talkin builds put the
+        # canonical username in field 22 while field 2 contains a display/id;
+        # prefer the canonical field so verified Join requests are recognized.
+        cricket_sender = username or frm
+        if self._cricket.handle(room, cricket_sender, body, is_private=False):
             return
 
         # Verified users may use normal bot commands; administration remains

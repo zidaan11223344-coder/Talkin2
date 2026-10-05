@@ -158,7 +158,7 @@ class CricketIntegration:
         if not room_key or not isinstance(match, dict):
             return
         current_rooms = {self._room_key(item) for item in self._match_rooms(match)}
-        if room_key not in current_rooms and room_key not in self._cursors:
+        if room_key not in current_rooms:
             # The Join action will create fresh events for this room. Starting
             # at the current high-water mark prevents old match images from
             # being replayed before those new events are delivered.

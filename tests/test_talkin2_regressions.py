@@ -103,12 +103,21 @@ class CricketIntegrationRegressions(unittest.TestCase):
             integration.handle("North", "N1", "Join")
             self.assertEqual(integration.game.current()["stage"], "lobby")
             old_match_id = integration.game.current()["id"]
+            def add_finished_match_result(data):
+                data["match"] = None
+                integration.game._emit(
+                    data, [{"key": "north", "name": "North"}],
+                    "🏆 نتيجة مباراة قديمة", ("cricket_result_old.png",),
+                )
+            integration.game.state.mutate(add_finished_match_result)
             integration.handle("North", "N1", ".cr 1")
             fresh = integration.game.current()
             self.assertEqual(fresh["stage"], "setup")
             self.assertNotEqual(fresh["id"], old_match_id)
             self.assertEqual(fresh["rooms"][0]["players"], [])
             self.assertIn("إعداد مباراة الكركيت", room_messages[-1][1])
+            self.assertFalse(any("مباراة قديمة" in text for _, text in room_messages[-2:]))
+            self.assertFalse(any("cricket_result_old.png" in url for _, url, _ in media_messages))
 
     def test_join_from_second_room_skips_old_match_images(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -583,6 +592,16 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot_module._is_cricket_verified_member("@verified_player"))
             self.assertTrue(bot_module._is_verified_user(" Verified_Player "))
             self.assertFalse(bot_module._is_cricket_verified_member("other_player"))
+
+    def test_cricket_verification_reads_nested_and_list_legacy_records(self):
+        with patch.object(bot_module, "_verified_data", return_value={
+            "users": ["List_Verified"],
+            "records": {"entry": {"name": "Nested_Verified"}},
+        }), patch.object(bot_module, "_vip_data", return_value={}), patch.object(
+            bot_module, "_is_master_name", return_value=False
+        ):
+            self.assertTrue(bot_module._is_cricket_verified_member("List_Verified"))
+            self.assertTrue(bot_module._is_cricket_verified_member("Nested_Verified"))
 
     def test_winner_awards_are_split_exactly_and_passed_to_result_card(self):
         with tempfile.TemporaryDirectory() as temp:
