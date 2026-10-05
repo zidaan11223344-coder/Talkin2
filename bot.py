@@ -2263,7 +2263,7 @@ def _looks_like_admin_command(text):
         return True
     prefixes = (
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
-        "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
+        "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "msb@",
         "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
@@ -3312,7 +3312,7 @@ def _default_help_sections():
         ],
         5: [
             '💰 النقاط — 1\n━━━━━━━━━━━━\nنقاطي — عرض الرصيد والمستوى وإحصاءات اللعب\npoints — عرض النقاط\nتوب — المتصدرين العام\ntop — المتصدرين العام\n\nتوب رهان — متصدروا الرهان\nتوب مضاربة — متصدروا المضاربة\nتوب حظي — متصدروا حظي\nتوب استثمار — متصدروا الاستثمار',
-            '💸 النقاط — 2: التحويل\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل نقاط من الماستر\n\nمثال:\nsb@ahmd555@1000\n\n📌 يعمل الأمر من خاص البوت فقط للماستر المحدد، ويمكنه تحويل أي عدد موجب دون خصم من رصيده.\n\nللاطلاع على الرصيد استخدم: نقاطي',
+            '💸 النقاط — 2: التحويل\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل عادي من رصيد المرسل\nmsb@اسم@عدد — تحويل الماستر من الخاص دون خصم\n\nمثال اللاعب:\nsb@ahmd555@1000\nمثال الماستر في الخاص:\nmsb@ahmd555@1000\n\n📌 sb متاح للموثقين في الغرف والخاص ويخصم من رصيد المرسل.\n📌 msb للماستر المحدد في خاص البوت فقط.\n\nللاطلاع على الرصيد استخدم: نقاطي',
         ],
         6: [
             '🚪 الغرف — 1\n━━━━━━━━━━━━\nدخول@اسم_الغرفة — دخول غرفة\nمثال: دخول@مشاعر\nخروج — الخروج من الغرفة الحالية\nخروج اسم_الغرفة — الخروج من غرفة محددة\nغرفي — عرض الغرف التي يتواجد بها البوت\nmyrooms — نفس الأمر\n\ninv — دعوة أعضاء الغرفة الحالية\ninv اسم_الغرفة — دعوة أعضاء غرفة محددة\nدعوات — نفس أمر inv\ninvite — نفس أمر inv\ninvmsg نص — تغيير رسالة الدعوة\ni@اسم — دعوة مستخدم واحد',
@@ -12524,8 +12524,9 @@ class TalkinBot:
         join_all_command = str(body or "").strip().casefold() in {"دخول الكل", "دخولكل", "join all"}
         verification_manager_command = _is_verification_manager_command(body)
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
-        if points_transfer_command and not (is_private and _is_primary_master(sender)):
-            message = "🚫 أمر تحويل النقاط للماستر المحدد ومن خاص البوت فقط." if is_private else "🚫 أرسل أمر تحويل النقاط في خاص البوت، وهو متاح للماستر المحدد فقط."
+        master_points_transfer_command = bool(re.fullmatch(r"msb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
+        if master_points_transfer_command and not (is_private and _is_primary_master(sender)):
+            message = "🚫 أمر msb للماستر المحدد ومن خاص البوت فقط." if is_private else "🚫 أرسل أمر msb في خاص البوت، وهو متاح للماستر المحدد فقط."
             if is_private:
                 self.send_private_text(sender, message)
             elif room:
@@ -14168,18 +14169,29 @@ class TalkinBot:
                 self.send_private_text(sender, confirm_msg)
                 
             return True
+        m_master_transfer = re.fullmatch(r"msb@([^@]+)@(\d+)", text, re.I)
+        if m_master_transfer and is_private and _is_primary_master(sender):
+            target, amount = m_master_transfer.group(1).strip().lstrip("@"), int(m_master_transfer.group(2))
+            if not target or amount <= 0:
+                self.send_private_text(sender, "❌ الصيغة: msb@اسم المستخدم@عدد النقاط")
+                return True
+            new = _add_points(target, amount)
+            self.send_private_text(sender, f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{target} من رصيد الماستر.\n💳 رصيد المستلم: {_fmt_points(new)}")
+            if _norm_user(target) != _norm_user(sender):
+                self.send_private_text(target, f"💰 إشعار تحويل: استلمت {_fmt_points(amount)} نقطة من الماستر. رصيدك الحالي: {_fmt_points(new)}")
+            return True
+
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
-        if m_transfer and is_private and _is_primary_master(sender):
+        if m_transfer and _is_verified_user(sender):
             target, amount = m_transfer.group(1).strip().lstrip("@"), int(m_transfer.group(2))
             if not target or amount <= 0:
                 self.send_private_text(sender, "❌ الصيغة: sb@اسم المستخدم@عدد النقاط")
                 return True
-            if not _is_primary_master(sender):
-                balance = _get_points(sender)
-                if balance < amount:
-                    self.send_private_text(sender, f"❌ رصيدك غير كافٍ. رصيدك الحالي: {_fmt_points(balance)} نقطة.")
-                    return True
-                _add_points(sender, -amount)
+            balance = _get_points(sender)
+            if balance < amount:
+                self.send_private_text(sender, f"❌ رصيدك غير كافٍ. رصيدك الحالي: {_fmt_points(balance)} نقطة.")
+                return True
+            _add_points(sender, -amount)
             new = _add_points(target, amount)
             self.send_private_text(sender, f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{target}. رصيدك: {_fmt_points(_get_points(sender))}")
             if _norm_user(target) != _norm_user(sender):

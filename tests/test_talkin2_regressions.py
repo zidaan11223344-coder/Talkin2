@@ -516,18 +516,30 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             welcome = bot_module._join_welcome_message("regular", "North")
         self.assertIn("🏅 مستوى الألعاب", welcome)
 
-    def test_points_transfer_is_private_primary_master_only(self):
+    def test_sb_uses_sender_balance_and_msb_is_master_private_only(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         room_replies = []
         private_replies = []
         bot.send_room_text = lambda room, text: room_replies.append((room, text))
         bot.send_private_text = lambda user, text: private_replies.append((user, text))
-        with patch.object(bot_module, "_is_primary_master", return_value=False):
-            self.assertTrue(bot._handle_management_command("North", "sb@target@100", "member"))
-            self.assertTrue(bot._handle_management_command("", "sb@target@100", "member", is_private=True))
-        self.assertTrue(room_replies)
-        self.assertTrue(private_replies)
-        self.assertTrue(all("خاص البوت" in text or "الماستر" in text for _, text in room_replies + private_replies))
+        changes = []
+        with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_get_points", return_value=1000
+        ), patch.object(bot_module, "_add_points", side_effect=lambda user, amount: changes.append((user, amount)) or 900):
+            self.assertTrue(bot._handle_management_command_impl("North", "sb@target@100", "member"))
+        self.assertIn(("member", -100), changes)
+        self.assertIn(("target", 100), changes)
+
+        changes.clear()
+        with patch.object(bot_module, "_is_primary_master", return_value=True), patch.object(
+            bot_module, "_add_points", side_effect=lambda user, amount: changes.append((user, amount)) or 100
+        ):
+            self.assertTrue(bot._handle_management_command_impl("", "msb@target@100", "Master", is_private=True))
+        self.assertEqual(changes, [("target", 100)])
+
+        with patch.object(bot_module, "_is_primary_master", return_value=True):
+            self.assertTrue(bot._handle_management_command("North", "msb@target@100", "Master"))
+        self.assertTrue(any("خاص البوت" in text for _, text in room_replies))
 
     def test_box_number_reply_uses_normalized_room_key(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
