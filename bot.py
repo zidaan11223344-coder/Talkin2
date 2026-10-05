@@ -2257,6 +2257,8 @@ def _is_room_creator(room, sender):
 
 def _looks_like_admin_command(text):
     low = str(text or "").strip().casefold()
+    if re.match(r"^(?:إضافة|اضافة|استرجاع|استعادة|زيادة|زود)\s+(?:العاب|ألعاب)@", str(text or "").strip(), re.I):
+        return True
     prefixes = (
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
@@ -2381,30 +2383,61 @@ def _game_name_key(name):
     return (compact or raw).casefold()
 
 
-def _game_item_for_username(data, username):
-    """Find one player's record across old decorated-name key formats."""
+def _game_record_matches(data, username):
     if not isinstance(data, dict):
-        return "", {}
-    exact_key = _norm_user(username)
-    exact = data.get(exact_key)
-    if isinstance(exact, dict) and exact:
-        return exact_key, exact
+        return []
     wanted = _game_name_key(username)
-    matches = []
-    for key, candidate in data.items():
-        if not isinstance(candidate, dict):
+    return [(str(key), candidate) for key, candidate in data.items()
+            if isinstance(candidate, dict)
+            and _game_name_key(candidate.get("username") or key) == wanted]
+
+
+def _merged_game_item(data, username):
+    """Return a lossless aggregate view of all equivalent name records."""
+    exact_key = _norm_user(username)
+    matches = _game_record_matches(data, username)
+    if not matches:
+        return exact_key, {}
+    # Prefer an exact non-empty key for the canonical record; otherwise keep
+    # the record with the richest history and preserve its displayed username.
+    canonical_key, canonical = next(
+        ((key, item) for key, item in matches if key == exact_key and item),
+        max(matches, key=lambda row: sum(
+            int((value or {}).get("plays", 0) or 0)
+            for value in (row[1].get("games") or {}).values()
+        ) if isinstance(row[1].get("games"), dict) else 0),
+    )
+    merged = copy.deepcopy(canonical)
+    merged_games = merged.get("games") if isinstance(merged.get("games"), dict) else {}
+    for key, item in matches:
+        if key == canonical_key:
             continue
-        candidate_name = candidate.get("username") or key
-        if _game_name_key(candidate_name) == wanted:
-            games = candidate.get("games") if isinstance(candidate.get("games"), dict) else {}
-            plays = sum(int((value or {}).get("plays", 0) or 0) for value in games.values())
-            matches.append((plays, str(key), candidate))
-    if matches:
-        # If a previous release split a user into multiple keys, retain the
-        # richest record rather than showing the empty/new fragment.
-        _plays, key, item = max(matches, key=lambda row: row[0])
-        return key, item
-    return exact_key, {}
+        games = item.get("games") if isinstance(item.get("games"), dict) else {}
+        for game_key, values in games.items():
+            if not isinstance(values, dict):
+                continue
+            target = merged_games.setdefault(game_key, {"plays": 0, "points": 0, "staked": 0})
+            for field in ("plays", "points", "staked"):
+                target[field] = int(target.get(field, 0) or 0) + int(values.get(field, 0) or 0)
+    merged["games"] = merged_games
+    return canonical_key, merged
+
+
+def _coalesce_game_records(data, username):
+    """Merge equivalent records in-place, summing every stored metric."""
+    key, merged = _merged_game_item(data, username)
+    if not merged:
+        return _norm_user(username), {}
+    data[key] = merged
+    wanted_keys = {record_key for record_key, _item in _game_record_matches(data, username)}
+    for duplicate_key in wanted_keys - {key}:
+        data.pop(duplicate_key, None)
+    return key, merged
+
+
+def _game_item_for_username(data, username):
+    """Find a lossless aggregate across old decorated-name key formats."""
+    return _merged_game_item(data, username)
 
 
 def _game_level_info(username):
@@ -2506,7 +2539,7 @@ def _record_game(username, game_key, points_delta=0, stake=0):
         return
     with _GAME_STATE_LOCK:
         data = _game_stats_data()
-        existing_key, item = _game_item_for_username(data, username)
+        existing_key, item = _coalesce_game_records(data, username)
         key = existing_key or key
         item = item if isinstance(item, dict) else {}
         item.setdefault("username", str(username).strip().lstrip("@"))
@@ -2521,6 +2554,40 @@ def _record_game(username, game_key, points_delta=0, stake=0):
         snapshot = copy.deepcopy(data)
     _queue_local_json_save(GAME_STATS_FILE, snapshot)
     _save_game_levels_snapshot()
+
+
+def _restore_game_play_count(username, count, *, increment=False):
+    """Restore or increase a player's aggregate game count safely."""
+    amount = max(0, int(count))
+    with _GAME_STATE_LOCK:
+        data = _game_stats_data()
+        key, item = _coalesce_game_records(data, username)
+        key = key or _norm_user(username)
+        item = item if isinstance(item, dict) else {}
+        item.setdefault("username", str(username).strip().lstrip("@"))
+        games = item.get("games") if isinstance(item.get("games"), dict) else {}
+        current = sum(int((value or {}).get("plays", 0) or 0) for value in games.values())
+        target = current + amount if increment else amount
+        delta = target - current
+        if delta > 0:
+            restored = games.get("restored", {"plays": 0, "points": 0, "staked": 0})
+            restored["plays"] = int(restored.get("plays", 0) or 0) + delta
+            games["restored"] = restored
+        elif delta < 0:
+            # Exact restore is useful when a wrong count was entered. Reduce
+            # only the synthetic restore bucket; never destroy real game data.
+            restored = games.get("restored")
+            removable = min(-delta, int((restored or {}).get("plays", 0) or 0))
+            if restored is not None:
+                restored["plays"] = int(restored.get("plays", 0) or 0) - removable
+            if removable < -delta:
+                target = current
+        item["games"] = games
+        data[key] = item
+        snapshot = copy.deepcopy(data)
+    _queue_local_json_save(GAME_STATS_FILE, snapshot)
+    _save_game_levels_snapshot()
+    return current, target
 
 
 def _game_stats(username, game_key):
@@ -12245,6 +12312,7 @@ class TalkinBot:
             or re.match(r"^l@[amob]$", str(body or "").strip(), re.I)
             or re.match(r"^is@.+", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
+            or re.match(r"^(?:إضافة|اضافة|استرجاع|استعادة|زيادة|زود)\s+(?:العاب|ألعاب)@", str(body or "").strip(), re.I)
         )
         # A pending room-join language choice belongs to the user who started
         # `دخول@...`, even when that user is not a master.  Handle it before
@@ -13121,6 +13189,36 @@ class TalkinBot:
         text=str(body or "").strip()
         low=text.casefold()
         if self._room_list_commands(room, text, sender, is_private):
+            return True
+
+        # Master-only recovery command. Use @ separators so decorated names
+        # remain intact: إضافة العاب@اسم_النك@3890
+        m_restore_games = re.fullmatch(
+            r"(?:إضافة|اضافة|استرجاع|استعادة)\s+(?:العاب|ألعاب)@([^@]+)@(\d+)",
+            text, re.I,
+        )
+        m_increase_games = re.fullmatch(
+            r"(?:زيادة|زود)\s+(?:العاب|ألعاب)@([^@]+)@(\d+)",
+            text, re.I,
+        )
+        if m_restore_games or m_increase_games:
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 أمر استعادة عدد الألعاب مخصص للماستر الأساسي فقط.")
+                return True
+            match = m_restore_games or m_increase_games
+            target = match.group(1).strip().lstrip("@")
+            amount = int(match.group(2))
+            current, total = _restore_game_play_count(
+                target, amount, increment=bool(m_increase_games)
+            )
+            action = "زيادة" if m_increase_games else "استعادة"
+            self.send_private_text(
+                sender,
+                f"✅ تمت {action} ألعاب @{target}\n"
+                f"🎮 العدد السابق: {current}\n"
+                f"🎮 العدد الحالي: {total}\n"
+                f"🏅 المستوى الحالي: {_game_level_info(target)[0]}"
+            )
             return True
 
         # Master runtime cleanup: تنضيف / تنظيف. This never deletes persistent

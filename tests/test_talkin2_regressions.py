@@ -392,6 +392,32 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(set(legacy), {"sourea"})
         self.assertEqual(legacy["sourea"]["games"]["star"]["plays"], 3891)
 
+    def test_restore_games_command_sums_duplicate_records_and_is_master_only(self):
+        legacy = {
+            "sourea": {"username": "SOUREA", "games": {"star": {"plays": 3890}}},
+            "sou☀rea": {"username": "𝐒𝐎𝐔☀𝐑𝐄𝐀", "games": {"coin": {"plays": 10}}},
+        }
+        admin = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        admin._room_list_commands = lambda *_args: False
+        replies = []
+        admin.send_private_text = lambda user, text: replies.append((user, text))
+        with patch.object(bot_module, "_is_primary_master", side_effect=lambda name: name == "Master"), patch.object(
+            bot_module, "_game_stats_data", return_value=legacy
+        ), patch.object(bot_module, "_queue_local_json_save"), patch.object(
+            bot_module, "_save_game_levels_snapshot"
+        ):
+            self.assertTrue(admin._handle_management_command_impl(
+                "", "إضافة العاب@𝐒𝐎𝐔☀𝐑𝐄𝐀@4000", "Master", is_private=True
+            ))
+            self.assertIn("العدد السابق: 3900", replies[-1][1])
+            self.assertIn("العدد الحالي: 4000", replies[-1][1])
+            self.assertEqual(len(legacy), 1)
+            self.assertEqual(bot_module._game_level_info("𝐒𝐎𝐔☀𝐑𝐄𝐀")[2], 4000)
+            self.assertTrue(admin._handle_management_command_impl(
+                "", "إضافة العاب@𝐒𝐎𝐔☀𝐑𝐄𝐀@5000", "Guest", is_private=True
+            ))
+        self.assertIn("مخصص للماستر", replies[-1][1])
+
     def test_decorated_username_matches_game_stats_and_keeps_display_name(self):
         decorated = "♥☼هـــــ☼ـــادي☼♥اا"
         with patch.object(bot_module, "_game_stats_data", return_value={
