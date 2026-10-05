@@ -2320,6 +2320,8 @@ def _is_vip_user(name):
 _GAME_STATE_LOCK = threading.RLock()
 _GAME_STATS_CACHE = None
 _GAME_STATS_MIGRATION_DONE = False
+_GAME_SNAPSHOT_LOCK = threading.RLock()
+_GAME_SNAPSHOT_PENDING = False
 _POINTS_CACHE = None
 _MEDIA_STATS_LOCK = threading.RLock()
 _MEDIA_STATS_CACHE = None
@@ -2638,6 +2640,28 @@ def _save_game_levels_snapshot():
     _queue_local_json_save(GAME_LEVELS_FILE, {"version": 1, "players": players})
 
 
+def _schedule_game_levels_snapshot():
+    """Refresh the derived levels file off the message/game response path."""
+    global _GAME_SNAPSHOT_PENDING
+    with _GAME_SNAPSHOT_LOCK:
+        if _GAME_SNAPSHOT_PENDING:
+            return
+        _GAME_SNAPSHOT_PENDING = True
+
+    def worker():
+        global _GAME_SNAPSHOT_PENDING
+        try:
+            time.sleep(0.05)
+            _save_game_levels_snapshot()
+        except Exception as exc:
+            print("[GAME-SNAPSHOT] background save failed:", repr(exc))
+        finally:
+            with _GAME_SNAPSHOT_LOCK:
+                _GAME_SNAPSHOT_PENDING = False
+
+    threading.Thread(target=worker, daemon=True, name="game-levels-snapshot").start()
+
+
 def _game_welcome(username, room):
     level, label, plays = _game_level_info(username)
     star_line = f"\n⭐ ترتيب النجوم\n       {'⭐' * level}"
@@ -2654,7 +2678,11 @@ def _record_game(username, game_key, points_delta=0, stake=0):
         return
     with _GAME_STATE_LOCK:
         data = _game_stats_data()
-        existing_key, item = _coalesce_game_records(data, username)
+        canonical_key = _game_name_key(username)
+        if _GAME_STATS_MIGRATION_DONE and canonical_key in data and isinstance(data[canonical_key], dict):
+            existing_key, item = canonical_key, data[canonical_key]
+        else:
+            existing_key, item = _coalesce_game_records(data, username)
         key = existing_key or key
         item = item if isinstance(item, dict) else {}
         item.setdefault("username", str(username).strip().lstrip("@"))
@@ -2668,7 +2696,7 @@ def _record_game(username, game_key, points_delta=0, stake=0):
         data[key] = item
         snapshot = copy.deepcopy(data)
     _queue_local_json_save(GAME_STATS_FILE, snapshot)
-    _save_game_levels_snapshot()
+    _schedule_game_levels_snapshot()
 
 
 def _restore_game_play_count(username, count, *, increment=False):
@@ -2676,7 +2704,11 @@ def _restore_game_play_count(username, count, *, increment=False):
     amount = max(0, int(count))
     with _GAME_STATE_LOCK:
         data = _game_stats_data()
-        key, item = _coalesce_game_records(data, username)
+        canonical_key = _game_name_key(username)
+        if _GAME_STATS_MIGRATION_DONE and canonical_key in data and isinstance(data[canonical_key], dict):
+            key, item = canonical_key, data[canonical_key]
+        else:
+            key, item = _coalesce_game_records(data, username)
         key = key or _norm_user(username)
         item = item if isinstance(item, dict) else {}
         item.setdefault("username", str(username).strip().lstrip("@"))
@@ -2701,7 +2733,7 @@ def _restore_game_play_count(username, count, *, increment=False):
         data[key] = item
         snapshot = copy.deepcopy(data)
     _queue_local_json_save(GAME_STATS_FILE, snapshot)
-    _save_game_levels_snapshot()
+    _schedule_game_levels_snapshot()
     return current, target
 
 
@@ -9342,18 +9374,36 @@ class TalkinBot:
                 path = None
                 url = ""
 
-                # البث المباشر يستخدم Audius كمصدر وحيد؛ لا ينتقل إلى
-                # YouTube أو SoundCloud أو تنزيل ملف احتياطي.
+                # البث المباشر يفضّل Audius، ثم يستخدم رابطًا مباشرًا من
+                # YouTube/SoundCloud، ثم تنزيلًا محليًا إذا لزم الأمر.
                 if live_stream:
                     audius = self._audius_live_source(query)
-                    if not audius or not str(audius.get("url") or "").strip():
-                        raise RuntimeError("تعذر العثور على الأغنية في مصدر البث الوحيد Audius أو أن المصدر غير متاح حالياً.")
-                    info = audius
-                    url = str(audius.get("url") or "")
-                    duration = int(audius.get("duration") or 0)
-                    title = str(audius.get("title") or query)
-                    artist = str(audius.get("uploader") or "Audius")
-                    self.log("[MUSIC] live source=Audius title=", title, "room=", room)
+                    if audius and str(audius.get("url") or "").strip():
+                        info = audius
+                        url = str(audius.get("url") or "")
+                        duration = int(audius.get("duration") or 0)
+                        title = str(audius.get("title") or query)
+                        artist = str(audius.get("uploader") or "Audius")
+                        self.log("[MUSIC] live source=Audius title=", title, "room=", room)
+                    else:
+                        direct = self._music_live_source(query)
+                        direct_url = str((direct or {}).get("url") or "").strip()
+                        if direct and direct_url and len(direct_url) <= 500:
+                            info = direct
+                            url = direct_url
+                            duration = int(direct.get("duration") or 0)
+                            title = str(direct.get("title") or query)
+                            artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
+                            self.log("[MUSIC] live source=direct-fallback title=", title, "room=", room)
+                        elif public_base:
+                            info, path = self._music_download(query)
+                            title = str(info.get("title") or query)
+                            artist = str(info.get("uploader") or info.get("channel") or "YouTube")
+                            duration = int(info.get("duration") or 0)
+                            url = public_base + "/media/" + path.name
+                            self.log("[MUSIC] live source=local-fallback title=", title, "room=", room)
+                        else:
+                            raise RuntimeError("تعذر العثور على الأغنية في Audius أو المصدر الاحتياطي المباشر.")
                 else:
                     # Prefer a short Audius stream URL so the room receives the
                     # song without waiting for a full download/conversion.
@@ -9482,7 +9532,7 @@ class TalkinBot:
                 self.report_master_error("تشغيل الأغنية", e, room)
                 if room_output:
                     self.send_room_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.")
-        self.send_room_text(room, f"جاري تلبيه طلبك\n@{requester}")
+        self.send_room_text(room, f"⏳ جاري تجهيز طلب الأغنية\n@{requester}")
         threading.Thread(target=worker, name="music-request", daemon=True).start()
         return True
 

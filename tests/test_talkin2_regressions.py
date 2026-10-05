@@ -717,6 +717,36 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         media_rooms = [item[1] for item in sent if item[0] == "media"]
         self.assertEqual(media_rooms, ["Room A", "Room B", "Room C"])
 
+    def test_live_broadcast_falls_back_when_audius_is_unavailable(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        bot._bot_is_room_owner = lambda _room: True
+        bot._audius_live_source = lambda _query: None
+        bot._music_live_source = lambda _query: {
+            "url": "https://cdn.example/fallback.mp3", "duration": 30,
+            "title": "Fallback Song", "uploader": "Backup",
+        }
+        bot._play_music_in_live_room = lambda room, url, duration: True
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: None
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+        with patch.object(bot_module.threading, "Thread", ImmediateThread), patch.object(
+            bot_module, "_record_media_publication", lambda *_args: None
+        ):
+            self.assertTrue(bot.handle_music_command(
+                "Syria", ".sa Fallback Song", "Tester",
+                live_stream=True, with_reactions=False,
+            ))
+        self.assertTrue(any("تم تشغيل الأغنية في البث" in text for _, text in sent))
+
     def test_room_protection_exempts_owner_and_moderator_but_not_member(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {
