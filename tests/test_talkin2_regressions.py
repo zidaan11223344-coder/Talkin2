@@ -39,10 +39,11 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertFalse(integration.game.enabled())
             self.assertIn("للماستر المحدد", private_messages[-1][1])
 
-            # `.cr 1` in a room is a player action, not a service toggle.
+            # The master toggles the service privately; a verified member then
+            # opens the room-only player-count setup with `.cr 1`.
             integration.handle("North", "Master", ".cr 1")
             self.assertFalse(integration.game.enabled())
-            self.assertIn("فعّلها", room_messages[-1][1])
+            self.assertIn("فعّل اللعبة", room_messages[-1][1])
             integration.handle("North", "Master", ".cr 0")
             self.assertFalse(integration.game.enabled())
             self.assertIn("خاص البوت", room_messages[-1][1])
@@ -52,8 +53,12 @@ class CricketIntegrationRegressions(unittest.TestCase):
 
             integration.handle("North", "Master", ".cr 1", is_private=True)
             self.assertTrue(integration.game.enabled())
+            self.assertIsNone(integration.game.current())
+            self.assertIn("ملفات لعبة الكركيت", private_messages[-1][1])
+
+            integration.handle("North", "Master", ".cr 1")
             self.assertEqual(integration.game.current()["stage"], "setup")
-            self.assertIn("تشغيل لعبة الكركيت", private_messages[-1][1])
+            self.assertIn("إعداد مباراة الكركيت", room_messages[-1][1])
 
             integration.handle("North", "N1", "1")
             self.assertEqual(integration.game.current()["stage"], "lobby")
@@ -94,6 +99,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             room_messages, private_messages, media_messages = [], [], []
             first = self.make_integration(root, room_messages, private_messages, media_messages)
             first.handle("North", "Master", "تشغيل لعبه الكركيت", is_private=True)
+            first.handle("North", "Master", ".cr 1")
             first.handle("North", "Master", "1")
             first.handle("North", "N1", "Join")
             first.handle("South", "S1", "Join")
@@ -131,6 +137,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
                 ],
             )
             integration.handle("North", "Master", ".cr 1", is_private=True)
+            integration.handle("North", "Master", ".cr 1")
             integration.handle("North", "N1", ".cr 2")
             for player in ("N1", "N2"):
                 integration.handle("North", player, "Join")
@@ -210,12 +217,18 @@ class CricketIntegrationRegressions(unittest.TestCase):
                 is_verified=lambda name: str(name).casefold() in {"master", "verified"},
             )
             integration.handle("Room", "Master", "تشغيل لعبه الكركيت", is_private=True)
-            self.assertEqual(integration.game.current()["stage"], "setup")
+            self.assertIsNone(integration.game.current())
 
-            integration.handle("Room", "Guest", ".cr 2")
-            self.assertEqual(integration.game.current()["stage"], "setup")
+            integration.handle("Room", "Guest", ".cr 1")
+            self.assertIsNone(integration.game.current())
             self.assertIn("موثقين", room_messages[-1][1])
 
+            integration.handle("Room", "Verified", ".cr 1")
+            self.assertEqual(integration.game.current()["stage"], "setup")
+            setup_text = room_messages[-1][1]
+            self.assertIn("إعداد مباراة الكركيت", setup_text)
+            self.assertIn("اختر عدد اللاعبين داخل هذه الغرفة فقط", setup_text)
+            self.assertIn("كل لاعب يرسل Join", setup_text)
             integration.handle("Room", "Verified", ".cr 2")
             self.assertEqual(integration.game.current()["stage"], "lobby")
             integration.handle("Room", "Guest", "Join")

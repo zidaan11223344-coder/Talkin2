@@ -238,13 +238,9 @@ class CricketIntegration:
 
         if enabled:
             if previous_match is None:
-                setup_result = self.game.begin_setup(room)
-                if setup_result:
-                    self._send_private(sender, room, str(setup_result))
-                    return True
-                confirmation = "✅ تم تشغيل لعبة الكركيت وفتح إعدادها في الغرفة المتصلة."
+                confirmation = "✅ تم تشغيل ملفات لعبة الكركيت. أرسل .cr 1 داخل الغرفة لفتح إعداد المباراة للأعضاء."
             else:
-                confirmation = "✅ لعبة الكركيت مفعّلة؛ المباراة المفتوحة مستمرة دون تغيير."
+                confirmation = "✅ ملفات لعبة الكركيت مفعّلة؛ المباراة المفتوحة مستمرة دون تغيير."
         else:
             if str(result or "").startswith("❌"):
                 self._send_private(sender, room, str(result))
@@ -253,6 +249,16 @@ class CricketIntegration:
 
         self._deliver_transition(previous_match, room)
         self._send_private(sender, room, confirmation)
+        return True
+
+    def _verified_room_setup(self, room: str, sender: str) -> bool:
+        if not self.is_verified(sender):
+            self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
+            return True
+        previous_match = self.game.current()
+        result = self.game.begin_setup(room)
+        self._reply_error(room, result)
+        self._deliver_transition(previous_match, room)
         return True
 
     def _reply_error(self, room: str, result: str | None) -> None:
@@ -284,7 +290,7 @@ class CricketIntegration:
             if is_private:
                 return self._private_toggle(room, sender, control in self.PRIVATE_START_COMMANDS)
             if control in self.PRIVATE_START_COMMANDS and control in {".cr 1", ".cr1"}:
-                return self._verified_room_start(room, sender, 1)
+                return self._verified_room_setup(room, sender)
             else:
                 self.send_room_text(room, "🔒 أرسل أمر تشغيل/إيقاف الكركيت في خاص البوت؛ الأمر مخصص للماستر المحدد في المتغيرات.")
                 return True

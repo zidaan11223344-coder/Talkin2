@@ -21,6 +21,8 @@ def test_master_toggle_and_player_count_are_persistent(tmp_path: Path):
     )
 
     assert integration.handle("Room A", "master", ".cr 1", is_private=True) is True
+    assert integration.game.current() is None
+    assert integration.handle("Room A", "member", ".cr 1") is True
     assert integration.game.current()["stage"] == "setup"
     assert integration.handle("Room A", "member", ".cr 2") is True
     assert integration.game.current()["stage"] == "lobby"
@@ -56,6 +58,8 @@ def test_only_master_can_toggle_cricket(tmp_path: Path):
     assert "فعّلها" in messages[-1][1]
     assert integration.handle("Room A", "master", ".cr 1", is_private=True) is True
     assert integration.game.enabled("Room A") is True
+    assert integration.game.current() is None
+    assert integration.handle("Room A", "master", ".cr 1") is True
     assert integration.game.current()["stage"] == "setup"
     assert integration.handle("Room A", "player", ".ct 0") is True
     assert integration.game.enabled("Room A") is True
