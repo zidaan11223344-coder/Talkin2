@@ -621,18 +621,35 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             with patch.object(bot_module, "_save_room_protection", side_effect=lambda room, **changes: saved.append((room, changes))), patch.object(
                 bot_module, "_save_room_moderation", lambda *_args, **_kwargs: None
             ):
-                # Numbered options from the room are rejected even while a private menu is pending.
-                self.assertTrue(bot._handle_management_command_impl("North", "3", "Master", is_private=False))
-                self.assertEqual(saved, [])
-                self.assertIn("خاص", private[-1][1])
-                self.assertTrue(bot._handle_management_command_impl("", "3", "Master", is_private=True))
+                # A room creator/master may use the numbered menu in the same room.
+                with patch.object(bot_module, "_room_manager", return_value=True):
+                    self.assertTrue(bot._handle_management_command_impl("North", "3", "Master", is_private=False))
                 self.assertEqual(saved, [("North", {"flood": True})])
+                self.assertTrue(public)
+                self.assertTrue(bot._handle_management_command_impl("", "حماية@North", "Master", is_private=True))
+                self.assertTrue(bot._handle_management_command_impl("", "3", "Master", is_private=True))
+            self.assertEqual(saved, [("North", {"flood": True}), ("North", {"flood": True})])
 
             self.assertTrue(bot._handle_management_command_impl("North", "حماية@North", "Master", is_private=False))
-            self.assertIn("خاص", private[-1][1])
-            self.assertEqual(public, [], "the protection menu must never be published in a room")
+            self.assertIn("قائمة حماية الغرفة", public[-1][1])
             self.assertTrue(bot._handle_management_command_impl("", "حماية@North", "Guest", is_private=True))
-            self.assertIn("مخصصة", private[-1][1])
+            self.assertIn("ماستر", private[-1][1])
+
+    def test_inv_finishes_without_leaving_the_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.invites_enabled = True
+        bot.invite_silent_master = False
+        bot.invite_lock = __import__("threading").Lock()
+        bot.invite_pending = True
+        bot.invite_sent = set()
+        bot._inv_response_room = "North"
+        bot._inv_response_to = ""
+        bot.send_private_invite = lambda username, room: True
+        bot.send_room_text = lambda *_args: None
+        bot.log = lambda *_args: None
+        bot.leave_room = lambda *_args: (_ for _ in ()).throw(AssertionError("inv must not leave the room"))
+        bot._finish_invites("North", ["Member"])
+        self.assertFalse(bot.invite_pending)
 
     def test_a1_ns_advances_one_management_section_and_m_command_is_supported(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

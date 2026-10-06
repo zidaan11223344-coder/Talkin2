@@ -12503,6 +12503,8 @@ class TalkinBot:
             or str(body or "").strip().casefold() in {"حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "l@mfb"}
             or re.match(r"^(?:amf|[-+]amf)@.+$", str(body or "").strip(), re.I)
             or re.match(r"^l@mfb$", str(body or "").strip(), re.I)
+            or str(body or "").strip().casefold() in {"inv", "invite", "دعوات"}
+            or re.match(r"^(?:inv|invite|دعوات)\s+", str(body or "").strip(), re.I)
             or re.match(r"^l@[amob]$", str(body or "").strip(), re.I)
             or re.match(r"^is@.+", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
@@ -13588,11 +13590,13 @@ class TalkinBot:
         # restricted to the configured primary master.
         protection_match = re.fullmatch(r"(?:حماية|حمايه|حماية الغرفة|حمايه الغرفه)(?:@([^@]+)|\s+(.+))?", text, re.I)
         if protection_match:
-            if not is_private or not _is_primary_master(sender):
-                if _is_primary_master(sender):
-                    self.send_private_text(sender, "🔒 افتح قائمة الحماية من خاص البوت فقط.")
+            room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
+                                          or _room_manager(self, room, sender)))
+            if not ((_is_primary_master(sender) and is_private) or room_manager):
+                if room and not is_private:
+                    self.send_room_text(room, "🚫 قائمة الحماية لصانع الغرفة أو الماستر فقط.")
                 else:
-                    self.send_private_text(sender, "🚫 قائمة الحماية مخصصة للماستر الأساسي في الخاص.")
+                    self.send_private_text(sender, "🚫 قائمة الحماية للماستر الأساسي في الخاص أو لصانع الغرفة داخلها.")
                 return True
             target_room = str(protection_match.group(1) or protection_match.group(2) or
                               getattr(self, "last_joined_room", "") or room or self.room or "").strip()
@@ -13600,8 +13604,9 @@ class TalkinBot:
                 self.send_private_text(sender, "⚠️ أرسل حماية@اسم_الغرفة من خاص البوت لفتح إعداداتها.")
                 return True
             self._pending_protection_number = getattr(self, "_pending_protection_number", {})
-            self._pending_protection_number[_norm_user(sender)] = {"room":target_room,"created":time.time()}
-            self.send_private_text(sender,
+            self._pending_protection_number[_norm_user(sender)] = {"room":target_room,"created":time.time(),"is_private":bool(is_private)}
+            send_menu = self.send_private_text if is_private else self.send_room_text
+            send_menu(sender if is_private else target_room,
                 "🛡️ قائمة حماية الغرفة\n"
                 "━━━━━━━━━━━━\n"
                 "1️⃣ تشغيل حماية الغرفة من السب\n"
@@ -13625,27 +13630,31 @@ class TalkinBot:
             pending_protection = self._pending_protection_number = {}
         st=pending_protection.get(protection_key,{})
         if st.get("awaiting_number") and re.fullmatch(r"\d+",low):
-            if not is_private or not _is_primary_master(sender):
+            room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
+                                          or _room_manager(self, room, sender)))
+            if not ((is_private and _is_primary_master(sender)) or (not is_private and room_manager)):
                 return True
             try:
                 limit=int(low)
             except Exception:
                 limit=0
             if not 2 <= limit <= 50:
-                self.send_private_text(sender,"⚠️ أرسل رقماً من 2 إلى 50 فقط.")
+                (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room,"⚠️ أرسل رقماً من 2 إلى 50 فقط.")
                 return True
             target_room=str(st.get("room") or room or self.room or "").strip()
             _save_room_protection(target_room,repeat_limit=limit)
             _save_room_moderation(target_room,repeat_limit=limit)
             self._pending_protection_number.pop(protection_key,None)
-            self.send_private_text(sender,f"✅ تم اعتماد حد الفلود: {limit} رسائل متكررة في الغرفة: {target_room}")
+            (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room,f"✅ تم اعتماد حد الفلود: {limit} رسائل متكررة في الغرفة: {target_room}")
             return True
 
         if protection_key in pending_protection and low.isdigit():
             st=pending_protection.get(protection_key,{})
-            if not is_private or not _is_primary_master(sender):
-                if _is_primary_master(sender):
-                    self.send_private_text(sender, "🔒 أرسل رقم الخيار من خاص البوت فقط.")
+            room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
+                                          or _room_manager(self, room, sender)))
+            if not ((is_private and _is_primary_master(sender)) or (not is_private and room_manager)):
+                if is_private and _is_primary_master(sender):
+                    self.send_private_text(sender, "🔒 أرسل رقم الخيار من خاص البوت أو داخل الغرفة بصفتك صانعاً.")
                 return True
             if time.time()-float(st.get("created",0))>180:
                 self._pending_protection_number.pop(protection_key,None)
@@ -13655,13 +13664,13 @@ class TalkinBot:
                     names={1:("swear",True,"🛡️ تم تشغيل حماية الغرفة من السب."),2:("swear",False,"⛔ تم إيقاف حماية الغرفة من السب."),3:("flood",True,"🛡️ تم تشغيل حماية الغرفة من الفلود."),4:("flood",False,"⛔ تم إيقاف حماية الغرفة من الفلود."),5:("joinleave",True,"🛡️ تم تشغيل حماية الغرفة من الدخول والخروج."),6:("joinleave",False,"⛔ تم إيقاف حماية الغرفة من الدخول والخروج."),8:("no_photo",True,"🛡️ تم تشغيل حظر الحسابات بلا صورة."),9:("no_photo",False,"⛔ تم إيقاف حظر الحسابات بلا صورة.")}[n]
                     _save_room_protection(target_room, **{names[0]:names[1]})
                     self._pending_protection_number.pop(protection_key,None)
-                    self.send_private_text(sender,names[2]+f"\n🏠 الغرفة: {target_room}")
+                    (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room,names[2]+f"\n🏠 الغرفة: {target_room}")
                     return True
                 if n==7:
                     self._pending_protection_number[protection_key]={"room":target_room,"created":time.time(),"awaiting_number":True}
-                    self.send_private_text(sender,"🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر (من 2 إلى 50).")
+                    (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room,"🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر (من 2 إلى 50).")
                     return True
-                self.send_private_text(sender,"⚠️ اختر رقماً من 1 إلى 9.")
+                (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room,"⚠️ اختر رقماً من 1 إلى 9.")
                 return True
         # Filter exceptions: amf@username adds, -amf@username removes, and
         # l@amf lists the accounts that the word filter must never ban.
@@ -13697,14 +13706,16 @@ class TalkinBot:
             return True
 
         if low in ("تشغيل الحماية", "تشغيل الحمايه", "الحماية تشغيل", "الحمايه تشغيل"):
-            if not room or not _room_manager(self, room, sender):
+            if not room or not (_is_master_name(sender) or _is_primary_master(sender)
+                                or _room_manager(self, room, sender)):
                 return True
             cfg = _save_room_moderation(room, enabled=True)
             _save_room_protection(room, swear=True, flood=True)
             self.send_room_text(room, f"🛡️ حماية الغرفة شغالة. حد التكرار: {cfg['repeat_limit']} رسائل.")
             return True
         if low in ("إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "الحماية إيقاف", "الحمايه ايقاف"):
-            if not room or not _room_manager(self, room, sender):
+            if not room or not (_is_master_name(sender) or _is_primary_master(sender)
+                                or _room_manager(self, room, sender)):
                 return True
             _save_room_moderation(room, enabled=False)
             _save_room_protection(room, swear=False, flood=False)
@@ -13712,7 +13723,8 @@ class TalkinBot:
             return True
         m_repeat = re.fullmatch(r"mr@(\d+)", text, re.I)
         if m_repeat:
-            if not room or not _room_manager(self, room, sender):
+            if not room or not (_is_master_name(sender) or _is_primary_master(sender)
+                                or _room_manager(self, room, sender)):
                 return True
             limit = max(2, min(50, int(m_repeat.group(1))))
             _save_room_moderation(room, repeat_limit=limit)
