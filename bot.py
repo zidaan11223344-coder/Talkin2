@@ -4809,6 +4809,7 @@ class TalkinBot:
             send_private_text=self.send_private_text,
             public_base=_public_base_url,
             reward=lambda username, amount: _add_points(username, amount),
+            bot_name=BOT_ID or "Talkin2",
             log=print,
         )
         self.auth = None

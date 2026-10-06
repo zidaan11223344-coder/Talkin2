@@ -12,7 +12,7 @@ from cricket_result import render_result_image
 
 
 class CricketIntegrationRegressions(unittest.TestCase):
-    def make_integration(self, root, room_messages, private_messages, media_messages, is_verified=None, send_all_rooms_text=None):
+    def make_integration(self, root, room_messages, private_messages, media_messages, is_verified=None, send_all_rooms_text=None, bot_name="Talkin2"):
         return CricketIntegration(
             root,
             is_master=lambda name: str(name).casefold() == "master",
@@ -23,6 +23,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             send_room_media=lambda room, url, kind: media_messages.append((room, url, kind)),
             send_private_text=lambda user, text: private_messages.append((user, text)),
             public_base=lambda: "https://bot.example",
+            bot_name=bot_name,
             log=lambda *_args: None,
         )
 
@@ -243,6 +244,19 @@ class CricketIntegrationRegressions(unittest.TestCase):
             match = integration.game.current()
             self.assertEqual(match["stage"], "live")
             self.assertIn("__sboot_cricket_bot__", match["teams"])
+
+    def test_bot_match_uses_configured_nickname_instead_of_repository_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            messages, private, media = [], [], []
+            integration = self.make_integration(
+                Path(temp), messages, private, media, bot_name="𝐒𝐎𝐔☀𝐑𝐄𝐀"
+            )
+            integration.game.set_enabled("Hall", True)
+            integration.handle("Hall", "Player", ".cr b")
+            self.assertIn("𝐒𝐎𝐔☀𝐑𝐄𝐀", messages[-1][1])
+            integration.handle("Hall", "Player", "1")
+            integration.handle("Hall", "Player", "Join")
+            self.assertTrue(any("𝐒𝐎𝐔☀𝐑𝐄𝐀" in text for _, text in messages))
 
     def test_batter_stays_until_out_and_bowler_rotates_every_six_balls(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -46,9 +46,15 @@ class CricketIntegration:
         send_private_text: Callable[[str, str], object] | None = None,
         public_base: Callable[[], str],
         reward: Callable[[str, int], object] | None = None,
+        bot_name: str = "Talkin2",
         log: Callable[..., object] = print,
     ):
-        self.game = CricketGame(Path(data_dir) / "cricket_state.json", persist=persist, reward=reward)
+        self.game = CricketGame(
+            Path(data_dir) / "cricket_state.json",
+            persist=persist,
+            reward=reward,
+            bot_name=bot_name,
+        )
         self.is_master = is_master
         self.is_configured_master = is_configured_master or is_master
         self.is_verified = is_verified or (lambda _username: True)

@@ -46,12 +46,13 @@ class CricketGame:
     BALLS_PER_PLAYER = 6
     EVENT_HISTORY = 5000
 
-    def __init__(self, root: str | Path, persist=None, reward=None):
+    def __init__(self, root: str | Path, persist=None, reward=None, bot_name: str = "Talkin2"):
         path = Path(root)
         if path.suffix.lower() != ".json":
             path = path / "cricket_state.json"
         self.state = JsonState(path, _blank, persist=persist)
         self.reward = reward
+        self.bot_name = str(bot_name or "Talkin2").strip().lstrip("@") or "Talkin2"
 
     @staticmethod
     def _participants(match: dict[str, Any]) -> list[dict[str, Any]]:
@@ -274,7 +275,7 @@ class CricketGame:
                 "🏏 إعداد مباراة ضد البوت\n"
                 "اختر عدد اللاعبين: 1 أو 2 أو 3 أو 4.\n"
                 "بعد اختيار العدد، يرسل كل لاعب Join من هذه الغرفة فقط.\n"
-                "🤖 الخصم هو بوت Talkin2.",
+                f"🤖 الخصم هو بوت {self.bot_name}.",
             )
             return None
 
@@ -305,7 +306,7 @@ class CricketGame:
                 ("👥 أرسل Join من لاعبي هذه الغرفة، وبعد اكتمال الفريق ترسل الغرفة الثانية Join."
                  if match["mode"] == "rooms" else
                  "👤 كل اللاعبين ينضمون من هذه الغرفة فقط بإرسال Join.\n"
-                 "🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد Talkin2."),
+                 f"🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد {self.bot_name}."),
             )
             return None
 
@@ -320,7 +321,7 @@ class CricketGame:
                 self._emit(
                     data,
                     rooms,
-                    "🤖 انضم بوت Talkin2 خصمًا لك. اختر دورك: 1 للهجوم أو 2 للدفاع؛ "
+                    f"🤖 انضم بوت {self.bot_name} خصمًا لك. اختر دورك: 1 للهجوم أو 2 للدفاع؛ "
                     "والبوت يأخذ الدور الآخر تلقائيًا.",
                 )
                 return True
@@ -385,7 +386,7 @@ class CricketGame:
                     self._emit(
                         data, [participant],
                         f"✅ انضم @{username}.\n👥 اكتمل {len(players)}/{target} لاعب في الغرفة.\n"
-                        "🔗 للمباراة الجماعية: اجعل الغرفة الثانية ترسل Join، أو أكمل العدد هنا للعب ضد Talkin2.",
+                        f"🔗 للمباراة الجماعية: اجعل الغرفة الثانية ترسل Join، أو أكمل العدد هنا للعب ضد {self.bot_name}.",
                     )
                 else:
                     if match.get("mode") == "solo":
@@ -512,7 +513,7 @@ class CricketGame:
     def _next_player(self, match: dict[str, Any], team: str, batting: bool) -> str:
         participant = self._room_for_team(match, team)
         if participant is None:
-            return "🤖 بوت Talkin2"
+            return f"🤖 بوت {self.bot_name}"
         players = [str(item) for item in participant.get("players", []) if str(item).strip()]
         if not players:
             return participant["name"]
@@ -665,7 +666,7 @@ class CricketGame:
             names = "، ".join(f"@{player}" for player in players) or "لاعبون قيد الانضمام"
             return f"👥 {self._team_label(team)} — {participant['name']} ({len(players)} لاعبين): {names}"
         if match.get("mode") == "solo" and (match.get("teams") or {}).get(BOT_TEAM_KEY) == team:
-            return f"🤖 {self._team_label(team)} — Talkin2 (1 لاعب)"
+            return f"🤖 {self._team_label(team)} — {self.bot_name} (1 لاعب)"
         return f"👥 {self._team_label(team)} — الفريق"
 
     def _finish(self, data: dict[str, Any], match: dict[str, Any], participants: list[dict[str, Any]]) -> None:
@@ -685,10 +686,10 @@ class CricketGame:
             human_team = next((value for key, value in teams.items() if key != BOT_TEAM_KEY), "attack")
             human_room = team_rooms.get(human_team)
             human_players = [str(p).lstrip("@") for p in (human_room or {}).get("players", []) if str(p).strip()]
-            bot_players = ["بوت Talkin2"]
-            winner = "تعادل" if winner_team == "tie" else ("الفريق البشري" if winner_team == human_team else "بوت Talkin2")
+            bot_players = [f"بوت {self.bot_name}"]
+            winner = "تعادل" if winner_team == "tie" else ("الفريق البشري" if winner_team == human_team else f"بوت {self.bot_name}")
             winning_players = human_players if winner_team == human_team else []
-            team1_name, team2_name = "الفريق البشري", "Talkin2"
+            team1_name, team2_name = "الفريق البشري", self.bot_name
             team1_players, team2_players = human_players, bot_players
             team1_score = attack_score if human_team == "attack" else defense_score
             team2_score = defense_score if human_team == "attack" else attack_score
@@ -798,8 +799,8 @@ class CricketGame:
                 choices["bat"] = {
                     "value": random.randint(0, 6),
                     "room_key": BOT_TEAM_KEY,
-                    "room": "بوت Talkin2",
-                    "sender": "بوت Talkin2",
+                        "room": f"بوت {self.bot_name}",
+                        "sender": f"بوت {self.bot_name}",
                 }
 
             if not choices.get("bat"):
@@ -811,7 +812,7 @@ class CricketGame:
                 }
                 if match.get("mode") == "solo":
                     bot_value = random.randint(0, 6)
-                    bot_choice = {"value": bot_value, "room_key": BOT_TEAM_KEY, "room": "بوت Talkin2", "sender": "بوت Talkin2"}
+                    bot_choice = {"value": bot_value, "room_key": BOT_TEAM_KEY, "room": f"بوت {self.bot_name}", "sender": f"بوت {self.bot_name}"}
                     bat_choice, bowl_choice = (choices["bat"], bot_choice) if batting == team else (bot_choice, choices["bat"])
                     return self._resolve_ball(data, match, participants, bat_choice, bowl_choice)
 
