@@ -20,6 +20,36 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertFalse(bot._is_duplicate_incoming("room", second_join))
         self.assertTrue(bot._is_duplicate_incoming("room", second_join))
 
+    def test_fast_join_pair_bans_both_and_keeps_banning_later_joins(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {"North": {"alpha": "member", "beta": "member", "gamma": "member"}}
+        with patch.object(bot_module, "_is_master_name", return_value=False), patch.object(
+            bot_module, "_is_room_creator", return_value=False
+        ):
+            self.assertEqual(bot_module._join_flood_candidates(bot, "North", "alpha", now=100.0), [])
+            early = bot_module._join_flood_candidates(bot, "North", "beta", now=100.5)
+            self.assertEqual(set(early), {"alpha", "beta"})
+            bot._join_flood_banned[bot_module._norm_room("North")].update(
+                bot_module._norm_user(name) for name in early
+            )
+            self.assertEqual(
+                bot_module._join_flood_candidates(bot, "North", "gamma", now=101.0),
+                ["gamma"],
+            )
+
+    def test_steal_and_marriage_candidates_are_scoped_to_the_live_room_roster(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {
+            "North": {"sender": "member", "north_user": "member", "banned_user": "outcast"},
+            "South": {"south_user": "member"},
+        }
+        with patch.object(bot_module, "_is_master_name", return_value=False):
+            self.assertEqual(
+                bot._room_member_usernames_for_steal(" north ", "sender"),
+                ["north_user"],
+            )
+        self.assertEqual(bot._fun_room_members("NORTH", "sender"), ["north_user"])
+
 
 class CricketIntegrationRegressions(unittest.TestCase):
     def make_integration(self, root, room_messages, private_messages, media_messages, is_verified=None, send_all_rooms_text=None, bot_name="Talkin2"):

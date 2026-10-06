@@ -3253,6 +3253,45 @@ def _auto_ban_candidate(bot, room, sender, event_role=None):
     }
     return role_key not in protected_roles
 
+def _join_flood_candidates(bot, room, username, event_role=None, now=None):
+    """Return new accounts to IP-ban for a fast or sustained join burst.
+
+    Two distinct joins within 1.25 seconds trigger immediately; three distinct
+    joins within five seconds trigger the sustained-burst rule. Once triggered,
+    every new eligible join renews a five-second incident window so later
+    accounts in the same wave are banned instead of escaping after a one-shot
+    history clear.
+    """
+    now = time.time() if now is None else float(now)
+    room_key = _norm_room(room)
+    if not hasattr(bot, "_join_flood_history"):
+        bot._join_flood_history = defaultdict(list)
+    if not hasattr(bot, "_join_flood_until"):
+        bot._join_flood_until = {}
+    if not hasattr(bot, "_join_flood_banned"):
+        bot._join_flood_banned = defaultdict(set)
+
+    history = bot._join_flood_history[room_key]
+    history[:] = [row for row in history if now - row[0] <= 5.0]
+    identity = _norm_user(username)
+    if identity and not any(_norm_user(row[1]) == identity for row in history):
+        history.append((now, username, event_role))
+
+    distinct = sorted(history, key=lambda row: row[0])
+    fast_pair = (len(distinct) >= 2 and
+                 distinct[-1][0] - distinct[-2][0] <= 1.25)
+    sustained_burst = len(distinct) >= 3
+    if fast_pair or sustained_burst:
+        bot._join_flood_until[room_key] = now + 5.0
+
+    if now > float(bot._join_flood_until.get(room_key, 0.0) or 0.0):
+        return []
+    bot._join_flood_until[room_key] = now + 5.0
+    banned = bot._join_flood_banned[room_key]
+    return [name for _, name, role in distinct
+            if _norm_user(name) not in banned
+            and _auto_ban_candidate(bot, room, name, role)]
+
 def _norm_filter_text(text):
     value = str(text or "").casefold()
     value = re.sub(r"[\u064b-\u065f\u0670\u0640]", "", value)
@@ -10877,13 +10916,12 @@ class TalkinBot:
             if base and image and image.is_file():
                 self.send_room_media(room, f"{base}/assets/{filename}", "image")
 
-    def _room_member_usernames_for_steal(self, room, exclude_username=""):
-        """Return only users currently present in the same live room."""
-        excluded = {_norm_user(exclude_username), _norm_user(BOT_ID)}
-        candidates = []
-        seen = set()
+    def _live_room_user_roles(self, room):
+        """Read the in-memory room roster only; never consult bot-wide member files."""
         room_key = _norm_room(room).casefold()
         live = {}
+        if not room_key:
+            return live
         for cached_room, cached_users in getattr(self, "room_users", {}).items():
             if _norm_room(cached_room).casefold() != room_key:
                 continue
@@ -10891,6 +10929,14 @@ class TalkinBot:
                 live.update(cached_users)
             elif isinstance(cached_users, (list, tuple, set)):
                 live.update({str(name): "member" for name in cached_users})
+        return live
+
+    def _room_member_usernames_for_steal(self, room, exclude_username=""):
+        """Return only eligible usernames from this room's live in-memory roster."""
+        excluded = {_norm_user(exclude_username), _norm_user(BOT_ID)}
+        candidates = []
+        seen = set()
+        live = self._live_room_user_roles(room)
         for username, role in live.items():
             u = str(username or "").strip().lstrip("@").strip()
             key = _norm_user(u)
@@ -11987,14 +12033,15 @@ class TalkinBot:
         return False
 
     def _fun_room_members(self, room, sender):
-        """Return live room members suitable for light social games."""
-        users = getattr(self, "room_users", {}).get(room, {}) or {}
-        names = list(users.keys()) if isinstance(users, dict) else list(users or [])
+        """Return eligible members of this room from the live cache only."""
+        users = self._live_room_user_roles(room)
         out=[]
-        for name in names:
+        excluded = {_norm_user(sender), _norm_user(BOT_ID), _norm_user("🤖 البوت")}
+        for name, role in users.items():
             clean=str(name or "").strip().lstrip("@")
-            if (clean and _norm_user(clean) not in {_norm_user(sender), _norm_user(BOT_ID)}
-                    and _norm_user(clean) not in {_norm_user("🤖 البوت")}):
+            role_key = str(role or "").casefold().strip()
+            if (clean and _norm_user(clean) not in excluded
+                    and role_key not in {"outcast", "banned", "ban", "blocked", "kicked"}):
                 out.append(clean)
         return out
 
@@ -15385,31 +15432,28 @@ class TalkinBot:
             norm_u = _norm_user(username)
             norm_r = _norm_room(room)
 
-            # --- حماية الفلود: كشف دخول عدد نكات غير محدود/جماعي بنفس الوقت وحظرهم IP ---
-            if (event_type == "user_joined" and pcfg.get("flood") and norm_u != _norm_user(BOT_ID)
-                    and _auto_ban_candidate(self, room, username, role if role_field_present else None)):
-                if not hasattr(self, "_join_flood_history"):
-                    self._join_flood_history = defaultdict(list)
-                history = self._join_flood_history[norm_r]
-                # إبقاء سجل آخر 5 ثوانٍ
-                history[:] = [h for h in history if now - h[0] <= 5.0]
-                history.append((now, username, role if role_field_present else None))
-                # إذا دخل 3 أو أكثر من النكات المختلفة خلال 5 ثوانٍ (هجوم فلود نكات)
-                if len(history) >= 3:
-                    self.log(f"[FLOOD] كشف فلود دخول جماعي في {room}: {len(history)} نكات خلال 5 ثوانٍ")
+            # --- حماية الفلود: ترقية سريعة (نكّان خلال 1.25 ثانية) أو
+            # مستمرة (3 خلال 5 ثوانٍ)، ثم حظر الحسابات اللاحقة في نفس الموجة. ---
+            if (event_type == "user_joined" and pcfg.get("flood")
+                    and norm_u != _norm_user(BOT_ID)):
+                candidates = _join_flood_candidates(
+                    self, room, username, role if role_field_present else None, now=now
+                )
+                if candidates:
+                    self.log(f"[FLOOD] كشف دخول سريع/جماعي في {room}: {len(candidates)} حسابات مستهدفة")
                     banned_names = []
-                    for _, u_flood, flood_role in list(history):
-                        if (_norm_user(u_flood) != _norm_user(BOT_ID)
-                                and _auto_ban_candidate(self, room, u_flood, flood_role)):
-                            try:
-                                self.send_admin(room, u_flood, "ban_ip")
-                                _record_filter_ban(u_flood, room, "حماية الفلود", "دخول جماعي متزامن (حظر IP)")
-                                banned_names.append(f"@{u_flood}")
-                            except Exception as f_err:
-                                self.log("[FLOOD] ban_ip error:", repr(f_err))
-                    history.clear()
+                    for u_flood in candidates:
+                        try:
+                            # Send the native IP ban synchronously before this
+                            # room event handler proceeds to later messages.
+                            self.send_admin(room, u_flood, "ban_ip")
+                            self._join_flood_banned[norm_r].add(_norm_user(u_flood))
+                            _record_filter_ban(u_flood, room, "حماية الفلود", "دخول سريع/جماعي (حظر IP)")
+                            banned_names.append(f"@{u_flood}")
+                        except Exception as f_err:
+                            self.log("[FLOOD] ban_ip error:", repr(f_err))
                     if banned_names:
-                        self.send_room_text(room, f"🚫 [حماية الفلود] تم حظر IP للنكات التالية لدخولها المتزامن: {' '.join(banned_names[:5])}")
+                        self.send_room_text(room, f"🚫 [حماية الفلود] تم حظر IP سريعاً للحسابات التالية: {' '.join(banned_names[:5])}")
 
             # --- حماية الدخول والخروج: كشف تكرار الدخول والخروج لنفس النك وحظره ---
             if (pcfg.get("joinleave") and norm_u != _norm_user(BOT_ID)
