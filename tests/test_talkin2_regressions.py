@@ -244,7 +244,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual(match["stage"], "live")
             self.assertIn("__sboot_cricket_bot__", match["teams"])
 
-    def test_each_player_gets_six_balls_in_both_innings_and_lead_does_not_end_match_early(self):
+    def test_batter_stays_until_out_and_bowler_rotates_every_six_balls(self):
         with tempfile.TemporaryDirectory() as temp:
             room_messages, private_messages, media_messages = [], [], []
             integration = self.make_integration(
@@ -318,12 +318,16 @@ class CricketIntegrationRegressions(unittest.TestCase):
             for _ in range(9):
                 play_delivery(6, 1)
             self.assertIsNone(integration.game.current())
-            for player in ("N1", "N2"):
-                self.assertEqual(batting_counts[(1, player)], 6)
-                self.assertEqual(bowling_counts[(2, player)], 6)
-            for player in ("S1", "S2"):
-                self.assertEqual(bowling_counts[(1, player)], 6)
-                self.assertEqual(batting_counts[(2, player)], 6)
+            # The batter remains at the crease until OUT, even for all 12
+            # team balls; the defender changes after six consecutive balls.
+            self.assertEqual(batting_counts[(1, "N1")], 12)
+            self.assertNotIn((1, "N2"), batting_counts)
+            self.assertEqual(bowling_counts[(1, "S1")], 6)
+            self.assertEqual(bowling_counts[(1, "S2")], 6)
+            self.assertEqual(batting_counts[(2, "S1")], 12)
+            self.assertNotIn((2, "S2"), batting_counts)
+            self.assertEqual(bowling_counts[(2, "N1")], 6)
+            self.assertEqual(bowling_counts[(2, "N2")], 6)
             self.assertEqual(integration.game.get_points("S1") + integration.game.get_points("S2"), 200_000)
 
     def test_first_team_attacks_then_roles_switch_and_same_bowler_gets_hattrick(self):

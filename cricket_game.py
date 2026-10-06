@@ -183,6 +183,9 @@ class CricketGame:
             "wicket_streak_bowler": "",
             "choices": {},
             "player_scores": {},
+            "active_batters": {"attack": "", "defense": ""},
+            "active_bowlers": {"attack": "", "defense": ""},
+            "bowler_balls": {"attack": 0, "defense": 0},
         }
         return match
 
@@ -513,6 +516,12 @@ class CricketGame:
         players = [str(item) for item in participant.get("players", []) if str(item).strip()]
         if not players:
             return participant["name"]
+        active_key = "active_batters" if batting else "active_bowlers"
+        active = str(match.get(active_key, {}).get(team, "") or "")
+        if active and (batting is False or _user_key(active) not in {
+            _user_key(item) for item in match.get("out_players", {}).get(team, [])
+        }):
+            return active
         turns = match.setdefault("turns", {"attack": 0, "defense": 0})
         start = int(turns.get(team, 0)) % len(players)
         out = {_user_key(item) for item in match.get("out_players", {}).get(team, [])} if batting else set()
@@ -521,6 +530,51 @@ class CricketGame:
             if _user_key(candidate) not in out:
                 return candidate
         return ""
+
+    def _set_initial_players(self, match: dict[str, Any]) -> None:
+        """Set the first batter and defender for each team at innings start."""
+        match["active_batters"] = {}
+        match["active_bowlers"] = {}
+        match["bowler_balls"] = {"attack": 0, "defense": 0}
+        for team in ("attack", "defense"):
+            match["active_batters"][team] = self._next_player(match, team, batting=True)
+            match["active_bowlers"][team] = self._next_player(match, team, batting=False)
+
+    def _advance_after_ball(self, match: dict[str, Any], batting: str, bowling: str, out_name: str) -> None:
+        """Keep batters until OUT; rotate bowlers only after six consecutive balls."""
+        batters = match.setdefault("active_batters", {})
+        bowlers = match.setdefault("active_bowlers", {})
+        bowler_balls = match.setdefault("bowler_balls", {"attack": 0, "defense": 0})
+        active_batter = str(batters.get(batting, "") or "")
+        if out_name and _user_key(active_batter) == _user_key(out_name):
+            participant = self._room_for_team(match, batting)
+            players = [str(item) for item in (participant or {}).get("players", []) if str(item).strip()]
+            out = {_user_key(item) for item in match.get("out_players", {}).get(batting, [])}
+            if players:
+                try:
+                    index = next(i for i, player in enumerate(players) if _user_key(player) == _user_key(out_name))
+                except StopIteration:
+                    index = -1
+                batters[batting] = next(
+                    (players[(index + offset) % len(players)] for offset in range(1, len(players) + 1)
+                     if _user_key(players[(index + offset) % len(players)]) not in out),
+                    "",
+                )
+            else:
+                batters[batting] = self._next_player(match, batting, batting=True)
+
+        bowler_balls[bowling] = int(bowler_balls.get(bowling, 0)) + 1
+        if bowler_balls[bowling] >= self.BALLS_PER_PLAYER:
+            participant = self._room_for_team(match, bowling)
+            players = [str(item) for item in (participant or {}).get("players", []) if str(item).strip()]
+            if len(players) > 1:
+                current = _user_key(str(bowlers.get(bowling, "")))
+                try:
+                    index = next(i for i, player in enumerate(players) if _user_key(player) == current)
+                except StopIteration:
+                    index = -1
+                bowlers[bowling] = players[(index + 1) % len(players)]
+            bowler_balls[bowling] = 0
 
     def _turn_prompt(self, match: dict[str, Any]) -> str:
         """Return a compact generic prompt (kept for older integrations)."""
@@ -570,6 +624,7 @@ class CricketGame:
         match["wicket_streak"] = 0
         match["wicket_streak_bowler"] = ""
         match["choices"] = {}
+        self._set_initial_players(match)
         match["player_scores"] = {
             str(player).lstrip("@"): 0
             for item in participants
@@ -833,6 +888,7 @@ class CricketGame:
         turns = match.setdefault("turns", {"attack": 0, "defense": 0})
         turns[batting] = int(turns.get(batting, 0)) + 1
         turns[bowling] = int(turns.get(bowling, 0)) + 1
+        self._advance_after_ball(match, batting, bowling, out_name if bat_value == bowl_value else "")
         balls_limit = self._balls_per_innings(match)
         current_wickets = int(wickets.get(batting, 0))
         total = int(scores.get(batting, 0))
@@ -857,6 +913,7 @@ class CricketGame:
                 match["wicket_streak"] = 0
                 match["wicket_streak_bowler"] = ""
                 match["choices"] = {}
+                self._set_initial_players(match)
                 target = attack_score + 1
                 self._emit(data, participants, f"🏁 الشوط الأول انتهى\n🎯 الهدف: {target}")
                 self._emit_room_messages(data, self._turn_messages(match))
