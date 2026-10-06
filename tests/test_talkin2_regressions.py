@@ -580,6 +580,30 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot_module._looks_like_bot_command(command), command)
         self.assertEqual(bot_module._normalize_game_command_text("coin@tails"), "عملة@كتابة")
 
+    def test_enter_my_rooms_joins_every_saved_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.known_rooms = set()
+        bot._room_list_commands = lambda *_args: False
+        sent = []
+        bot.send_private_text = lambda _user, text: sent.append(text)
+        joined = []
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_persistent_rooms", return_value=["North", "South", "North"]), patch.object(
+            bot_module, "_is_primary_master", return_value=True
+        ), patch.object(bot_module.threading, "Thread", ImmediateThread):
+            bot._join_rooms_serially = lambda rooms, sender: joined.append((rooms, sender))
+            self.assertTrue(bot._handle_management_command_impl("", "دخول غرفي", "Master", is_private=True))
+
+        self.assertEqual(joined, [(["North", "South"], "Master")])
+        self.assertIn("2 غرفة", sent[-1])
+
     def test_auto_ban_candidate_allows_known_non_supervision_roles_only(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {"North": {
