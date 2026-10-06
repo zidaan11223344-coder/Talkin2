@@ -604,6 +604,19 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(joined, [(["North", "South"], "Master")])
         self.assertIn("2 غرفة", sent[-1])
 
+    def test_points_top_collapses_decorated_duplicate_accounts(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.send_private_text = lambda _user, text: setattr(bot, "top_message", text)
+        with patch.object(bot_module, "_points_data", return_value={
+            "sourea": {"username": "sourea", "points": 1_000_000_000},
+            "decorated": {"username": "𝐒𝐎𝐔☀𝐑𝐄𝐀", "points": 2_000_000_000},
+            "other": {"username": "other", "points": 3_000_000},
+        }):
+            self.assertTrue(bot._handle_management_command_impl("", "توب النقاط", "Master", is_private=True))
+        self.assertEqual(bot.top_message.count("𝐒𝐎𝐔☀𝐑𝐄𝐀"), 1)
+        self.assertNotIn("sourea — 1b", bot.top_message)
+        self.assertIn("𝐒𝐎𝐔☀𝐑𝐄𝐀 — 2b", bot.top_message)
+
     def test_auto_ban_candidate_allows_known_non_supervision_roles_only(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {"North": {
@@ -658,6 +671,25 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertIn("قائمة حماية الغرفة", public[-1][1])
             self.assertTrue(bot._handle_management_command_impl("", "حماية@North", "Guest", is_private=True))
             self.assertIn("ماستر", private[-1][1])
+
+    def test_room_protection_menu_keeps_current_room_for_options_five_and_six(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = "RoomA"
+        bot.last_joined_room = "RoomB"
+        bot._pending_protection_number = {}
+        bot._room_list_commands = lambda *_args: False
+        bot.send_room_text = lambda *_args: None
+        saved = []
+        with patch.object(bot_module, "_room_manager", return_value=True), patch.object(
+            bot_module, "_is_master_name", return_value=False
+        ), patch.object(bot_module, "_is_primary_master", return_value=False), patch.object(
+            bot_module, "_save_room_protection", side_effect=lambda room, **changes: saved.append((room, changes))
+        ):
+            self.assertTrue(bot._handle_management_command_impl("RoomA", "حماية", "Creator", is_private=False))
+            self.assertTrue(bot._handle_management_command_impl("RoomA", "5", "Creator", is_private=False))
+            self.assertTrue(bot._handle_management_command_impl("RoomA", "حماية", "Creator", is_private=False))
+            self.assertTrue(bot._handle_management_command_impl("RoomA", "6", "Creator", is_private=False))
+        self.assertEqual(saved, [("RoomA", {"joinleave": True}), ("RoomA", {"joinleave": False})])
 
     def test_inv_finishes_without_leaving_the_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

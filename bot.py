@@ -13598,8 +13598,10 @@ class TalkinBot:
                 else:
                     self.send_private_text(sender, "🚫 قائمة الحماية للماستر الأساسي في الخاص أو لصانع الغرفة داخلها.")
                 return True
+            # When the menu is opened inside a room, that room is authoritative.
+            # A stale last_joined_room must never redirect options 1..9 elsewhere.
             target_room = str(protection_match.group(1) or protection_match.group(2) or
-                              getattr(self, "last_joined_room", "") or room or self.room or "").strip()
+                              room or self.room or getattr(self, "last_joined_room", "") or "").strip()
             if not target_room:
                 self.send_private_text(sender, "⚠️ أرسل حماية@اسم_الغرفة من خاص البوت لفتح إعداداتها.")
                 return True
@@ -13857,8 +13859,9 @@ class TalkinBot:
                 self.send_room_text(room, message)
             return True
         mtop=re.fullmatch(r"توب\s*(رهان|مضاربة|حظي|حظ|استثمار|حظ يا نصيب|بورصة|بورصه)?", low)
-        if low in ("توب","top") or mtop:
-            game_label=mtop.group(1) if mtop else None
+        points_top_command = low in ("توب النقاط", "توب النقاطي", "top points", "points top")
+        if low in ("توب","top") or mtop or points_top_command:
+            game_label=mtop.group(1) if mtop and not points_top_command else None
             game_map={"رهان":"bet","مضاربة":"duel","حظي":"luck","حظ":"luck","استثمار":"investment","حظ يا نصيب":"investment","بورصة":"stock","بورصه":"stock"}
             if game_label:
                 rows=_game_top(game_map[game_label])
@@ -13866,11 +13869,26 @@ class TalkinBot:
                     return {1:"🥇",2:"🥈",3:"🥉"}.get(i, f"{i}️⃣")
                 msg=f"🏆 توب {game_label}\n━━━━━━━━━━━━\n" + ("\n".join(f"{_top_medal(i)} {str(u).strip().lstrip('@')} — {_fmt_points(p)} نقطة | {pl} لعب" for i,(p,st,pl,u) in enumerate(rows,1)) if rows else "لا توجد نتائج بعد.")
             else:
-                data=_points_data(); rows=[]
-                for v in data.values():
-                    try: rows.append((int(v.get("points",0)),v.get("username", "")))
-                    except Exception: pass
-                rows.sort(reverse=True)
+                data=_points_data(); unique={}
+                for key, value in data.items():
+                    if not isinstance(value, dict):
+                        continue
+                    username = str(value.get("username") or key or "").strip().lstrip("@")
+                    canonical = _game_name_key(username)
+                    if not canonical:
+                        continue
+                    try:
+                        points = int(value.get("points", 0) or 0)
+                    except Exception:
+                        continue
+                    # Old point files can contain several decorated spellings
+                    # of one account. They are snapshots, not separate users;
+                    # keep the largest balance and one display name.
+                    previous = unique.get(canonical)
+                    if previous is None or points > previous[0]:
+                        unique[canonical] = (points, username)
+                rows=list(unique.values())
+                rows.sort(key=lambda item: (-item[0], _game_name_key(item[1])))
                 def _top_medal(i):
                     return {1:"🥇",2:"🥈",3:"🥉"}.get(i, f"{i}️⃣")
                 msg="🏆 توب النقاط\n━━━━━━━━━━━━\n"+"\n".join(f"{_top_medal(i)} {str(u).strip().lstrip('@')} — {_fmt_points(p)}" for i,(p,u) in enumerate(rows[:10],1)) if rows else "🏆 لا توجد نقاط بعد."
