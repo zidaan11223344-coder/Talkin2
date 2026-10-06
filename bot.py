@@ -15367,7 +15367,9 @@ class TalkinBot:
             and not _skip_room_text_signature_dedup
             and self._is_duplicate_incoming(
                 "room",
-                (event_type, room, frm, to, body, str(event.get(7, "") or "")),
+                (event_type, room, frm, to, body, str(event.get(7, "") or ""),
+                 username if event_type in ("user_joined", "user_left") else "",
+                 role if event_type in ("user_joined", "user_left") else ""),
                 event_id,
             )
         ):
@@ -15715,10 +15717,10 @@ class TalkinBot:
                 and not _is_master_name(frm)
                 and not is_creator_allowed
                 and not (_is_mvip_master(frm) and _is_verification_manager_command(body))
-                and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and _is_verified_user(frm))
-                and not (is_publish_command and _is_verified_user(frm))
+                and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and _is_verified_user(username or frm))
+                and not (is_publish_command and _is_verified_user(username or frm))
                 and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}):
-            if not _is_verified_user(frm):
+            if not _is_verified_user(username or frm):
                 self.send_room_text(room, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
             return
 
@@ -15838,7 +15840,7 @@ class TalkinBot:
         # Verified users may use normal bot commands; administration remains
         # restricted to masters. Unverified command attempts receive one clear
         # notice instead of being silently ignored.
-        is_verified = _is_verified_user(frm)
+        is_verified = _is_verified_user(username or frm)
         if (not is_verified
                 and _looks_like_bot_command(body)
                 and not re.match(r"^دخول\s*@\s*.+$", body.strip(), re.I)
@@ -15847,7 +15849,7 @@ class TalkinBot:
             return
         # Music/gifts require verification; masters are always allowed.
         if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
-            if not _is_verified_user(frm):
+            if not _is_verified_user(username or frm):
                 self.send_room_text(room, f"🔒 @{frm} يحتاج توثيقاً لاستخدام الهدايا.\n{_verification_notice()}")
                 return
             if self.handle_gift_command(room, body, frm):

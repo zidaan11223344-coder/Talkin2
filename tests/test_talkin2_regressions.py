@@ -11,6 +11,16 @@ from cricket_integration import CricketIntegration
 from cricket_result import render_result_image
 
 
+class IncomingEventDedupRegressions(unittest.TestCase):
+    def test_distinct_joining_users_are_not_deduplicated(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        first_join = ("user_joined", "North", "", "", "", "", "account_a", "")
+        second_join = ("user_joined", "North", "", "", "", "", "account_b", "")
+        self.assertFalse(bot._is_duplicate_incoming("room", first_join))
+        self.assertFalse(bot._is_duplicate_incoming("room", second_join))
+        self.assertTrue(bot._is_duplicate_incoming("room", second_join))
+
+
 class CricketIntegrationRegressions(unittest.TestCase):
     def make_integration(self, root, room_messages, private_messages, media_messages, is_verified=None, send_all_rooms_text=None, bot_name="Talkin2"):
         return CricketIntegration(
