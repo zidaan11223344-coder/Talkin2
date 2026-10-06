@@ -2391,6 +2391,27 @@ def _game_name_key(name):
     return (compact or raw).casefold()
 
 
+def _display_name_score(name):
+    """Prefer the richest original spelling when duplicate accounts merge."""
+    raw = str(name or "").strip().lstrip("@")
+    if not raw:
+        return (0, 0, 0, "")
+    normalized = unicodedata.normalize("NFKC", raw)
+    ornaments = sum(
+        1 for char in raw
+        if unicodedata.category(char).startswith(("M", "P", "S"))
+        or unicodedata.normalize("NFKC", char) != char
+    )
+    non_ascii = sum(1 for char in raw if ord(char) > 127)
+    return (ornaments, non_ascii, len(raw), raw)
+
+
+def _preferred_display_name(current, candidate):
+    current = str(current or "").strip().lstrip("@")
+    candidate = str(candidate or "").strip().lstrip("@")
+    return candidate if _display_name_score(candidate) > _display_name_score(current) else current
+
+
 def _game_record_matches(data, username):
     if not isinstance(data, dict):
         return []
@@ -2806,8 +2827,9 @@ def _add_points(username, amount):
         return 0
     with _GAME_STATE_LOCK:
         data = _points_data()
-        item = data.get(key, {"username": str(username).strip().lstrip("@"), "points": 0})
-        item["username"] = str(username).strip().lstrip("@")
+        display_name = str(username).strip().lstrip("@")
+        item = data.get(key, {"username": display_name, "points": 0})
+        item["username"] = _preferred_display_name(item.get("username"), display_name)
         item["points"] = int(item.get("points", 0) or 0) + amount
         data[key] = item
         snapshot = copy.deepcopy(data)
@@ -13885,8 +13907,13 @@ class TalkinBot:
                     # of one account. They are snapshots, not separate users;
                     # keep the largest balance and one display name.
                     previous = unique.get(canonical)
-                    if previous is None or points > previous[0]:
+                    if previous is None:
                         unique[canonical] = (points, username)
+                    else:
+                        unique[canonical] = (
+                            max(points, previous[0]),
+                            _preferred_display_name(previous[1], username),
+                        )
                 rows=list(unique.values())
                 rows.sort(key=lambda item: (-item[0], _game_name_key(item[1])))
                 def _top_medal(i):
