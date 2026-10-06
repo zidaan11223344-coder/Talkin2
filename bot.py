@@ -12570,6 +12570,7 @@ class TalkinBot:
                 and not public_top_command
                 and not (verification_manager_command and _is_mvip_master(sender))
                 and not (is_publish and _is_verified_user(sender))
+                and not (points_transfer_command and _is_verified_user(sender))
                 and not join_command
                 and not join_all_command
                 and not repeat_last_command

@@ -364,12 +364,19 @@ class CricketIntegration:
             return False
 
         stage = str(match.get("stage") or "")
+        room_key = self._room_key(room)
+        participant_keys = {
+            self._room_key(item.get("name"))
+            for item in match.get("rooms", [])
+            if isinstance(item, dict) and item.get("name")
+        }
         is_action = (
             low in {"join", "انضمام"}
             or (stage == "setup" and low in {"1", "2", "3", "4"})
             or (stage == "lobby" and low in {"bot", "بوت", "ضد البوت", "solo", "vs bot"})
             or (stage == "teams" and low in {"1", "2"})
-            or (stage == "live" and re.fullmatch(r"[0-6]", low) is not None)
+            or (stage == "live" and room_key in participant_keys
+                and re.fullmatch(r"[0-6]", low) is not None)
         )
         if not is_action:
             return False

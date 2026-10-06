@@ -229,6 +229,18 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual(len(integration.game.current()["rooms"]), 2)
             self.assertEqual(integration.game.current()["stage"], "teams")
 
+    def test_numbers_in_non_participating_room_are_not_cricket_actions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            messages, private, media = [], [], []
+            integration = self.make_integration(Path(temp), messages, private, media)
+            integration.game.set_enabled("North", True)
+            integration.handle("North", "N1", ".cr 2")
+            integration.handle("North", "N1", "Join")
+            integration.handle("North", "N2", "Join")
+            messages.clear()
+            self.assertFalse(integration.handle("Other", "Stranger", "6"))
+            self.assertEqual(messages, [])
+
     def test_cr_b_opens_bot_setup_and_accepts_multiple_players_in_one_room(self):
         with tempfile.TemporaryDirectory() as temp:
             messages, private, media = [], [], []
@@ -599,6 +611,16 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.object(bot_module, "_is_primary_master", return_value=True):
             self.assertTrue(bot._handle_management_command("North", "msb@target@100", "Master"))
         self.assertTrue(any("خاص البوت" in text for _, text in room_replies))
+
+    def test_verified_sb_is_allowed_through_public_management_gate(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._master_reply_local = __import__("threading").local()
+        bot.send_room_text = lambda *_args: None
+        bot.send_private_text = lambda *_args: None
+        with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_get_points", return_value=1000
+        ), patch.object(bot_module, "_add_points", return_value=900):
+            self.assertTrue(bot._handle_management_command("North", "sb@target@100", "member"))
 
     def test_box_number_reply_uses_normalized_room_key(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
