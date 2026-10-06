@@ -263,12 +263,13 @@ class CricketIntegration:
         self._send_private(sender, room, confirmation)
         return True
 
-    def _verified_room_setup(self, room: str, sender: str) -> bool:
+    def _verified_room_setup(self, room: str, sender: str, *, bot_match: bool = False) -> bool:
         if not self.is_verified(sender):
             self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
             return True
         previous_match = self.game.current()
-        result = self.game.begin_setup(room, reset_existing=True)
+        result = (self.game.begin_bot_setup(room, reset_existing=True)
+                  if bot_match else self.game.begin_setup(room, reset_existing=True))
         self._reply_error(room, result)
         self._deliver_transition(previous_match, room)
         return True
@@ -277,7 +278,7 @@ class CricketIntegration:
         if result:
             self.send_room_text(room, str(result))
 
-    def _verified_room_start(self, room: str, sender: str, player_count: int) -> bool:
+    def _verified_room_start(self, room: str, sender: str, player_count: int, *, room_match: bool = False) -> bool:
         if not self.is_verified(sender):
             self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
             return True
@@ -285,7 +286,7 @@ class CricketIntegration:
         if isinstance(previous_match, dict) and previous_match.get("stage") == "setup":
             result = self.game.select_player_count(room, player_count)
         else:
-            result = self.game.start(room, player_count)
+            result = self.game.start(room, player_count, mode="rooms" if room_match else "solo")
         self._reply_error(room, result)
         self._deliver_transition(previous_match, room)
         return True
@@ -341,7 +342,12 @@ class CricketIntegration:
 
         room_count = re.fullmatch(r"\.cr\s*([1-4])", low)
         if room_count and not is_private:
-            return self._verified_room_start(room, sender, int(room_count.group(1)))
+            count = int(room_count.group(1))
+            if count == 1:
+                return self._verified_room_setup(room, sender)
+            return self._verified_room_start(room, sender, count, room_match=True)
+        if re.fullmatch(r"\.cr\s*b", low) and not is_private:
+            return self._verified_room_setup(room, sender, bot_match=True)
 
         # Private messages can toggle the service only. Player actions remain room-scoped.
         if is_private:

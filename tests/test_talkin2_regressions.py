@@ -60,10 +60,12 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual(integration.game.current()["stage"], "setup")
             self.assertIn("إعداد مباراة الكركيت", room_messages[-1][1])
 
-            integration.handle("North", "N1", "1")
+            integration.handle("North", "N1", "2")
             self.assertEqual(integration.game.current()["stage"], "lobby")
             integration.handle("North", "N1", "Join")
+            integration.handle("North", "N2", "Join")
             integration.handle("South", "S1", "Join")
+            integration.handle("South", "S2", "Join")
             self.assertEqual(integration.game.current()["stage"], "teams")
 
             # The initiating room chooses; the other team is assigned the opposite side.
@@ -126,8 +128,9 @@ class CricketIntegrationRegressions(unittest.TestCase):
             first = self.make_integration(root, first_messages, private_messages, first_media)
             first.handle("North", "Master", ".cr 1", is_private=True)
             first.handle("North", "N1", ".cr 1")
-            first.handle("North", "N1", "1")
+            first.handle("North", "N1", "2")
             first.handle("North", "N1", "Join")
+            first.handle("North", "N2", "Join")
             self.assertEqual(first.game.current()["stage"], "lobby")
 
             def add_stale_image(data):
@@ -140,6 +143,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             second_messages, second_media = [], []
             second = self.make_integration(root, second_messages, [], second_media)
             second.handle("South", "S1", "Join")
+            second.handle("South", "S2", "Join")
             self.assertEqual(second.game.current()["stage"], "teams")
             self.assertEqual(second_media, [])
             self.assertFalse(any("مباراة قديمة" in text for _, text in second_messages))
@@ -169,9 +173,11 @@ class CricketIntegrationRegressions(unittest.TestCase):
             first = self.make_integration(root, room_messages, private_messages, media_messages)
             first.handle("North", "Master", "تشغيل لعبه الكركيت", is_private=True)
             first.handle("North", "Master", ".cr 1")
-            first.handle("North", "Master", "1")
+            first.handle("North", "Master", "2")
             first.handle("North", "N1", "Join")
+            first.handle("North", "N2", "Join")
             first.handle("South", "S1", "Join")
+            first.handle("South", "S2", "Join")
             first.handle("North", "N1", "1")
             first.handle("North", "N1", "4")
 
@@ -202,6 +208,41 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertTrue(any("انتهت مباراة الكركيت" in text for _, text in messages))
             self.assertTrue(any("cricket_number_6.png" in url for _, url, _ in media))
             self.assertTrue(any("cricket_result_" in url for _, url, _ in media))
+
+    def test_cr2_starts_room_vs_room_and_rejects_same_room_second_team(self):
+        with tempfile.TemporaryDirectory() as temp:
+            messages, private, media = [], [], []
+            integration = self.make_integration(Path(temp), messages, private, media)
+            integration.game.set_enabled("North", True)
+            integration.handle("North", "N1", ".cr 2")
+            match = integration.game.current()
+            self.assertEqual(match["mode"], "rooms")
+            self.assertEqual(match["target_players"], 2)
+            integration.handle("North", "N1", "Join")
+            integration.handle("North", "N2", "Join")
+            integration.handle("North", "N3", "Join")
+            self.assertEqual(len(integration.game.current()["rooms"]), 1)
+            self.assertEqual(integration.game.current()["stage"], "lobby")
+            integration.handle("South", "S1", "Join")
+            integration.handle("South", "S2", "Join")
+            self.assertEqual(len(integration.game.current()["rooms"]), 2)
+            self.assertEqual(integration.game.current()["stage"], "teams")
+
+    def test_cr_b_opens_bot_setup_and_accepts_multiple_players_in_one_room(self):
+        with tempfile.TemporaryDirectory() as temp:
+            messages, private, media = [], [], []
+            integration = self.make_integration(Path(temp), messages, private, media)
+            integration.game.set_enabled("Hall", True)
+            integration.handle("Hall", "Player", ".cr b")
+            match = integration.game.current()
+            self.assertEqual(match["mode"], "solo")
+            self.assertEqual(match["stage"], "setup")
+            integration.handle("Hall", "Player", "3")
+            for player in ("P1", "P2", "P3"):
+                integration.handle("Hall", player, "Join")
+            match = integration.game.current()
+            self.assertEqual(match["stage"], "live")
+            self.assertIn("__sboot_cricket_bot__", match["teams"])
 
     def test_each_player_gets_six_balls_in_both_innings_and_lead_does_not_end_match_early(self):
         with tempfile.TemporaryDirectory() as temp:

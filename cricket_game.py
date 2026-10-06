@@ -231,20 +231,53 @@ class CricketGame:
             if room_key != str(match.get("setup_room") or ""):
                 return "🔒 اختيار عدد اللاعبين متاح في غرفة بدء اللعبة فقط."
             match["target_players"] = count
+            # One player means a solo match against Talkin2. Counts 2..4 are
+            # room-vs-room matches; the second side must join from another
+            # room and cannot be filled by more players in the first room.
+            if match.get("mode") != "solo":
+                match["mode"] = "rooms" if count >= 2 else "solo"
             match["stage"] = "lobby"
-            room_name = self._participants(match)[0]["name"]
             self._emit(
                 data,
                 self._participants(match),
-                f"🏏 كركيت | الفريق: {count} لاعبين\n"
-                "أرسل Join للانضمام.\n"
-                "بعد اكتمال الفريق، تنضم الغرفة الثانية بـ Join.",
+                ("🏏 كركيت | مباراة فردية ضد البوت\n"
+                 "أرسل Join مرة واحدة، ثم اختر 1 للهجوم أو 2 للدفاع."
+                 if count == 1 else
+                 f"🏏 كركيت | {count} لاعبين في كل غرفة\n"
+                 "أرسل Join من لاعبي الغرفة الأولى. بعد اكتمالها، يجب أن ترسل الغرفة الثانية Join؛ لا يمكن إكمال الفريقين من الغرفة نفسها."),
             )
             return None
 
         return self.state.mutate(mutate)
 
-    def start(self, room: str, player_count: int) -> str | None:
+    def begin_bot_setup(self, room: str, *, reset_existing: bool = True) -> str | None:
+        """Open a fresh player-count setup for a match against Talkin2."""
+        room_name, room_key = str(room or "").strip(), _key(room)
+
+        def mutate(data: dict[str, Any]) -> str | None:
+            if not data.get("enabled"):
+                return "⛔ فعّل اللعبة أولاً من خاص الماستر: تشغيل لعبه الكركيت."
+            if isinstance(data.get("match"), dict) and not reset_existing:
+                return "⏳ توجد مباراة/قائمة انتظار مفتوحة بالفعل. أرسل Join للانضمام أو انتظر انتهائها."
+            if reset_existing:
+                data["match"] = None
+                data["events"] = []
+            match = self._new_match(room_name, room_key, "setup")
+            match["mode"] = "solo"
+            data["match"] = match
+            self._emit(
+                data,
+                self._participants(match),
+                "🏏 إعداد مباراة ضد البوت\n"
+                "اختر عدد اللاعبين: 1 أو 2 أو 3 أو 4.\n"
+                "بعد اختيار العدد، يرسل كل لاعب Join من هذه الغرفة فقط.\n"
+                "🤖 الخصم هو بوت Talkin2.",
+            )
+            return None
+
+        return self.state.mutate(mutate)
+
+    def start(self, room: str, player_count: int, *, mode: str = "solo") -> str | None:
         """Open a lobby directly; retained for the `cricket N` command."""
         room_name, room_key = str(room or "").strip(), _key(room)
         try:
@@ -260,14 +293,16 @@ class CricketGame:
             if isinstance(data.get("match"), dict):
                 return "⏳ توجد مباراة مفتوحة بالفعل؛ أرسل Join للانضمام أو انتظر انتهائها."
             match = self._new_match(room_name, room_key, "lobby", count)
-            match["mode"] = "solo"
+            match["mode"] = "rooms" if mode == "rooms" else "solo"
             data["match"] = match
             self._emit(
                 data,
                 self._participants(match),
-                f"🏏 فُتحت مباراة الكركيت في {room_name} — المطلوب {count} لاعب(ين).\n"
-                "👤 كل اللاعبين ينضمون من هذه الغرفة فقط بإرسال Join.\n"
-                "🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد Talkin2.",
+                f"🏏 فُتحت مباراة الكركيت في {room_name} — المطلوب {count} لاعب(ين).\n" +
+                ("👥 أرسل Join من لاعبي هذه الغرفة، وبعد اكتمال الفريق ترسل الغرفة الثانية Join."
+                 if match["mode"] == "rooms" else
+                 "👤 كل اللاعبين ينضمون من هذه الغرفة فقط بإرسال Join.\n"
+                 "🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد Talkin2."),
             )
             return None
 
@@ -277,7 +312,7 @@ class CricketGame:
         rooms = self._participants(match)
         target = int(match.get("target_players") or 0)
         if match.get("mode") == "solo":
-            if len(rooms) == 1 and len(rooms[0].get("players", [])) == 1:
+            if len(rooms) == 1 and target > 0 and len(rooms[0].get("players", [])) >= target:
                 match["stage"] = "teams"
                 self._emit(
                     data,
