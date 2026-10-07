@@ -117,12 +117,13 @@ class CricketIntegration:
             return f"{base}/cricket-media/{filename}"
         return f"{base}/assets/{filename}"
 
-    def deliver(self, room: str) -> None:
+    def deliver(self, room: str, *, skip_text_event_ids: set[int] | None = None) -> None:
         room = str(room or "").strip()
         if not room:
             return
         room_key = self._room_key(room)
         cursor = int(self._cursors.get(room_key, 0))
+        skip_text_event_ids = skip_text_event_ids or set()
         try:
             events = self.game.events_after(room, cursor)
             for event in events:
@@ -142,21 +143,27 @@ class CricketIntegration:
                         else:
                             self.send_room_text(room, text)
                         self._broadcast_cursor = event_id
-                elif text:
+                elif text and event_id not in skip_text_event_ids:
                     self.send_room_text(room, text)
                 cursor = max(cursor, event_id)
             self._cursors[room_key] = cursor
         except Exception as exc:
             self.log("[CRICKET] event delivery failed", room, repr(exc))
 
-    def deliver_rooms(self, rooms: Iterable[str]) -> None:
+    def deliver_rooms(
+        self,
+        rooms: Iterable[str],
+        *,
+        skip_text_event_ids_by_room: dict[str, set[int]] | None = None,
+    ) -> None:
+        skip_text_event_ids_by_room = skip_text_event_ids_by_room or {}
         sent: set[str] = set()
         for room in rooms:
             name = str(room or "").strip()
             key = self._room_key(name)
             if name and key not in sent:
                 sent.add(key)
-                self.deliver(name)
+                self.deliver(name, skip_text_event_ids=skip_text_event_ids_by_room.get(key, set()))
 
     def _prime_new_room_cursor(self, room: str, match: dict | None) -> None:
         """Skip historical events when a room joins an already-open match."""
@@ -170,14 +177,20 @@ class CricketIntegration:
             # being replayed before those new events are delivered.
             self._cursors[room_key] = self.game.latest_event_id(room)
 
-    def _deliver_transition(self, previous_match: dict | None, fallback_room: str = "") -> None:
+    def _deliver_transition(
+        self,
+        previous_match: dict | None,
+        fallback_room: str = "",
+        *,
+        skip_text_event_ids_by_room: dict[str, set[int]] | None = None,
+    ) -> None:
         # Events are generated independently for both room keys. Deliver them
         # together after each action so the opposing team receives its prompt.
         rooms = self._match_rooms(previous_match)
         rooms.extend(self._match_rooms(self.game.current()))
         if fallback_room:
             rooms.append(str(fallback_room).strip())
-        self.deliver_rooms(rooms)
+        self.deliver_rooms(rooms, skip_text_event_ids_by_room=skip_text_event_ids_by_room)
 
     def _resume_after_restart(self) -> None:
         if not self._resume_pending:
@@ -303,7 +316,9 @@ class CricketIntegration:
         control = self._control_key(text)
         room = str(room or "").strip()
         sender = str(sender or "").strip().lstrip("@")
-        self._resume_after_restart()
+        defer_resume = not is_private and low in {"join", "انضمام"}
+        if not defer_resume:
+            self._resume_after_restart()
 
         if control in self.PRIVATE_START_COMMANDS | self.PRIVATE_STOP_COMMANDS:
             if is_private:
@@ -382,19 +397,45 @@ class CricketIntegration:
             return False
         if not self.is_verified(sender):
             self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
+            if defer_resume:
+                self._resume_after_restart()
             return True
 
         previous_match = match
         result: str | None = None
+        skip_text_event_ids_by_room: dict[str, set[int]] = {}
         if low in {"join", "انضمام"}:
-            # Acknowledge the chat message before persistence/event fan-out so
-            # players receive immediate feedback even on a busy host.
-            try:
-                self.send_room_text(room, f"🏏 وصل طلب Join من @{sender}؛ جارٍ تسجيله...")
-            except Exception as exc:
-                self.log("[CRICKET] immediate Join acknowledgement failed", room, repr(exc))
             self._prime_new_room_cursor(room, previous_match)
             result = self.game.join(room, sender)
+            if result is None:
+                # Confirm the committed Join before any team-wide announcements,
+                # image delivery, or restart prompts can delay the player.
+                updated_match = self.game.current() or {}
+                participants = [item for item in updated_match.get("rooms", []) if isinstance(item, dict)]
+                team_index = next(
+                    (index for index, item in enumerate(participants)
+                     if self._room_key(item.get("name")) == room_key),
+                    -1,
+                )
+                if updated_match.get("mode") == "solo":
+                    team_label = "فريقك"
+                else:
+                    team_label = "الفريق الأول" if team_index <= 0 else "الفريق الثاني"
+                try:
+                    self.send_room_text(room, f"🏏 تم الانضمام إلى {team_label} يا @{sender}.")
+                except Exception as exc:
+                    self.log("[CRICKET] immediate Join confirmation failed", room, repr(exc))
+                try:
+                    cursor = int(self._cursors.get(room_key, 0))
+                    duplicate_text = f"✅ انضم @{sender}."
+                    duplicate_ids = {
+                        int(event.get("id", 0)) for event in self.game.events_after(room, cursor)
+                        if not event.get("broadcast") and duplicate_text in str(event.get("text") or "")
+                    }
+                    if duplicate_ids:
+                        skip_text_event_ids_by_room[room_key] = duplicate_ids
+                except Exception as exc:
+                    self.log("[CRICKET] fast Join event scan failed", room, repr(exc))
         elif match.get("stage") == "setup" and low in {"1", "2", "3", "4"}:
             result = self.game.select_player_count(room, int(low))
         elif match.get("stage") == "lobby" and low in {"bot", "بوت", "ضد البوت", "solo", "vs bot"}:
@@ -407,5 +448,10 @@ class CricketIntegration:
             return False
 
         self._reply_error(room, result)
-        self._deliver_transition(previous_match, room)
+        self._deliver_transition(
+            previous_match, room,
+            skip_text_event_ids_by_room=skip_text_event_ids_by_room,
+        )
+        if defer_resume:
+            self._resume_after_restart()
         return True

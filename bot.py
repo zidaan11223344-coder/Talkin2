@@ -89,15 +89,18 @@ MUSIC_CONCURRENT_FRAGMENTS = int(os.getenv("MUSIC_CONCURRENT_FRAGMENTS", "16"))
 MUSIC_BUFFER_SIZE = int(os.getenv("MUSIC_BUFFER_SIZE", str(4 * 1024 * 1024)))
 MUSIC_THROTTLED_RATE = int(os.getenv("MUSIC_THROTTLED_RATE", str(128 * 1024)))
 MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
-MUSIC_DIRECT_CACHE_TTL = float(os.getenv("MUSIC_DIRECT_CACHE_TTL", "45"))
+MUSIC_DIRECT_CACHE_TTL = float(os.getenv("MUSIC_DIRECT_CACHE_TTL", "300"))
+MUSIC_FAST_LOOKUP_TIMEOUT = 6.0
 # Audius is an additional lightweight source used primarily by live broadcast.
 # It can search the catalog and expose a streamable MP3 URL without first
 # downloading the whole song to Railway. The API supports read-only access;
 # an optional API key can be supplied for higher limits.
 AUDIUS_API_BASE = os.getenv("AUDIUS_API_BASE", "https://api.audius.co/v1").strip().rstrip("/")
 AUDIUS_API_KEY = os.getenv("AUDIUS_API_KEY", "").strip()
-AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "2.5"))
-AUDIUS_CACHE_TTL = float(os.getenv("AUDIUS_CACHE_TTL", "90"))
+AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "1.8"))
+AUDIUS_CACHE_TTL = float(os.getenv("AUDIUS_CACHE_TTL", "300"))
+_MUSIC_SOURCE_SEMAPHORE = threading.BoundedSemaphore(8)
+_MUSIC_LOOKUP_THREAD = threading.Thread
 # Optional YouTube Netscape cookies supplied as a secret value or mounted file.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
@@ -6356,6 +6359,35 @@ class TalkinBot:
             self.log("[WS] long-text notice failed:", repr(exc))
             return False
 
+    @staticmethod
+    def _is_game_result_text(text):
+        value = str(text or "").casefold()
+        return any(marker in value for marker in (
+            "🏆", "نتيجة المباراة", "نتيجة اللعبة", "النتيجة:",
+            "الفائز:", "الفائزة:", "انتهت المباراة", "انتهت لعبة",
+        ))
+
+    @staticmethod
+    def _split_text_to_payload_limit(text, make_payload, limit):
+        """Split only at safe UTF-8 character boundaries, preferring word breaks."""
+        chunks = []
+        current = ""
+        for char in str(text or ""):
+            while current and len(make_payload(current + char)) > limit:
+                split_at = max(current.rfind("\n"), current.rfind(" "))
+                if split_at >= 0:
+                    chunks.append(current[:split_at + 1])
+                    current = current[split_at + 1:]
+                else:
+                    chunks.append(current)
+                    current = ""
+            if len(make_payload(char)) > limit:
+                return []
+            current += char
+        if current:
+            chunks.append(current)
+        return chunks
+
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
         """Send text safely; oversized packets are ignored and routed to Telegram."""
         text = str(text or "")
@@ -6374,6 +6406,21 @@ class TalkinBot:
         if len(make_payload(text)) <= limit:
             self.send_query(make_payload(text))
             return True
+
+        # Game results belong in the room where the match happened. Keep them
+        # visible there by splitting into protocol-safe text packets instead of
+        # quietly routing the result to Telegram as a long-text attachment.
+        if packet_type == "room_message" and self._is_game_result_text(text):
+            chunks = self._split_text_to_payload_limit(text, make_payload, limit)
+            if chunks:
+                try:
+                    for chunk in chunks:
+                        self.send_query(make_payload(chunk))
+                    self.log("[WS_OVERSIZE] game result split into room packets", len(chunks))
+                    return True
+                except Exception as exc:
+                    self.log("[WS_OVERSIZE] game result room chunk failed:", repr(exc))
+                    return False
 
         # The complete message is too large for Talkin/WebSocket. Do NOT
         # split it into visible Talkin messages. Route the original full text
@@ -9458,9 +9505,9 @@ class TalkinBot:
                     "noplaylist": True,
                     "skip_download": True,
                     "format": "bestaudio[abr<=192]/bestaudio",
-                    "socket_timeout": 8,
-                    "retries": 1,
-                    "extractor_retries": 1,
+                    "socket_timeout": 4,
+                    "retries": 0,
+                    "extractor_retries": 0,
                     "cachedir": False,
                     "check_formats": False,
                     "http_headers": {
@@ -9543,6 +9590,67 @@ class TalkinBot:
                 continue
         if errors:
             self.log("[MUSIC] direct live source failed:", " | ".join(errors[-6:]))
+        return None
+
+    def _music_fast_source(self, query):
+        """Race Audius and direct extractor lookups; use the first playable URL."""
+        q = str(query or "").strip()
+        if not q:
+            return None
+        results = queue.Queue()
+        tasks = (
+            ("Audius", self._audius_live_source),
+            ("direct", self._music_live_source),
+        )
+        launched = 0
+        started_at = time.monotonic()
+        for label, resolver in tasks:
+            if not _MUSIC_SOURCE_SEMAPHORE.acquire(blocking=False):
+                continue
+
+            def run_lookup(source_label=label, source_resolver=resolver):
+                try:
+                    results.put((source_label, source_resolver(q), None))
+                except Exception as exc:
+                    results.put((source_label, None, exc))
+                finally:
+                    _MUSIC_SOURCE_SEMAPHORE.release()
+
+            try:
+                _MUSIC_LOOKUP_THREAD(
+                    target=run_lookup, daemon=True,
+                    name=f"music-source-{label.casefold()}",
+                ).start()
+                launched += 1
+            except Exception as exc:
+                _MUSIC_SOURCE_SEMAPHORE.release()
+                self.log("[MUSIC] source lookup could not start:", label, repr(exc))
+
+        remaining_sources = launched
+        deadline = started_at + max(0.5, MUSIC_FAST_LOOKUP_TIMEOUT)
+        while remaining_sources:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                label, result, error = results.get(timeout=remaining)
+            except queue.Empty:
+                break
+            remaining_sources -= 1
+            if error is not None:
+                self.log("[MUSIC] source lookup failed:", label, repr(error))
+                continue
+            if not isinstance(result, dict) or not str(result.get("url") or "").strip():
+                continue
+            value = dict(result)
+            value.setdefault("source", label)
+            value.setdefault("uploader", label)
+            self.log(
+                "[MUSIC] fastest playable source:", label,
+                f"in {time.monotonic() - started_at:.2f}s",
+            )
+            return value
+        self.log("[MUSIC] fast source lookup timed out/empty:", q[:100])
         return None
 
     def _music_download(self,query):
@@ -9815,68 +9923,45 @@ class TalkinBot:
                 path = None
                 url = ""
                 if live_stream:
-                    # Direct playable sources first: avoid waiting for a full file download.
-                    audius = self._audius_live_source(search_query)
-                    if audius and str(audius.get("url") or "").strip():
-                        info = audius
-                        url = str(audius.get("url") or "")
-                        duration = int(audius.get("duration") or 0)
-                        title = str(audius.get("title") or search_query)
-                        artist = str(audius.get("uploader") or "Audius")
-                        self.log("[MUSIC] live source=Audius title=", title, "room=", room)
+                    # Race direct streaming sources; only fall back to a full
+                    # download if neither resolver finds a playable URL quickly.
+                    direct = self._music_fast_source(search_query)
+                    direct_url = str((direct or {}).get("url") or "").strip()
+                    if direct and direct_url:
+                        info = direct
+                        url = direct_url
+                        duration = int(direct.get("duration") or 0)
+                        title = str(direct.get("title") or search_query)
+                        artist = str(direct.get("uploader") or direct.get("source") or "Music")
+                        self.log("[MUSIC] live source=fast-race title=", title, "room=", room)
                     else:
-                        direct = self._music_live_source(search_query)
-                        direct_url = str((direct or {}).get("url") or "").strip()
-                        if direct and direct_url and len(direct_url) <= 500:
-                            info = direct
-                            url = direct_url
-                            duration = int(direct.get("duration") or 0)
-                            title = str(direct.get("title") or search_query)
-                            artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
-                            self.log("[MUSIC] live source=direct-fallback title=", title, "room=", room)
-                        else:
-                            info, path = self._music_download(search_query)
-                            title = str(info.get("title") or search_query)
-                            artist = str(info.get("uploader") or info.get("channel") or "YouTube")
-                            duration = int(info.get("duration") or 0)
-                            url = public_base + "/media/" + path.name if public_base else str(path)
-                            self.log("[MUSIC] live source=local-fallback title=", title, "room=", room)
+                        info, path = self._music_download(search_query)
+                        title = str(info.get("title") or search_query)
+                        artist = str(info.get("uploader") or info.get("channel") or "YouTube")
+                        duration = int(info.get("duration") or 0)
+                        url = public_base + "/media/" + path.name if public_base else str(path)
+                        self.log("[MUSIC] live source=local-fallback title=", title, "room=", room)
                 else:
-                    # Search the short streaming source first; try yt-dlp for a
-                    # progressive direct URL before converting/downloading a file.
-                    fast = None
-                    if spotify or not re.match(r"^https?://", search_query, re.I):
-                        try:
-                            fast = self._audius_live_source(search_query)
-                        except Exception as exc:
-                            self.log("[MUSIC] fast Audius lookup failed:", repr(exc))
+                    # Race Audius against direct audio extraction; avoid
+                    # serial network waits and full downloads where possible.
+                    fast = self._music_fast_source(search_query)
                     fast_url = str((fast or {}).get("url") or "").strip()
                     if fast and fast_url and len(fast_url) <= 500:
                         info = fast
                         url = fast_url
                         duration = int(fast.get("duration") or 0)
                         title = str(fast.get("title") or search_query)
-                        artist = str(fast.get("uploader") or "Audius")
-                        self.log("[MUSIC] normal source=short-audius title=", title, "room=", room)
+                        artist = str(fast.get("uploader") or fast.get("source") or "Music")
+                        self.log("[MUSIC] normal source=fast-race title=", title, "room=", room)
+                    elif public_base:
+                        info, path = self._music_download(search_query)
+                        title = str(info.get("title") or search_query)
+                        artist = str(info.get("uploader") or info.get("channel") or "YouTube")
+                        duration = int(info.get("duration") or 0)
+                        url = public_base + "/media/" + path.name
+                        self.log("[MUSIC] normal source=local-public-media title=", title, "room=", room)
                     else:
-                        direct = self._music_live_source(search_query)
-                        direct_url = str((direct or {}).get("url") or "").strip()
-                        if direct and direct_url and len(direct_url) <= 500:
-                            info = direct
-                            url = direct_url
-                            duration = int(direct.get("duration") or 0)
-                            title = str(direct.get("title") or search_query)
-                            artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
-                            self.log("[MUSIC] normal source=short-direct-audio title=", title, "room=", room)
-                        elif public_base:
-                            info, path = self._music_download(search_query)
-                            title = str(info.get("title") or search_query)
-                            artist = str(info.get("uploader") or info.get("channel") or "YouTube")
-                            duration = int(info.get("duration") or 0)
-                            url = public_base + "/media/" + path.name
-                            self.log("[MUSIC] normal source=local-public-media title=", title, "room=", room)
-                        else:
-                            raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
+                        raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
                     "url": url, "duration": duration, "created_at": time.time(),
@@ -9947,16 +10032,24 @@ class TalkinBot:
                             ]
                     else:
                         target_rooms = [str(room or "").strip()] if str(room or "").strip() else []
+                    published_rooms = []
                     for target_room in target_rooms:
                         try:
                             sent = self.send_room_media(target_room, url, "audio", duration)
                             if sent is False:
                                 raise RuntimeError("Talkin لم يقبل حزمة الصوت")
                             music_published = True
-                            if caption:
-                                self.send_room_text(target_room, caption)
+                            published_rooms.append(target_room)
                         except Exception as exc:
                             self.log("[MUSIC] room audio send failed:", target_room, repr(exc))
+                    # Queue audio packets to every room first; captions are
+                    # secondary and must not hold up another room's playback.
+                    if caption:
+                        for target_room in published_rooms:
+                            try:
+                                self.send_room_text(target_room, caption)
+                            except Exception as exc:
+                                self.log("[MUSIC] room caption send failed:", target_room, repr(exc))
                     if not music_published:
                         raise RuntimeError("تعذر إرسال الصوت إلى أي غرفة متصلة")
                 if music_published:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -141,7 +143,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             room_messages.clear()
 
             self.assertTrue(integration.handle("North", "N1", "Join"))
-            self.assertIn("وصل طلب Join", room_messages[0][1])
+            self.assertIn("تم الانضمام إلى الفريق الأول", room_messages[0][1])
             self.assertIn("N1", integration.game.current()["rooms"][0]["players"])
             self.assertTrue(any("اكتمل الفريق الأول" in text for _, text in room_messages[1:]))
 
@@ -1037,6 +1039,26 @@ class BotGameAndMusicRegressions(unittest.TestCase):
 
         self.assertTrue(any(item[0] == "media" and item[2] == "https://cdn.example/direct.mp3" for item in sent))
 
+    def test_music_fast_source_uses_first_ready_resolver(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        audius_started = threading.Event()
+
+        def slow_audius(_query):
+            audius_started.set()
+            time.sleep(0.25)
+            return {"url": "https://cdn.example/slow.mp3", "title": "slow"}
+
+        bot._audius_live_source = slow_audius
+        bot._music_live_source = lambda _query: {
+            "url": "https://cdn.example/fast.mp3", "title": "fast", "uploader": "Direct",
+        }
+        bot.log = lambda *_args: None
+
+        result = bot._music_fast_source("fast song")
+
+        self.assertTrue(audius_started.wait(1))
+        self.assertEqual(result["url"], "https://cdn.example/fast.mp3")
+
     def test_spotify_link_is_resolved_before_playable_source_search(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.music_last = {}
@@ -1119,6 +1141,28 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(text(3), "42")
         self.assertEqual(text(6), "North")
         self.assertEqual(text(7), "https://cdn.example/song.mp3")
+
+    def test_oversized_game_result_is_split_into_room_messages_not_telegram(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        packets = []
+        bot.send_query = lambda payload: packets.append(payload)
+        bot.log = lambda *_args: None
+        bot._send_long_text_to_telegram = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("game results should stay in the room")
+        )
+        text = "🏆 انتهت مباراة الكركيت\n" + "\n".join(
+            f"💰 @Player{i} +200,000 نقطة — جائزة الفريق الأول والثاني" for i in range(20)
+        )
+
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "300"}):
+            self.assertTrue(bot._send_text_packets("room_message", text, room="North"))
+
+        self.assertGreater(len(packets), 1)
+        decoded = [bot_module.decode_message(packet) for packet in packets]
+        self.assertTrue(all(len(packet) <= 300 for packet in packets))
+        self.assertTrue(all(fields[6][0].decode("utf-8") == "North" for fields in decoded))
+        self.assertEqual("".join(fields[5][0].decode("utf-8") for fields in decoded), text)
+
     def test_normal_song_request_broadcasts_to_all_active_rooms(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.music_last = {}
@@ -1152,6 +1196,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
 
         media_rooms = [item[1] for item in sent if item[0] == "media"]
         self.assertEqual(media_rooms, ["Room A", "Room B", "Room C"])
+        last_media = max(i for i, item in enumerate(sent) if item[0] == "media")
+        first_caption = min(i for i, item in enumerate(sent) if item[0] == "text" and "تم تشغيل الأغنية" in item[2])
+        self.assertLess(last_media, first_caption)
 
     def test_live_broadcast_falls_back_when_audius_is_unavailable(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
