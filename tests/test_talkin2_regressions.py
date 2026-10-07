@@ -118,6 +118,99 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertIn("بقلبي", sent[0][1])
 
 
+class RoomExclusionRegressions(unittest.TestCase):
+    def test_unauthorized_room_is_persisted_skipped_and_only_manual_join_clears_it(self):
+        class NoOpTimer:
+            def __init__(self, *_args, **_kwargs):
+                self.daemon = True
+            def start(self):
+                pass
+            def cancel(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            blocked_file = Path(temp) / "blocked_rooms.json"
+            bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+            bot.room = "Forbidden"
+            bot.known_rooms = {"Forbidden", "Other"}
+            bot.connected_rooms = {"Forbidden", "Other"}
+            bot.room_users = {"Forbidden": {"Member": "member"}}
+            bot.blocked_rooms = set()
+            bot._blocked_room_reasons = {}
+            bot.log = lambda *_args: None
+            saved_room_lists = []
+
+            with patch.object(bot_module, "BLOCKED_ROOMS_FILE", blocked_file), patch.object(
+                bot_module, "_save_persistent_rooms",
+                side_effect=lambda rooms: saved_room_lists.append(set(rooms)),
+            ):
+                bot._mark_room_blocked("Forbidden", "🚫 محظور", persistent=True)
+                self.assertEqual(bot_module._persistent_blocked_rooms(), ["Forbidden"])
+                self.assertEqual(bot.known_rooms, {"Other"})
+                self.assertEqual(bot._active_rooms(), ["Other"])
+
+                # Simulate a process restart with a stale tracked list: the
+                # persisted denied-room file still suppresses automatic joins.
+                restored = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                restored.room = "Forbidden"
+                restored.known_rooms = {"Forbidden", "Other"}
+                restored.connected_rooms = {"Forbidden"}
+                restored.room_users = {}
+                restored.blocked_rooms = set(bot_module._persistent_blocked_rooms())
+                restored._blocked_room_reasons = {}
+                restored._blocked_room_notices = set()
+                restored._pending_room_joins = {}
+                restored._last_join_sent = {}
+                restored._join_lock = threading.Lock()
+                restored.log = lambda *_args: None
+                sent_queries = []
+                restored.send_query = lambda payload: sent_queries.append(payload)
+                restored._save_blocked_rooms = lambda: bot_module._save_persistent_blocked_rooms(
+                    restored.blocked_rooms
+                )
+
+                with patch.object(bot_module.threading, "Timer", NoOpTimer):
+                    self.assertFalse(restored.join_room("Forbidden"))
+                    self.assertEqual(sent_queries, [])
+                    self.assertEqual(restored._active_rooms(), ["Other"])
+                    self.assertTrue(restored.join_room("Forbidden", requested_by="Master"))
+
+                self.assertEqual(len(sent_queries), 1)
+                self.assertNotIn("Forbidden", restored.blocked_rooms)
+                self.assertEqual(bot_module._persistent_blocked_rooms(), [])
+                self.assertTrue(saved_room_lists)
+
+    def test_room_list_import_does_not_restore_a_blocked_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.blocked_rooms = {"Forbidden"}
+        bot.known_rooms = set()
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "_save_persistent_rooms"):
+            bot._process_room_list([{"name": "Forbidden"}, {"name": "Other"}])
+        self.assertEqual(bot.known_rooms, {"Other"})
+
+
+class RawWebSocketTransportRegressions(unittest.TestCase):
+    def test_transient_eagain_waits_for_readability_and_continues(self):
+        class FakeSocket:
+            def __init__(self):
+                self.calls = 0
+            def recv(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    raise BlockingIOError(11, "Resource temporarily unavailable")
+                return b"ok"
+
+        ws = bot_module.RawWebSocket.__new__(bot_module.RawWebSocket)
+        ws.sock = FakeSocket()
+        ws._recvbuf = bytearray()
+        ws.timeout = 1
+        with patch.object(bot_module.select, "select", return_value=([], [], [])) as wait_readable:
+            self.assertEqual(ws._recv_exact(2), b"ok")
+        self.assertEqual(ws.sock.calls, 2)
+        wait_readable.assert_called_once()
+
+
 class CricketIntegrationRegressions(unittest.TestCase):
     def make_integration(self, root, room_messages, private_messages, media_messages, is_verified=None, send_all_rooms_text=None, bot_name="Talkin2"):
         return CricketIntegration(

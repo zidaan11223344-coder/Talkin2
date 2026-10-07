@@ -8,6 +8,8 @@ import math
 import secrets
 import ssl
 import socket
+import errno
+import select
 import struct
 import hashlib
 import threading
@@ -1265,8 +1267,30 @@ class RawWebSocket:
         self._recvbuf = bytearray(self._prefetch)
 
     def _recv_exact(self, n):
+        try:
+            socket_timeout = self.sock.gettimeout()
+        except Exception:
+            socket_timeout = None
+        wait_timeout = socket_timeout if socket_timeout is not None else getattr(self, "timeout", 20)
+        deadline = time.monotonic() + max(0.1, float(wait_timeout or 20))
         while len(self._recvbuf) < n:
-            chunk = self.sock.recv(max(4096, n-len(self._recvbuf)))
+            try:
+                chunk = self.sock.recv(max(4096, n-len(self._recvbuf)))
+            except InterruptedError:
+                continue
+            except BlockingIOError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("timed out waiting for WebSocket data") from exc
+                # EAGAIN is a normal transient result on a non-blocking socket.
+                # Wait for readability instead of tearing down the whole bot.
+                try:
+                    select.select([self.sock], [], [], remaining)
+                except InterruptedError:
+                    pass
+                continue
             if not chunk:
                 raise ConnectionError("socket closed")
             self._recvbuf.extend(chunk)
@@ -2098,6 +2122,17 @@ def _persistent_rooms():
 
 def _save_persistent_rooms(rooms):
     _save_local_json(TRACKED_ROOMS_FILE, {"version": 1, "rooms": sorted({_norm_room(x) for x in rooms if _norm_room(x)})})
+
+def _persistent_blocked_rooms():
+    data = _load_local_json(BLOCKED_ROOMS_FILE, {})
+    rooms = data.get("rooms", []) if isinstance(data, dict) else data
+    if not isinstance(rooms, list):
+        return []
+    return sorted({_norm_room(room) for room in rooms if _norm_room(room)})
+
+def _save_persistent_blocked_rooms(rooms):
+    clean = sorted({_norm_room(room) for room in (rooms or []) if _norm_room(room)})
+    _save_local_json(BLOCKED_ROOMS_FILE, {"version": 1, "rooms": clean})
 
 def _persistent_rosters():
     data = _load_local_json(ROOM_USERS_FILE, {})
@@ -5092,7 +5127,12 @@ class TalkinBot:
         self.invite_thread = None
         self.invite_lock = threading.Lock()
         self.invite_message_template = "يوجد معجب مخفي في {room}"
-        self.known_rooms = set(_persistent_rooms())
+        self.blocked_rooms = set(_persistent_blocked_rooms())
+        self._blocked_room_reasons = {}
+        self.known_rooms = {
+            room for room in _persistent_rooms()
+            if _norm_room(room) not in self.blocked_rooms
+        }
         # Live rooms are session-only: unlike known_rooms (history on disk),
         # this set contains only rooms for which the current WebSocket session
         # has received a room/occupants response. It is cleared on disconnect.
@@ -5104,14 +5144,11 @@ class TalkinBot:
         self._master_online_rooms = set()
         self._offline_support_sessions = {}
         self._offline_support_recent = {}
-        # A room's access state is authoritative only when reported by the
-        # current Talkin server session. Never restore blocked rooms from a
-        # local exception file, because permissions may have changed.
-        self.blocked_rooms = set()
-        self._blocked_room_reasons = {}
+        # Server-confirmed unauthorized rooms stay excluded across reconnects;
+        # a manual join request clears the exclusion if permissions changed.
         self._blocked_room_notices = set()
         self._pending_room_joins = {}
-        if self.room:
+        if self.room and _norm_room(self.room) not in self.blocked_rooms:
             self.known_rooms.add(_norm_room(self.room))
         _save_persistent_rooms(self.known_rooms)
         self._join_lock = threading.Lock()
@@ -5622,7 +5659,7 @@ class TalkinBot:
             message += "\nℹ️ الرمز 1009 غالباً يعني أن الخادم رفض حزمة WebSocket كبيرة."
         if isinstance(command, dict) and command.get("command"):
             message += (
-                "\n\n📌 آخر أمر كان قيد التنفيذ:"
+                "\n\n📌 آخر أمر مسجل وقت الانقطاع (للسياق فقط، وليس دليلاً على السبب):"
                 f"\n• الأمر: {self._redact_connection_secrets(command.get('command'))[:300]}"
                 f"\n• الغرفة: {self._redact_connection_secrets(command.get('room') or 'خاص')[:120]}"
                 f"\n• المرسل: @{self._redact_connection_secrets(command.get('sender') or 'غير معروف')[:120]}"
@@ -5977,21 +6014,24 @@ class TalkinBot:
         self._heartbeat_thread = None
 
     def _save_blocked_rooms(self):
-        # Kept as a compatibility hook for old callers. Blocked rooms are not
-        # persisted; the server response is the only source of truth.
-        self.blocked_rooms.clear()
+        _save_persistent_blocked_rooms(getattr(self, "blocked_rooms", set()))
 
-    def _mark_room_blocked(self, room: str, reason: str = ""):
+    def _mark_room_blocked(self, room: str, reason: str = "", persistent: bool = False):
         room = _norm_room(room)
         if not room:
             return
+        if not hasattr(self, "blocked_rooms"):
+            self.blocked_rooms = set()
+        if persistent:
+            self.blocked_rooms.add(room)
+            self._save_blocked_rooms()
         if reason:
             self._blocked_room_reasons[room] = reason
         self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != room}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != room}
         self.room_users.pop(room, None)
         _save_persistent_rooms(self.known_rooms)
-        self.log("[ROOM] server rejected room (not persisted as exception):", room, reason)
+        self.log("[ROOM] server rejected room; removed from tracked list:", room, reason)
 
     def _room_failure_message(self, room: str, event_type: str):
         event_type = str(event_type or "").replace("_rejoin", "").replace("room_full _rejoin", "room_full")
@@ -6051,9 +6091,8 @@ class TalkinBot:
         if not room:
             return False
         room_norm = _norm_room(room)
-        # An explicit/forced join is always a fresh TalkinChat request. Clear
-        # only runtime failure markers so lifting a room ban or changing the
-        # bot role allows a new join packet to be sent immediately.
+        # Forced automatic rejoin may bypass debounce, but it must not bypass a
+        # server-confirmed ban. Only a user-requested join clears that ban.
         if force or requested_by:
             stale = self._pending_room_joins.pop(room_norm, None)
             if stale and stale.get("timer"):
@@ -6061,9 +6100,24 @@ class TalkinBot:
                     stale["timer"].cancel()
                 except Exception:
                     pass
+        if requested_by:
             self.blocked_rooms.discard(room_norm)
-            self._blocked_room_reasons.pop(room_norm, None)
-            self._blocked_room_notices.discard(room_norm)
+            getattr(self, "_blocked_room_reasons", {}).pop(room_norm, None)
+            getattr(self, "_blocked_room_notices", set()).discard(room_norm)
+            self._save_blocked_rooms()
+        elif room_norm in getattr(self, "blocked_rooms", set()):
+            self.known_rooms = {
+                saved for saved in getattr(self, "known_rooms", set())
+                if _norm_room(saved) != room_norm
+            }
+            self.connected_rooms = {
+                saved for saved in getattr(self, "connected_rooms", set())
+                if _norm_room(saved) != room_norm
+            }
+            self.room_users.pop(room_norm, None)
+            _save_persistent_rooms(self.known_rooms)
+            self.log("[ROOM] blocked room join suppressed:", room)
+            return False
         known_norm = {_norm_room(r) for r in getattr(self, "known_rooms", set())}
         connected_norm = {_norm_room(r) for r in getattr(self, "connected_rooms", set())}
         already_known = _norm_room(room) in known_norm
@@ -6463,11 +6517,21 @@ class TalkinBot:
         return self._send_text_packets(packet_type, text, **kwargs)
 
     def _active_rooms(self):
-        rooms = {str(r).strip() for r in getattr(self, "known_rooms", set()) if str(r).strip()}
-        if self.room:
+        blocked = getattr(self, "blocked_rooms", set())
+        rooms = {
+            str(r).strip() for r in getattr(self, "known_rooms", set())
+            if str(r).strip() and _norm_room(r) not in blocked
+        }
+        if self.room and _norm_room(self.room) not in blocked:
             rooms.add(str(self.room).strip())
-        rooms.update(str(r).strip() for r in self.room_users.keys() if str(r).strip())
-        rooms.update(str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip())
+        rooms.update(
+            str(r).strip() for r in self.room_users.keys()
+            if str(r).strip() and _norm_room(r) not in blocked
+        )
+        rooms.update(
+            str(r).strip() for r in getattr(self, "connected_rooms", set())
+            if str(r).strip() and _norm_room(r) not in blocked
+        )
         return sorted(rooms)
 
     def broadcast_all_rooms(self, text: str):
@@ -13404,7 +13468,9 @@ class TalkinBot:
         if not rooms:
             self.send_private_text(sender,"❌ أرسل أسماء الغرف مفصولة بمسافة.\nمثال: مشاعر ادم نبض قلوب سوالف")
             return True
-        existing=_persistent_rooms()
+        blocked = getattr(self, "blocked_rooms", set())
+        rooms = [room_name for room_name in rooms if _norm_room(room_name) not in blocked]
+        existing=[room_name for room_name in _persistent_rooms() if _norm_room(room_name) not in blocked]
         existing_keys={_norm_room(x).casefold() for x in existing}
         added=[]
         for room_name in rooms:
@@ -13413,7 +13479,7 @@ class TalkinBot:
                 existing_keys.add(_norm_room(room_name).casefold())
                 added.append(room_name)
         _save_persistent_rooms(existing)
-        self.known_rooms.update(existing)
+        self.known_rooms.update(room_name for room_name in existing if _norm_room(room_name) not in blocked)
         self.send_private_text(
             sender,
             "✅ تم تحديث ملف الغرف المحفوظة.\n"
@@ -15952,7 +16018,7 @@ class TalkinBot:
         room = str(event.get(13, self.room))
         if body:
             self._remember_inflight_command(room, body, frm, is_private=False)
-        if room and room != BOT_MASTER:
+        if room and room != BOT_MASTER and _norm_room(room) not in getattr(self, "blocked_rooms", set()):
             # This handler runs for every room message.  Rewriting the JSON
             # file (and possibly enqueueing DB/GitHub persistence) on every
             # event blocks the WebSocket reader and makes commands feel slow.
@@ -16172,6 +16238,9 @@ class TalkinBot:
             pending_join = self._pending_room_joins.pop(rnorm, None)
             if pending_join and pending_join.get("timer"):
                 pending_join["timer"].cancel()
+            if rnorm in getattr(self, "blocked_rooms", set()):
+                self.blocked_rooms.discard(rnorm)
+                self._save_blocked_rooms()
             self._blocked_room_reasons.pop(rnorm, None)
             self._blocked_room_notices.discard(rnorm)
             if room:
@@ -16211,8 +16280,11 @@ class TalkinBot:
                 pending_join = self._pending_room_joins.pop(blocked_room, None)
                 if pending_join and pending_join.get("timer"):
                     pending_join["timer"].cancel()
-                self._mark_room_blocked(room, reason_text)
                 normalized_event = event_type.replace("_rejoin", "")
+                self._mark_room_blocked(
+                    room, reason_text,
+                    persistent=(normalized_event == "room_unauthorized"),
+                )
                 if normalized_event == "room_unauthorized":
                     advice = "ارفع البوت إشرافاً أو أونر ثم أعد المحاولة."
                 elif normalized_event == "room_membership_required":
@@ -16604,6 +16676,8 @@ class TalkinBot:
             elif isinstance(obj, list):
                 for v in obj: walk(v)
         walk(rooms)
+        blocked = getattr(self, "blocked_rooms", set())
+        found = {room for room in found if _norm_room(room) not in blocked}
         if not found:
             return
         self.log("[ROOM-LIST] loaded", len(found), "rooms")
