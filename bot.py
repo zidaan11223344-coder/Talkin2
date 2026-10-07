@@ -4997,7 +4997,7 @@ class TalkinBot:
             is_verified=_is_cricket_verified_member,
             send_room_text=self.send_room_text,
             send_room_media=self.send_room_media,
-            send_all_rooms_text=self.broadcast_all_rooms,
+            send_all_rooms_text=self.broadcast_game_rooms,
             send_private_text=self.send_private_text,
             public_base=_public_base_url,
             reward=lambda username, amount: _add_points(username, amount),
@@ -5119,6 +5119,7 @@ class TalkinBot:
         # packets and media broadcasts concurrently can make the gateway
         # replay room_join/room_leave events or close the WebSocket.
         self._room_bulk_lock = threading.Lock()
+        self._game_broadcast_lock = threading.Lock()
         self._last_join_sent = {}
         self._rejoin_attempts = defaultdict(int)
         self._last_reconnect = 0.0
@@ -6483,6 +6484,31 @@ class TalkinBot:
                     self.log("[BROADCAST] failed", target_room, repr(exc))
                 if index+1 < len(rooms):
                     time.sleep(delay)
+        return sent
+
+    def broadcast_game_rooms(self, text: str, first_room: str = ""):
+        """Quickly announce a game, delivering to its initiating room first."""
+        rooms = self._active_rooms()
+        first_room = str(first_room or "").strip()
+        if first_room:
+            rooms = [first_room] + [
+                room for room in rooms if _norm_room(room) != _norm_room(first_room)
+            ]
+        lock = getattr(self, "_game_broadcast_lock", None)
+        if lock is None:
+            lock = self._game_broadcast_lock = threading.Lock()
+        sent = 0
+        with lock:
+            for index, target_room in enumerate(rooms):
+                try:
+                    self.send_room_text(target_room, text)
+                    sent += 1
+                except Exception as exc:
+                    self.log("[GAME-BROADCAST] failed", target_room, repr(exc))
+                if index + 1 < len(rooms):
+                    # Text-only game announcements are much smaller than media
+                    # bursts; keep a tiny pacing gap without multi-second waits.
+                    time.sleep(0.05)
         return sent
 
     def send_room_text(self, room: str, text: str):
@@ -10692,8 +10718,8 @@ class TalkinBot:
             f"🎯 اكتب {command}@المبلغ لبدء الرهان"
         )
         # GLOBAL challenge announcement: every tracked bot room sees the same
-        # open challenge, regardless of where the first player started it.
-        self.broadcast_all_rooms(opening)
+        # open challenge, regardless of where the first player started.
+        self.broadcast_game_rooms(opening, first_room=room)
         return True
 
     def _fixed_game_result(self, first, second, game_name, prize=500):
@@ -11680,7 +11706,6 @@ class TalkinBot:
             "🔎 جاري البحث عن الجائزة...\n"
             "━━━━━━━━━━━━━━"
         )
-        time.sleep(1.0)
         won = secrets.randbelow(100) == 0
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
@@ -11702,9 +11727,13 @@ class TalkinBot:
         # connected in THIS WebSocket session. ``_active_rooms()`` also contains
         # historical/persisted rooms and can make the bot send to stale rooms.
         connected = {str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()}
-        if room and str(room).strip():
-            connected.add(str(room).strip())
-        target_rooms = sorted(connected, key=str.casefold) or [str(room).strip()]
+        preferred_room = str(room or "").strip()
+        target_rooms = ([preferred_room] if preferred_room else []) + sorted(
+            (target for target in connected if _norm_room(target) != _norm_room(preferred_room)),
+            key=str.casefold,
+        )
+        if not target_rooms:
+            target_rooms = [preferred_room]
 
         # Do not burst all room packets at once. The short pacing keeps the
         # realtime connection alive while preserving the existing all-room
@@ -11715,7 +11744,7 @@ class TalkinBot:
             except Exception as exc:
                 self.log("[GAME] bank winner text send failed:", target_room, repr(exc))
             if index + 1 < len(target_rooms):
-                time.sleep(0.35)
+                time.sleep(0.05)
 
         self._send_game_winner_card("بنك مليون", sender_name, target_rooms, send_delay=0.35)
         return True
@@ -12751,7 +12780,6 @@ class TalkinBot:
                 f"🔎 جاري البحث عن مليار...\n"
                 f"━━━━━━━━━━━━━━"
             )
-            time.sleep(1.0)
             won = (secrets.randbelow(100) == 0)
             reward = 1000000000 if won else 0
             _record_game(sender_name, "billion", reward, 0)
@@ -12777,8 +12805,14 @@ class TalkinBot:
                     f"━━━━━━━━━━━━━━━━"
                 )
                 target_rooms = self._active_rooms() or [room]
-                for target_room in target_rooms:
+                target_rooms = [room] + [
+                    target_room for target_room in target_rooms
+                    if _norm_room(target_room) != _norm_room(room)
+                ]
+                for index, target_room in enumerate(target_rooms):
                     self.send_room_text(target_room, winner_text)
+                    if index + 1 < len(target_rooms):
+                        time.sleep(0.05)
 
                 try:
                     base = _public_base_url()

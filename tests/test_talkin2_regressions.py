@@ -798,6 +798,46 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot_module._looks_like_bot_command(command), command)
         self.assertEqual(bot_module._normalize_game_command_text("coin@tails"), "عملة@كتابة")
 
+    def test_game_broadcast_prioritizes_origin_room_with_short_gap(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._active_rooms = lambda: ["Alpha", "Beta", "Hall"]
+        bot._game_broadcast_lock = threading.Lock()
+        sent, gaps = [], []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        bot.log = lambda *_args: None
+        with patch.object(bot_module.time, "sleep", side_effect=gaps.append):
+            self.assertEqual(bot.broadcast_game_rooms("challenge", first_room="Hall"), 3)
+        self.assertEqual([room for room, _ in sent], ["Hall", "Alpha", "Beta"])
+        self.assertEqual(gaps, [0.05, 0.05])
+
+    def test_wager_opening_uses_fast_game_broadcast_from_origin_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.game_lock = threading.Lock()
+        bot.wager_waiting = {}
+        bot._cleanup_expired_wagers = lambda: None
+        bot._game_cooldown_notice = lambda *_args: True
+        sent = []
+        bot.broadcast_game_rooms = lambda text, first_room="": sent.append((first_room, text)) or 1
+        with patch.object(bot_module, "_get_points", return_value=100), patch.object(
+            bot_module, "_add_points", return_value=80
+        ):
+            self.assertTrue(bot._queue_wager("North", "Player", "رهان", 20))
+        self.assertEqual(sent[0][0], "North")
+        self.assertIn("بدأت لعبة رهان", sent[0][1])
+
+    def test_million_bank_result_has_no_artificial_reveal_sleep(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._game_cooldown_notice = lambda *_args: True
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        with patch.object(bot_module.secrets, "randbelow", return_value=99), patch.object(
+            bot_module, "_record_game", lambda *_args: None
+        ), patch.object(bot_module.time, "sleep", side_effect=AssertionError("unexpected delay")):
+            self.assertTrue(bot._million_bank_game("North", "Player"))
+        self.assertEqual(len(sent), 2)
+        self.assertIn("جاري البحث", sent[0][1])
+        self.assertIn("لم يحالفه الحظ", sent[1][1])
+
     def test_enter_my_rooms_joins_every_saved_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room = ""
