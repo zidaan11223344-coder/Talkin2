@@ -98,10 +98,12 @@ AUDIUS_API_BASE = os.getenv("AUDIUS_API_BASE", "https://api.audius.co/v1").strip
 AUDIUS_API_KEY = os.getenv("AUDIUS_API_KEY", "").strip()
 AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "2.5"))
 AUDIUS_CACHE_TTL = float(os.getenv("AUDIUS_CACHE_TTL", "90"))
-# Optional YouTube Netscape cookies supplied as a Railway secret variable.
+# Optional YouTube Netscape cookies supplied as a secret value or mounted file.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
-YOUTUBE_COOKIE_FILE = None
-if YOUTUBE_COOKIES:
+YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
+if YOUTUBE_COOKIE_FILE and not Path(YOUTUBE_COOKIE_FILE).is_file():
+    YOUTUBE_COOKIE_FILE = None
+if not YOUTUBE_COOKIE_FILE and YOUTUBE_COOKIES:
     try:
         cookie_text = YOUTUBE_COOKIES.replace("\\n", "\n").replace("\\t", "\t")
         if not cookie_text.startswith("# Netscape HTTP Cookie File"):
@@ -110,6 +112,118 @@ if YOUTUBE_COOKIES:
         Path(YOUTUBE_COOKIE_FILE).write_text(cookie_text, encoding="utf-8")
     except Exception:
         YOUTUBE_COOKIE_FILE = None
+
+# Spotify supplies catalog metadata and search, not downloadable full tracks.
+# The resolved title/artist is handed to the existing playable audio sources.
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+_SPOTIFY_TOKEN = {"value": "", "expires_at": 0.0}
+_SPOTIFY_TOKEN_LOCK = threading.Lock()
+_SPOTIFY_TRACK_CACHE = {}
+_SPOTIFY_TRACK_CACHE_LOCK = threading.Lock()
+
+
+def _spotify_track_metadata(query):
+    """Resolve Spotify links or text searches to a title/artist search phrase.
+
+    Spotify Web API credentials enable catalog search. A track URL can still be
+    resolved without credentials through Spotify's public oEmbed endpoint.
+    This function never scrapes or downloads Spotify audio.
+    """
+    value = str(query or "").strip()
+    if not value:
+        return None
+    track_match = re.search(r"(?:open\.spotify\.com/track/|spotify:track:)([A-Za-z0-9]+)", value, re.I)
+    is_spotify_url = bool(track_match or "spotify.com/" in value.casefold() or value.casefold().startswith("spotify:"))
+    if not is_spotify_url and not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+        return None
+    cache_key = ("track:" + track_match.group(1) if track_match else "query:" + value.casefold())
+    now = time.time()
+    with _SPOTIFY_TRACK_CACHE_LOCK:
+        cached = _SPOTIFY_TRACK_CACHE.get(cache_key)
+        if cached and now - cached[0] < 900:
+            return dict(cached[1])
+
+    def cache_result(result):
+        with _SPOTIFY_TRACK_CACHE_LOCK:
+            _SPOTIFY_TRACK_CACHE[cache_key] = (time.time(), dict(result))
+            if len(_SPOTIFY_TRACK_CACHE) > 100:
+                oldest = sorted(_SPOTIFY_TRACK_CACHE.items(), key=lambda item: item[1][0])[:25]
+                for key, _item in oldest:
+                    _SPOTIFY_TRACK_CACHE.pop(key, None)
+        return result
+
+    token = ""
+    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+        with _SPOTIFY_TOKEN_LOCK:
+            if time.time() < float(_SPOTIFY_TOKEN.get("expires_at", 0)):
+                token = str(_SPOTIFY_TOKEN.get("value") or "")
+            else:
+                try:
+                    response = requests.post(
+                        "https://accounts.spotify.com/api/token",
+                        data={"grant_type": "client_credentials"},
+                        auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+                        timeout=(3, 7),
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                    token = str(body.get("access_token") or "")
+                    _SPOTIFY_TOKEN.update(value=token, expires_at=time.time() + max(30, int(body.get("expires_in") or 3600) - 60))
+                except Exception:
+                    token = ""
+        if token:
+            try:
+                headers = {"Authorization": "Bearer " + token}
+                if track_match:
+                    response = requests.get(
+                        "https://api.spotify.com/v1/tracks/" + track_match.group(1),
+                        headers=headers, timeout=(3, 7),
+                    )
+                else:
+                    response = requests.get(
+                        "https://api.spotify.com/v1/search",
+                        params={"q": value, "type": "track", "limit": 1},
+                        headers=headers, timeout=(3, 7),
+                    )
+                response.raise_for_status()
+                payload = response.json()
+                track = payload if track_match else next(iter((payload.get("tracks") or {}).get("items") or []), None)
+                if isinstance(track, dict):
+                    title = str(track.get("name") or "").strip()
+                    artist = ", ".join(
+                        str(item.get("name") or "").strip()
+                        for item in track.get("artists") or []
+                        if isinstance(item, dict) and str(item.get("name") or "").strip()
+                    )
+                    if title:
+                        return cache_result({
+                            "title": title, "artist": artist,
+                            "search_query": " ".join(part for part in (title, artist) if part),
+                            "source": "Spotify",
+                        })
+            except Exception:
+                pass
+
+    if is_spotify_url:
+        try:
+            response = requests.get(
+                "https://open.spotify.com/oembed", params={"url": value}, timeout=(3, 7),
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            title = str(payload.get("title") or "").strip()
+            artist = str(payload.get("author_name") or "").strip()
+            if title:
+                return cache_result({
+                    "title": title, "artist": artist,
+                    "search_query": " ".join(part for part in (title, artist) if part),
+                    "source": "Spotify",
+                })
+        except Exception:
+            pass
+    return None
 
 # Gift images copied verbatim from the supplied Giant Chat bot assets/.
 BASE_DIR = Path(__file__).resolve().parent
@@ -4403,16 +4517,13 @@ def _extract_image_urls_from_bing(html_text):
     return urls
 
 
-def _search_lookalike_image(query, exclude_urls=None):
-    """Search Bing Images and return a fresh/random image URL.
-
-    No username->image cache is kept: every command performs a new search and
-    randomly chooses from several current Bing results, so the same account can
-    receive a different lookalike image on every invocation.
-    """
+def _search_lookalike_images(query, exclude_urls=None, limit=12):
+    """Return several current Bing results, falling back to Commons search."""
     q = str(query or "").strip()
     if not q:
-        return None
+        return []
+    excluded = {str(x).strip() for x in (exclude_urls or []) if str(x).strip()}
+    urls = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Android 10; Mobile) AppleWebKit/537.36 "
                       "Chrome/120.0 Mobile Safari/537.36",
@@ -4423,21 +4534,46 @@ def _search_lookalike_image(query, exclude_urls=None):
             "https://www.bing.com/images/search",
             params={"q": q + " safe for work", "form": "HDRSC2", "first": "1", "adlt": "strict"},
             headers=headers,
-            timeout=LOOKALIKE_TIMEOUT,
+            timeout=(3, 6),
         )
         r.raise_for_status()
         urls = _extract_image_urls_from_bing(r.text)
-        excluded = {str(x).strip() for x in (exclude_urls or []) if str(x).strip()}
-        fresh = [u for u in urls if u not in excluded]
-        if not fresh:
-            fresh = urls
-        if not fresh:
-            return None
-        # Randomize the result so repeated commands do not keep returning the
-        # first Bing image for the same username.
-        return secrets.choice(fresh[:12])
     except Exception:
-        return None
+        urls = []
+    fresh = list(dict.fromkeys(url for url in urls if url and url not in excluded))
+    if len(fresh) < min(3, max(1, int(limit))):
+        # Bing can block datacenter IPs or change its image-result markup.
+        # Commons' public API is a stable, license-aware image-search fallback.
+        try:
+            commons_query = re.sub(r"\b(?:celebrity|portrait|safe for work)\b", " ", q, flags=re.I)
+            commons_query = re.sub(r"\s+", " ", commons_query).strip() or q
+            response = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={
+                    "action": "query", "generator": "search", "gsrsearch": commons_query,
+                    "gsrnamespace": 6, "gsrlimit": max(8, int(limit)),
+                    "prop": "imageinfo", "iiprop": "url|mime", "iiurlwidth": 1200,
+                    "format": "json", "formatversion": 2,
+                },
+                headers={"User-Agent": "TalkinBot/1.0 (https://github.com/zidaan11223344-coder/Talkin2)", "Accept": "application/json"},
+                timeout=(3, 6),
+            )
+            response.raise_for_status()
+            for page in response.json().get("query", {}).get("pages", []):
+                image = (page.get("imageinfo") or [{}])[0]
+                image_url = image.get("thumburl") or image.get("url")
+                mime = str(image.get("mime") or "").lower()
+                if image_url and mime in {"image/jpeg", "image/png", "image/webp"} and image_url not in excluded:
+                    fresh.append(image_url)
+        except Exception:
+            pass
+    return fresh[:max(1, int(limit))]
+
+
+def _search_lookalike_image(query, exclude_urls=None):
+    """Return a fresh random image URL from Bing or Wikimedia Commons."""
+    urls = _search_lookalike_images(query, exclude_urls=exclude_urls)
+    return secrets.choice(urls) if urls else None
 
 
 def _search_monkey_image(exclude_urls=None):
@@ -4492,12 +4628,21 @@ def _download_lookalike_image(image_url, target_name):
         r = requests.get(
             image_url,
             headers={"User-Agent": "Mozilla/5.0", "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
-            timeout=LOOKALIKE_TIMEOUT,
+            timeout=(3, 7),
             stream=True,
         )
         r.raise_for_status()
-        data = r.content
-        if len(data) > 8 * 1024 * 1024:
+        chunks = []
+        total = 0
+        for chunk in r.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > 8 * 1024 * 1024:
+                return None
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
             return None
         if not PIL_AVAILABLE:
             return None
@@ -9239,7 +9384,7 @@ class TalkinBot:
             return dict(cached.get("value") or {})
         errors = []
 
-        clients = ("web_embedded", "default", "native_default")
+        clients = ("web_embedded", "default")
         for client in clients:
             try:
                 opts = {
@@ -9248,7 +9393,7 @@ class TalkinBot:
                     "noplaylist": True,
                     "skip_download": True,
                     "format": "bestaudio[abr<=192]/bestaudio",
-                    "socket_timeout": 12,
+                    "socket_timeout": 8,
                     "retries": 1,
                     "extractor_retries": 1,
                     "cachedir": False,
@@ -9597,45 +9742,47 @@ class TalkinBot:
         def worker():
             try:
                 public_base = _public_base_url()
+                spotify = _spotify_track_metadata(query)
+                search_query = str((spotify or {}).get("search_query") or query).strip()
+                if spotify:
+                    self.log("[MUSIC] Spotify metadata resolved:", spotify.get("title"), "—", spotify.get("artist"))
                 info = None
                 path = None
                 url = ""
-
-                # البث المباشر يفضّل Audius، ثم يستخدم رابطًا مباشرًا من
-                # YouTube/SoundCloud، ثم تنزيلًا محليًا إذا لزم الأمر.
                 if live_stream:
-                    audius = self._audius_live_source(query)
+                    # Direct playable sources first: avoid waiting for a full file download.
+                    audius = self._audius_live_source(search_query)
                     if audius and str(audius.get("url") or "").strip():
                         info = audius
                         url = str(audius.get("url") or "")
                         duration = int(audius.get("duration") or 0)
-                        title = str(audius.get("title") or query)
+                        title = str(audius.get("title") or search_query)
                         artist = str(audius.get("uploader") or "Audius")
                         self.log("[MUSIC] live source=Audius title=", title, "room=", room)
                     else:
-                        direct = self._music_live_source(query)
+                        direct = self._music_live_source(search_query)
                         direct_url = str((direct or {}).get("url") or "").strip()
                         if direct and direct_url and len(direct_url) <= 500:
                             info = direct
                             url = direct_url
                             duration = int(direct.get("duration") or 0)
-                            title = str(direct.get("title") or query)
+                            title = str(direct.get("title") or search_query)
                             artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
                             self.log("[MUSIC] live source=direct-fallback title=", title, "room=", room)
                         else:
-                            info, path = self._music_download(query)
-                            title = str(info.get("title") or query)
+                            info, path = self._music_download(search_query)
+                            title = str(info.get("title") or search_query)
                             artist = str(info.get("uploader") or info.get("channel") or "YouTube")
                             duration = int(info.get("duration") or 0)
                             url = public_base + "/media/" + path.name if public_base else str(path)
                             self.log("[MUSIC] live source=local-fallback title=", title, "room=", room)
                 else:
-                    # Prefer a short Audius stream URL so the room receives the
-                    # song without waiting for a full download/conversion.
+                    # Search the short streaming source first; try yt-dlp for a
+                    # progressive direct URL before converting/downloading a file.
                     fast = None
-                    if not re.match(r"^https?://", query, re.I):
+                    if spotify or not re.match(r"^https?://", search_query, re.I):
                         try:
-                            fast = self._audius_live_source(query)
+                            fast = self._audius_live_source(search_query)
                         except Exception as exc:
                             self.log("[MUSIC] fast Audius lookup failed:", repr(exc))
                     fast_url = str((fast or {}).get("url") or "").strip()
@@ -9643,32 +9790,28 @@ class TalkinBot:
                         info = fast
                         url = fast_url
                         duration = int(fast.get("duration") or 0)
-                        title = str(fast.get("title") or query)
+                        title = str(fast.get("title") or search_query)
                         artist = str(fast.get("uploader") or "Audius")
                         self.log("[MUSIC] normal source=short-audius title=", title, "room=", room)
-                    elif public_base:
-                        # Keep the compact local URL fallback for long signed
-                        # YouTube/SoundCloud URLs that do not fit a room packet.
-                        info, path = self._music_download(query)
-                        title = str(info.get("title") or query)
-                        artist = str(info.get("uploader") or info.get("channel") or "YouTube")
-                        duration = int(info.get("duration") or 0)
-                        url = public_base + "/media/" + path.name
-                        self.log("[MUSIC] normal source=local-public-media title=", title, "room=", room)
                     else:
-                        # Only use a direct URL when it is short enough to be
-                        # safely embedded in a Talkin message packet.
-                        direct = self._music_live_source(query)
-                        direct_url = str((direct or {}).get("url") or "")
-                        if not direct or not direct_url or len(direct_url) > 500:
+                        direct = self._music_live_source(search_query)
+                        direct_url = str((direct or {}).get("url") or "").strip()
+                        if direct and direct_url and len(direct_url) <= 500:
+                            info = direct
+                            url = direct_url
+                            duration = int(direct.get("duration") or 0)
+                            title = str(direct.get("title") or search_query)
+                            artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
+                            self.log("[MUSIC] normal source=short-direct-audio title=", title, "room=", room)
+                        elif public_base:
+                            info, path = self._music_download(search_query)
+                            title = str(info.get("title") or search_query)
+                            artist = str(info.get("uploader") or info.get("channel") or "YouTube")
+                            duration = int(info.get("duration") or 0)
+                            url = public_base + "/media/" + path.name
+                            self.log("[MUSIC] normal source=local-public-media title=", title, "room=", room)
+                        else:
                             raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
-                        info = direct
-                        url = direct_url
-                        duration = int(direct.get("duration") or 0)
-                        title = str(direct.get("title") or query)
-                        artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
-                        self.log("[MUSIC] normal source=short-direct-audio title=", title, "room=", room)
-
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
                     "url": url, "duration": duration, "created_at": time.time(),
@@ -12234,10 +12377,13 @@ class TalkinBot:
                 image_result = None
                 name = ""
                 for candidate in secrets.SystemRandom().sample(names, min(4, len(names))):
-                    image_url = _search_lookalike_image(f"{candidate} celebrity portrait")
-                    local = _download_lookalike_image(image_url, f"celebrity_{uuid.uuid4().hex}") if image_url else None
-                    if local:
-                        image_result, name = local, candidate
+                    image_urls = _search_lookalike_images(f"{candidate} celebrity portrait", limit=8)
+                    for image_url in image_urls[:5]:
+                        local = _download_lookalike_image(image_url, f"celebrity_{uuid.uuid4().hex}")
+                        if local:
+                            image_result, name = local, candidate
+                            break
+                    if image_result:
                         break
                 if not image_result:
                     self.send_room_text(room, "❌ تعذر العثور على صورة مناسبة الآن؛ جرّب مرة أخرى لاحقاً.")

@@ -109,6 +109,19 @@ class CricketIntegrationRegressions(unittest.TestCase):
             log=lambda *_args: None,
         )
 
+    def test_join_acknowledgement_is_sent_before_game_event_delivery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            room_messages, private_messages, media_messages = [], [], []
+            integration = self.make_integration(Path(temp), room_messages, private_messages, media_messages)
+            integration.game.set_enabled("North", True)
+            integration.game.start("North", 1, mode="rooms")
+            room_messages.clear()
+
+            self.assertTrue(integration.handle("North", "N1", "Join"))
+            self.assertIn("وصل طلب Join", room_messages[0][1])
+            self.assertIn("N1", integration.game.current()["rooms"][0]["players"])
+            self.assertTrue(any("اكتمل الفريق الأول" in text for _, text in room_messages[1:]))
+
     def test_private_master_toggle_and_cross_room_turn_delivery(self):
         with tempfile.TemporaryDirectory() as temp:
             room_messages, private_messages, media_messages = [], [], []
@@ -970,6 +983,100 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         caption_index = next(i for i, item in enumerate(sent) if item[0] == "text" and "تم تشغيل الأغنية" in item[2])
         self.assertLess(media_index, caption_index)
         self.assertEqual(sent[media_index][1:4], ("Room A", "https://cdn.example/track.mp3", "audio"))
+
+    def test_normal_song_uses_direct_audio_before_full_download(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append(("text", room, text))
+        bot.send_room_media = lambda room, url, kind, duration=0: sent.append(("media", room, url, kind, duration)) or True
+        bot._audius_live_source = lambda _query: None
+        bot._music_live_source = lambda query: {
+            "url": "https://cdn.example/direct.mp3", "duration": 35,
+            "title": query, "uploader": "Direct source",
+        }
+        bot._music_download = lambda _query: (_ for _ in ()).throw(AssertionError("full download should be fallback only"))
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: None
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_public_base_url", lambda: "https://bot.example"), patch.object(
+            bot_module, "_record_media_publication", lambda *_args: None
+        ), patch.object(bot_module.threading, "Thread", ImmediateThread):
+            self.assertTrue(bot.handle_music_command("Hall", ".sa Fast Song", "Tester", with_reactions=False))
+
+        self.assertTrue(any(item[0] == "media" and item[2] == "https://cdn.example/direct.mp3" for item in sent))
+
+    def test_spotify_link_is_resolved_before_playable_source_search(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        searched, sent = [], []
+        bot.send_room_text = lambda room, text: sent.append(("text", room, text))
+        bot.send_room_media = lambda room, url, kind, duration=0: sent.append(("media", room, url, kind, duration)) or True
+        bot._audius_live_source = lambda query: (
+            searched.append(query) or {
+                "url": "https://cdn.example/spotify-match.mp3", "duration": 30,
+                "title": "Never Gonna Give You Up", "uploader": "Artist",
+            }
+        )
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: None
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_spotify_track_metadata", return_value={
+            "title": "Never Gonna Give You Up", "artist": "Rick Astley",
+            "search_query": "Never Gonna Give You Up Rick Astley", "source": "Spotify",
+        }), patch.object(bot_module, "_public_base_url", lambda: "https://bot.example"), patch.object(
+            bot_module, "_record_media_publication", lambda *_args: None
+        ), patch.object(bot_module.threading, "Thread", ImmediateThread):
+            self.assertTrue(bot.handle_music_command(
+                "Hall", ".sa https://open.spotify.com/track/example", "Tester", with_reactions=False,
+            ))
+
+        self.assertEqual(searched, ["Never Gonna Give You Up Rick Astley"])
+        self.assertTrue(any(item[0] == "media" and item[2] == "https://cdn.example/spotify-match.mp3" for item in sent))
+
+    def test_spotify_oembed_resolves_track_title_and_artist_without_api_credentials(self):
+        response = type("Response", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {"title": "Song Name", "author_name": "Artist"},
+        })()
+        with patch.object(bot_module, "SPOTIFY_CLIENT_ID", ""), patch.object(
+            bot_module, "SPOTIFY_CLIENT_SECRET", ""
+        ), patch.object(bot_module, "_SPOTIFY_TRACK_CACHE", {}), patch.object(
+            bot_module.requests, "get", return_value=response
+        ) as mocked_get:
+            metadata = bot_module._spotify_track_metadata("https://open.spotify.com/track/abc123")
+
+        self.assertEqual(metadata["search_query"], "Song Name Artist")
+        self.assertEqual(metadata["source"], "Spotify")
+        self.assertEqual(mocked_get.call_args.args[0], "https://open.spotify.com/oembed")
+
+    def test_lookalike_search_falls_back_to_wikimedia_when_bing_has_no_results(self):
+        bing = type("Response", (), {"raise_for_status": lambda self: None, "text": "no image metadata"})()
+        commons = type("Response", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {"query": {"pages": [
+                {"imageinfo": [{"thumburl": "https://upload.wikimedia.org/test.jpg", "mime": "image/jpeg"}]}
+            ]}},
+        })()
+        with patch.object(bot_module.requests, "get", side_effect=[bing, commons]):
+            urls = bot_module._search_lookalike_images("test celebrity", limit=3)
+        self.assertIn("https://upload.wikimedia.org/test.jpg", urls)
 
     def test_room_audio_packet_contains_actual_room_and_attachment_url(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

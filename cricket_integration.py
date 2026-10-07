@@ -387,6 +387,12 @@ class CricketIntegration:
         previous_match = match
         result: str | None = None
         if low in {"join", "انضمام"}:
+            # Acknowledge the chat message before persistence/event fan-out so
+            # players receive immediate feedback even on a busy host.
+            try:
+                self.send_room_text(room, f"🏏 وصل طلب Join من @{sender}؛ جارٍ تسجيله...")
+            except Exception as exc:
+                self.log("[CRICKET] immediate Join acknowledgement failed", room, repr(exc))
             self._prime_new_room_cursor(room, previous_match)
             result = self.game.join(room, sender)
         elif match.get("stage") == "setup" and low in {"1", "2", "3", "4"}:
