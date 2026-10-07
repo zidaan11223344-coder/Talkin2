@@ -212,8 +212,8 @@ class CricketGame:
                 "🏏 إعداد مباراة الكركيت\n"
                 "اختر عدد اللاعبين داخل هذه الغرفة فقط:\n"
                 "1️⃣ لاعب واحد\n2️⃣ لاعبان\n3️⃣ ثلاثة لاعبين\n4️⃣ أربعة لاعبين\n"
-                "أرسل الرقم فقط، وبعدها كل لاعب يرسل Join في نفس الغرفة.\n"
-                "📢 بعد اكتمال الفريق الأول سيعلن البوت اسم الغرفة وعدد اللاعبين وأسماءهم لكل الغرف.",
+                "أرسل الرقم فقط (العدد لكل غرفة). بعد اكتمال لاعبي هذه الغرفة، يرسل لاعبو غرفة أخرى Join.\n"
+                "📢 سيعلن البوت اسم الغرف وعدد اللاعبين وأسماءهم عند اكتمال الفريقين.",
             )
             return None
 
@@ -235,19 +235,18 @@ class CricketGame:
             if room_key != str(match.get("setup_room") or ""):
                 return "🔒 اختيار عدد اللاعبين متاح في غرفة بدء اللعبة فقط."
             match["target_players"] = count
-            # One player means a solo match against Talkin2. Counts 2..4 are
-            # room-vs-room matches; the second side must join from another
-            # room and cannot be filled by more players in the first room.
+            # Regular room setup is always room-vs-room, including one player
+            # per side. Only `.cr b` marks the setup as a match against the bot.
             if match.get("mode") != "solo":
-                match["mode"] = "rooms" if count >= 2 else "solo"
+                match["mode"] = "rooms"
             match["stage"] = "lobby"
             self._emit(
                 data,
                 self._participants(match),
-                ("🏏 كركيت | مباراة فردية ضد البوت\n"
-                 "أرسل Join مرة واحدة، ثم اختر 1 للهجوم أو 2 للدفاع."
-                 if count == 1 else
-                 f"🏏 كركيت | {count} لاعبين في كل غرفة\n"
+                (f"🏏 كركيت | مباراة ضد البوت — المطلوب {count} لاعب(ين) في هذه الغرفة.\n"
+                 "أرسل Join من كل لاعب؛ بعد اكتمال العدد تبدأ المباراة ضد البوت."
+                 if match.get("mode") == "solo" else
+                 f"🏏 كركيت | {count} لاعب(ين) في كل غرفة\n"
                  "أرسل Join من لاعبي الغرفة الأولى. بعد اكتمالها، يجب أن ترسل الغرفة الثانية Join؛ لا يمكن إكمال الفريقين من الغرفة نفسها."),
             )
             return None
