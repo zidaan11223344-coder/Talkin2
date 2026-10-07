@@ -5587,6 +5587,71 @@ class TalkinBot:
             except Exception as notify_error:
                 self.log("[MASTER-ERROR] failed:", repr(notify_error))
 
+    @staticmethod
+    def _redact_connection_secrets(value):
+        """Remove known deployment secrets before forwarding transport errors."""
+        text = " ".join(str(value or "خطأ اتصال غير معروف").split())
+        secret_names = (
+            "BOT_PWD", "BOT_PASSWORD", "TELEGRAM_BOT_TOKEN", "GITHUB_TOKEN",
+            "SPOTIFY_CLIENT_SECRET", "RIVEN_DB_PASSWORD", "SUPABASE_KEY",
+            "SUPABASE_PASSWORD", "YOUTUBE_COOKIES",
+        )
+        for name in secret_names:
+            secret = str(os.getenv(name, "") or "")
+            if len(secret) >= 4:
+                text = text.replace(secret, "[محذوف]")
+        text = re.sub(
+            r"(?i)\b(password|token|secret|cookie)\s*([=:])\s*[^\s,;]+",
+            r"\1\2[محذوف]", text,
+        )
+        return text[:1200]
+
+    def _send_reconnect_notice(self, reason, command=None):
+        """Deliver a sanitized connection-recovery diagnostic to both channels."""
+        safe_reason = self._redact_connection_secrets(reason)
+        message = (
+            "⚠️ عاد اتصال بوت Talkin بعد انقطاع/تعذر اتصال."
+            f"\n📍 الغرفة: {self.room or 'غير محددة'}"
+            f"\n🧾 سبب الاتصال المسجل: {safe_reason}"
+        )
+        if "1009" in safe_reason:
+            message += "\nℹ️ الرمز 1009 غالباً يعني أن الخادم رفض حزمة WebSocket كبيرة."
+        if isinstance(command, dict) and command.get("command"):
+            message += (
+                "\n\n📌 آخر أمر كان قيد التنفيذ:"
+                f"\n• الأمر: {self._redact_connection_secrets(command.get('command'))[:300]}"
+                f"\n• الغرفة: {self._redact_connection_secrets(command.get('room') or 'خاص')[:120]}"
+                f"\n• المرسل: @{self._redact_connection_secrets(command.get('sender') or 'غير معروف')[:120]}"
+            )
+
+        master_sent = False
+        if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
+            try:
+                master_sent = bool(self.send_private_text(BOT_MASTER, message))
+            except Exception as exc:
+                self.log("[CONNECTION_NOTICE] master DM failed:", repr(exc))
+
+        telegram_sent = False
+        chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
+        if TELEGRAM_BOT_TOKEN and chat_id:
+            try:
+                response = self._telegram_api(
+                    "sendMessage", chat_id=chat_id, text=message[:3900],
+                    disable_web_page_preview=True,
+                )
+                telegram_sent = bool(response and response.get("ok"))
+            except Exception as exc:
+                self.log("[CONNECTION_NOTICE] Telegram send failed:", repr(exc))
+        else:
+            self.log(
+                "[CONNECTION_NOTICE] Telegram skipped:",
+                "TELEGRAM_BOT_TOKEN missing" if not TELEGRAM_BOT_TOKEN else "Telegram chat_id not captured/configured",
+            )
+        self.log(
+            "[CONNECTION_NOTICE] delivered:",
+            f"master_dm={master_sent}", f"telegram={telegram_sent}",
+        )
+
     def _monitor_command(self, sender, text):
         """Handle master-only private monitoring commands."""
         if not _is_primary_master(sender):
@@ -16991,33 +17056,25 @@ class TalkinBot:
                             if not gift_active:
                                 self._set_profile_status(self._profile_base_status or BOT_BASE_STATUS)
                                 self._profile_current_status = self._profile_base_status or BOT_BASE_STATUS
-                        if BOT_MASTER:
-                            now = time.time()
-                            reason = self._pending_reconnect_reason
-                            self._pending_reconnect_reason = ""
-                            reconnect_command = self._pending_reconnect_command
-                            self._pending_reconnect_command = None
-                            # Do not spam the master for normal reconnects.
-                            # A visible diagnostic is emitted only for the specific
-                            # WebSocket 1009 (message too large) condition.
-                            should_notify = bool(reason and "1009" in reason)
-                            if should_notify and now - self._last_connection_notice >= 30.0:
-                                reconnect_notice = (
-                                    "⚠️ انقطع WebSocket بسبب حجم رسالة أكبر من الحد المسموح (1009)."
-                                    "\n🛠️ تم تعديل الإرسال لتقسيم الرسائل الكبيرة تلقائياً قبل الإرسال."
-                                )
-                                cmd_age = now - float(reconnect_command.get("created_at", 0)) if isinstance(reconnect_command, dict) else 999999
-                                if isinstance(reconnect_command, dict) and reconnect_command.get("command") and cmd_age <= 45.0:
-                                    reconnect_notice += (
-                                        "\n\n📌 الأمر الفعلي الذي كان قيد التنفيذ:"
-                                        f"\n• الأمر: {reconnect_command['command']}"
-                                        f"\n• الغرفة: {reconnect_command.get('room') or 'خاص'}"
-                                        f"\n• المرسل: @{reconnect_command.get('sender') or 'غير معروف'}"
-                                    )
-                                else:
-                                    reconnect_notice += "\n📌 لم يكن هناك أمر قيد التنفيذ لحظة الانقطاع (أو انقضت مدته)."
-                                self.send_private_text(BOT_MASTER, reconnect_notice)
-                                self._last_connection_notice = now
+                        now = time.time()
+                        reason = self._pending_reconnect_reason
+                        self._pending_reconnect_reason = ""
+                        reconnect_command = self._pending_reconnect_command
+                        self._pending_reconnect_command = None
+                        cooldown = float(getattr(self, "_connection_notice_cooldown", 300.0))
+                        if reason and now - self._last_connection_notice >= cooldown:
+                            cmd_age = now - float(reconnect_command.get("created_at", 0)) if isinstance(reconnect_command, dict) else 999999
+                            if not (isinstance(reconnect_command, dict) and reconnect_command.get("command") and cmd_age <= 45.0):
+                                reconnect_command = None
+                            threading.Thread(
+                                target=self._send_reconnect_notice,
+                                args=(reason, reconnect_command),
+                                daemon=True,
+                                name="connection-recovery-notice",
+                            ).start()
+                            self._last_connection_notice = now
+                        elif reason:
+                            self.log("[CONNECTION_NOTICE] suppressed by cooldown; reason=", reason[:500])
                         self._had_connection = True
 
                         while not self.stop_event.is_set():
@@ -17083,17 +17140,16 @@ class TalkinBot:
                 self._reconnect_delay = 10.0
             except Exception as e:
                 self.last_error = str(e)
-                if self._had_connection:
-                    raw_reason = " ".join(str(e).split())
-                    if "code': 1000" in raw_reason or '"code": 1000' in raw_reason:
-                        raw_reason = "الخادم أغلق WebSocket إغلاقًا طبيعيًا (1000)"
-                    if "1009" in raw_reason:
-                        raw_reason = "الخادم أغلق WebSocket بسبب حجم الرسالة (1009)" + (f" | آخر غرفة: {self.room}" if self.room else "") + " | السبب التقني: " + raw_reason[:700]
-                    elif self.room:
-                        raw_reason = f"{raw_reason[:850]} | آخر غرفة: {self.room}"
-                    self._pending_reconnect_reason = raw_reason[:1200]
-                    if isinstance(getattr(self, "_inflight_command", None), dict):
-                        self._pending_reconnect_command = dict(self._inflight_command)
+                raw_reason = self._redact_connection_secrets(e)
+                if "code': 1000" in raw_reason or '"code": 1000' in raw_reason:
+                    raw_reason = "الخادم أغلق WebSocket إغلاقًا طبيعياً (1000): " + raw_reason
+                if "1009" in raw_reason:
+                    raw_reason = "الخادم أغلق WebSocket بسبب حجم الرسالة (1009): " + raw_reason
+                if self.room:
+                    raw_reason = f"{raw_reason[:850]} | آخر غرفة: {self.room}"
+                self._pending_reconnect_reason = raw_reason[:1200]
+                if isinstance(getattr(self, "_inflight_command", None), dict):
+                    self._pending_reconnect_command = dict(self._inflight_command)
                 if DEBUG and not QUIET_MODE:
                     print("[BOT] error:", repr(e), flush=True)
             if not self.stop_event.is_set():

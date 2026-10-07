@@ -20,6 +20,29 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertFalse(bot._is_duplicate_incoming("room", second_join))
         self.assertTrue(bot._is_duplicate_incoming("room", second_join))
 
+    def test_reconnect_notice_sends_reason_to_master_and_telegram_without_secrets(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = "North"
+        bot._telegram_chat_id = "98765"
+        private = []
+        logs = []
+        bot.send_private_text = lambda username, text: private.append((username, text)) or True
+        bot.log = lambda *args: logs.append(args)
+        telegram = []
+        bot._telegram_api = lambda method, **payload: telegram.append((method, payload)) or {"ok": True}
+
+        with patch.object(bot_module, "BOT_MASTER", "Master"), patch.object(
+            bot_module, "BOT_ID", "TalkinBot"
+        ), patch.object(bot_module, "TELEGRAM_BOT_TOKEN", "telegram-token-test"):
+            bot._send_reconnect_notice("ConnectionResetError: password=hunter2; socket closed")
+
+        self.assertEqual(private[0][0], "Master")
+        self.assertIn("ConnectionResetError", private[0][1])
+        self.assertNotIn("hunter2", private[0][1])
+        self.assertEqual(telegram[0][0], "sendMessage")
+        self.assertEqual(telegram[0][1]["chat_id"], "98765")
+        self.assertNotIn("hunter2", telegram[0][1]["text"])
+
     def test_fast_join_pair_bans_both_and_keeps_banning_later_joins(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {"North": {"alpha": "member", "beta": "member", "gamma": "member"}}
