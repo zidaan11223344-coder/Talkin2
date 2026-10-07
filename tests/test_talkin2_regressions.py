@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +21,29 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertFalse(bot._is_duplicate_incoming("room", first_join))
         self.assertFalse(bot._is_duplicate_incoming("room", second_join))
         self.assertTrue(bot._is_duplicate_incoming("room", second_join))
+
+    def test_reconnect_notice_sends_reason_to_master_and_telegram_without_secrets(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = "North"
+        bot._telegram_chat_id = "98765"
+        private = []
+        logs = []
+        bot.send_private_text = lambda username, text: private.append((username, text)) or True
+        bot.log = lambda *args: logs.append(args)
+        telegram = []
+        bot._telegram_api = lambda method, **payload: telegram.append((method, payload)) or {"ok": True}
+
+        with patch.object(bot_module, "BOT_MASTER", "Master"), patch.object(
+            bot_module, "BOT_ID", "TalkinBot"
+        ), patch.object(bot_module, "TELEGRAM_BOT_TOKEN", "telegram-token-test"):
+            bot._send_reconnect_notice("ConnectionResetError: password=hunter2; socket closed")
+
+        self.assertEqual(private[0][0], "Master")
+        self.assertIn("ConnectionResetError", private[0][1])
+        self.assertNotIn("hunter2", private[0][1])
+        self.assertEqual(telegram[0][0], "sendMessage")
+        self.assertEqual(telegram[0][1]["chat_id"], "98765")
+        self.assertNotIn("hunter2", telegram[0][1]["text"])
 
     def test_fast_join_pair_bans_both_and_keeps_banning_later_joins(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -93,6 +118,99 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertIn("بقلبي", sent[0][1])
 
 
+class RoomExclusionRegressions(unittest.TestCase):
+    def test_unauthorized_room_is_persisted_skipped_and_only_manual_join_clears_it(self):
+        class NoOpTimer:
+            def __init__(self, *_args, **_kwargs):
+                self.daemon = True
+            def start(self):
+                pass
+            def cancel(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            blocked_file = Path(temp) / "blocked_rooms.json"
+            bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+            bot.room = "Forbidden"
+            bot.known_rooms = {"Forbidden", "Other"}
+            bot.connected_rooms = {"Forbidden", "Other"}
+            bot.room_users = {"Forbidden": {"Member": "member"}}
+            bot.blocked_rooms = set()
+            bot._blocked_room_reasons = {}
+            bot.log = lambda *_args: None
+            saved_room_lists = []
+
+            with patch.object(bot_module, "BLOCKED_ROOMS_FILE", blocked_file), patch.object(
+                bot_module, "_save_persistent_rooms",
+                side_effect=lambda rooms: saved_room_lists.append(set(rooms)),
+            ):
+                bot._mark_room_blocked("Forbidden", "🚫 محظور", persistent=True)
+                self.assertEqual(bot_module._persistent_blocked_rooms(), ["Forbidden"])
+                self.assertEqual(bot.known_rooms, {"Other"})
+                self.assertEqual(bot._active_rooms(), ["Other"])
+
+                # Simulate a process restart with a stale tracked list: the
+                # persisted denied-room file still suppresses automatic joins.
+                restored = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                restored.room = "Forbidden"
+                restored.known_rooms = {"Forbidden", "Other"}
+                restored.connected_rooms = {"Forbidden"}
+                restored.room_users = {}
+                restored.blocked_rooms = set(bot_module._persistent_blocked_rooms())
+                restored._blocked_room_reasons = {}
+                restored._blocked_room_notices = set()
+                restored._pending_room_joins = {}
+                restored._last_join_sent = {}
+                restored._join_lock = threading.Lock()
+                restored.log = lambda *_args: None
+                sent_queries = []
+                restored.send_query = lambda payload: sent_queries.append(payload)
+                restored._save_blocked_rooms = lambda: bot_module._save_persistent_blocked_rooms(
+                    restored.blocked_rooms
+                )
+
+                with patch.object(bot_module.threading, "Timer", NoOpTimer):
+                    self.assertFalse(restored.join_room("Forbidden"))
+                    self.assertEqual(sent_queries, [])
+                    self.assertEqual(restored._active_rooms(), ["Other"])
+                    self.assertTrue(restored.join_room("Forbidden", requested_by="Master"))
+
+                self.assertEqual(len(sent_queries), 1)
+                self.assertNotIn("Forbidden", restored.blocked_rooms)
+                self.assertEqual(bot_module._persistent_blocked_rooms(), [])
+                self.assertTrue(saved_room_lists)
+
+    def test_room_list_import_does_not_restore_a_blocked_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.blocked_rooms = {"Forbidden"}
+        bot.known_rooms = set()
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "_save_persistent_rooms"):
+            bot._process_room_list([{"name": "Forbidden"}, {"name": "Other"}])
+        self.assertEqual(bot.known_rooms, {"Other"})
+
+
+class RawWebSocketTransportRegressions(unittest.TestCase):
+    def test_transient_eagain_waits_for_readability_and_continues(self):
+        class FakeSocket:
+            def __init__(self):
+                self.calls = 0
+            def recv(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    raise BlockingIOError(11, "Resource temporarily unavailable")
+                return b"ok"
+
+        ws = bot_module.RawWebSocket.__new__(bot_module.RawWebSocket)
+        ws.sock = FakeSocket()
+        ws._recvbuf = bytearray()
+        ws.timeout = 1
+        with patch.object(bot_module.select, "select", return_value=([], [], [])) as wait_readable:
+            self.assertEqual(ws._recv_exact(2), b"ok")
+        self.assertEqual(ws.sock.calls, 2)
+        wait_readable.assert_called_once()
+
+
 class CricketIntegrationRegressions(unittest.TestCase):
     def make_integration(self, root, room_messages, private_messages, media_messages, is_verified=None, send_all_rooms_text=None, bot_name="Talkin2"):
         return CricketIntegration(
@@ -108,6 +226,19 @@ class CricketIntegrationRegressions(unittest.TestCase):
             bot_name=bot_name,
             log=lambda *_args: None,
         )
+
+    def test_join_acknowledgement_is_sent_before_game_event_delivery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            room_messages, private_messages, media_messages = [], [], []
+            integration = self.make_integration(Path(temp), room_messages, private_messages, media_messages)
+            integration.game.set_enabled("North", True)
+            integration.game.start("North", 1, mode="rooms")
+            room_messages.clear()
+
+            self.assertTrue(integration.handle("North", "N1", "Join"))
+            self.assertIn("تم الانضمام إلى الفريق الأول", room_messages[0][1])
+            self.assertIn("N1", integration.game.current()["rooms"][0]["players"])
+            self.assertTrue(any("اكتمل الفريق الأول" in text for _, text in room_messages[1:]))
 
     def test_private_master_toggle_and_cross_room_turn_delivery(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -760,6 +891,46 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot_module._looks_like_bot_command(command), command)
         self.assertEqual(bot_module._normalize_game_command_text("coin@tails"), "عملة@كتابة")
 
+    def test_game_broadcast_prioritizes_origin_room_with_short_gap(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._active_rooms = lambda: ["Alpha", "Beta", "Hall"]
+        bot._game_broadcast_lock = threading.Lock()
+        sent, gaps = [], []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        bot.log = lambda *_args: None
+        with patch.object(bot_module.time, "sleep", side_effect=gaps.append):
+            self.assertEqual(bot.broadcast_game_rooms("challenge", first_room="Hall"), 3)
+        self.assertEqual([room for room, _ in sent], ["Hall", "Alpha", "Beta"])
+        self.assertEqual(gaps, [0.05, 0.05])
+
+    def test_wager_opening_uses_fast_game_broadcast_from_origin_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.game_lock = threading.Lock()
+        bot.wager_waiting = {}
+        bot._cleanup_expired_wagers = lambda: None
+        bot._game_cooldown_notice = lambda *_args: True
+        sent = []
+        bot.broadcast_game_rooms = lambda text, first_room="": sent.append((first_room, text)) or 1
+        with patch.object(bot_module, "_get_points", return_value=100), patch.object(
+            bot_module, "_add_points", return_value=80
+        ):
+            self.assertTrue(bot._queue_wager("North", "Player", "رهان", 20))
+        self.assertEqual(sent[0][0], "North")
+        self.assertIn("بدأت لعبة رهان", sent[0][1])
+
+    def test_million_bank_result_has_no_artificial_reveal_sleep(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._game_cooldown_notice = lambda *_args: True
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        with patch.object(bot_module.secrets, "randbelow", return_value=99), patch.object(
+            bot_module, "_record_game", lambda *_args: None
+        ), patch.object(bot_module.time, "sleep", side_effect=AssertionError("unexpected delay")):
+            self.assertTrue(bot._million_bank_game("North", "Player"))
+        self.assertEqual(len(sent), 2)
+        self.assertIn("جاري البحث", sent[0][1])
+        self.assertIn("لم يحالفه الحظ", sent[1][1])
+
     def test_enter_my_rooms_joins_every_saved_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room = ""
@@ -971,6 +1142,120 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertLess(media_index, caption_index)
         self.assertEqual(sent[media_index][1:4], ("Room A", "https://cdn.example/track.mp3", "audio"))
 
+    def test_normal_song_uses_direct_audio_before_full_download(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append(("text", room, text))
+        bot.send_room_media = lambda room, url, kind, duration=0: sent.append(("media", room, url, kind, duration)) or True
+        bot._audius_live_source = lambda _query: None
+        bot._music_live_source = lambda query: {
+            "url": "https://cdn.example/direct.mp3", "duration": 35,
+            "title": query, "uploader": "Direct source",
+        }
+        bot._music_download = lambda _query: (_ for _ in ()).throw(AssertionError("full download should be fallback only"))
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: None
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_public_base_url", lambda: "https://bot.example"), patch.object(
+            bot_module, "_record_media_publication", lambda *_args: None
+        ), patch.object(bot_module.threading, "Thread", ImmediateThread):
+            self.assertTrue(bot.handle_music_command("Hall", ".sa Fast Song", "Tester", with_reactions=False))
+
+        self.assertTrue(any(item[0] == "media" and item[2] == "https://cdn.example/direct.mp3" for item in sent))
+
+    def test_music_fast_source_uses_first_ready_resolver(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        audius_started = threading.Event()
+
+        def slow_audius(_query):
+            audius_started.set()
+            time.sleep(0.25)
+            return {"url": "https://cdn.example/slow.mp3", "title": "slow"}
+
+        bot._audius_live_source = slow_audius
+        bot._music_live_source = lambda _query: {
+            "url": "https://cdn.example/fast.mp3", "title": "fast", "uploader": "Direct",
+        }
+        bot.log = lambda *_args: None
+
+        result = bot._music_fast_source("fast song")
+
+        self.assertTrue(audius_started.wait(1))
+        self.assertEqual(result["url"], "https://cdn.example/fast.mp3")
+
+    def test_spotify_link_is_resolved_before_playable_source_search(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        searched, sent = [], []
+        bot.send_room_text = lambda room, text: sent.append(("text", room, text))
+        bot.send_room_media = lambda room, url, kind, duration=0: sent.append(("media", room, url, kind, duration)) or True
+        bot._audius_live_source = lambda query: (
+            searched.append(query) or {
+                "url": "https://cdn.example/spotify-match.mp3", "duration": 30,
+                "title": "Never Gonna Give You Up", "uploader": "Artist",
+            }
+        )
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: None
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_spotify_track_metadata", return_value={
+            "title": "Never Gonna Give You Up", "artist": "Rick Astley",
+            "search_query": "Never Gonna Give You Up Rick Astley", "source": "Spotify",
+        }), patch.object(bot_module, "_public_base_url", lambda: "https://bot.example"), patch.object(
+            bot_module, "_record_media_publication", lambda *_args: None
+        ), patch.object(bot_module.threading, "Thread", ImmediateThread):
+            self.assertTrue(bot.handle_music_command(
+                "Hall", ".sa https://open.spotify.com/track/example", "Tester", with_reactions=False,
+            ))
+
+        self.assertEqual(searched, ["Never Gonna Give You Up Rick Astley"])
+        self.assertTrue(any(item[0] == "media" and item[2] == "https://cdn.example/spotify-match.mp3" for item in sent))
+
+    def test_spotify_oembed_resolves_track_title_and_artist_without_api_credentials(self):
+        response = type("Response", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {"title": "Song Name", "author_name": "Artist"},
+        })()
+        with patch.object(bot_module, "SPOTIFY_CLIENT_ID", ""), patch.object(
+            bot_module, "SPOTIFY_CLIENT_SECRET", ""
+        ), patch.object(bot_module, "_SPOTIFY_TRACK_CACHE", {}), patch.object(
+            bot_module.requests, "get", return_value=response
+        ) as mocked_get:
+            metadata = bot_module._spotify_track_metadata("https://open.spotify.com/track/abc123")
+
+        self.assertEqual(metadata["search_query"], "Song Name Artist")
+        self.assertEqual(metadata["source"], "Spotify")
+        self.assertEqual(mocked_get.call_args.args[0], "https://open.spotify.com/oembed")
+
+    def test_lookalike_search_falls_back_to_wikimedia_when_bing_has_no_results(self):
+        bing = type("Response", (), {"raise_for_status": lambda self: None, "text": "no image metadata"})()
+        commons = type("Response", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {"query": {"pages": [
+                {"imageinfo": [{"thumburl": "https://upload.wikimedia.org/test.jpg", "mime": "image/jpeg"}]}
+            ]}},
+        })()
+        with patch.object(bot_module.requests, "get", side_effect=[bing, commons]):
+            urls = bot_module._search_lookalike_images("test celebrity", limit=3)
+        self.assertIn("https://upload.wikimedia.org/test.jpg", urls)
+
     def test_room_audio_packet_contains_actual_room_and_attachment_url(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.log = lambda *_args: None
@@ -989,6 +1274,28 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(text(3), "42")
         self.assertEqual(text(6), "North")
         self.assertEqual(text(7), "https://cdn.example/song.mp3")
+
+    def test_oversized_game_result_is_split_into_room_messages_not_telegram(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        packets = []
+        bot.send_query = lambda payload: packets.append(payload)
+        bot.log = lambda *_args: None
+        bot._send_long_text_to_telegram = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("game results should stay in the room")
+        )
+        text = "🏆 انتهت مباراة الكركيت\n" + "\n".join(
+            f"💰 @Player{i} +200,000 نقطة — جائزة الفريق الأول والثاني" for i in range(20)
+        )
+
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "300"}):
+            self.assertTrue(bot._send_text_packets("room_message", text, room="North"))
+
+        self.assertGreater(len(packets), 1)
+        decoded = [bot_module.decode_message(packet) for packet in packets]
+        self.assertTrue(all(len(packet) <= 300 for packet in packets))
+        self.assertTrue(all(fields[6][0].decode("utf-8") == "North" for fields in decoded))
+        self.assertEqual("".join(fields[5][0].decode("utf-8") for fields in decoded), text)
+
     def test_normal_song_request_broadcasts_to_all_active_rooms(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.music_last = {}
@@ -1022,6 +1329,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
 
         media_rooms = [item[1] for item in sent if item[0] == "media"]
         self.assertEqual(media_rooms, ["Room A", "Room B", "Room C"])
+        last_media = max(i for i, item in enumerate(sent) if item[0] == "media")
+        first_caption = min(i for i, item in enumerate(sent) if item[0] == "text" and "تم تشغيل الأغنية" in item[2])
+        self.assertLess(last_media, first_caption)
 
     def test_live_broadcast_falls_back_when_audius_is_unavailable(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

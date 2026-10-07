@@ -8,6 +8,8 @@ import math
 import secrets
 import ssl
 import socket
+import errno
+import select
 import struct
 import hashlib
 import threading
@@ -89,19 +91,24 @@ MUSIC_CONCURRENT_FRAGMENTS = int(os.getenv("MUSIC_CONCURRENT_FRAGMENTS", "16"))
 MUSIC_BUFFER_SIZE = int(os.getenv("MUSIC_BUFFER_SIZE", str(4 * 1024 * 1024)))
 MUSIC_THROTTLED_RATE = int(os.getenv("MUSIC_THROTTLED_RATE", str(128 * 1024)))
 MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
-MUSIC_DIRECT_CACHE_TTL = float(os.getenv("MUSIC_DIRECT_CACHE_TTL", "45"))
+MUSIC_DIRECT_CACHE_TTL = float(os.getenv("MUSIC_DIRECT_CACHE_TTL", "300"))
+MUSIC_FAST_LOOKUP_TIMEOUT = 6.0
 # Audius is an additional lightweight source used primarily by live broadcast.
 # It can search the catalog and expose a streamable MP3 URL without first
 # downloading the whole song to Railway. The API supports read-only access;
 # an optional API key can be supplied for higher limits.
 AUDIUS_API_BASE = os.getenv("AUDIUS_API_BASE", "https://api.audius.co/v1").strip().rstrip("/")
 AUDIUS_API_KEY = os.getenv("AUDIUS_API_KEY", "").strip()
-AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "2.5"))
-AUDIUS_CACHE_TTL = float(os.getenv("AUDIUS_CACHE_TTL", "90"))
-# Optional YouTube Netscape cookies supplied as a Railway secret variable.
+AUDIUS_TIMEOUT = float(os.getenv("AUDIUS_TIMEOUT", "1.8"))
+AUDIUS_CACHE_TTL = float(os.getenv("AUDIUS_CACHE_TTL", "300"))
+_MUSIC_SOURCE_SEMAPHORE = threading.BoundedSemaphore(8)
+_MUSIC_LOOKUP_THREAD = threading.Thread
+# Optional YouTube Netscape cookies supplied as a secret value or mounted file.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
-YOUTUBE_COOKIE_FILE = None
-if YOUTUBE_COOKIES:
+YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
+if YOUTUBE_COOKIE_FILE and not Path(YOUTUBE_COOKIE_FILE).is_file():
+    YOUTUBE_COOKIE_FILE = None
+if not YOUTUBE_COOKIE_FILE and YOUTUBE_COOKIES:
     try:
         cookie_text = YOUTUBE_COOKIES.replace("\\n", "\n").replace("\\t", "\t")
         if not cookie_text.startswith("# Netscape HTTP Cookie File"):
@@ -110,6 +117,118 @@ if YOUTUBE_COOKIES:
         Path(YOUTUBE_COOKIE_FILE).write_text(cookie_text, encoding="utf-8")
     except Exception:
         YOUTUBE_COOKIE_FILE = None
+
+# Spotify supplies catalog metadata and search, not downloadable full tracks.
+# The resolved title/artist is handed to the existing playable audio sources.
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+_SPOTIFY_TOKEN = {"value": "", "expires_at": 0.0}
+_SPOTIFY_TOKEN_LOCK = threading.Lock()
+_SPOTIFY_TRACK_CACHE = {}
+_SPOTIFY_TRACK_CACHE_LOCK = threading.Lock()
+
+
+def _spotify_track_metadata(query):
+    """Resolve Spotify links or text searches to a title/artist search phrase.
+
+    Spotify Web API credentials enable catalog search. A track URL can still be
+    resolved without credentials through Spotify's public oEmbed endpoint.
+    This function never scrapes or downloads Spotify audio.
+    """
+    value = str(query or "").strip()
+    if not value:
+        return None
+    track_match = re.search(r"(?:open\.spotify\.com/track/|spotify:track:)([A-Za-z0-9]+)", value, re.I)
+    is_spotify_url = bool(track_match or "spotify.com/" in value.casefold() or value.casefold().startswith("spotify:"))
+    if not is_spotify_url and not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+        return None
+    cache_key = ("track:" + track_match.group(1) if track_match else "query:" + value.casefold())
+    now = time.time()
+    with _SPOTIFY_TRACK_CACHE_LOCK:
+        cached = _SPOTIFY_TRACK_CACHE.get(cache_key)
+        if cached and now - cached[0] < 900:
+            return dict(cached[1])
+
+    def cache_result(result):
+        with _SPOTIFY_TRACK_CACHE_LOCK:
+            _SPOTIFY_TRACK_CACHE[cache_key] = (time.time(), dict(result))
+            if len(_SPOTIFY_TRACK_CACHE) > 100:
+                oldest = sorted(_SPOTIFY_TRACK_CACHE.items(), key=lambda item: item[1][0])[:25]
+                for key, _item in oldest:
+                    _SPOTIFY_TRACK_CACHE.pop(key, None)
+        return result
+
+    token = ""
+    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+        with _SPOTIFY_TOKEN_LOCK:
+            if time.time() < float(_SPOTIFY_TOKEN.get("expires_at", 0)):
+                token = str(_SPOTIFY_TOKEN.get("value") or "")
+            else:
+                try:
+                    response = requests.post(
+                        "https://accounts.spotify.com/api/token",
+                        data={"grant_type": "client_credentials"},
+                        auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+                        timeout=(3, 7),
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                    token = str(body.get("access_token") or "")
+                    _SPOTIFY_TOKEN.update(value=token, expires_at=time.time() + max(30, int(body.get("expires_in") or 3600) - 60))
+                except Exception:
+                    token = ""
+        if token:
+            try:
+                headers = {"Authorization": "Bearer " + token}
+                if track_match:
+                    response = requests.get(
+                        "https://api.spotify.com/v1/tracks/" + track_match.group(1),
+                        headers=headers, timeout=(3, 7),
+                    )
+                else:
+                    response = requests.get(
+                        "https://api.spotify.com/v1/search",
+                        params={"q": value, "type": "track", "limit": 1},
+                        headers=headers, timeout=(3, 7),
+                    )
+                response.raise_for_status()
+                payload = response.json()
+                track = payload if track_match else next(iter((payload.get("tracks") or {}).get("items") or []), None)
+                if isinstance(track, dict):
+                    title = str(track.get("name") or "").strip()
+                    artist = ", ".join(
+                        str(item.get("name") or "").strip()
+                        for item in track.get("artists") or []
+                        if isinstance(item, dict) and str(item.get("name") or "").strip()
+                    )
+                    if title:
+                        return cache_result({
+                            "title": title, "artist": artist,
+                            "search_query": " ".join(part for part in (title, artist) if part),
+                            "source": "Spotify",
+                        })
+            except Exception:
+                pass
+
+    if is_spotify_url:
+        try:
+            response = requests.get(
+                "https://open.spotify.com/oembed", params={"url": value}, timeout=(3, 7),
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            title = str(payload.get("title") or "").strip()
+            artist = str(payload.get("author_name") or "").strip()
+            if title:
+                return cache_result({
+                    "title": title, "artist": artist,
+                    "search_query": " ".join(part for part in (title, artist) if part),
+                    "source": "Spotify",
+                })
+        except Exception:
+            pass
+    return None
 
 # Gift images copied verbatim from the supplied Giant Chat bot assets/.
 BASE_DIR = Path(__file__).resolve().parent
@@ -1148,8 +1267,30 @@ class RawWebSocket:
         self._recvbuf = bytearray(self._prefetch)
 
     def _recv_exact(self, n):
+        try:
+            socket_timeout = self.sock.gettimeout()
+        except Exception:
+            socket_timeout = None
+        wait_timeout = socket_timeout if socket_timeout is not None else getattr(self, "timeout", 20)
+        deadline = time.monotonic() + max(0.1, float(wait_timeout or 20))
         while len(self._recvbuf) < n:
-            chunk = self.sock.recv(max(4096, n-len(self._recvbuf)))
+            try:
+                chunk = self.sock.recv(max(4096, n-len(self._recvbuf)))
+            except InterruptedError:
+                continue
+            except BlockingIOError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("timed out waiting for WebSocket data") from exc
+                # EAGAIN is a normal transient result on a non-blocking socket.
+                # Wait for readability instead of tearing down the whole bot.
+                try:
+                    select.select([self.sock], [], [], remaining)
+                except InterruptedError:
+                    pass
+                continue
             if not chunk:
                 raise ConnectionError("socket closed")
             self._recvbuf.extend(chunk)
@@ -1981,6 +2122,17 @@ def _persistent_rooms():
 
 def _save_persistent_rooms(rooms):
     _save_local_json(TRACKED_ROOMS_FILE, {"version": 1, "rooms": sorted({_norm_room(x) for x in rooms if _norm_room(x)})})
+
+def _persistent_blocked_rooms():
+    data = _load_local_json(BLOCKED_ROOMS_FILE, {})
+    rooms = data.get("rooms", []) if isinstance(data, dict) else data
+    if not isinstance(rooms, list):
+        return []
+    return sorted({_norm_room(room) for room in rooms if _norm_room(room)})
+
+def _save_persistent_blocked_rooms(rooms):
+    clean = sorted({_norm_room(room) for room in (rooms or []) if _norm_room(room)})
+    _save_local_json(BLOCKED_ROOMS_FILE, {"version": 1, "rooms": clean})
 
 def _persistent_rosters():
     data = _load_local_json(ROOM_USERS_FILE, {})
@@ -4403,16 +4555,13 @@ def _extract_image_urls_from_bing(html_text):
     return urls
 
 
-def _search_lookalike_image(query, exclude_urls=None):
-    """Search Bing Images and return a fresh/random image URL.
-
-    No username->image cache is kept: every command performs a new search and
-    randomly chooses from several current Bing results, so the same account can
-    receive a different lookalike image on every invocation.
-    """
+def _search_lookalike_images(query, exclude_urls=None, limit=12):
+    """Return several current Bing results, falling back to Commons search."""
     q = str(query or "").strip()
     if not q:
-        return None
+        return []
+    excluded = {str(x).strip() for x in (exclude_urls or []) if str(x).strip()}
+    urls = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Android 10; Mobile) AppleWebKit/537.36 "
                       "Chrome/120.0 Mobile Safari/537.36",
@@ -4423,21 +4572,46 @@ def _search_lookalike_image(query, exclude_urls=None):
             "https://www.bing.com/images/search",
             params={"q": q + " safe for work", "form": "HDRSC2", "first": "1", "adlt": "strict"},
             headers=headers,
-            timeout=LOOKALIKE_TIMEOUT,
+            timeout=(3, 6),
         )
         r.raise_for_status()
         urls = _extract_image_urls_from_bing(r.text)
-        excluded = {str(x).strip() for x in (exclude_urls or []) if str(x).strip()}
-        fresh = [u for u in urls if u not in excluded]
-        if not fresh:
-            fresh = urls
-        if not fresh:
-            return None
-        # Randomize the result so repeated commands do not keep returning the
-        # first Bing image for the same username.
-        return secrets.choice(fresh[:12])
     except Exception:
-        return None
+        urls = []
+    fresh = list(dict.fromkeys(url for url in urls if url and url not in excluded))
+    if len(fresh) < min(3, max(1, int(limit))):
+        # Bing can block datacenter IPs or change its image-result markup.
+        # Commons' public API is a stable, license-aware image-search fallback.
+        try:
+            commons_query = re.sub(r"\b(?:celebrity|portrait|safe for work)\b", " ", q, flags=re.I)
+            commons_query = re.sub(r"\s+", " ", commons_query).strip() or q
+            response = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={
+                    "action": "query", "generator": "search", "gsrsearch": commons_query,
+                    "gsrnamespace": 6, "gsrlimit": max(8, int(limit)),
+                    "prop": "imageinfo", "iiprop": "url|mime", "iiurlwidth": 1200,
+                    "format": "json", "formatversion": 2,
+                },
+                headers={"User-Agent": "TalkinBot/1.0 (https://github.com/zidaan11223344-coder/Talkin2)", "Accept": "application/json"},
+                timeout=(3, 6),
+            )
+            response.raise_for_status()
+            for page in response.json().get("query", {}).get("pages", []):
+                image = (page.get("imageinfo") or [{}])[0]
+                image_url = image.get("thumburl") or image.get("url")
+                mime = str(image.get("mime") or "").lower()
+                if image_url and mime in {"image/jpeg", "image/png", "image/webp"} and image_url not in excluded:
+                    fresh.append(image_url)
+        except Exception:
+            pass
+    return fresh[:max(1, int(limit))]
+
+
+def _search_lookalike_image(query, exclude_urls=None):
+    """Return a fresh random image URL from Bing or Wikimedia Commons."""
+    urls = _search_lookalike_images(query, exclude_urls=exclude_urls)
+    return secrets.choice(urls) if urls else None
 
 
 def _search_monkey_image(exclude_urls=None):
@@ -4492,12 +4666,21 @@ def _download_lookalike_image(image_url, target_name):
         r = requests.get(
             image_url,
             headers={"User-Agent": "Mozilla/5.0", "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
-            timeout=LOOKALIKE_TIMEOUT,
+            timeout=(3, 7),
             stream=True,
         )
         r.raise_for_status()
-        data = r.content
-        if len(data) > 8 * 1024 * 1024:
+        chunks = []
+        total = 0
+        for chunk in r.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > 8 * 1024 * 1024:
+                return None
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
             return None
         if not PIL_AVAILABLE:
             return None
@@ -4849,7 +5032,7 @@ class TalkinBot:
             is_verified=_is_cricket_verified_member,
             send_room_text=self.send_room_text,
             send_room_media=self.send_room_media,
-            send_all_rooms_text=self.broadcast_all_rooms,
+            send_all_rooms_text=self.broadcast_game_rooms,
             send_private_text=self.send_private_text,
             public_base=_public_base_url,
             reward=lambda username, amount: _add_points(username, amount),
@@ -4944,7 +5127,12 @@ class TalkinBot:
         self.invite_thread = None
         self.invite_lock = threading.Lock()
         self.invite_message_template = "يوجد معجب مخفي في {room}"
-        self.known_rooms = set(_persistent_rooms())
+        self.blocked_rooms = set(_persistent_blocked_rooms())
+        self._blocked_room_reasons = {}
+        self.known_rooms = {
+            room for room in _persistent_rooms()
+            if _norm_room(room) not in self.blocked_rooms
+        }
         # Live rooms are session-only: unlike known_rooms (history on disk),
         # this set contains only rooms for which the current WebSocket session
         # has received a room/occupants response. It is cleared on disconnect.
@@ -4956,14 +5144,11 @@ class TalkinBot:
         self._master_online_rooms = set()
         self._offline_support_sessions = {}
         self._offline_support_recent = {}
-        # A room's access state is authoritative only when reported by the
-        # current Talkin server session. Never restore blocked rooms from a
-        # local exception file, because permissions may have changed.
-        self.blocked_rooms = set()
-        self._blocked_room_reasons = {}
+        # Server-confirmed unauthorized rooms stay excluded across reconnects;
+        # a manual join request clears the exclusion if permissions changed.
         self._blocked_room_notices = set()
         self._pending_room_joins = {}
-        if self.room:
+        if self.room and _norm_room(self.room) not in self.blocked_rooms:
             self.known_rooms.add(_norm_room(self.room))
         _save_persistent_rooms(self.known_rooms)
         self._join_lock = threading.Lock()
@@ -4971,6 +5156,7 @@ class TalkinBot:
         # packets and media broadcasts concurrently can make the gateway
         # replay room_join/room_leave events or close the WebSocket.
         self._room_bulk_lock = threading.Lock()
+        self._game_broadcast_lock = threading.Lock()
         self._last_join_sent = {}
         self._rejoin_attempts = defaultdict(int)
         self._last_reconnect = 0.0
@@ -5442,6 +5628,71 @@ class TalkinBot:
             except Exception as notify_error:
                 self.log("[MASTER-ERROR] failed:", repr(notify_error))
 
+    @staticmethod
+    def _redact_connection_secrets(value):
+        """Remove known deployment secrets before forwarding transport errors."""
+        text = " ".join(str(value or "خطأ اتصال غير معروف").split())
+        secret_names = (
+            "BOT_PWD", "BOT_PASSWORD", "TELEGRAM_BOT_TOKEN", "GITHUB_TOKEN",
+            "SPOTIFY_CLIENT_SECRET", "RIVEN_DB_PASSWORD", "SUPABASE_KEY",
+            "SUPABASE_PASSWORD", "YOUTUBE_COOKIES",
+        )
+        for name in secret_names:
+            secret = str(os.getenv(name, "") or "")
+            if len(secret) >= 4:
+                text = text.replace(secret, "[محذوف]")
+        text = re.sub(
+            r"(?i)\b(password|token|secret|cookie)\s*([=:])\s*[^\s,;]+",
+            r"\1\2[محذوف]", text,
+        )
+        return text[:1200]
+
+    def _send_reconnect_notice(self, reason, command=None):
+        """Deliver a sanitized connection-recovery diagnostic to both channels."""
+        safe_reason = self._redact_connection_secrets(reason)
+        message = (
+            "⚠️ عاد اتصال بوت Talkin بعد انقطاع/تعذر اتصال."
+            f"\n📍 الغرفة: {self.room or 'غير محددة'}"
+            f"\n🧾 سبب الاتصال المسجل: {safe_reason}"
+        )
+        if "1009" in safe_reason:
+            message += "\nℹ️ الرمز 1009 غالباً يعني أن الخادم رفض حزمة WebSocket كبيرة."
+        if isinstance(command, dict) and command.get("command"):
+            message += (
+                "\n\n📌 آخر أمر مسجل وقت الانقطاع (للسياق فقط، وليس دليلاً على السبب):"
+                f"\n• الأمر: {self._redact_connection_secrets(command.get('command'))[:300]}"
+                f"\n• الغرفة: {self._redact_connection_secrets(command.get('room') or 'خاص')[:120]}"
+                f"\n• المرسل: @{self._redact_connection_secrets(command.get('sender') or 'غير معروف')[:120]}"
+            )
+
+        master_sent = False
+        if BOT_MASTER and _norm_user(BOT_MASTER) != _norm_user(BOT_ID):
+            try:
+                master_sent = bool(self.send_private_text(BOT_MASTER, message))
+            except Exception as exc:
+                self.log("[CONNECTION_NOTICE] master DM failed:", repr(exc))
+
+        telegram_sent = False
+        chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
+        if TELEGRAM_BOT_TOKEN and chat_id:
+            try:
+                response = self._telegram_api(
+                    "sendMessage", chat_id=chat_id, text=message[:3900],
+                    disable_web_page_preview=True,
+                )
+                telegram_sent = bool(response and response.get("ok"))
+            except Exception as exc:
+                self.log("[CONNECTION_NOTICE] Telegram send failed:", repr(exc))
+        else:
+            self.log(
+                "[CONNECTION_NOTICE] Telegram skipped:",
+                "TELEGRAM_BOT_TOKEN missing" if not TELEGRAM_BOT_TOKEN else "Telegram chat_id not captured/configured",
+            )
+        self.log(
+            "[CONNECTION_NOTICE] delivered:",
+            f"master_dm={master_sent}", f"telegram={telegram_sent}",
+        )
+
     def _monitor_command(self, sender, text):
         """Handle master-only private monitoring commands."""
         if not _is_primary_master(sender):
@@ -5763,21 +6014,24 @@ class TalkinBot:
         self._heartbeat_thread = None
 
     def _save_blocked_rooms(self):
-        # Kept as a compatibility hook for old callers. Blocked rooms are not
-        # persisted; the server response is the only source of truth.
-        self.blocked_rooms.clear()
+        _save_persistent_blocked_rooms(getattr(self, "blocked_rooms", set()))
 
-    def _mark_room_blocked(self, room: str, reason: str = ""):
+    def _mark_room_blocked(self, room: str, reason: str = "", persistent: bool = False):
         room = _norm_room(room)
         if not room:
             return
+        if not hasattr(self, "blocked_rooms"):
+            self.blocked_rooms = set()
+        if persistent:
+            self.blocked_rooms.add(room)
+            self._save_blocked_rooms()
         if reason:
             self._blocked_room_reasons[room] = reason
         self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != room}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != room}
         self.room_users.pop(room, None)
         _save_persistent_rooms(self.known_rooms)
-        self.log("[ROOM] server rejected room (not persisted as exception):", room, reason)
+        self.log("[ROOM] server rejected room; removed from tracked list:", room, reason)
 
     def _room_failure_message(self, room: str, event_type: str):
         event_type = str(event_type or "").replace("_rejoin", "").replace("room_full _rejoin", "room_full")
@@ -5837,9 +6091,8 @@ class TalkinBot:
         if not room:
             return False
         room_norm = _norm_room(room)
-        # An explicit/forced join is always a fresh TalkinChat request. Clear
-        # only runtime failure markers so lifting a room ban or changing the
-        # bot role allows a new join packet to be sent immediately.
+        # Forced automatic rejoin may bypass debounce, but it must not bypass a
+        # server-confirmed ban. Only a user-requested join clears that ban.
         if force or requested_by:
             stale = self._pending_room_joins.pop(room_norm, None)
             if stale and stale.get("timer"):
@@ -5847,9 +6100,24 @@ class TalkinBot:
                     stale["timer"].cancel()
                 except Exception:
                     pass
+        if requested_by:
             self.blocked_rooms.discard(room_norm)
-            self._blocked_room_reasons.pop(room_norm, None)
-            self._blocked_room_notices.discard(room_norm)
+            getattr(self, "_blocked_room_reasons", {}).pop(room_norm, None)
+            getattr(self, "_blocked_room_notices", set()).discard(room_norm)
+            self._save_blocked_rooms()
+        elif room_norm in getattr(self, "blocked_rooms", set()):
+            self.known_rooms = {
+                saved for saved in getattr(self, "known_rooms", set())
+                if _norm_room(saved) != room_norm
+            }
+            self.connected_rooms = {
+                saved for saved in getattr(self, "connected_rooms", set())
+                if _norm_room(saved) != room_norm
+            }
+            self.room_users.pop(room_norm, None)
+            _save_persistent_rooms(self.known_rooms)
+            self.log("[ROOM] blocked room join suppressed:", room)
+            return False
         known_norm = {_norm_room(r) for r in getattr(self, "known_rooms", set())}
         connected_norm = {_norm_room(r) for r in getattr(self, "connected_rooms", set())}
         already_known = _norm_room(room) in known_norm
@@ -6146,6 +6414,35 @@ class TalkinBot:
             self.log("[WS] long-text notice failed:", repr(exc))
             return False
 
+    @staticmethod
+    def _is_game_result_text(text):
+        value = str(text or "").casefold()
+        return any(marker in value for marker in (
+            "🏆", "نتيجة المباراة", "نتيجة اللعبة", "النتيجة:",
+            "الفائز:", "الفائزة:", "انتهت المباراة", "انتهت لعبة",
+        ))
+
+    @staticmethod
+    def _split_text_to_payload_limit(text, make_payload, limit):
+        """Split only at safe UTF-8 character boundaries, preferring word breaks."""
+        chunks = []
+        current = ""
+        for char in str(text or ""):
+            while current and len(make_payload(current + char)) > limit:
+                split_at = max(current.rfind("\n"), current.rfind(" "))
+                if split_at >= 0:
+                    chunks.append(current[:split_at + 1])
+                    current = current[split_at + 1:]
+                else:
+                    chunks.append(current)
+                    current = ""
+            if len(make_payload(char)) > limit:
+                return []
+            current += char
+        if current:
+            chunks.append(current)
+        return chunks
+
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
         """Send text safely; oversized packets are ignored and routed to Telegram."""
         text = str(text or "")
@@ -6164,6 +6461,21 @@ class TalkinBot:
         if len(make_payload(text)) <= limit:
             self.send_query(make_payload(text))
             return True
+
+        # Game results belong in the room where the match happened. Keep them
+        # visible there by splitting into protocol-safe text packets instead of
+        # quietly routing the result to Telegram as a long-text attachment.
+        if packet_type == "room_message" and self._is_game_result_text(text):
+            chunks = self._split_text_to_payload_limit(text, make_payload, limit)
+            if chunks:
+                try:
+                    for chunk in chunks:
+                        self.send_query(make_payload(chunk))
+                    self.log("[WS_OVERSIZE] game result split into room packets", len(chunks))
+                    return True
+                except Exception as exc:
+                    self.log("[WS_OVERSIZE] game result room chunk failed:", repr(exc))
+                    return False
 
         # The complete message is too large for Talkin/WebSocket. Do NOT
         # split it into visible Talkin messages. Route the original full text
@@ -6205,11 +6517,21 @@ class TalkinBot:
         return self._send_text_packets(packet_type, text, **kwargs)
 
     def _active_rooms(self):
-        rooms = {str(r).strip() for r in getattr(self, "known_rooms", set()) if str(r).strip()}
-        if self.room:
+        blocked = getattr(self, "blocked_rooms", set())
+        rooms = {
+            str(r).strip() for r in getattr(self, "known_rooms", set())
+            if str(r).strip() and _norm_room(r) not in blocked
+        }
+        if self.room and _norm_room(self.room) not in blocked:
             rooms.add(str(self.room).strip())
-        rooms.update(str(r).strip() for r in self.room_users.keys() if str(r).strip())
-        rooms.update(str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip())
+        rooms.update(
+            str(r).strip() for r in self.room_users.keys()
+            if str(r).strip() and _norm_room(r) not in blocked
+        )
+        rooms.update(
+            str(r).strip() for r in getattr(self, "connected_rooms", set())
+            if str(r).strip() and _norm_room(r) not in blocked
+        )
         return sorted(rooms)
 
     def broadcast_all_rooms(self, text: str):
@@ -6226,6 +6548,31 @@ class TalkinBot:
                     self.log("[BROADCAST] failed", target_room, repr(exc))
                 if index+1 < len(rooms):
                     time.sleep(delay)
+        return sent
+
+    def broadcast_game_rooms(self, text: str, first_room: str = ""):
+        """Quickly announce a game, delivering to its initiating room first."""
+        rooms = self._active_rooms()
+        first_room = str(first_room or "").strip()
+        if first_room:
+            rooms = [first_room] + [
+                room for room in rooms if _norm_room(room) != _norm_room(first_room)
+            ]
+        lock = getattr(self, "_game_broadcast_lock", None)
+        if lock is None:
+            lock = self._game_broadcast_lock = threading.Lock()
+        sent = 0
+        with lock:
+            for index, target_room in enumerate(rooms):
+                try:
+                    self.send_room_text(target_room, text)
+                    sent += 1
+                except Exception as exc:
+                    self.log("[GAME-BROADCAST] failed", target_room, repr(exc))
+                if index + 1 < len(rooms):
+                    # Text-only game announcements are much smaller than media
+                    # bursts; keep a tiny pacing gap without multi-second waits.
+                    time.sleep(0.05)
         return sent
 
     def send_room_text(self, room: str, text: str):
@@ -9239,7 +9586,7 @@ class TalkinBot:
             return dict(cached.get("value") or {})
         errors = []
 
-        clients = ("web_embedded", "default", "native_default")
+        clients = ("web_embedded", "default")
         for client in clients:
             try:
                 opts = {
@@ -9248,9 +9595,9 @@ class TalkinBot:
                     "noplaylist": True,
                     "skip_download": True,
                     "format": "bestaudio[abr<=192]/bestaudio",
-                    "socket_timeout": 12,
-                    "retries": 1,
-                    "extractor_retries": 1,
+                    "socket_timeout": 4,
+                    "retries": 0,
+                    "extractor_retries": 0,
                     "cachedir": False,
                     "check_formats": False,
                     "http_headers": {
@@ -9333,6 +9680,67 @@ class TalkinBot:
                 continue
         if errors:
             self.log("[MUSIC] direct live source failed:", " | ".join(errors[-6:]))
+        return None
+
+    def _music_fast_source(self, query):
+        """Race Audius and direct extractor lookups; use the first playable URL."""
+        q = str(query or "").strip()
+        if not q:
+            return None
+        results = queue.Queue()
+        tasks = (
+            ("Audius", self._audius_live_source),
+            ("direct", self._music_live_source),
+        )
+        launched = 0
+        started_at = time.monotonic()
+        for label, resolver in tasks:
+            if not _MUSIC_SOURCE_SEMAPHORE.acquire(blocking=False):
+                continue
+
+            def run_lookup(source_label=label, source_resolver=resolver):
+                try:
+                    results.put((source_label, source_resolver(q), None))
+                except Exception as exc:
+                    results.put((source_label, None, exc))
+                finally:
+                    _MUSIC_SOURCE_SEMAPHORE.release()
+
+            try:
+                _MUSIC_LOOKUP_THREAD(
+                    target=run_lookup, daemon=True,
+                    name=f"music-source-{label.casefold()}",
+                ).start()
+                launched += 1
+            except Exception as exc:
+                _MUSIC_SOURCE_SEMAPHORE.release()
+                self.log("[MUSIC] source lookup could not start:", label, repr(exc))
+
+        remaining_sources = launched
+        deadline = started_at + max(0.5, MUSIC_FAST_LOOKUP_TIMEOUT)
+        while remaining_sources:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                label, result, error = results.get(timeout=remaining)
+            except queue.Empty:
+                break
+            remaining_sources -= 1
+            if error is not None:
+                self.log("[MUSIC] source lookup failed:", label, repr(error))
+                continue
+            if not isinstance(result, dict) or not str(result.get("url") or "").strip():
+                continue
+            value = dict(result)
+            value.setdefault("source", label)
+            value.setdefault("uploader", label)
+            self.log(
+                "[MUSIC] fastest playable source:", label,
+                f"in {time.monotonic() - started_at:.2f}s",
+            )
+            return value
+        self.log("[MUSIC] fast source lookup timed out/empty:", q[:100])
         return None
 
     def _music_download(self,query):
@@ -9597,78 +10005,53 @@ class TalkinBot:
         def worker():
             try:
                 public_base = _public_base_url()
+                spotify = _spotify_track_metadata(query)
+                search_query = str((spotify or {}).get("search_query") or query).strip()
+                if spotify:
+                    self.log("[MUSIC] Spotify metadata resolved:", spotify.get("title"), "—", spotify.get("artist"))
                 info = None
                 path = None
                 url = ""
-
-                # البث المباشر يفضّل Audius، ثم يستخدم رابطًا مباشرًا من
-                # YouTube/SoundCloud، ثم تنزيلًا محليًا إذا لزم الأمر.
                 if live_stream:
-                    audius = self._audius_live_source(query)
-                    if audius and str(audius.get("url") or "").strip():
-                        info = audius
-                        url = str(audius.get("url") or "")
-                        duration = int(audius.get("duration") or 0)
-                        title = str(audius.get("title") or query)
-                        artist = str(audius.get("uploader") or "Audius")
-                        self.log("[MUSIC] live source=Audius title=", title, "room=", room)
+                    # Race direct streaming sources; only fall back to a full
+                    # download if neither resolver finds a playable URL quickly.
+                    direct = self._music_fast_source(search_query)
+                    direct_url = str((direct or {}).get("url") or "").strip()
+                    if direct and direct_url:
+                        info = direct
+                        url = direct_url
+                        duration = int(direct.get("duration") or 0)
+                        title = str(direct.get("title") or search_query)
+                        artist = str(direct.get("uploader") or direct.get("source") or "Music")
+                        self.log("[MUSIC] live source=fast-race title=", title, "room=", room)
                     else:
-                        direct = self._music_live_source(query)
-                        direct_url = str((direct or {}).get("url") or "").strip()
-                        if direct and direct_url and len(direct_url) <= 500:
-                            info = direct
-                            url = direct_url
-                            duration = int(direct.get("duration") or 0)
-                            title = str(direct.get("title") or query)
-                            artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
-                            self.log("[MUSIC] live source=direct-fallback title=", title, "room=", room)
-                        else:
-                            info, path = self._music_download(query)
-                            title = str(info.get("title") or query)
-                            artist = str(info.get("uploader") or info.get("channel") or "YouTube")
-                            duration = int(info.get("duration") or 0)
-                            url = public_base + "/media/" + path.name if public_base else str(path)
-                            self.log("[MUSIC] live source=local-fallback title=", title, "room=", room)
+                        info, path = self._music_download(search_query)
+                        title = str(info.get("title") or search_query)
+                        artist = str(info.get("uploader") or info.get("channel") or "YouTube")
+                        duration = int(info.get("duration") or 0)
+                        url = public_base + "/media/" + path.name if public_base else str(path)
+                        self.log("[MUSIC] live source=local-fallback title=", title, "room=", room)
                 else:
-                    # Prefer a short Audius stream URL so the room receives the
-                    # song without waiting for a full download/conversion.
-                    fast = None
-                    if not re.match(r"^https?://", query, re.I):
-                        try:
-                            fast = self._audius_live_source(query)
-                        except Exception as exc:
-                            self.log("[MUSIC] fast Audius lookup failed:", repr(exc))
+                    # Race Audius against direct audio extraction; avoid
+                    # serial network waits and full downloads where possible.
+                    fast = self._music_fast_source(search_query)
                     fast_url = str((fast or {}).get("url") or "").strip()
                     if fast and fast_url and len(fast_url) <= 500:
                         info = fast
                         url = fast_url
                         duration = int(fast.get("duration") or 0)
-                        title = str(fast.get("title") or query)
-                        artist = str(fast.get("uploader") or "Audius")
-                        self.log("[MUSIC] normal source=short-audius title=", title, "room=", room)
+                        title = str(fast.get("title") or search_query)
+                        artist = str(fast.get("uploader") or fast.get("source") or "Music")
+                        self.log("[MUSIC] normal source=fast-race title=", title, "room=", room)
                     elif public_base:
-                        # Keep the compact local URL fallback for long signed
-                        # YouTube/SoundCloud URLs that do not fit a room packet.
-                        info, path = self._music_download(query)
-                        title = str(info.get("title") or query)
+                        info, path = self._music_download(search_query)
+                        title = str(info.get("title") or search_query)
                         artist = str(info.get("uploader") or info.get("channel") or "YouTube")
                         duration = int(info.get("duration") or 0)
                         url = public_base + "/media/" + path.name
                         self.log("[MUSIC] normal source=local-public-media title=", title, "room=", room)
                     else:
-                        # Only use a direct URL when it is short enough to be
-                        # safely embedded in a Talkin message packet.
-                        direct = self._music_live_source(query)
-                        direct_url = str((direct or {}).get("url") or "")
-                        if not direct or not direct_url or len(direct_url) > 500:
-                            raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
-                        info = direct
-                        url = direct_url
-                        duration = int(direct.get("duration") or 0)
-                        title = str(direct.get("title") or query)
-                        artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
-                        self.log("[MUSIC] normal source=short-direct-audio title=", title, "room=", room)
-
+                        raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
                     "url": url, "duration": duration, "created_at": time.time(),
@@ -9739,16 +10122,24 @@ class TalkinBot:
                             ]
                     else:
                         target_rooms = [str(room or "").strip()] if str(room or "").strip() else []
+                    published_rooms = []
                     for target_room in target_rooms:
                         try:
                             sent = self.send_room_media(target_room, url, "audio", duration)
                             if sent is False:
                                 raise RuntimeError("Talkin لم يقبل حزمة الصوت")
                             music_published = True
-                            if caption:
-                                self.send_room_text(target_room, caption)
+                            published_rooms.append(target_room)
                         except Exception as exc:
                             self.log("[MUSIC] room audio send failed:", target_room, repr(exc))
+                    # Queue audio packets to every room first; captions are
+                    # secondary and must not hold up another room's playback.
+                    if caption:
+                        for target_room in published_rooms:
+                            try:
+                                self.send_room_text(target_room, caption)
+                            except Exception as exc:
+                                self.log("[MUSIC] room caption send failed:", target_room, repr(exc))
                     if not music_published:
                         raise RuntimeError("تعذر إرسال الصوت إلى أي غرفة متصلة")
                 if music_published:
@@ -10391,8 +10782,8 @@ class TalkinBot:
             f"🎯 اكتب {command}@المبلغ لبدء الرهان"
         )
         # GLOBAL challenge announcement: every tracked bot room sees the same
-        # open challenge, regardless of where the first player started it.
-        self.broadcast_all_rooms(opening)
+        # open challenge, regardless of where the first player started.
+        self.broadcast_game_rooms(opening, first_room=room)
         return True
 
     def _fixed_game_result(self, first, second, game_name, prize=500):
@@ -11379,7 +11770,6 @@ class TalkinBot:
             "🔎 جاري البحث عن الجائزة...\n"
             "━━━━━━━━━━━━━━"
         )
-        time.sleep(1.0)
         won = secrets.randbelow(100) == 0
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
@@ -11401,9 +11791,13 @@ class TalkinBot:
         # connected in THIS WebSocket session. ``_active_rooms()`` also contains
         # historical/persisted rooms and can make the bot send to stale rooms.
         connected = {str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()}
-        if room and str(room).strip():
-            connected.add(str(room).strip())
-        target_rooms = sorted(connected, key=str.casefold) or [str(room).strip()]
+        preferred_room = str(room or "").strip()
+        target_rooms = ([preferred_room] if preferred_room else []) + sorted(
+            (target for target in connected if _norm_room(target) != _norm_room(preferred_room)),
+            key=str.casefold,
+        )
+        if not target_rooms:
+            target_rooms = [preferred_room]
 
         # Do not burst all room packets at once. The short pacing keeps the
         # realtime connection alive while preserving the existing all-room
@@ -11414,7 +11808,7 @@ class TalkinBot:
             except Exception as exc:
                 self.log("[GAME] bank winner text send failed:", target_room, repr(exc))
             if index + 1 < len(target_rooms):
-                time.sleep(0.35)
+                time.sleep(0.05)
 
         self._send_game_winner_card("بنك مليون", sender_name, target_rooms, send_delay=0.35)
         return True
@@ -12234,10 +12628,13 @@ class TalkinBot:
                 image_result = None
                 name = ""
                 for candidate in secrets.SystemRandom().sample(names, min(4, len(names))):
-                    image_url = _search_lookalike_image(f"{candidate} celebrity portrait")
-                    local = _download_lookalike_image(image_url, f"celebrity_{uuid.uuid4().hex}") if image_url else None
-                    if local:
-                        image_result, name = local, candidate
+                    image_urls = _search_lookalike_images(f"{candidate} celebrity portrait", limit=8)
+                    for image_url in image_urls[:5]:
+                        local = _download_lookalike_image(image_url, f"celebrity_{uuid.uuid4().hex}")
+                        if local:
+                            image_result, name = local, candidate
+                            break
+                    if image_result:
                         break
                 if not image_result:
                     self.send_room_text(room, "❌ تعذر العثور على صورة مناسبة الآن؛ جرّب مرة أخرى لاحقاً.")
@@ -12447,7 +12844,6 @@ class TalkinBot:
                 f"🔎 جاري البحث عن مليار...\n"
                 f"━━━━━━━━━━━━━━"
             )
-            time.sleep(1.0)
             won = (secrets.randbelow(100) == 0)
             reward = 1000000000 if won else 0
             _record_game(sender_name, "billion", reward, 0)
@@ -12473,8 +12869,14 @@ class TalkinBot:
                     f"━━━━━━━━━━━━━━━━"
                 )
                 target_rooms = self._active_rooms() or [room]
-                for target_room in target_rooms:
+                target_rooms = [room] + [
+                    target_room for target_room in target_rooms
+                    if _norm_room(target_room) != _norm_room(room)
+                ]
+                for index, target_room in enumerate(target_rooms):
                     self.send_room_text(target_room, winner_text)
+                    if index + 1 < len(target_rooms):
+                        time.sleep(0.05)
 
                 try:
                     base = _public_base_url()
@@ -13066,7 +13468,9 @@ class TalkinBot:
         if not rooms:
             self.send_private_text(sender,"❌ أرسل أسماء الغرف مفصولة بمسافة.\nمثال: مشاعر ادم نبض قلوب سوالف")
             return True
-        existing=_persistent_rooms()
+        blocked = getattr(self, "blocked_rooms", set())
+        rooms = [room_name for room_name in rooms if _norm_room(room_name) not in blocked]
+        existing=[room_name for room_name in _persistent_rooms() if _norm_room(room_name) not in blocked]
         existing_keys={_norm_room(x).casefold() for x in existing}
         added=[]
         for room_name in rooms:
@@ -13075,7 +13479,7 @@ class TalkinBot:
                 existing_keys.add(_norm_room(room_name).casefold())
                 added.append(room_name)
         _save_persistent_rooms(existing)
-        self.known_rooms.update(existing)
+        self.known_rooms.update(room_name for room_name in existing if _norm_room(room_name) not in blocked)
         self.send_private_text(
             sender,
             "✅ تم تحديث ملف الغرف المحفوظة.\n"
@@ -15614,7 +16018,7 @@ class TalkinBot:
         room = str(event.get(13, self.room))
         if body:
             self._remember_inflight_command(room, body, frm, is_private=False)
-        if room and room != BOT_MASTER:
+        if room and room != BOT_MASTER and _norm_room(room) not in getattr(self, "blocked_rooms", set()):
             # This handler runs for every room message.  Rewriting the JSON
             # file (and possibly enqueueing DB/GitHub persistence) on every
             # event blocks the WebSocket reader and makes commands feel slow.
@@ -15834,6 +16238,9 @@ class TalkinBot:
             pending_join = self._pending_room_joins.pop(rnorm, None)
             if pending_join and pending_join.get("timer"):
                 pending_join["timer"].cancel()
+            if rnorm in getattr(self, "blocked_rooms", set()):
+                self.blocked_rooms.discard(rnorm)
+                self._save_blocked_rooms()
             self._blocked_room_reasons.pop(rnorm, None)
             self._blocked_room_notices.discard(rnorm)
             if room:
@@ -15873,8 +16280,11 @@ class TalkinBot:
                 pending_join = self._pending_room_joins.pop(blocked_room, None)
                 if pending_join and pending_join.get("timer"):
                     pending_join["timer"].cancel()
-                self._mark_room_blocked(room, reason_text)
                 normalized_event = event_type.replace("_rejoin", "")
+                self._mark_room_blocked(
+                    room, reason_text,
+                    persistent=(normalized_event == "room_unauthorized"),
+                )
                 if normalized_event == "room_unauthorized":
                     advice = "ارفع البوت إشرافاً أو أونر ثم أعد المحاولة."
                 elif normalized_event == "room_membership_required":
@@ -16266,6 +16676,8 @@ class TalkinBot:
             elif isinstance(obj, list):
                 for v in obj: walk(v)
         walk(rooms)
+        blocked = getattr(self, "blocked_rooms", set())
+        found = {room for room in found if _norm_room(room) not in blocked}
         if not found:
             return
         self.log("[ROOM-LIST] loaded", len(found), "rooms")
@@ -16845,33 +17257,25 @@ class TalkinBot:
                             if not gift_active:
                                 self._set_profile_status(self._profile_base_status or BOT_BASE_STATUS)
                                 self._profile_current_status = self._profile_base_status or BOT_BASE_STATUS
-                        if BOT_MASTER:
-                            now = time.time()
-                            reason = self._pending_reconnect_reason
-                            self._pending_reconnect_reason = ""
-                            reconnect_command = self._pending_reconnect_command
-                            self._pending_reconnect_command = None
-                            # Do not spam the master for normal reconnects.
-                            # A visible diagnostic is emitted only for the specific
-                            # WebSocket 1009 (message too large) condition.
-                            should_notify = bool(reason and "1009" in reason)
-                            if should_notify and now - self._last_connection_notice >= 30.0:
-                                reconnect_notice = (
-                                    "⚠️ انقطع WebSocket بسبب حجم رسالة أكبر من الحد المسموح (1009)."
-                                    "\n🛠️ تم تعديل الإرسال لتقسيم الرسائل الكبيرة تلقائياً قبل الإرسال."
-                                )
-                                cmd_age = now - float(reconnect_command.get("created_at", 0)) if isinstance(reconnect_command, dict) else 999999
-                                if isinstance(reconnect_command, dict) and reconnect_command.get("command") and cmd_age <= 45.0:
-                                    reconnect_notice += (
-                                        "\n\n📌 الأمر الفعلي الذي كان قيد التنفيذ:"
-                                        f"\n• الأمر: {reconnect_command['command']}"
-                                        f"\n• الغرفة: {reconnect_command.get('room') or 'خاص'}"
-                                        f"\n• المرسل: @{reconnect_command.get('sender') or 'غير معروف'}"
-                                    )
-                                else:
-                                    reconnect_notice += "\n📌 لم يكن هناك أمر قيد التنفيذ لحظة الانقطاع (أو انقضت مدته)."
-                                self.send_private_text(BOT_MASTER, reconnect_notice)
-                                self._last_connection_notice = now
+                        now = time.time()
+                        reason = self._pending_reconnect_reason
+                        self._pending_reconnect_reason = ""
+                        reconnect_command = self._pending_reconnect_command
+                        self._pending_reconnect_command = None
+                        cooldown = float(getattr(self, "_connection_notice_cooldown", 300.0))
+                        if reason and now - self._last_connection_notice >= cooldown:
+                            cmd_age = now - float(reconnect_command.get("created_at", 0)) if isinstance(reconnect_command, dict) else 999999
+                            if not (isinstance(reconnect_command, dict) and reconnect_command.get("command") and cmd_age <= 45.0):
+                                reconnect_command = None
+                            threading.Thread(
+                                target=self._send_reconnect_notice,
+                                args=(reason, reconnect_command),
+                                daemon=True,
+                                name="connection-recovery-notice",
+                            ).start()
+                            self._last_connection_notice = now
+                        elif reason:
+                            self.log("[CONNECTION_NOTICE] suppressed by cooldown; reason=", reason[:500])
                         self._had_connection = True
 
                         while not self.stop_event.is_set():
@@ -16937,17 +17341,16 @@ class TalkinBot:
                 self._reconnect_delay = 10.0
             except Exception as e:
                 self.last_error = str(e)
-                if self._had_connection:
-                    raw_reason = " ".join(str(e).split())
-                    if "code': 1000" in raw_reason or '"code": 1000' in raw_reason:
-                        raw_reason = "الخادم أغلق WebSocket إغلاقًا طبيعيًا (1000)"
-                    if "1009" in raw_reason:
-                        raw_reason = "الخادم أغلق WebSocket بسبب حجم الرسالة (1009)" + (f" | آخر غرفة: {self.room}" if self.room else "") + " | السبب التقني: " + raw_reason[:700]
-                    elif self.room:
-                        raw_reason = f"{raw_reason[:850]} | آخر غرفة: {self.room}"
-                    self._pending_reconnect_reason = raw_reason[:1200]
-                    if isinstance(getattr(self, "_inflight_command", None), dict):
-                        self._pending_reconnect_command = dict(self._inflight_command)
+                raw_reason = self._redact_connection_secrets(e)
+                if "code': 1000" in raw_reason or '"code": 1000' in raw_reason:
+                    raw_reason = "الخادم أغلق WebSocket إغلاقًا طبيعياً (1000): " + raw_reason
+                if "1009" in raw_reason:
+                    raw_reason = "الخادم أغلق WebSocket بسبب حجم الرسالة (1009): " + raw_reason
+                if self.room:
+                    raw_reason = f"{raw_reason[:850]} | آخر غرفة: {self.room}"
+                self._pending_reconnect_reason = raw_reason[:1200]
+                if isinstance(getattr(self, "_inflight_command", None), dict):
+                    self._pending_reconnect_command = dict(self._inflight_command)
                 if DEBUG and not QUIET_MODE:
                     print("[BOT] error:", repr(e), flush=True)
             if not self.stop_event.is_set():

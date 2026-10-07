@@ -8,11 +8,18 @@ Railway variables (required):
 Optional:
 - BOT_MASTER
 - YOUTUBE_COOKIES (optional but recommended for YouTube)
+- YOUTUBE_COOKIES_FILE (optional mounted Netscape cookie file; alternative to YOUTUBE_COOKIES)
+- SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET (optional Spotify catalog search credentials)
 - PUBLIC_BASE_URL (optional; RAILWAY_PUBLIC_DOMAIN is preferred automatically)
 - GIFT_PUBLIC_BASE_URL (optional fallback public URL)
 - PIPED_APIS (optional comma-separated Piped API instances; auto-discovery is attempted)
 - MUSIC_MAX_SECONDS=900
 - MUSIC_COOLDOWN=15
+
+Spotify track links and text searches can be resolved to a title/artist, then the bot
+uses Audius or its configured direct audio/download fallbacks for playback. Spotify's
+catalog/API does not provide a general full-track audio URL, so Spotify itself is not
+used to bypass its player or stream protected audio.
 
 Local data files:
 - `verified_users.json` — verified accounts allowed to use normal commands.
