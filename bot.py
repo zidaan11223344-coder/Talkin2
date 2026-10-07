@@ -26,7 +26,7 @@ import sys
 import inspect
 import gc
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse, unquote, urlencode
+from urllib.parse import urlparse, unquote, urlencode, quote
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from collections import defaultdict
 from pathlib import Path
@@ -157,7 +157,10 @@ GAME_COMMANDS = {
     "box": "صندوق", "chest": "صندوق", "cup": "كوب", "goblet": "كوب",
     "monster": "وحش", "volcano": "بركان", "bird": "طائر", "star": "نجم", "table": "طاولة", "tavla": "طاولة", "uno": "اونو",
     "bet": "رهان", "wager": "رهان", "gamble": "رهان", "duel": "مضاربة", "my luck": "حظي", "myluck": "حظي",
-    "marriage": "زواج", "wedding": "زواج", "challenge": "تحدي", "riddle": "لغز", "puzzle": "لغز", "mood": "مزاج",
+    "marriage": "زواج", "wedding": "زواج", "wife": "زوجتي", "husband": "زوجي",
+    "engagement": "خطبة", "fiance": "خطيب", "love": "حبك", "enemy": "عدو",
+    "friend": "صديق", "creep": "زاحف", "sheep": "خروف",
+    "challenge": "تحدي", "riddle": "لغز", "puzzle": "لغز", "mood": "مزاج",
     "entertainment": "تسليه", "horse": "حصانه", "stock": "بورصة", "market": "بورصة",
     "bank": "بنك", "million": "بنك مليون", "million bank": "بنك مليون", "bank million": "بنك مليون",
     "billion": "مليار", "farm": "زرع", "crop": "زرع", "plant": "زرع", "face": "فيس", "fruit match": "فيس",
@@ -2201,7 +2204,7 @@ def _looks_like_bot_command(text):
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
     )
-    prefixes = prefixes + ("bl@", "رهان ", "مضاربه ", "استثمار ", "حظي ")
+    prefixes = prefixes + ("bl@", "+ds@", "رهان ", "مضاربه ", "استثمار ", "حظي ")
     normalized_low = low.replace("ة", "ه")
     normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
     normalized_games = {str(x).casefold().replace("ة", "ه") for x in (*GAME_COMMANDS, *GAME_COMMANDS.values())}
@@ -2259,6 +2262,8 @@ def _is_room_creator(room, sender):
 
 def _looks_like_admin_command(text):
     low = str(text or "").strip().casefold()
+    if low.startswith("+ds@"):
+        return True
     if re.match(r"^(?:إضافة|اضافة|استرجاع|استعادة|زيادة|زود)\s+(?:العاب|ألعاب)@", str(text or "").strip(), re.I):
         return True
     prefixes = (
@@ -4886,6 +4891,7 @@ class TalkinBot:
         # roster/settings snapshots and can refresh last_seen for everyone.
         self._room_entry_times = {}
         self._room_entry_users = defaultdict(dict)
+        self._last_departed_user_by_room = {}
         # Moderation commands are confirmed only after the server emits a
         # matching role_changed event.  Sending a packet is not proof that it
         # was accepted by the room server.
@@ -5033,6 +5039,7 @@ class TalkinBot:
         self.custom_welcome_enabled = True
         self.custom_welcomes = {}
         self._load_social_features()
+        self._load_departure_replies()
         threading.Thread(target=self._crop_worker, name="crop-worker", daemon=True).start()
         self.invite_message_template = _message_template("invite", "default", "يوجد معجب مخفي في {room}")
 
@@ -5075,6 +5082,26 @@ class TalkinBot:
         data["auto_replies"] = self.auto_replies
         _save_local_json(self.auto_replies_file, data)
         _save_local_json(self.custom_welcomes_file, {"enabled": self.custom_welcome_enabled, "welcomes": self.custom_welcomes})
+
+    def _load_departure_replies(self):
+        """Load departure-trigger replies from their own file, separate from auto replies."""
+        self.departure_replies_file = DATA_DIR / "departure_replies.json"
+        data = _load_local_json(self.departure_replies_file, {})
+        raw = data.get("replies", {}) if isinstance(data, dict) else {}
+        fixed = {}
+        if isinstance(raw, dict):
+            for trigger, replies in raw.items():
+                key = _auto_reply_key(trigger)
+                values = [str(item).strip() for item in (replies if isinstance(replies, list) else [replies]) if str(item).strip()]
+                if key in {"ب", "ت", "ق"} and values:
+                    fixed[key] = values
+        self.departure_replies = fixed
+
+    def _save_departure_replies(self):
+        _save_local_json(
+            getattr(self, "departure_replies_file", DATA_DIR / "departure_replies.json"),
+            {"replies": getattr(self, "departure_replies", {})},
+        )
 
     def _auto_reply_variants(self, trigger):
         item = self.auto_replies.get(_auto_reply_key(trigger))
@@ -5141,6 +5168,30 @@ class TalkinBot:
         state[key] = entry
         self._auto_reply_cycle = state
         return self._render_auto_reply(reply, username, room)
+
+    def _departure_reply_text(self, trigger, username, room):
+        defaults = {"ب": "🌀 في الخلاط", "ت": "⚰️ في التابوت", "ق": "❤️ بقلبي"}
+        choices = getattr(self, "departure_replies", {}).get(trigger, [])
+        if isinstance(choices, str):
+            choices = [choices]
+        template = secrets.choice(choices) if choices else defaults[trigger]
+        name = str(username or "").strip().lstrip("@")
+        text = str(template).replace("{username}", name).replace("{room}", str(room or "")).strip()
+        if "{username}" not in str(template) and name:
+            text = f"👤 {name} {text}"
+        return text
+
+    def _handle_departure_reply_command(self, room, body):
+        trigger = _auto_reply_key(body)
+        if trigger not in {"ب", "ت", "ق"}:
+            return False
+        last = getattr(self, "_last_departed_user_by_room", {})
+        username = last.get(_norm_room(room), "") if isinstance(last, dict) else ""
+        if not username:
+            self.send_room_text(room, "📭 لم يغادر أحد من هذه الغرفة بعد.")
+            return True
+        self.send_room_text(room, self._departure_reply_text(trigger, username, room))
+        return True
 
     def log(self, *args):
         """Optional diagnostics. Quiet mode avoids stdout and persistent log growth."""
@@ -6767,37 +6818,43 @@ class TalkinBot:
 
                 # حماية WebSocket من خطأ 1009: روابط اليوتيوب المباشرة تتجاوز 1500 بايت
                 # وبث الصوت يتم عبر WebRTC/LiveKit، لذلك نرسل رابط قصير فقط إن وجد
-                safe_ws_url = str(packet_url) if len(str(packet_url)) <= 250 else ""
+                safe_ws_url = str(packet_url) if (
+                    len(str(packet_url)) <= 250
+                    and str(packet_url).lower().startswith(("https://", "http://"))
+                ) else ""
 
-                # 1. إرسال حزمة STREAM_AUDIO_ACTION
-                try:
-                    self.send_query(encode_query(
-                        STREAM_AUDIO_ACTION,
-                        type_="audio",
-                        room=room_id,
-                        id_=session_id,
-                        url=safe_ws_url,
-                        length=str(max(0, int(duration or 0))),
-                    ))
-                    self.log("[STREAM] أُرسلت حزمة STREAM_AUDIO_ACTION بنجاح إلى:", room)
-                except Exception as exc:
-                    self.log("[STREAM] فشل إرسال STREAM_AUDIO_ACTION:", repr(exc))
-
-                # 2. إرسال حزمة room_stream المخصصة للبث
+                # LiveKit carries the actual audio frames. Do not send an empty
+                # or local filesystem URL as a second room attachment: older
+                # Talkin clients display that packet as a blank audio file.
                 audio_sent = False
-                try:
-                    self.send_query(encode_query(
-                        "room_stream",
-                        type_="audio",
-                        room=room_id,
-                        id_=session_id,
-                        url=safe_ws_url,
-                        length=str(max(0, int(duration or 0))),
-                    ))
-                    audio_sent = True
-                    self.log("[STREAM] أُرسلت حزمة room_stream audio بنجاح إلى:", room)
-                except Exception as exc:
-                    self.log("[STREAM] فشل إرسال room_stream audio:", repr(exc))
+                if safe_ws_url:
+                    try:
+                        self.send_query(encode_query(
+                            STREAM_AUDIO_ACTION,
+                            type_="audio",
+                            room=room_id,
+                            id_=session_id,
+                            url=safe_ws_url,
+                            length=str(max(0, int(duration or 0))),
+                        ))
+                        self.log("[STREAM] أُرسلت حزمة STREAM_AUDIO_ACTION بنجاح إلى:", room)
+                    except Exception as exc:
+                        self.log("[STREAM] فشل إرسال STREAM_AUDIO_ACTION:", repr(exc))
+                    try:
+                        self.send_query(encode_query(
+                            "room_stream",
+                            type_="audio",
+                            room=room_id,
+                            id_=session_id,
+                            url=safe_ws_url,
+                            length=str(max(0, int(duration or 0))),
+                        ))
+                        audio_sent = True
+                        self.log("[STREAM] أُرسلت حزمة room_stream audio بنجاح إلى:", room)
+                    except Exception as exc:
+                        self.log("[STREAM] فشل إرسال room_stream audio:", repr(exc))
+                else:
+                    self.log("[STREAM] skipped room audio attachment; LiveKit is carrying the audio frames:", room)
 
                 # === اختبار آلي للتحقق من إرسال حزم الصوت وجاهزية البث ===
                 lk_active = getattr(self, f"_livekit_active_{room}", False)
@@ -9280,16 +9337,13 @@ class TalkinBot:
 
     def _music_download(self,query):
         """Search/download public audio and return an MP3 ready for TalkinChat.
-        Fast YouTube search (ytsearch1:) first for speed, with SoundCloud fallback.
+        Try fast YouTube and SoundCloud sources first, then Internet Archive audio.
         """
-        if yt_dlp is None:
-            raise RuntimeError("yt-dlp غير مثبت")
-
         outdir = BASE_DIR / "generated_music"
         outdir.mkdir(parents=True, exist_ok=True)
         stamp = uuid.uuid4().hex
         out_mp3 = outdir / (stamp + ".mp3")
-        errors = []
+        errors = ["yt-dlp غير مثبت"] if yt_dlp is None else []
 
         def resolve_public_title(value):
             try:
@@ -9338,6 +9392,8 @@ class TalkinBot:
             return out_mp3
 
         def download_with_ydl(target, label, cookies=False):
+            if yt_dlp is None:
+                return None
             tmpdir = outdir / f".{stamp}_{label}"
             tmpdir.mkdir(parents=True, exist_ok=True)
             template = str(tmpdir / "source.%(ext)s")
@@ -9379,7 +9435,12 @@ class TalkinBot:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(target, download=True)
                     if info and info.get("entries"):
-                        info = next((x for x in info["entries"] if x), None)
+                        entries = [x for x in info["entries"] if x]
+                        info = next(
+                            (x for x in entries if not int(x.get("duration") or 0)
+                             or int(x.get("duration") or 0) <= MUSIC_MAX_SECONDS),
+                            None,
+                        )
                     if not info:
                         raise RuntimeError("لم يتم العثور على الأغنية")
                 candidates = [x for x in tmpdir.iterdir() if x.is_file() and x.suffix.lower() not in (".part", ".ytdl", ".temp") and x.stat().st_size > 4096]
@@ -9412,7 +9473,7 @@ class TalkinBot:
         if re.match(r"^https?://", query, re.I) and not ("soundcloud.com" in query.lower()):
             yt_targets = [query]
         else:
-            yt_targets = ["ytsearch1:" + search_query]
+            yt_targets = ["ytsearch3:" + search_query]
 
         for yt_target in yt_targets:
             for client in ("android", "web_embedded", "web", "default"):
@@ -9438,8 +9499,83 @@ class TalkinBot:
                     if child.is_dir(): shutil.rmtree(child, ignore_errors=True)
                 return info, mp3
 
+        # Last public fallback for freely available tracks, recitations and
+        # prayers: Internet Archive audio items. This path is used only after
+        # the faster Audius/YouTube/SoundCloud sources fail.
+        archive_tmp = None
+        try:
+            query_text = re.sub(r"\s+", " ", search_query).strip()
+            if query_text:
+                search = requests.get(
+                    "https://archive.org/advancedsearch.php",
+                    params=[("q", f"({query_text}) AND mediatype:audio"),
+                            ("fl[]", "identifier"), ("fl[]", "title"),
+                            ("rows", "6"), ("output", "json")],
+                    headers={"User-Agent": "TalkinBot/1.0 audio search"}, timeout=(6, 15),
+                )
+                search.raise_for_status()
+                docs = search.json().get("response", {}).get("docs", [])
+                for doc in docs[:6]:
+                    identifier = str(doc.get("identifier") or "").strip()
+                    if not identifier:
+                        continue
+                    metadata_response = requests.get(
+                        f"https://archive.org/metadata/{quote(identifier, safe='')}",
+                        headers={"User-Agent": "TalkinBot/1.0 audio search"}, timeout=(6, 15),
+                    )
+                    metadata_response.raise_for_status()
+                    metadata = metadata_response.json()
+                    files = metadata.get("files") or []
+                    audio_files = []
+                    for item in files:
+                        filename = str(item.get("name") or "")
+                        extension = Path(filename).suffix.lower()
+                        size = int(item.get("size") or 0)
+                        if extension in {".mp3", ".m4a", ".ogg", ".opus", ".flac", ".wav", ".webm"} and (not size or size <= MUSIC_MAX_BYTES):
+                            audio_files.append(item)
+                    if not audio_files:
+                        continue
+                    audio_files.sort(key=lambda item: (Path(str(item.get("name") or "")).suffix.lower() != ".mp3", -int(item.get("size") or 0)))
+                    item = audio_files[0]
+                    filename = str(item.get("name") or "")
+                    extension = Path(filename).suffix.lower() or ".audio"
+                    archive_tmp = outdir / f".{stamp}_archive{extension}"
+                    audio_url = f"https://archive.org/download/{quote(identifier, safe='')}/{quote(filename, safe='')}"
+                    with requests.get(audio_url, headers={"User-Agent": "TalkinBot/1.0 audio download"}, stream=True, timeout=(8, 40)) as response:
+                        response.raise_for_status()
+                        total = 0
+                        with archive_tmp.open("wb") as handle:
+                            for chunk in response.iter_content(64 * 1024):
+                                if not chunk:
+                                    continue
+                                total += len(chunk)
+                                if total > MUSIC_MAX_BYTES:
+                                    raise RuntimeError(f"ملف الأرشيف أكبر من {int(MUSIC_MAX_MB)} ميجابايت")
+                                handle.write(chunk)
+                    if total <= 4096:
+                        raise RuntimeError("ملف الأرشيف الصوتي فارغ أو غير مكتمل")
+                    duration = int(float((metadata.get("metadata") or {}).get("runtime") or 0))
+                    if duration > MUSIC_MAX_SECONDS:
+                        raise RuntimeError(f"الأغنية أطول من {MUSIC_MAX_SECONDS} ثانية")
+                    archive_mp3 = normalize_to_mp3(archive_tmp, duration)
+                    if archive_mp3 != out_mp3:
+                        archive_mp3.replace(out_mp3)
+                    title = str(doc.get("title") or query_text)
+                    creator = str((metadata.get("metadata") or {}).get("creator") or "Internet Archive")
+                    self.log("[MUSIC] fallback source=Internet Archive title=", title)
+                    return {"id": identifier, "title": title, "uploader": creator, "duration": duration}, out_mp3
+        except Exception as exc:
+            errors.append(f"Internet Archive: {type(exc).__name__}: {exc}")
+            self.log("[MUSIC] Internet Archive fallback failed:", repr(exc))
+        finally:
+            if archive_tmp is not None:
+                try:
+                    archive_tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
         detail = " | ".join(errors[-10:])
-        raise RuntimeError("تعذر تنزيل ملف صوت من YouTube أو SoundCloud." + (f" تفاصيل: {detail[:1200]}" if detail else ""))
+        raise RuntimeError("تعذر تنزيل ملف صوت من المصادر المتاحة." + (f" تفاصيل: {detail[:1200]}" if detail else ""))
 
     def handle_music_command(self,room,text,requester,private_to="",broadcast_all=False,with_reactions=True,room_output=True,live_stream=False):
         raw=text.strip()
@@ -9486,15 +9622,13 @@ class TalkinBot:
                             title = str(direct.get("title") or query)
                             artist = str(direct.get("uploader") or direct.get("source") or "YouTube")
                             self.log("[MUSIC] live source=direct-fallback title=", title, "room=", room)
-                        elif public_base:
+                        else:
                             info, path = self._music_download(query)
                             title = str(info.get("title") or query)
                             artist = str(info.get("uploader") or info.get("channel") or "YouTube")
                             duration = int(info.get("duration") or 0)
-                            url = public_base + "/media/" + path.name
+                            url = public_base + "/media/" + path.name if public_base else str(path)
                             self.log("[MUSIC] live source=local-fallback title=", title, "room=", room)
-                        else:
-                            raise RuntimeError("تعذر العثور على الأغنية في Audius أو المصدر الاحتياطي المباشر.")
                 else:
                     # Prefer a short Audius stream URL so the room receives the
                     # song without waiting for a full download/conversion.
@@ -9620,9 +9754,9 @@ class TalkinBot:
                 if music_published:
                     _record_media_publication("music", title, requester, room)
             except Exception as e:
-                self.report_master_error("تشغيل الأغنية", e, room)
+                self.log("[MUSIC] request failed:", repr(e), "room=", room)
                 if room_output:
-                    self.send_room_text(room, "❌ تعذر تشغيل الأغنية. تم إرسال الخطأ الحقيقي للماستر.")
+                    self.send_room_text(room, "❌ تعذر جلب الأغنية.")
         self.send_room_text(room, f"⏳ جاري تجهيز طلب الأغنية\n@{requester}")
         threading.Thread(target=worker, name="music-request", daemon=True).start()
         return True
@@ -10049,6 +10183,8 @@ class TalkinBot:
             "🆕 سنارة | برق | ياقوت | صدام | كاشف — ألعاب عالمية، الجائزة 500 نقطة.\n"
             "🐎 حصانه — يحصّن المستخدم من السرقة لمدة دقيقة.\n"
             "🕵️ اسرق — اختر عضوًا عشوائيًا من الموجودين حالياً في نفس الغرفة وحاول سرقة 500 نقطة منه.\n"
+            "💞 زواج | زوجتي | زوجي — شريك من الغرفة أو صورة شخصية مشهورة.\n"
+            "💍 خطبة | حبك | عدو | صديق | زاحف | خروف — نتائج مرحة من أعضاء الغرفة الحاضرين.\n"
             "🏆 توب رهان | توب مضاربة | توب حظي | توب استثمار\n"
             "🤖 ألعاب جديدة مع البوت — عملة | عجلة | صندوق@1..3 | كوب@1..3 | وحش | بركان | طائر | نجم.\n"            "📝 ألعاب البوت الجديدة نصية فقط وبدون أي صور.")
 
@@ -12057,6 +12193,78 @@ class TalkinBot:
                                  "نتمنى لكما حياة سعيدة مليئة بالفرح.")
         return True
 
+    def _social_pair_game(self, room, sender, command):
+        candidates = self._fun_room_members(room, sender)
+        if not candidates:
+            self.send_room_text(room, f"🤝 @{sender} لم أجد عضواً آخر حاضراً في هذه الغرفة.")
+            return True
+        partner = secrets.choice(candidates)
+        score = secrets.randbelow(101)
+        kind = str(command or "").replace("ة", "ه")
+        if kind in {"خطبه", "خطيب"}:
+            result = f"💍 خبرٌ جميل يا @{sender}: خطيبك هو @{partner}.\nنتمنى لكما أياماً مليئة بالمودة والفرح."
+        elif kind == "حبك":
+            result = f"❤️ حبك هو @{partner} بنسبة {score}% — يبدو أن بينكما انسجاماً جميلاً!"
+        elif kind == "عدو":
+            result = f"😼 عدوك في المزاح اليوم هو @{partner} بنسبة {score}% — صلّحوا الأمور بالضحك!"
+        elif kind == "صديق":
+            result = f"🫶 صديقك الأقرب اليوم هو @{partner} بنسبة صداقة {score}%!"
+        elif kind == "زاحف":
+            result = f"🦎 أكثر شخص يلاحق السوالف اليوم: @{partner} — نسبة الزحف {score}% (مزاحاً)."
+        else:
+            result = f"🐑 خروف الغرفة بالمزاح هو @{partner} بنسبة {score}% — لا تزعلوا، كلها لعبة!"
+        self.send_room_text(room, result)
+        return True
+
+    def _celebrity_partner_game(self, room, sender, gender):
+        female = ["نانسي عجرم", "إليسا", "أصالة نصري", "أحلام الشامسي", "نجوى كرم", "شيرين عبد الوهاب", "بيونسيه", "تايلور سويفت"]
+        male = ["ماجد المهندس", "كاظم الساهر", "عمرو دياب", "محمد عبده", "تامر حسني", "عادل إمام", "توم كروز", "ليوناردو دي كابريو"]
+        names = female if gender == "female" else male
+        busy = getattr(self, "_celebrity_partner_busy", set())
+        key = (_norm_user(sender), _norm_room(room))
+        if key in busy:
+            self.send_room_text(room, f"⏳ @{sender} جاري البحث عن الصورة...")
+            return True
+        busy.add(key)
+        self._celebrity_partner_busy = busy
+        self.send_room_text(room, "🔎 جاري البحث عن صورة شخصية مشهورة مناسبة...")
+
+        def worker():
+            try:
+                image_result = None
+                name = ""
+                for candidate in secrets.SystemRandom().sample(names, min(4, len(names))):
+                    image_url = _search_lookalike_image(f"{candidate} celebrity portrait")
+                    local = _download_lookalike_image(image_url, f"celebrity_{uuid.uuid4().hex}") if image_url else None
+                    if local:
+                        image_result, name = local, candidate
+                        break
+                if not image_result:
+                    self.send_room_text(room, "❌ تعذر العثور على صورة مناسبة الآن؛ جرّب مرة أخرى لاحقاً.")
+                    return
+                base = _public_base_url()
+                if not base:
+                    self.send_room_text(room, "❌ تعذر عرض الصورة لأن رابط الوسائط العام غير مضبوط.")
+                    return
+                image_url = f"{base}/lookalikes/{image_result.name}"
+                sent = self.send_room_media(room, image_url, "image")
+                if sent is False:
+                    self.send_room_text(room, "❌ تعذر إرسال الصورة إلى الغرفة.")
+                    return
+                label = "زوجتك" if gender == "female" else "زوجك"
+                self.send_room_text(room, f"💞 @{sender}، {label} هي الشخصية المشهورة: {name} ❤️")
+            except Exception as exc:
+                self.log("[CELEBRITY_PARTNER] failed:", repr(exc))
+                try:
+                    self.send_room_text(room, "❌ تعذر البحث عن صورة مناسبة حالياً.")
+                except Exception:
+                    pass
+            finally:
+                busy.discard(key)
+
+        threading.Thread(target=worker, name="celebrity-partner-search", daemon=True).start()
+        return True
+
     def _fun_game(self, room, sender, command):
         options={
             "تحدي": ["أرسل كلمة طيبة لعضو في الغرفة.", "اكتب أول شيء تحبه اليوم.", "امدح شخصاً لم تتحدث معه كثيراً.", "اكتب نكتة قصيرة للجميع."],
@@ -12154,6 +12362,12 @@ class TalkinBot:
             return True
         if game_low in ("زواج", "زوجه"):
             return self._marriage_game(room, sender_name)
+        if game_low == "زوجتي":
+            return self._celebrity_partner_game(room, sender_name, "female")
+        if game_low == "زوجي":
+            return self._celebrity_partner_game(room, sender_name, "male")
+        if game_low in ("خطبه", "خطيب", "حبك", "عدو", "صديق", "زاحف", "خروف"):
+            return self._social_pair_game(room, sender_name, game_low)
         if game_low in ("تحدي", "لغز", "حظي", "مزاج"):
             return self._fun_game(room, sender_name, game_low)
         if game_low == "تسليه":
@@ -14887,6 +15101,26 @@ class TalkinBot:
             if room and msg: self.send_room_text(room,msg)
             else: self.send_private_text(sender,"❌ استخدم say نص داخل غرفة.")
             return True
+        # Departure replies use a dedicated file and never modify existing +sr replies.
+        m_ds = re.match(r"^\+ds@([^@]+)@(.+)$", text.strip(), re.I)
+        if m_ds:
+            if not _is_master_name(sender):
+                self.send_private_text(sender, "🔒 إضافة ردود المغادرة مخصصة للماستر.")
+                return True
+            trigger, reply = _auto_reply_key(m_ds.group(1)), m_ds.group(2).strip()
+            if trigger not in {"ب", "ت", "ق"} or not reply:
+                self.send_private_text(sender, "❌ الصيغة: +ds@ب أو ت أو ق@الرد")
+                return True
+            replies = getattr(self, "departure_replies", {})
+            variants = list(replies.get(trigger, []))
+            if reply not in variants:
+                variants.append(reply)
+            replies[trigger] = variants
+            self.departure_replies = replies
+            self._save_departure_replies()
+            self.send_private_text(sender, f"✅ حُفظ رد المغادرة للمفتاح «{trigger}» مستقلاً عن الردود السابقة.")
+            return True
+
         # Auto replies: +sr@وصف@الرد / Sr@on / Sr@off
         m_sr = re.match(r"^\+sr@([^@]+)@(.+)$", text.strip(), re.I)
         if m_sr and _is_master_name(sender):
@@ -15526,6 +15760,10 @@ class TalkinBot:
 
         elif event_type == "user_left" and username:
             self.room_users[room].pop(username, None)
+            departed = getattr(self, "_last_departed_user_by_room", None)
+            if departed is None:
+                departed = self._last_departed_user_by_room = {}
+            departed[_norm_room(room)] = username
             if _norm_user(username) == _norm_user(BOT_ID):
                 if getattr(self, "_intentional_leaves", None) and _norm_room(room) in self._intentional_leaves:
                     self.log(f"[USER_LEFT_DETECTED] Bot left {room} intentionally; skipping auto-rejoin.")
@@ -15996,6 +16234,9 @@ class TalkinBot:
         if self._run_game_command_async(room, body, frm):
             if not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, frm, is_private=False)
+            return
+
+        if self._handle_departure_reply_command(room, body):
             return
 
         # Exact-match automatic replies are intentionally evaluated LAST so

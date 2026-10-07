@@ -50,6 +50,48 @@ class IncomingEventDedupRegressions(unittest.TestCase):
             )
         self.assertEqual(bot._fun_room_members("NORTH", "sender"), ["north_user"])
 
+    def test_social_pair_game_uses_only_live_members_in_the_same_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {
+            "North": {"sender": "member", "north_user": "member"},
+            "South": {"south_user": "member"},
+        }
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        with patch.object(bot_module.secrets, "choice", return_value="north_user"), patch.object(
+            bot_module.secrets, "randbelow", return_value=73
+        ):
+            self.assertTrue(bot._social_pair_game("North", "sender", "حبك"))
+        self.assertIn("@north_user", sent[0][1])
+        self.assertIn("73%", sent[0][1])
+        self.assertNotIn("south_user", sent[0][1])
+
+    def test_departure_replies_are_separate_from_existing_auto_replies(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.departure_replies = {}
+        bot.departure_replies_file = Path("departure_replies.json")
+        bot.auto_replies = {"hello": {"trigger": "hello", "replies": ["legacy"]}}
+        private, saved = [], []
+        bot.send_private_text = lambda user, text: private.append((user, text))
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_save_local_json", side_effect=lambda path, value: saved.append((Path(path).name, value))
+        ):
+            self.assertTrue(bot._handle_management_command_impl("", "+ds@ق@بقلبي", "Master", is_private=True))
+        self.assertEqual(bot.departure_replies, {"ق": ["بقلبي"]})
+        self.assertEqual(bot.auto_replies["hello"]["replies"], ["legacy"])
+        self.assertEqual(saved[0][0], "departure_replies.json")
+        self.assertEqual(saved[0][1], {"replies": {"ق": ["بقلبي"]}})
+
+    def test_departure_command_uses_last_user_and_dedicated_reply(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._last_departed_user_by_room = {bot_module._norm_room("North"): "left_user"}
+        bot.departure_replies = {"ق": ["بقلبي"]}
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        self.assertTrue(bot._handle_departure_reply_command("North", "ق"))
+        self.assertIn("left_user", sent[0][1])
+        self.assertIn("بقلبي", sent[0][1])
+
 
 class CricketIntegrationRegressions(unittest.TestCase):
     def make_integration(self, root, room_messages, private_messages, media_messages, is_verified=None, send_all_rooms_text=None, bot_name="Talkin2"):
@@ -269,6 +311,23 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual(len(integration.game.current()["rooms"]), 2)
             self.assertEqual(integration.game.current()["stage"], "teams")
 
+    def test_cr1_setup_is_one_player_per_side_across_two_rooms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            messages, private, media = [], [], []
+            integration = self.make_integration(Path(temp), messages, private, media)
+            integration.game.set_enabled("North", True)
+            integration.handle("North", "N1", ".cr 1")
+            integration.handle("North", "N1", "1")
+            match = integration.game.current()
+            self.assertEqual(match["mode"], "rooms")
+            self.assertEqual(match["target_players"], 1)
+            integration.handle("North", "N1", "Join")
+            self.assertEqual(integration.game.current()["stage"], "lobby")
+            integration.handle("South", "S1", "Join")
+            match = integration.game.current()
+            self.assertEqual(match["stage"], "teams")
+            self.assertEqual([len(item["players"]) for item in match["rooms"]], [1, 1])
+
     def test_numbers_in_non_participating_room_are_not_cricket_actions(self):
         with tempfile.TemporaryDirectory() as temp:
             messages, private, media = [], [], []
@@ -461,7 +520,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             setup_text = room_messages[-1][1]
             self.assertIn("إعداد مباراة الكركيت", setup_text)
             self.assertIn("اختر عدد اللاعبين داخل هذه الغرفة فقط", setup_text)
-            self.assertIn("كل لاعب يرسل Join", setup_text)
+            self.assertIn("غرفة أخرى Join", setup_text)
             integration.handle("Room", "Verified", ".cr 2")
             self.assertEqual(integration.game.current()["stage"], "lobby")
             integration.handle("Room", "Guest", "Join")
@@ -993,6 +1052,89 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 live_stream=True, with_reactions=False,
             ))
         self.assertTrue(any("تم تشغيل الأغنية في البث" in text for _, text in sent))
+
+    def test_live_broadcast_can_play_downloaded_local_file_without_public_url(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        sent, played = [], []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        bot._bot_is_room_owner = lambda _room: True
+        bot._audius_live_source = lambda _query: None
+        bot._music_live_source = lambda _query: None
+        local_path = Path("/tmp/talkin2-local-fallback.mp3")
+        bot._music_download = lambda _query: ({"title": "Local", "duration": 30}, local_path)
+        bot._play_music_in_live_room = lambda room, url, duration: played.append((room, url, duration)) or True
+        bot.log = lambda *_args: None
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+        with patch.object(bot_module.threading, "Thread", ImmediateThread), patch.object(
+            bot_module, "_record_media_publication", lambda *_args: None
+        ), patch.object(bot_module, "_public_base_url", lambda: ""):
+            self.assertTrue(bot.handle_music_command(
+                "Hall", ".sa Local", "Tester", live_stream=True, with_reactions=False,
+            ))
+        self.assertEqual(played, [("Hall", str(local_path), 30)])
+        self.assertTrue(any("تم تشغيل الأغنية في البث" in text for _, text in sent))
+
+    def test_music_failure_is_reported_in_room_without_private_master_error(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        bot._audius_live_source = lambda _query: None
+        bot._music_download = lambda _query: (_ for _ in ()).throw(RuntimeError("source unavailable"))
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: (_ for _ in ()).throw(AssertionError("should not DM master"))
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_public_base_url", lambda: "https://bot.example"), patch.object(
+            bot_module.threading, "Thread", ImmediateThread
+        ):
+            self.assertTrue(bot.handle_music_command("Hall", ".sa dua", "Tester", with_reactions=False))
+        self.assertTrue(any("تعذر جلب الأغنية" in text for _, text in sent))
+
+    def test_live_broadcast_skips_local_path_audio_attachments(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent_packets = []
+        bot.send_query = lambda packet: sent_packets.append(packet)
+        bot.send_room_text = lambda *_args: None
+        bot.log = lambda *_args: None
+        bot._live_room_is_active = lambda _room: (
+            "Hall", {"room_id": "room-id", "session_id": "session-id"}, True
+        )
+        bot._livekit_active_Hall = True
+        bot._livekit_source_Hall = object()
+        class FakeLoop:
+            @staticmethod
+            def is_closed():
+                return False
+        bot._livekit_loop_Hall = FakeLoop()
+        bot._reassert_live_speaker = lambda *_args: True
+        bot._feed_livekit_audio = lambda *_args: True
+        bot._live_ready_rooms = set()
+        bot._last_live_play_status_by_room = {}
+        class NoStartThread:
+            def __init__(self, **_kwargs):
+                pass
+            def start(self):
+                pass
+        with patch.object(bot_module, "_public_base_url", lambda: ""), patch.object(
+            bot_module.threading, "Thread", NoStartThread
+        ):
+            self.assertTrue(bot._play_music_in_live_room("Hall", "/tmp/local-song.mp3", 30))
+        self.assertEqual(sent_packets, [])
 
     def test_room_protection_exempts_owner_and_moderator_but_not_member(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
