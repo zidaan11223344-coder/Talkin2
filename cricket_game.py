@@ -22,6 +22,8 @@ def _blank() -> dict[str, Any]:
         "enabled": False,
         "enabled_rooms": {},
         "next_event_id": 0,
+        "matches": {},
+        # Legacy single-match slot; migrated lazily by _matches().
         "match": None,
         "events": [],
         "points": {},
@@ -61,6 +63,87 @@ class CricketGame:
             if isinstance(item, dict) and item.get("key") and item.get("name")
         ]
 
+    @staticmethod
+    def _matches(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Load the multi-match map and migrate a legacy single match in place."""
+        matches = data.get("matches")
+        if not isinstance(matches, dict):
+            matches = {}
+            data["matches"] = matches
+        legacy = data.get("match")
+        if isinstance(legacy, dict):
+            match_id = str(legacy.get("id") or uuid.uuid4().hex)
+            legacy["id"] = match_id
+            matches.setdefault(match_id, legacy)
+            data["match"] = None
+        normalized = {
+            str(match_id): match
+            for match_id, match in matches.items()
+            if isinstance(match, dict)
+        }
+        matches.clear()
+        matches.update(normalized)
+        return matches
+
+    @classmethod
+    def _match_for_room(cls, data: dict[str, Any], room: str) -> dict[str, Any] | None:
+        room_key = _key(room)
+        if not room_key:
+            return None
+        return next((
+            match for match in cls._matches(data).values()
+            if any(str(item.get("key") or "") == room_key for item in cls._participants(match))
+        ), None)
+
+    @classmethod
+    def _remove_match(cls, data: dict[str, Any], match: dict[str, Any]) -> None:
+        matches = data.setdefault("matches", {})
+        match_id = str(match.get("id") or "")
+        if match_id:
+            matches.pop(match_id, None)
+        else:
+            for key, candidate in list(matches.items()):
+                if candidate is match:
+                    matches.pop(key, None)
+
+    @classmethod
+    def _discard_match_events(cls, data: dict[str, Any], match: dict[str, Any]) -> None:
+        """Drop queued messages for the cancelled pair without touching other matches."""
+        room_keys = {str(item.get("key") or "") for item in cls._participants(match)}
+        data["events"] = [
+            event for event in data.get("events", [])
+            if not isinstance(event, dict) or str(event.get("room_key") or "") not in room_keys
+        ]
+
+    @classmethod
+    def _join_candidates(cls, data: dict[str, Any], room: str) -> list[dict[str, Any]]:
+        room_key = _key(room)
+        candidates = []
+        for match in cls._matches(data).values():
+            rooms = cls._participants(match)
+            target = int(match.get("target_players") or 0)
+            if (
+                match.get("stage") == "lobby"
+                and match.get("mode") != "solo"
+                and len(rooms) == 1
+                and rooms[0]["key"] != room_key
+                and target > 0
+                and len(rooms[0].get("players", [])) >= target
+            ):
+                candidates.append(match)
+        # Plain Join selects the oldest complete, unpaired first team. Each
+        # match's UUID remains internal and keeps concurrent games isolated.
+        return sorted(candidates, key=lambda item: (float(item.get("created_at") or 0), str(item.get("id") or "")))
+
+    def match_for_join(self, room: str) -> dict[str, Any] | None:
+        """Resolve a room's match or the oldest waiting opponent match."""
+        data = self.state.load()
+        existing = self._match_for_room(data, room)
+        if existing:
+            return existing
+        candidates = self._join_candidates(data, room)
+        return candidates[0] if candidates else None
+
     def _emit(self, data: dict[str, Any], rooms: list[dict[str, Any]], text: str, images: tuple[str, ...] = ()) -> None:
         events = data.setdefault("events", [])
         for participant in rooms:
@@ -76,22 +159,6 @@ class CricketGame:
                 ],
                 "created_at": time.time(),
             })
-        if len(events) > self.EVENT_HISTORY:
-            del events[:-self.EVENT_HISTORY]
-
-    def _emit_broadcast(self, data: dict[str, Any], text: str) -> None:
-        """Emit one server-wide announcement. Every controller room can deliver it."""
-        events = data.setdefault("events", [])
-        data["next_event_id"] = int(data.get("next_event_id", 0)) + 1
-        events.append({
-            "id": data["next_event_id"],
-            "room": "",
-            "room_key": "",
-            "broadcast": True,
-            "text": str(text),
-            "images": [],
-            "created_at": time.time(),
-        })
         if len(events) > self.EVENT_HISTORY:
             del events[:-self.EVENT_HISTORY]
 
@@ -133,14 +200,15 @@ class CricketGame:
         def mutate(data: dict[str, Any]) -> str:
             data["enabled"] = bool(enabled)
             data["enabled_rooms"] = {}
-            match = data.get("match")
             if enabled:
                 return f"✅ تم تشغيل الكركيت على مستوى السيرفر من غرفة {room_name}."
-            participants = self._participants(match) if isinstance(match, dict) else []
-            if isinstance(match, dict):
-                other_rooms = [item for item in participants if item["key"] != room_key]
-                self._emit(data, other_rooms, f"⛔ أوقفت غرفة {room_name} اللعبة؛ أُلغيت المباراة.")
-                data["match"] = None
+            for match in list(self._matches(data).values()):
+                self._discard_match_events(data, match)
+                self._emit(
+                    data, self._participants(match),
+                    f"⛔ أوقفت غرفة {room_name} اللعبة؛ أُلغيت المباراة.",
+                )
+                self._remove_match(data, match)
             return f"⛔ تم إيقاف الكركيت على مستوى السيرفر من غرفة {room_name}."
 
         return self.state.mutate(mutate)
@@ -150,14 +218,15 @@ class CricketGame:
         room_key = _key(room)
 
         def mutate(data: dict[str, Any]) -> str:
-            match = data.get("match")
+            match = self._match_for_room(data, room_key)
             if not isinstance(match, dict):
                 return "📭 لا توجد مباراة كركيت مفتوحة لإيقافها."
             participants = self._participants(match)
             if room_key not in {str(item.get("key") or "") for item in participants}:
                 return "⛔ لا يمكنك إيقاف مباراة من غرفة غير مشاركة فيها."
+            self._discard_match_events(data, match)
             self._emit(data, participants, "⛔ تم إيقاف مباراة الكركيت الحالية من أحد الأعضاء.")
-            data["match"] = None
+            self._remove_match(data, match)
             return "✅ تم إيقاف مباراة الكركيت الحالية."
 
         return self.state.mutate(mutate)
@@ -196,23 +265,28 @@ class CricketGame:
         def mutate(data: dict[str, Any]) -> str | None:
             if not data.get("enabled"):
                 return "⛔ فعّل اللعبة أولاً من خاص الماستر: تشغيل لعبه الكركيت."
-            if isinstance(data.get("match"), dict) and not reset_existing:
-                return "⏳ توجد مباراة/قائمة انتظار مفتوحة بالفعل. أرسل Join للانضمام أو انتظر انتهائها."
+            existing = self._match_for_room(data, room_key)
+            if existing and not reset_existing:
+                return "⏳ هذه الغرفة مشاركة في مباراة مفتوحة بالفعل؛ أكملها أو أوقفها قبل بدء مباراة أخرى."
             if reset_existing:
-                # `.cr 1` is an explicit request for a fresh room game. Do not
-                # resume a stale setup/live match or replay a finished match's
-                # result events. Keep points and wins intact.
-                data["match"] = None
-                data["events"] = []
+                # Reset only the match involving this room. Other room pairs
+                # continue playing independently.
+                if existing:
+                    self._discard_match_events(data, existing)
+                    self._emit(
+                        data, self._participants(existing),
+                        f"⛔ أُلغيت المباراة المفتوحة من غرفة {room_name} لإعداد مباراة جديدة.",
+                    )
+                    self._remove_match(data, existing)
             match = self._new_match(room_name, room_key, "setup")
-            data["match"] = match
+            self._matches(data)[match["id"]] = match
             self._emit(
                 data,
                 self._participants(match),
                 "🏏 إعداد مباراة الكركيت\n"
                 "اختر عدد اللاعبين داخل هذه الغرفة فقط:\n"
                 "1️⃣ لاعب واحد\n2️⃣ لاعبان\n3️⃣ ثلاثة لاعبين\n4️⃣ أربعة لاعبين\n"
-                "أرسل الرقم فقط (العدد لكل غرفة). بعد اكتمال لاعبي هذه الغرفة، يرسل لاعبو غرفة أخرى Join.\n"
+                "أرسل الرقم فقط (العدد لكل غرفة). بعد اكتمال الفريق الأول، ترسل الغرفة الثانية Join.\n"
                 "📢 سيعلن البوت اسم الغرف وعدد اللاعبين وأسماءهم عند اكتمال الفريقين.",
             )
             return None
@@ -229,7 +303,7 @@ class CricketGame:
             return "❌ عدد اللاعبين في كل غرفة يجب أن يكون من 1 إلى 4."
 
         def mutate(data: dict[str, Any]) -> str | None:
-            match = data.get("match")
+            match = self._match_for_room(data, room_key)
             if not isinstance(match, dict) or match.get("stage") != "setup":
                 return "📭 لا توجد لعبة تنتظر اختيار عدد اللاعبين."
             if room_key != str(match.get("setup_room") or ""):
@@ -247,7 +321,8 @@ class CricketGame:
                  "أرسل Join من كل لاعب؛ بعد اكتمال العدد تبدأ المباراة ضد البوت."
                  if match.get("mode") == "solo" else
                  f"🏏 كركيت | {count} لاعب(ين) في كل غرفة\n"
-                 "أرسل Join من لاعبي الغرفة الأولى. بعد اكتمالها، يجب أن ترسل الغرفة الثانية Join؛ لا يمكن إكمال الفريقين من الغرفة نفسها."),
+                 "أرسل Join من لاعبي الغرفة الأولى. بعد اكتمالها، ترسل الغرفة الثانية Join. "
+                 "عند تعدد قوائم الانتظار، يُقرن Join بأقدم فريق أول مكتمل. لا يمكن إكمال الفريقين من الغرفة نفسها."),
             )
             return None
 
@@ -260,14 +335,17 @@ class CricketGame:
         def mutate(data: dict[str, Any]) -> str | None:
             if not data.get("enabled"):
                 return "⛔ فعّل اللعبة أولاً من خاص الماستر: تشغيل لعبه الكركيت."
-            if isinstance(data.get("match"), dict) and not reset_existing:
-                return "⏳ توجد مباراة/قائمة انتظار مفتوحة بالفعل. أرسل Join للانضمام أو انتظر انتهائها."
+            existing = self._match_for_room(data, room_key)
+            if existing and not reset_existing:
+                return "⏳ هذه الغرفة مشاركة في مباراة مفتوحة بالفعل؛ أكملها أو أوقفها قبل بدء مباراة أخرى."
             if reset_existing:
-                data["match"] = None
-                data["events"] = []
+                if existing:
+                    self._discard_match_events(data, existing)
+                    self._emit(data, self._participants(existing), "⛔ أُلغيت المباراة السابقة لبدء مباراة ضد البوت.")
+                    self._remove_match(data, existing)
             match = self._new_match(room_name, room_key, "setup")
             match["mode"] = "solo"
-            data["match"] = match
+            self._matches(data)[match["id"]] = match
             self._emit(
                 data,
                 self._participants(match),
@@ -293,16 +371,16 @@ class CricketGame:
         def mutate(data: dict[str, Any]) -> str | None:
             if not bool(data.get("enabled", bool(data.get("enabled_rooms") or {}))):
                 return "⛔ اللعبة متوقفة على مستوى السيرفر. فعّلها من خاص الماستر: تشغيل لعبه الكركيت."
-            if isinstance(data.get("match"), dict):
-                return "⏳ توجد مباراة مفتوحة بالفعل؛ أرسل Join للانضمام أو انتظر انتهائها."
+            if self._match_for_room(data, room_key):
+                return "⏳ هذه الغرفة مشاركة في مباراة مفتوحة بالفعل؛ أكملها أو أوقفها قبل بدء مباراة أخرى."
             match = self._new_match(room_name, room_key, "lobby", count)
             match["mode"] = "rooms" if mode == "rooms" else "solo"
-            data["match"] = match
+            self._matches(data)[match["id"]] = match
             self._emit(
                 data,
                 self._participants(match),
                 f"🏏 فُتحت مباراة الكركيت في {room_name} — المطلوب {count} لاعب(ين).\n" +
-                ("👥 أرسل Join من لاعبي هذه الغرفة، وبعد اكتمال الفريق ترسل الغرفة الثانية Join."
+                ("👥 بعد اكتمال الفريق الأول، أرسل لاعبو الغرفة الثانية Join. عند تعدد قوائم الانتظار، يُختار أقدم فريق مكتمل."
                  if match["mode"] == "rooms" else
                  "👤 كل اللاعبين ينضمون من هذه الغرفة فقط بإرسال Join.\n"
                  f"🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد {self.bot_name}."),
@@ -347,21 +425,29 @@ class CricketGame:
 
         def mutate(data: dict[str, Any]) -> str | None:
             if not data.get("enabled"):
-                return "⛔ فعّل الكركيت من خاص الماستر: تشغيل لعبه الكركيت."
-            match = data.get("match")
-            if not isinstance(match, dict) or match.get("stage") != "lobby":
-                return "📭 لا توجد قائمة لاعبين مفتوحة الآن."
+                return "⛔ فعّل اللعبة أولاً: شغّل الكركيت من خاص الماستر."
+            match = self._match_for_room(data, room_key)
+            if match is None:
+                candidates = self._join_candidates(data, room_name)
+                if not candidates:
+                    return "📭 لا توجد مباراة مكتملة تنتظر الانضمام الآن."
+                match = candidates[0]
+            if match.get("stage") != "lobby":
+                return "📭 لا توجد قائمة لاعبين مفتوحة لهذه المباراة الآن."
             target = int(match.get("target_players") or 0)
             if target < self.MIN_PLAYERS or target > self.MAX_PLAYERS:
                 return "⏳ انتظر اختيار عدد اللاعبين أولاً."
             participants = self._participants(match)
-            if any(_user_key(player) == user_key for item in participants for player in item.get("players", [])):
-                return f"✅ @{username} مسجل بالفعل في المباراة."
+            for other_match in self._matches(data).values():
+                for item in self._participants(other_match):
+                    if any(_user_key(player) == user_key for player in item.get("players", [])):
+                        if str(other_match.get("id")) == str(match.get("id")):
+                            return f"✅ @{username} مسجل بالفعل في المباراة."
+                        return "⛔ لا يمكن للحساب نفسه المشاركة في مباراتين كركيت متزامنتين."
             participant = next((item for item in participants if item["key"] == room_key), None)
             if participant is None:
                 if len(participants) >= self.ROOM_TEAMS:
                     return "⛔ اكتملت غرفتا المباراة."
-                # The second team can join only after the starting team is complete.
                 first_room = participants[0]
                 if len(first_room.get("players", [])) < target:
                     return f"⏳ أكمل الفريق الأول {target} لاعبين أولاً."
@@ -371,7 +457,7 @@ class CricketGame:
                 self._emit(
                     data,
                     participants,
-                    f"🔗 انضمت غرفة {room_name} للمباراة الجماعية.\n"
+                    f"🔗 انضمت غرفة {room_name} إلى المباراة.\n"
                     f"👥 المطلوب {target} لاعب(ين) في كل غرفة.\n"
                     "أرسل Join من لاعبي هذه الغرفة.",
                 )
@@ -385,7 +471,8 @@ class CricketGame:
                     self._emit(
                         data, [participant],
                         f"✅ انضم @{username}.\n👥 اكتمل {len(players)}/{target} لاعب في الغرفة.\n"
-                        f"🔗 للمباراة الجماعية: اجعل الغرفة الثانية ترسل Join، أو أكمل العدد هنا للعب ضد {self.bot_name}.",
+                        "🔗 بعد اكتمال الفريق الأول، ترسل الغرفة الثانية Join؛ وعند تعدد القوائم يُقرن بأقدم فريق مكتمل. "
+                        f"أو أكمل العدد هنا للعب ضد {self.bot_name}.",
                     )
                 else:
                     if match.get("mode") == "solo":
@@ -402,11 +489,13 @@ class CricketGame:
                             if str(player).strip()
                         ]
                         team_names = "، ".join(f"@{player}" for player in team_players)
-                        self._emit_broadcast(
-                            data,
+                        self._emit(
+                            data, [participant],
                             f"🏏 اكتمل الفريق الأول — مباراة الكركيت قيد التجهيز\n"
                             f"👥 {participant['name']} ({len(team_players)} لاعبين): {team_names}\n"
-                            "🔗 بانتظار الفريق الثاني: يرسل لاعبوه Join من الغرفة الأخرى؛ ثم يختار الفريق الأول 1 للهجوم أو 2 للدفاع.",
+                            "🔗 بانتظار الفريق الثاني: أرسلوا Join من الغرفة الأخرى؛ "
+                            "وعند وجود عدة قوائم انتظار، يُقرن الطلب بأقدم فريق أول مكتمل. "
+                            "ثم يختار الفريق الأول 1 للهجوم أو 2 للدفاع.",
                         )
             elif len(participants) == self.ROOM_TEAMS:
                 full = all(len(item.get("players", [])) >= target for item in participants)
@@ -415,7 +504,8 @@ class CricketGame:
                     match["stage"] = "teams"
                     self._emit(
                         data, participants,
-                        f"🏏 اكتمل الفريقان: {target} لاعبين\n"
+                        f"🏏 اكتمل الفريقان: {target} لاعبين لكل غرفة\n"
+                        f"👥 {participants[0]['name']} ضد {participants[1]['name']}\n"
                         "🎯 الفريق الأول يختار: 1 هجوم أو 2 دفاع.\n"
                         "الفريق الثاني يُحدد تلقائيًا.",
                     )
@@ -435,7 +525,7 @@ class CricketGame:
         user_key = _user_key(username)
 
         def mutate(data: dict[str, Any]) -> str | None:
-            match = data.get("match")
+            match = self._match_for_room(data, room_key)
             if not data.get("enabled"):
                 return "⛔ فعّل الكركيت أولاً من خاص الماستر: تشغيل لعبه الكركيت."
             if not isinstance(match, dict) or match.get("stage") != "lobby":
@@ -469,7 +559,7 @@ class CricketGame:
             return "❌ اختر 1 للهجوم أو 2 للدفاع."
 
         def mutate(data: dict[str, Any]) -> str | None:
-            match = data.get("match")
+            match = self._match_for_room(data, room_key)
             if not isinstance(match, dict):
                 return "📭 لا توجد مباراة."
 
@@ -737,7 +827,7 @@ class CricketGame:
             + ("\n🎁 الجائزة 200,000 نقطة\n" + "\n".join(reward_lines) if reward_lines else ""),
             images,
         )
-        data["match"] = None
+        self._remove_match(data, match)
 
     def _render_result_image(
         self,
@@ -771,7 +861,7 @@ class CricketGame:
             return "❌ اختر 0 إلى 6."
 
         def mutate(data: dict[str, Any]) -> str | None:
-            match = data.get("match")
+            match = self._match_for_room(data, room_key)
             if not isinstance(match, dict) or match.get("stage") != "live":
                 return "📭 لا توجد كرة الآن."
             participants = self._participants(match)
@@ -942,10 +1032,22 @@ class CricketGame:
         rows.sort(key=lambda item: (-item[1], -item[2], item[0]))
         return rows[:max(1, int(limit))]
 
-    def current(self) -> dict[str, Any] | None:
+    def current(self, room: str | None = None) -> dict[str, Any] | None:
         data = self.state.load()
-        match = data.get("match")
-        return match if isinstance(match, dict) else None
+        if room is not None:
+            return self._match_for_room(data, room)
+        matches = sorted(
+            self._matches(data).values(),
+            key=lambda item: float(item.get("created_at") or 0),
+        )
+        return matches[0] if matches else None
+
+    def matches(self) -> list[dict[str, Any]]:
+        data = self.state.load()
+        return sorted(
+            self._matches(data).values(),
+            key=lambda item: float(item.get("created_at") or 0),
+        )
 
     def latest_event_id(self, room: str) -> int:
         room_key = _key(room)
@@ -953,7 +1055,7 @@ class CricketGame:
         events = data.get("events", [])
         return max(
             (int(item.get("id", 0)) for item in events
-             if isinstance(item, dict) and (item.get("broadcast") or item.get("room_key") == room_key)),
+             if isinstance(item, dict) and item.get("room_key") == room_key),
             default=0,
         )
 
@@ -963,6 +1065,6 @@ class CricketGame:
         return [
             dict(item) for item in data.get("events", [])
             if isinstance(item, dict)
-            and (item.get("broadcast") or item.get("room_key") == room_key)
+            and item.get("room_key") == room_key
             and int(item.get("id", 0)) > int(event_id)
         ]

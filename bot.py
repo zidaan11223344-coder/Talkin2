@@ -880,6 +880,15 @@ def encode_query(action: str, *, type_: str = None, length: str = None,
     return bytes(out)
 
 
+def _ws_payload_limit():
+    """Return the configured WebSocket payload limit, capped at 1008 bytes."""
+    try:
+        configured = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+    except (TypeError, ValueError):
+        configured = 1008
+    return max(1, min(1008, configured))
+
+
 def encode_live_invitation(inviter: str, target: str, token: str,
                            room_id: str, room_name: str, invitation_id: str) -> bytes:
     """Encode the manual Talkin live invitation packet captured from the app.
@@ -1299,7 +1308,7 @@ class RawWebSocket:
 
     def send_binary(self, payload):
         payload = bytes(payload)
-        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+        max_bytes = _ws_payload_limit()
         if len(payload) > max_bytes:
             print(f"[WS_DROP_OVERSIZE] تم تجاهل إرسال حزمة WebSocket بحجم {len(payload)} بايت لتجاوزها الحد الآمن ({max_bytes} بايت) لمنع فصل الخادم برمز 1009.", flush=True)
             return
@@ -5883,7 +5892,7 @@ class TalkinBot:
 
         # Never pass an oversized protobuf packet to RawWebSocket. The server
         # closes the whole connection with 1009, so handle it locally instead.
-        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+        max_bytes = _ws_payload_limit()
         payload = bytes(payload)
         if len(payload) > max_bytes:
             packet_type = ""
@@ -6414,42 +6423,13 @@ class TalkinBot:
             self.log("[WS] long-text notice failed:", repr(exc))
             return False
 
-    @staticmethod
-    def _is_game_result_text(text):
-        value = str(text or "").casefold()
-        return any(marker in value for marker in (
-            "🏆", "نتيجة المباراة", "نتيجة اللعبة", "النتيجة:",
-            "الفائز:", "الفائزة:", "انتهت المباراة", "انتهت لعبة",
-        ))
-
-    @staticmethod
-    def _split_text_to_payload_limit(text, make_payload, limit):
-        """Split only at safe UTF-8 character boundaries, preferring word breaks."""
-        chunks = []
-        current = ""
-        for char in str(text or ""):
-            while current and len(make_payload(current + char)) > limit:
-                split_at = max(current.rfind("\n"), current.rfind(" "))
-                if split_at >= 0:
-                    chunks.append(current[:split_at + 1])
-                    current = current[split_at + 1:]
-                else:
-                    chunks.append(current)
-                    current = ""
-            if len(make_payload(char)) > limit:
-                return []
-            current += char
-        if current:
-            chunks.append(current)
-        return chunks
-
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
-        """Send text safely; oversized packets are ignored and routed to Telegram."""
+        """Send text safely; route any complete oversized message to Telegram."""
         text = str(text or "")
         if not text:
             return True
 
-        limit = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+        limit = _ws_payload_limit()
 
         def make_payload(value):
             payload = dict(kwargs)
@@ -6462,25 +6442,9 @@ class TalkinBot:
             self.send_query(make_payload(text))
             return True
 
-        # Game results belong in the room where the match happened. Keep them
-        # visible there by splitting into protocol-safe text packets instead of
-        # quietly routing the result to Telegram as a long-text attachment.
-        if packet_type == "room_message" and self._is_game_result_text(text):
-            chunks = self._split_text_to_payload_limit(text, make_payload, limit)
-            if chunks:
-                try:
-                    for chunk in chunks:
-                        self.send_query(make_payload(chunk))
-                    self.log("[WS_OVERSIZE] game result split into room packets", len(chunks))
-                    return True
-                except Exception as exc:
-                    self.log("[WS_OVERSIZE] game result room chunk failed:", repr(exc))
-                    return False
-
-        # The complete message is too large for Talkin/WebSocket. Do NOT
-        # split it into visible Talkin messages. Route the original full text
-        # to Telegram instead. This keeps the WebSocket connection safe from
-        # close code 1009 without sending an error message to Talkin users.
+        # Do not split any oversized text into Talkin packets. Route the full
+        # original message (game results included) to Telegram instead, keeping
+        # the WebSocket connection safe from close code 1009.
         telegram_title = "رسالة طويلة من البوت"
         if packet_type == "room_message":
             room_name = str(kwargs.get("room") or "").strip()
@@ -10559,25 +10523,14 @@ class TalkinBot:
             self.log("[GAME] winner card send failed:", game_key, repr(exc))
             return False
 
-    def game_help(self, room):
-        self.send_room_text(room, "🎮✨ ألعاب البوت\n━━━━━━━━━━━━\n"
-            "🎲 رهان@المبلغ أو رهان المبلغ — تحدي لاعب ضد لاعب، والفائز عشوائي.\n"
-            "⚔️ مضاربة@المبلغ أو مضاربة المبلغ — مواجهة عشوائية عادلة.\n"
-            "🍀 حظ — لعبة عشوائية مع البوت.\n"
-            "🎯 حظ@المبلغ — حظ عشوائي بمبلغ ضد البوت.\n"
-            "🎯 حظي@المبلغ أو حظي المبلغ — تحدي حظ لاعب ضد لاعب.\n"
-            "📊 استثمار@المبلغ — استثمار لاعب ضد لاعب مثل الرهان.\n"
-            "🎰 مليار — فرصة عشوائية للفوز بمليار نقطة.\n"
-            "🏦 بنك مليون — فرصة عشوائية للفوز بمليون نقطة بنفس النظام.\n"
-            "🌱 زرع — حتى 5 محاصيل نشطة لكل مستخدم، وكل نوع مرة واحدة فقط.\n"
-            "📈 بورصة — اختر 1 ذهب، 2 نفط، 3 معادن ثم أرسل الرقم، والجائزة نقاط حسب حركة السوق.\n"
-            "🆕 سنارة | برق | ياقوت | صدام | كاشف — ألعاب عالمية، الجائزة 500 نقطة.\n"
-            "🐎 حصانه — يحصّن المستخدم من السرقة لمدة دقيقة.\n"
-            "🕵️ اسرق — اختر عضوًا عشوائيًا من الموجودين حالياً في نفس الغرفة وحاول سرقة 500 نقطة منه.\n"
-            "💞 زواج | زوجتي | زوجي — شريك من الغرفة أو صورة شخصية مشهورة.\n"
-            "💍 خطبة | حبك | عدو | صديق | زاحف | خروف — نتائج مرحة من أعضاء الغرفة الحاضرين.\n"
-            "🏆 توب رهان | توب مضاربة | توب حظي | توب استثمار\n"
-            "🤖 ألعاب جديدة مع البوت — عملة | عجلة | صندوق@1..3 | كوب@1..3 | وحش | بركان | طائر | نجم.\n"            "📝 ألعاب البوت الجديدة نصية فقط وبدون أي صور.")
+    def game_help(self, room, sender=None):
+        """Open the canonical A3 game catalog and let ns page through it."""
+        if sender:
+            key = (str(room or ""), _norm_user(sender))
+            self.help_pages[key] = 3
+            self.help_page_part[key] = 1
+            self.help_game_part[key] = 1
+        return self._send_game_help_section(room=room, part=1)
 
     def _game_balance_ok(self, username, amount):
         return _get_points(username) >= int(amount)
@@ -12753,7 +12706,7 @@ class TalkinBot:
             self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
             return True
         if low in ("العاب","ألعاب","لعب","games","game"):
-            self.game_help(room); return True
+            self.game_help(room, sender_name); return True
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
