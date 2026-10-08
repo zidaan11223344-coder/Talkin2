@@ -6217,12 +6217,25 @@ class TalkinBot:
             self.log("[ROOM] leave suppressed (room is blocked):", room)
             return False
         self.send_query(encode_query("room_leave", room=room))
+        room_norm = _norm_room(room)
         with self._join_lock:
-            self.known_rooms.discard(room)
+            self.known_rooms = {
+                saved for saved in self.known_rooms
+                if _norm_room(saved) != room_norm
+            }
             _save_persistent_rooms(self.known_rooms)
-            self._last_join_sent.pop(room, None)
-        self.room_users.pop(room, None)
-        self.connected_rooms.discard(room)
+            self._last_join_sent = {
+                joined: timestamp for joined, timestamp in self._last_join_sent.items()
+                if _norm_room(joined) != room_norm
+            }
+        self.room_users = {
+            saved: users for saved, users in self.room_users.items()
+            if _norm_room(saved) != room_norm
+        }
+        self.connected_rooms = {
+            saved for saved in self.connected_rooms
+            if _norm_room(saved) != room_norm
+        }
         self.log("[ROOM] left", room)
         return True
 
@@ -9492,11 +9505,9 @@ class TalkinBot:
         room = (self.invite_room or result.get("_occupants_room") or
                 self.last_joined_room or self.room)
         room = str(room or "").strip()
-        # A successful occupants response proves that this room is reachable
-        # in the current WebSocket session. Keep it out of the persisted
-        # history logic: connected_rooms is intentionally session-only.
-        if room:
-            self.connected_rooms.add(room)
+        # An occupants response proves only that the roster was readable; it
+        # does not prove that the bot is a member. Only you_joined/you_rejoined
+        # events add rooms to connected_rooms.
 
         # Fallback live responses are tagged by the room they came from.
         # Accumulate all room responses before sending the final invitation batch.
@@ -10435,10 +10446,10 @@ class TalkinBot:
                 payload = encode_query(action, type_="status", body=status, value=status)
                 if len(payload) > _ws_payload_limit():
                     # Long HTML statuses must fit the hard 1008-byte Talkin
-                    # frame limit. The status text is identical in either
-                    # field; use the canonical body field rather than send an
-                    # oversized packet that would be rejected by the gateway.
-                    payload = encode_query(action, type_="status", body=status)
+                    # frame limit. Talkin's profile_update protocol reads the
+                    # status from Query.value (field 11); keep that canonical
+                    # field and omit the redundant body copy.
+                    payload = encode_query(action, type_="status", value=status)
                 self.send_query(payload)
                 self.log("[PROFILE] status update sent via", action)
                 sent = True
@@ -13625,8 +13636,19 @@ class TalkinBot:
             for target in cleaned:
                 key=_norm_room(target)
                 if any(_norm_room(r)==key for r in getattr(self, "connected_rooms", set())):
-                    skipped += 1
-                    continue
+                    if not sender:
+                        skipped += 1
+                        continue
+                    # A manual join also recovers stale local membership after
+                    # a missed departure event; cycle only this requested room.
+                    try:
+                        self.log("[ROOM] manual join requested for a listed room; refreshing membership:", target)
+                        self.leave_room(target)
+                        time.sleep(max(0.5, float(os.getenv("ROOM_CYCLE_DELAY_SECONDS", "1.0") or 1.0)))
+                    except Exception as exc:
+                        skipped += 1
+                        self.log("[ROOM] manual membership refresh failed:", target, repr(exc))
+                        continue
                 try:
                     if self.join_room(target, force=False, requested_by=sender):
                         sent += 1

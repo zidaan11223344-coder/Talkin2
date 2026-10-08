@@ -39,8 +39,8 @@ class ProfileStatusRegressions(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertLessEqual(len(sent[0]), bot_module._ws_payload_limit())
         fields = bot_module.decode_message(sent[0])
-        self.assertEqual(bot_module.as_text(fields[5][0]), expected)
-        self.assertNotIn(11, fields)
+        self.assertEqual(bot_module.as_text(fields[11][0]), expected)
+        self.assertNotIn(5, fields)
 
 
 class IncomingEventDedupRegressions(unittest.TestCase):
@@ -317,6 +317,43 @@ class RoomExclusionRegressions(unittest.TestCase):
         with patch.object(bot_module, "_save_persistent_rooms"):
             bot._process_room_list([{"name": "Forbidden"}, {"name": "Other"}])
         self.assertEqual(bot.known_rooms, {"Other"})
+
+    def test_manual_join_refreshes_a_room_already_listed_as_connected(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = {"RoomA"}
+        bot._pending_room_joins = {}
+        bot._room_bulk_lock = threading.RLock()
+        bot.log = lambda *_args: None
+        calls = []
+
+        def leave(room):
+            calls.append(("leave", room))
+            bot.connected_rooms.clear()
+            return True
+
+        def join(room, force=False, requested_by=""):
+            calls.append(("join", room, force, requested_by))
+            return True
+
+        bot.leave_room = leave
+        bot.join_room = join
+        with patch.object(bot_module.time, "sleep"):
+            result = bot._join_rooms_serially(["RoomA"], sender="Master")
+        self.assertEqual(result, {"sent": 1, "skipped": 0})
+        self.assertEqual(calls, [("leave", "RoomA"), ("join", "RoomA", False, "Master")])
+
+    def test_occupants_response_alone_does_not_mark_room_connected(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.invite_room = "RemoteRoom"
+        bot.last_joined_room = ""
+        bot.room = ""
+        bot.connected_rooms = set()
+        bot.bot_room_roles = {}
+        bot.room_users = {}
+        bot.invite_pending = False
+        bot._users_from_room_admin = lambda *_args: []
+        bot.process_occupants_for_invite({"_occupants_room": "RemoteRoom", "room_admin": {}})
+        self.assertEqual(bot.connected_rooms, set())
 
 
 class RawWebSocketTransportRegressions(unittest.TestCase):
