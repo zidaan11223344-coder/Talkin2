@@ -240,14 +240,14 @@ class CricketIntegration:
                         prompt = str(turn_messages.get(item.get("key")) or "").strip()
                     text = "🔄 استؤنفت مباراة الكركيت بعد إعادة تشغيل البوت.\n" + prompt
                 elif stage == "setup":
-                    text = f"🔄 استؤنف إعداد المباراة {self.game._match_code(match)}. اختر عدد اللاعبين من 1 إلى 4."
+                    text = "🔄 استؤنف إعداد مباراة الكركيت. اختر عدد اللاعبين من 1 إلى 4."
                 elif stage == "teams":
-                    text = f"🔄 استؤنفت المباراة {self.game._match_code(match)}. ترسل غرفة الإعداد 1 للهجوم أو 2 للدفاع؛ ويُعيّن دور الغرفة الثانية تلقائيًا."
+                    text = "🔄 استؤنفت مباراة الكركيت. ترسل غرفة الإعداد 1 للهجوم أو 2 للدفاع؛ ويُعيّن دور الغرفة الثانية تلقائيًا."
                 else:
                     target = int(match.get("target_players") or 1)
                     text = (
-                        f"🔄 استؤنفت قائمة المباراة {self.game._match_code(match)}؛ المطلوب {target} لاعب(ين) في كل غرفة. "
-                        f"الغرفة الثانية تنضم بـ Join@{self.game._match_code(match)}."
+                        f"🔄 استؤنفت قائمة الكركيت؛ المطلوب {target} لاعب(ين) في كل غرفة. "
+                        "تنضم الغرفة الثانية بإرسال Join؛ وعند تعدد القوائم يُقرن الطلب بأقدم فريق مكتمل."
                     )
                 try:
                     self.send_room_text(room, text)
@@ -323,9 +323,7 @@ class CricketIntegration:
         control = self._control_key(text)
         room = str(room or "").strip()
         sender = str(sender or "").strip().lstrip("@")
-        join_code_match = re.fullmatch(r"(?:join|انضمام)(?:@|\s+)([a-z0-9]{4,8})", low, re.I)
-        join_code = join_code_match.group(1).upper() if join_code_match else ""
-        join_command = low in {"join", "انضمام"} or bool(join_code_match)
+        join_command = low in {"join", "انضمام"}
         defer_resume = not is_private and join_command
         if not defer_resume:
             self._resume_after_restart()
@@ -386,7 +384,7 @@ class CricketIntegration:
 
         match = self.game.current(room)
         if join_command and not isinstance(match, dict):
-            match = self.game.match_for_join(room, join_code)
+            match = self.game.match_for_join(room)
         if not isinstance(match, dict) and not join_command:
             return False
 
@@ -418,7 +416,7 @@ class CricketIntegration:
         skip_text_event_ids_by_room: dict[str, set[int]] = {}
         if join_command:
             self._prime_new_room_cursor(room, previous_match)
-            result = self.game.join(room, sender, code=join_code)
+            result = self.game.join(room, sender)
             if result is None:
                 # Confirm the committed Join before any team-wide announcements,
                 # image delivery, or restart prompts can delay the player.

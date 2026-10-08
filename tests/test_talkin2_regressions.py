@@ -497,24 +497,23 @@ class CricketIntegrationRegressions(unittest.TestCase):
 
                 north_match = integration.game.current("North")
                 east_match = integration.game.current("East")
-                north_code = north_match["join_code"]
-                east_code = east_match["join_code"]
                 self.assertNotEqual(north_match["id"], east_match["id"])
-                self.assertNotEqual(north_code, east_code)
 
-                # A room must not accidentally join the neighboring match's code.
-                wrong_code = next(code for code in ("000000", "FFFFFF", "ABCDEF", "123456")
-                                  if code not in {north_code, east_code})
-                integration.handle("South", "S1", f"Join@{wrong_code}")
-                self.assertIsNone(integration.game.current("South"))
-
-                # A bare Join cannot guess between simultaneous waiting games.
+                # Plain Join deterministically pairs with the oldest complete lobby.
                 integration.handle("South", "S1", "Join")
-                self.assertTrue(any("توجد عدة مباريات انتظار" in text for room, text in messages if room == "South"))
+                self.assertEqual(integration.game.current("South")["id"], north_match["id"])
+                integration.handle("West", "W1", "Join")
+                self.assertEqual(integration.game.current("West")["id"], east_match["id"])
 
-                for index in range(1, count + 1):
-                    integration.handle("South", f"S{index}", f"Join@{north_code}")
-                    integration.handle("West", f"W{index}", f"Join@{east_code}")
+                for index in range(2, count + 1):
+                    integration.handle("South", f"S{index}", "Join")
+                    integration.handle("West", f"W{index}", "Join")
+
+                self.assertFalse(any(
+                    internal_id in text
+                    for _, text in messages
+                    for internal_id in (north_match["id"], east_match["id"])
+                ))
 
                 self.assertEqual(integration.game.current("North")["stage"], "teams")
                 self.assertEqual(integration.game.current("East")["stage"], "teams")
@@ -621,7 +620,8 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual({room for room, _ in first_team_announcements}, {"North"})
             self.assertEqual(len(first_team_announcements), 1)
             self.assertIn("North (2 لاعبين): @N1، @N2", first_team_announcements[0][1])
-            self.assertIn("رمز هذه المباراة", first_team_announcements[0][1])
+            self.assertIn("أرسلوا Join", first_team_announcements[0][1])
+            self.assertNotIn("Join@", first_team_announcements[0][1])
             self.assertEqual(integration.game.current()["stage"], "lobby")
 
             for player in ("S1", "S2"):
@@ -752,7 +752,8 @@ class CricketIntegrationRegressions(unittest.TestCase):
             setup_text = room_messages[-1][1]
             self.assertIn("إعداد مباراة الكركيت", setup_text)
             self.assertIn("اختر عدد اللاعبين داخل هذه الغرفة فقط", setup_text)
-            self.assertIn("Join@", setup_text)
+            self.assertIn("ترسل الغرفة الثانية Join", setup_text)
+            self.assertNotIn("Join@", setup_text)
             integration.handle("Room", "Verified", ".cr 2")
             self.assertEqual(integration.game.current()["stage"], "lobby")
             integration.handle("Room", "Guest", "Join")
@@ -1376,26 +1377,76 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(text(6), "North")
         self.assertEqual(text(7), "https://cdn.example/song.mp3")
 
-    def test_oversized_game_result_is_split_into_room_messages_not_telegram(self):
+    def test_oversized_game_result_is_routed_whole_to_telegram_not_websocket(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         packets = []
         bot.send_query = lambda payload: packets.append(payload)
         bot.log = lambda *_args: None
-        bot._send_long_text_to_telegram = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("game results should stay in the room")
-        )
+        telegram = []
+        bot._send_long_text_to_telegram = lambda text, title="": telegram.append((text, title)) or True
         text = "🏆 انتهت مباراة الكركيت\n" + "\n".join(
             f"💰 @Player{i} +200,000 نقطة — جائزة الفريق الأول والثاني" for i in range(20)
         )
+        self.assertGreater(
+            len(bot_module.encode_query("room_message", type_="text", body=text, room="North")),
+            1008,
+        )
 
-        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "300"}):
-            self.assertTrue(bot._send_text_packets("room_message", text, room="North"))
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
+            self.assertFalse(bot._send_text_packets("room_message", text, room="North"))
 
-        self.assertGreater(len(packets), 1)
-        decoded = [bot_module.decode_message(packet) for packet in packets]
-        self.assertTrue(all(len(packet) <= 300 for packet in packets))
-        self.assertTrue(all(fields[6][0].decode("utf-8") == "North" for fields in decoded))
-        self.assertEqual("".join(fields[5][0].decode("utf-8") for fields in decoded), text)
+        self.assertEqual(packets, [])
+        self.assertEqual(telegram, [(text, "رسالة طويلة من غرفة: North")])
+
+    def test_send_query_hard_caps_payload_at_1008_and_routes_text_to_telegram(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        telegram = []
+        bot.ws = type("FakeWebSocket", (), {"send_binary": lambda _self, payload: sent.append(payload)})()
+        bot.log = lambda *_args: None
+        bot._send_long_text_to_telegram = lambda text, title="": telegram.append((text, title)) or True
+        text = "x" * 2000
+        payload = bot_module.encode_query("room_message", type_="text", body=text, room="North")
+
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "5000"}):
+            self.assertFalse(bot.send_query(payload))
+
+        self.assertEqual(sent, [])
+        self.assertEqual(telegram, [(text, "رسالة طويلة من غرفة: North")])
+
+    def test_games_command_opens_the_a3_catalog_and_sets_ns_navigation(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.stock_pending = {}
+        bot.help_pages = {}
+        bot.help_page_part = {}
+        bot.help_game_part = {}
+        bot._room_list_commands = lambda *_args: False
+        bot._snake_command = lambda *_args: False
+        bot._ludo_command = lambda *_args: False
+        bot._handle_pending_bot_choice = lambda *_args: False
+        sent = []
+        bot._send_text_packets = lambda packet_type, text, **kwargs: sent.append(
+            (packet_type, text, kwargs)
+        ) or True
+
+        with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_looks_like_bot_command", return_value=True
+        ):
+            self.assertTrue(bot.handle_game_command("North", "العاب", "Player"))
+
+        key = ("North", bot_module._norm_user("Player"))
+        self.assertEqual(bot.help_pages[key], 3)
+        self.assertEqual(bot.help_page_part[key], 1)
+        self.assertEqual(bot.help_game_part[key], 1)
+        self.assertEqual(sent[0][0], "room_message")
+        self.assertEqual(sent[0][1], bot_module._default_help_sections()[3][0])
+        self.assertIn("13.", sent[0][1])
+        self.assertIn("اكتب ns", sent[0][1])
+        self.assertTrue(
+            bot._handle_management_command_impl("North", "ns", "Player", is_private=False)
+        )
+        self.assertEqual(bot.help_page_part[key], 2)
+        self.assertEqual(sent[1][1].split("\n\n📌", 1)[0], bot_module._default_help_sections()[3][1])
 
     def test_normal_song_request_broadcasts_to_all_active_rooms(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

@@ -116,11 +116,8 @@ class CricketGame:
         ]
 
     @classmethod
-    def _join_candidates(
-        cls, data: dict[str, Any], room: str, code: str = "",
-    ) -> list[dict[str, Any]]:
+    def _join_candidates(cls, data: dict[str, Any], room: str) -> list[dict[str, Any]]:
         room_key = _key(room)
-        code_key = str(code or "").strip().casefold()
         candidates = []
         for match in cls._matches(data).values():
             rooms = cls._participants(match)
@@ -132,30 +129,20 @@ class CricketGame:
                 and rooms[0]["key"] != room_key
                 and target > 0
                 and len(rooms[0].get("players", [])) >= target
-                and (not code_key or cls._match_code(match).casefold() == code_key)
             ):
                 candidates.append(match)
-        return sorted(candidates, key=lambda item: float(item.get("created_at") or 0))
+        # Plain Join selects the oldest complete, unpaired first team. Each
+        # match's UUID remains internal and keeps concurrent games isolated.
+        return sorted(candidates, key=lambda item: (float(item.get("created_at") or 0), str(item.get("id") or "")))
 
-    @classmethod
-    def _new_join_code(cls, data: dict[str, Any]) -> str:
-        existing = {cls._match_code(match).casefold() for match in cls._matches(data).values()}
-        for _ in range(20):
-            code = uuid.uuid4().hex[:6].upper()
-            if code.casefold() not in existing:
-                return code
-        return uuid.uuid4().hex[:8].upper()
-
-    def match_for_join(self, room: str, code: str = "") -> dict[str, Any] | None:
-        """Resolve a room's own match or an unambiguous waiting opponent match."""
+    def match_for_join(self, room: str) -> dict[str, Any] | None:
+        """Resolve a room's match or the oldest waiting opponent match."""
         data = self.state.load()
         existing = self._match_for_room(data, room)
         if existing:
-            if not code or self._match_code(existing).casefold() == str(code).casefold():
-                return existing
-            return None
-        candidates = self._join_candidates(data, room, code)
-        return candidates[0] if len(candidates) == 1 else None
+            return existing
+        candidates = self._join_candidates(data, room)
+        return candidates[0] if candidates else None
 
     def _emit(self, data: dict[str, Any], rooms: list[dict[str, Any]], text: str, images: tuple[str, ...] = ()) -> None:
         events = data.setdefault("events", [])
@@ -219,7 +206,7 @@ class CricketGame:
                 self._discard_match_events(data, match)
                 self._emit(
                     data, self._participants(match),
-                    f"⛔ أوقفت غرفة {room_name} اللعبة؛ أُلغيت مباراة {self._match_code(match)}.",
+                    f"⛔ أوقفت غرفة {room_name} اللعبة؛ أُلغيت المباراة.",
                 )
                 self._remove_match(data, match)
             return f"⛔ تم إيقاف الكركيت على مستوى السيرفر من غرفة {room_name}."
@@ -272,16 +259,6 @@ class CricketGame:
         }
         return match
 
-    @staticmethod
-    def _match_code(match: dict[str, Any]) -> str:
-        code = str(match.get("join_code") or "").strip()
-        if code:
-            return code.upper()
-        # Older persisted matches predate explicit join codes. Derive a stable
-        # code without requiring a write on every read of the state file.
-        match_id = str(match.get("id") or "")
-        return uuid.uuid5(uuid.NAMESPACE_DNS, f"talkin2-cricket:{match_id}").hex[:6].upper() if match_id else "------"
-
     def begin_setup(self, room: str, *, reset_existing: bool = False) -> str | None:
         room_name, room_key = str(room or "").strip(), _key(room)
 
@@ -298,11 +275,10 @@ class CricketGame:
                     self._discard_match_events(data, existing)
                     self._emit(
                         data, self._participants(existing),
-                        f"⛔ أُلغيت مباراة {self._match_code(existing)} لإعداد مباراة جديدة من غرفة {room_name}.",
+                        f"⛔ أُلغيت المباراة المفتوحة من غرفة {room_name} لإعداد مباراة جديدة.",
                     )
                     self._remove_match(data, existing)
             match = self._new_match(room_name, room_key, "setup")
-            match["join_code"] = self._new_join_code(data)
             self._matches(data)[match["id"]] = match
             self._emit(
                 data,
@@ -310,8 +286,7 @@ class CricketGame:
                 "🏏 إعداد مباراة الكركيت\n"
                 "اختر عدد اللاعبين داخل هذه الغرفة فقط:\n"
                 "1️⃣ لاعب واحد\n2️⃣ لاعبان\n3️⃣ ثلاثة لاعبين\n4️⃣ أربعة لاعبين\n"
-                f"أرسل الرقم فقط (العدد لكل غرفة). رمز المباراة: {self._match_code(match)}. "
-                f"بعد اكتمال الفريق الأول، تنضم الغرفة الثانية بـ Join@{self._match_code(match)}.\n"
+                "أرسل الرقم فقط (العدد لكل غرفة). بعد اكتمال الفريق الأول، ترسل الغرفة الثانية Join.\n"
                 "📢 سيعلن البوت اسم الغرف وعدد اللاعبين وأسماءهم عند اكتمال الفريقين.",
             )
             return None
@@ -346,8 +321,8 @@ class CricketGame:
                  "أرسل Join من كل لاعب؛ بعد اكتمال العدد تبدأ المباراة ضد البوت."
                  if match.get("mode") == "solo" else
                  f"🏏 كركيت | {count} لاعب(ين) في كل غرفة\n"
-                 f"أرسل Join من لاعبي الغرفة الأولى. بعد اكتمالها، تنضم الغرفة الثانية بـ Join@{self._match_code(match)} "
-                 "(يمكن استخدام Join فقط إذا كانت هناك مباراة انتظار واحدة). لا يمكن إكمال الفريقين من الغرفة نفسها."),
+                 "أرسل Join من لاعبي الغرفة الأولى. بعد اكتمالها، ترسل الغرفة الثانية Join. "
+                 "عند تعدد قوائم الانتظار، يُقرن Join بأقدم فريق أول مكتمل. لا يمكن إكمال الفريقين من الغرفة نفسها."),
             )
             return None
 
@@ -370,7 +345,6 @@ class CricketGame:
                     self._remove_match(data, existing)
             match = self._new_match(room_name, room_key, "setup")
             match["mode"] = "solo"
-            match["join_code"] = self._new_join_code(data)
             self._matches(data)[match["id"]] = match
             self._emit(
                 data,
@@ -401,13 +375,12 @@ class CricketGame:
                 return "⏳ هذه الغرفة مشاركة في مباراة مفتوحة بالفعل؛ أكملها أو أوقفها قبل بدء مباراة أخرى."
             match = self._new_match(room_name, room_key, "lobby", count)
             match["mode"] = "rooms" if mode == "rooms" else "solo"
-            match["join_code"] = self._new_join_code(data)
             self._matches(data)[match["id"]] = match
             self._emit(
                 data,
                 self._participants(match),
                 f"🏏 فُتحت مباراة الكركيت في {room_name} — المطلوب {count} لاعب(ين).\n" +
-                (f"👥 رمز المباراة: {self._match_code(match)}. أرسل لاعبو الغرفة الثانية Join@{self._match_code(match)} بعد اكتمال فريقكم."
+                ("👥 بعد اكتمال الفريق الأول، أرسل لاعبو الغرفة الثانية Join. عند تعدد قوائم الانتظار، يُختار أقدم فريق مكتمل."
                  if match["mode"] == "rooms" else
                  "👤 كل اللاعبين ينضمون من هذه الغرفة فقط بإرسال Join.\n"
                  f"🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد {self.bot_name}."),
@@ -443,7 +416,7 @@ class CricketGame:
             return True
         return False
 
-    def join(self, room: str, sender: str = "", code: str = "") -> str | None:
+    def join(self, room: str, sender: str = "") -> str | None:
         room_name, room_key = str(room or "").strip(), _key(room)
         username = str(sender or "").strip().lstrip("@")
         user_key = _user_key(username)
@@ -454,18 +427,10 @@ class CricketGame:
             if not data.get("enabled"):
                 return "⛔ فعّل اللعبة أولاً: شغّل الكركيت من خاص الماستر."
             match = self._match_for_room(data, room_key)
-            if match is not None:
-                if code and self._match_code(match).casefold() != str(code).casefold():
-                    return "❌ رمز المباراة لا يطابق المباراة المفتوحة في هذه الغرفة."
-            else:
-                candidates = self._join_candidates(data, room_name, code)
+            if match is None:
+                candidates = self._join_candidates(data, room_name)
                 if not candidates:
-                    return (
-                        "📭 لا توجد مباراة مكتملة تنتظر هذا الرمز. تأكد من الرمز وأكمل لاعبو الغرفة الأولى أولاً."
-                        if code else "📭 لا توجد مباراة مكتملة تنتظر الانضمام الآن."
-                    )
-                if len(candidates) > 1:
-                    return "⚠️ توجد عدة مباريات انتظار. استخدم Join@رمز_المباراة الذي أرسلته الغرفة التي تريد اللعب معها."
+                    return "📭 لا توجد مباراة مكتملة تنتظر الانضمام الآن."
                 match = candidates[0]
             if match.get("stage") != "lobby":
                 return "📭 لا توجد قائمة لاعبين مفتوحة لهذه المباراة الآن."
@@ -492,7 +457,7 @@ class CricketGame:
                 self._emit(
                     data,
                     participants,
-                    f"🔗 انضمت غرفة {room_name} إلى المباراة {self._match_code(match)}.\n"
+                    f"🔗 انضمت غرفة {room_name} إلى المباراة.\n"
                     f"👥 المطلوب {target} لاعب(ين) في كل غرفة.\n"
                     "أرسل Join من لاعبي هذه الغرفة.",
                 )
@@ -506,8 +471,8 @@ class CricketGame:
                     self._emit(
                         data, [participant],
                         f"✅ انضم @{username}.\n👥 اكتمل {len(players)}/{target} لاعب في الغرفة.\n"
-                        f"🔗 رمز المباراة {self._match_code(match)}: بعد اكتمال الفريق الأول، ترسل الغرفة الثانية Join@{self._match_code(match)} "
-                        f"(أو Join إذا كانت هذه المباراة الوحيدة)، أو أكمل العدد هنا للعب ضد {self.bot_name}.",
+                        "🔗 بعد اكتمال الفريق الأول، ترسل الغرفة الثانية Join؛ وعند تعدد القوائم يُقرن بأقدم فريق مكتمل. "
+                        f"أو أكمل العدد هنا للعب ضد {self.bot_name}.",
                     )
                 else:
                     if match.get("mode") == "solo":
@@ -528,8 +493,8 @@ class CricketGame:
                             data, [participant],
                             f"🏏 اكتمل الفريق الأول — مباراة الكركيت قيد التجهيز\n"
                             f"👥 {participant['name']} ({len(team_players)} لاعبين): {team_names}\n"
-                            f"🆔 رمز هذه المباراة: {self._match_code(match)}\n"
-                            f"🔗 بانتظار الفريق الثاني: أرسلوا Join@{self._match_code(match)} من الغرفة الأخرى؛ "
+                            "🔗 بانتظار الفريق الثاني: أرسلوا Join من الغرفة الأخرى؛ "
+                            "وعند وجود عدة قوائم انتظار، يُقرن الطلب بأقدم فريق أول مكتمل. "
                             "ثم يختار الفريق الأول 1 للهجوم أو 2 للدفاع.",
                         )
             elif len(participants) == self.ROOM_TEAMS:
@@ -539,7 +504,7 @@ class CricketGame:
                     match["stage"] = "teams"
                     self._emit(
                         data, participants,
-                        f"🏏 اكتمل الفريقان في المباراة {self._match_code(match)}: {target} لاعبين لكل غرفة\n"
+                        f"🏏 اكتمل الفريقان: {target} لاعبين لكل غرفة\n"
                         f"👥 {participants[0]['name']} ضد {participants[1]['name']}\n"
                         "🎯 الفريق الأول يختار: 1 هجوم أو 2 دفاع.\n"
                         "الفريق الثاني يُحدد تلقائيًا.",
