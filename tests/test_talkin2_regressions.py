@@ -14,6 +14,69 @@ from cricket_result import render_result_image
 
 
 class IncomingEventDedupRegressions(unittest.TestCase):
+    def test_english_game_catalogs_and_protection_menu_are_localized(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        sent = []
+        bot._send_text_packets = lambda packet, text, **kwargs: sent.append(text) or True
+        bot._send_help_chunks = lambda packet, text, **kwargs: sent.append(text) or True
+
+        for page, count in ((1, 6), (2, 2), (3, 6), (4, 2), (5, 2), (6, 2)):
+            for part in range(1, count + 1):
+                bot._send_help_section(room="EnglishRoom", page=page, part=part)
+        self.assertTrue(any("First token to the finish wins" in text for text in sent))
+        self.assertTrue(any("protection@room" in text.lower() for text in sent))
+        self.assertFalse(any(any("\u0600" <= char <= "\u06ff" for char in text) for text in sent))
+
+        arabic_menu = (
+            "🛡️ قائمة حماية الغرفة\n━━━━━━━━━━━━\n"
+            "1️⃣ تشغيل حماية الغرفة من السب\n2️⃣ إيقاف حماية الغرفة من السب\n"
+            "3️⃣ تشغيل حماية الفلود (هجوم الدخول المتزامن + حظر IP)\n4️⃣ إيقاف حماية الفلود\n"
+            "5️⃣ تشغيل حماية الدخول والخروج (تكرار الدخول)\n6️⃣ إيقاف حماية الدخول والخروج\n"
+            "7️⃣ تعيين حد رسائل الفلود\n8️⃣ تشغيل حظر الحسابات بلا صورة\n"
+            "9️⃣ إيقاف حظر الحسابات بلا صورة\n━━━━━━━━━━━━\n📌 أرسل رقم الخيار الآن."
+        )
+        translated = bot._localize_room_text("EnglishRoom", arabic_menu)
+        self.assertIn("Room protection settings", translated)
+        self.assertNotIn("حماية", translated)
+
+    def test_ludo_dynamic_results_are_english_only_for_english_rooms(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        english = bot._localize_room_text(
+            "EnglishRoom", "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين"
+        )
+        self.assertIn("How to play", english)
+        self.assertIn("type rool", english)
+        result = bot._localize_room_text("EnglishRoom", "🎯 الآن دور @player1، اكتب rool.")
+        self.assertEqual(result, "🎯 @player1, it is your turn — type rool to roll.")
+        arabic_bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        arabic_bot.room_languages = {bot_module._norm_room("ArabicRoom"): "ar"}
+        original = "🎯 الآن دور @player1، اكتب rool."
+        self.assertEqual(arabic_bot._localize_room_text("ArabicRoom", original), original)
+
+        game_bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        game_bot._ludo_lock = threading.RLock()
+        game_bot.ludo_games = {}
+        game_bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        game_bot._board_game_cooldown_notice = lambda *_args, **_kwargs: True
+        game_bot._schedule_board_game_timeout = lambda *_args, **_kwargs: None
+        sent = []
+        game_bot.send_room_text = lambda room, text: sent.append(text)
+        self.assertTrue(game_bot._ludo_command_unlocked("EnglishRoom", "player1", "لودو"))
+        self.assertEqual(game_bot.ludo_games["ludo:EnglishRoom"]["lang"], "en")
+        self.assertIn("First token to the finish wins", sent[0])
+
+    def test_common_game_result_templates_translate_to_english(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        coin = "🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@player\n🎯 اختيارك: وجه\n🪙 النتيجة: كتابة\n🏆 فزت!\n🎁 +1,000 نقطة\n💰 رصيدك: 1,000"
+        translated = bot._localize_room_text("EnglishRoom", coin)
+        self.assertIn("Coin toss", translated)
+        self.assertIn("Heads", translated)
+        self.assertIn("Tails", translated)
+        self.assertFalse(any("\u0600" <= char <= "\u06ff" for char in translated))
+
     def test_distinct_joining_users_are_not_deduplicated(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         first_join = ("user_joined", "North", "", "", "", "", "account_a", "")

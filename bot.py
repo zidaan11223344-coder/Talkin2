@@ -2382,7 +2382,7 @@ def _looks_like_bot_command(text):
         "sa@", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
@@ -2452,7 +2452,7 @@ def _looks_like_admin_command(text):
     prefixes = (
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "msb@",
-        "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
+        "i@", "inv", "دعوات", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
     return low.startswith(prefixes)
@@ -6498,25 +6498,246 @@ class TalkinBot:
         if getattr(self, "room_languages", {}).get(_norm_room(room)) != "en":
             return str(text or "")
         value = str(text or "")
-        exact = {
-            "📡 بث مباشر\n⏳ جاري تشغيل الأغنية...": "📡 Live broadcast\n⏳ Starting the song...",
-            "🎶 تم تشغيل الأغنية في البث\n📡 بث مباشر": "🎶 The request is now playing in the live broadcast\n📡 Live broadcast",
-            "❌ تعذر تشغيل الأغنية في البث؛ تم استخدام المصدر الاحتياطي إن توفر.": "❌ Could not play the song in the live broadcast.",
-            "🖼️ تم استلام أمر النشر. أرسل الصورة الآن خلال دقيقتين في الروم أو الخاص، وسيتم نشرها في جميع الغرف.": "🖼️ Publish request received. Send the image within two minutes; it will be posted in all rooms.",
-            "✅ تم تغيير نص الدعوة إلى": "✅ Invitation message changed to",
-            "📭 لا توجد غرف متصلة فعلياً حالياً.": "📭 No rooms are currently connected.",
-        }
+        # English text needs no processing. Arabic rooms returned above already;
+        # therefore translation work is limited to Arabic-bearing text in English rooms.
+        if not any("\u0600" <= char <= "\u06ff" for char in value):
+            return value
+        cached = getattr(self, "_english_room_exact_translations", None)
+        if cached is None:
+            cached = {
+                "📡 بث مباشر\n⏳ جاري تشغيل الأغنية...": "📡 Live broadcast\n⏳ Starting the song...",
+                "🎶 تم تشغيل الأغنية في البث\n📡 بث مباشر": "🎶 The request is now playing in the live broadcast\n📡 Live broadcast",
+                "❌ تعذر تشغيل الأغنية في البث؛ تم استخدام المصدر الاحتياطي إن توفر.": "❌ Could not play the song in the live broadcast.",
+                "🖼️ تم استلام أمر النشر. أرسل الصورة الآن خلال دقيقتين في الروم أو الخاص، وسيتم نشرها في جميع الغرف.": "🖼️ Publish request received. Send the image within two minutes; it will be posted in all rooms.",
+                "✅ تم تغيير نص الدعوة إلى": "✅ Invitation message changed to",
+                "📭 لا توجد غرف متصلة فعلياً حالياً.": "📭 No rooms are currently connected.",
+                "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين": "🎲 Ludo — choose the number of players:\n1 = You vs. the bot\n2 = 2 players\n3 = 3 players\n4 = 4 players\n\nHow to play: type 1–4 to set the player count. Other players type join. On your turn, type rool to roll the die and move your token. First to reach the finish wins.",
+                "⚠️ هذه اللعبة مع البوت. لا تحتاج join.": "⚠️ This game is against the bot. No one needs to type join.",
+                "❌ اختر عدد اللاعبين أولاً: 1 أو 2 أو 3 أو 4.": "❌ Choose the number of players first: 1, 2, 3, or 4.",
+                "⏳ ما زلنا ننتظر اكتمال عدد اللاعبين.": "⏳ Waiting for enough players to join.",
+                "⏳ انتظر دورك.": "⏳ Please wait for your turn.",
+                "🚫 قائمة الحماية لصانع الغرفة أو الماستر فقط.": "🚫 Room protection settings are available only to the room creator or the bot master.",
+                "🛡️ قائمة حماية الغرفة\n━━━━━━━━━━━━\n1️⃣ تشغيل حماية الغرفة من السب\n2️⃣ إيقاف حماية الغرفة من السب\n3️⃣ تشغيل حماية الفلود (هجوم الدخول المتزامن + حظر IP)\n4️⃣ إيقاف حماية الفلود\n5️⃣ تشغيل حماية الدخول والخروج (تكرار الدخول)\n6️⃣ إيقاف حماية الدخول والخروج\n7️⃣ تعيين حد رسائل الفلود\n8️⃣ تشغيل حظر الحسابات بلا صورة\n9️⃣ إيقاف حظر الحسابات بلا صورة\n━━━━━━━━━━━━\n📌 أرسل رقم الخيار الآن.": "🛡️ Room protection settings\n━━━━━━━━━━━━\n1️⃣ Enable profanity protection\n2️⃣ Disable profanity protection\n3️⃣ Enable flood protection (mass-join attack + IP ban)\n4️⃣ Disable flood protection\n5️⃣ Enable repeated join/leave protection\n6️⃣ Disable repeated join/leave protection\n7️⃣ Set the flood message limit\n8️⃣ Block accounts without a profile photo\n9️⃣ Stop blocking accounts without a profile photo\n━━━━━━━━━━━━\n📌 Send the option number now.",
+                "🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر (من 2 إلى 50).": "🔢 Send the allowed number of repeated messages before a ban (2–50).",
+                "⛔ حماية الغرفة متوقفة.": "⛔ Room protection is disabled.",
+                "🛑 الألعاب متوقفة في هذه الغرفة حالياً.": "🛑 Games are currently disabled in this room.",
+                "✅ قائمة صناع الغرفة فارغة.": "✅ The room creator list is empty.",
+                "❌ اختر محصولاً من قائمة زرع.": "❌ Choose a crop from the farm list.",
+                "⏳ لديك 5 محاصيل قيد الزراعة حالياً. احصد أحدها أولاً ثم ازرع محصولاً جديداً.": "⏳ You already have 5 crops growing. Harvest one before planting another.",
+                "❌ المبلغ غير صحيح.": "❌ Invalid amount.",
+                "❌ اختر 1 أو 2 أو 3 فقط.": "❌ Choose 1, 2, or 3 only.",
+                "❌ الصيغة: .صوره اسم_المستخدم": "❌ Usage: .photo username",
+                "❌ لم أجد صورة مناسبة حالياً.": "❌ I couldn't find a suitable image right now.",
+                "❌ وجدت صورة لكن تعذر تحميلها حالياً.": "❌ I found an image, but couldn't download it.",
+                "❌ تعذر تحميل الصورة من المصادر المتاحة حالياً.": "❌ Couldn't download an image from the available sources.",
+                "❌ رابط الصور العام غير مضبوط في إعدادات البوت.": "❌ The public image URL is not configured.",
+                "❌ تعذر البحث عن الصورة حالياً.": "❌ Image search is temporarily unavailable.",
+                "❌ الصيغة: شبيه@اسم_المستخدم": "❌ Usage: lookalike@username",
+                "❌ فشلت السرقة: لا يوجد عضو آخر متاح للسرقة حالياً.": "❌ The steal game failed: no other eligible room member is available.",
+                "❌ اختر 1 أو 2 فقط.\n\u20661.\u2069 وجه\n\u20662.\u2069 كتابة": "❌ Choose 1 or 2 only.\n1. Heads\n2. Tails",
+                "🐍 تم انضمام اللاعب. اكتب rool للعب.": "🐍 Player joined. Type rool to play.",
+                "⏳ اللعبة ما زالت تنتظر لاعباً ثانياً.\n👥 اكتب join أولاً، وبعدها يبدأ الرول.": "⏳ The game is waiting for a second player.\n👥 Type join first; rolling starts once they join.",
+                "🔎 جاري البحث عن صورة شخصية مشهورة مناسبة...": "🔎 Searching for a suitable celebrity image...",
+                "❌ تعذر العثور على صورة مناسبة الآن؛ جرّب مرة أخرى لاحقاً.": "❌ Couldn't find a suitable image. Please try again later.",
+                "❌ تعذر عرض الصورة لأن رابط الوسائط العام غير مضبوط.": "❌ Couldn't show the image because the public media URL is not configured.",
+                "❌ تعذر إرسال الصورة إلى الغرفة.": "❌ Couldn't send the image to the room.",
+                "❌ تعذر البحث عن صورة مناسبة حالياً.": "❌ Image search is temporarily unavailable.",
+                "🛑 الألعاب متوقفة في هذه الغرفة حالياً.": "🛑 Games are currently disabled in this room.",
+                "🎉 ألعاب التسلية: زواج، تحدي، لغز، حظي، مزاج": "🎉 Fun games: marriage, challenge, riddle, my luck, mood",
+                "⌛ انتهت مهلة البورصة. اكتب بورصة من جديد.": "⌛ The stock-market choice timed out. Type stock to try again.",
+                "🔒 هذا الأمر مخصص للماستر فقط.": "🔒 This command is for the bot master only.",
+                "🌱 ازرع محصولاً آخر.\n📖 الطريقة: اكتب زرع ثم @ ثم رمز المحصول.\nمثال: زرع@🍐\n💡 لا يمكن زراعة نفس النوع مرتين في نفس الوقت.": "🌱 Plant another crop.\n📖 Type farm@ followed by the crop symbol.\nExample: farm@🍐\n💡 You cannot grow the same crop twice at once.",
+                "🌱 ازرع محصولاً آخر.\n📖 الطريقة: زرع@رمز_المحصول\nمثال: زرع@🍐\n💡 لا يمكن زراعة نفس النوع مرتين في نفس الوقت.": "🌱 Plant another crop.\n📖 Use farm@crop_symbol.\nExample: farm@🍐\n💡 You cannot grow the same crop twice at once.",
+                "📈💰 البورصة\n━━━━━━━━━━━━━━\n1️⃣ 🥇 ذهب\n2️⃣ 🛢️ نفط\n3️⃣ ⛏️ معادن\n\n🎯 أرسل رقم الخيار 1 أو 2 أو 3.\n⌛ لديك دقيقتان لاختيارك.": "📈💰 Stock market\n━━━━━━━━━━━━━━\n1️⃣ 🥇 Gold\n2️⃣ 🛢️ Oil\n3️⃣ ⛏️ Metals\n\n🎯 Send 1, 2, or 3 to choose.\n⌛ You have two minutes to choose.",
+                "🐍 تم انضمام اللاعب. اكتب rool للعب.": "🐍 Player joined. Type rool to play.",
+            }
+            self._english_room_exact_translations = cached
+        exact = cached
         if value in exact:
             return exact[value]
+        # Ludo has dynamic player names and scores; translate full message
+        # templates while preserving those values exactly.
+        match = re.fullmatch(r"🎲 تم اختيار لودو لـ (\d+) لاعبين\.\n👥 اكتب join للانضمام — نحتاج (\d+) لاعباً إضافياً\.\n📌 يبدأ اللعب بعد اكتمال العدد، ثم اكتب rool\.", value)
+        if match:
+            return f"🎲 Ludo set for {match.group(1)} players.\n👥 Type join to enter — {match.group(2)} more player(s) needed.\n📌 The game starts when all players join; type rool on your turn to roll."
+        match = re.fullmatch(r"🎮 لديك لعبة لودو شغالة بالفعل في غرفة: (.+)\n✏️ اكتب اسم اللعبة لبدء لعبة جديدة\.", value)
+        if match:
+            return f"🎮 You already have a Ludo game running in {match.group(1)}.\n✏️ Type ludo to start a new game."
+        match = re.fullmatch(r"🎲 توجد لعبة لودو شغالة بالفعل في غرفة: (.+)\. اختر العدد أو اكتب join/انضمام\.", value)
+        if match:
+            return f"🎲 A Ludo game is already running in {match.group(1)}. Choose the player count or type join."
+        match = re.fullmatch(r"🤖 بدأت لعبة لودو مع البوت! أنت تبدأ أولاً، اكتب rool للعب\.", value)
+        if match:
+            return "🤖 Ludo vs. the bot has started! You go first. Type rool to roll the die."
+        match = re.fullmatch(r"🎲 بدأت لعبة لودو!\n👥 اللاعبون: (.+)\n🎯 دور (.+)، اكتب rool\.", value)
+        if match:
+            return f"🎲 Ludo has started!\n👥 Players: {match.group(1)}\n🎯 {match.group(2)} goes first — type rool to roll."
+        match = re.fullmatch(r"✅ انضم اللاعب\.\n👥 باقي (\d+) لاعب/لاعبين ثم تبدأ اللعبة\.", value)
+        if match:
+            return f"✅ Player joined.\n👥 {match.group(1)} more player(s) needed before the game starts."
+        match = re.fullmatch(r"🎲 @(.+?) وقف الرول على (\d+) وانتقل من المربع (\d+) إلى (\d+)\.", value)
+        if match:
+            return f"🎲 @{match.group(1)} rolled {match.group(2)} and moved from space {match.group(3)} to {match.group(4)}."
+        match = re.fullmatch(r"🤖 البوت رمى (\d+) وانتقل من المربع (\d+) إلى (\d+)\.\n🎯 الآن دور @(.+)، اكتب rool\.", value)
+        if match:
+            return f"🤖 The bot rolled {match.group(1)} and moved from space {match.group(2)} to {match.group(3)}.\n🎯 @{match.group(4)}, it is your turn — type rool."
+        match = re.fullmatch(r"🎯 الآن دور @(.+)، اكتب rool\.", value)
+        if match:
+            return f"🎯 @{match.group(1)}, it is your turn — type rool to roll."
+        match = re.fullmatch(r"🏆 مبروك! فاز @(.+?) بلعبة لودو\.\n🎲 الرول الأخير: (\d+)\n📍 وصل إلى نهاية المسار\.\n💰 جائزة الفوز: \+([\d,]+) نقطة\n💳 رصيده الآن: ([\d,]+) نقطة", value)
+        if match:
+            return f"🏆 Congratulations, @{match.group(1)} won Ludo!\n🎲 Final roll: {match.group(2)}\n📍 Reached the finish.\n💰 Prize: +{match.group(3)} points\n💳 New balance: {match.group(4)} points"
+        match = re.fullmatch(r"🛡️ حماية الغرفة شغالة\. حد التكرار: (\d+) رسائل\.", value)
+        if match:
+            return f"🛡️ Room protection is enabled. Repetition limit: {match.group(1)} messages."
+        match = re.fullmatch(r"🛡️ تم تشغيل حماية الغرفة من السب\.|⛔ تم إيقاف حماية الغرفة من السب\.|🛡️ تم تشغيل حماية الغرفة من الفلود\.|⛔ تم إيقاف حماية الغرفة من الفلود\.|🛡️ تم تشغيل حماية الدخول والخروج\.|⛔ تم إيقاف حماية الدخول والخروج\.|🛡️ تم تشغيل حظر الحسابات بلا صورة\.|⛔ تم إيقاف حظر الحسابات بلا صورة\.", value)
+        if match:
+            protection_messages = {
+                "🛡️ تم تشغيل حماية الغرفة من السب.": "🛡️ Profanity protection enabled.",
+                "⛔ تم إيقاف حماية الغرفة من السب.": "⛔ Profanity protection disabled.",
+                "🛡️ تم تشغيل حماية الغرفة من الفلود.": "🛡️ Flood protection enabled.",
+                "⛔ تم إيقاف حماية الغرفة من الفلود.": "⛔ Flood protection disabled.",
+                "🛡️ تم تشغيل حماية الدخول والخروج.": "🛡️ Repeated join/leave protection enabled.",
+                "⛔ تم إيقاف حماية الدخول والخروج.": "⛔ Repeated join/leave protection disabled.",
+                "🛡️ تم تشغيل حظر الحسابات بلا صورة.": "🛡️ Blocking accounts without a profile photo enabled.",
+                "⛔ تم إيقاف حظر الحسابات بلا صورة.": "⛔ Blocking accounts without a profile photo disabled.",
+            }
+            return protection_messages[value]
+        match = re.fullmatch(r"✅ تم ضبط حماية التكرار في (.+) على (\d+) رسائل متتالية\.", value)
+        if match:
+            return f"✅ Repetition protection for {match.group(1)} is set to {match.group(2)} consecutive messages."
+        match = re.fullmatch(r"✅ تم اعتماد حد الفلود: (\d+) رسائل متكررة في الغرفة: (.+)", value)
+        if match:
+            return f"✅ Flood limit set to {match.group(1)} repeated messages in room {match.group(2)}."
+        match = re.fullmatch(r"🐎🛡️ @(.+?) حصل على حصانة!\n━━━━━━━━━━━━\n⏱️ الحماية من السرقة: دقيقة واحدة\n🔓 تنتهي بعد 60 ثانية\.\n━━━━━━━━━━━━", value)
+        if match:
+            return f"🐎🛡️ @{match.group(1)} is protected from stealing for one minute.\n🔓 Protection expires in 60 seconds."
+        match = re.fullmatch(r"⌛ انتهت لعبة (.+) تلقائياً لعدم وجود تفاعل لمدة دقيقتين\.", value)
+        if match:
+            return f"⌛ {match.group(1)} ended automatically after two minutes without activity."
+        match = re.fullmatch(r"⏳ @(.+?) انتظر (.+) قبل بدء لعبة (.+)\.\n🎮 الفاصل بين لعبتي (.+) لنفس اللاعب هو 4 دقائق\.", value)
+        if match:
+            return f"⏳ @{match.group(1)}, wait {match.group(2)} before starting {match.group(3)} again.\n🎮 The cooldown for the same player and game is 4 minutes."
+        match = re.fullmatch(r"⏳ @(.+?) لديك لعبة (.+) شغالة حالياً\.\n🎯 ما زالت تبحث عن منافس\.\n⌛ مدة البحث دقيقتان فقط، وبعدها تُلغى تلقائياً إذا لم يدخل منافس\.", value)
+        if match:
+            return f"⏳ @{match.group(1)}, your {match.group(2)} game is already waiting.\n🎯 Looking for an opponent.\n⌛ It will be cancelled after two minutes if nobody joins."
+        match = re.fullmatch(r"❌ تحتاج (.+) نقطة للمشاركة في (.+)\. رصيدك: (.+)", value)
+        if match:
+            return f"❌ You need {match.group(1)} points to play {match.group(2)}. Your balance: {match.group(3)}."
+        match = re.fullmatch(r"🌱 تم زرع (.+) بنجاح!\n⏱️ الانتظار: (.+) دقيقة\n🎁 المكافأة: (.+) نقطة\n📩 عند اكتمال الزراعة ستصلك النتيجة تلقائياً في الخاص\.", value)
+        if match:
+            return f"🌱 {match.group(1)} planted successfully!\n⏱️ Growing time: {match.group(2)} minutes\n🎁 Reward: {match.group(3)} points\n📩 You'll receive the result in a private message when it's ready."
+        match = re.fullmatch(r"❌ رصيدك غير كافٍ\. رصيدك: (.+)", value)
+        if match:
+            return f"❌ Not enough points. Your balance: {match.group(1)}."
+        match = re.fullmatch(r"⏰ @(.+?) انتهى وقت الاختيار\. أرسل أمر اللعبة من جديد\.", value)
+        if match:
+            return f"⏰ @{match.group(1)}, the selection timed out. Send the game command again."
+        match = re.fullmatch(r"❌ لم أجد @(.+?) ضمن أعضاء الغرفة\.", value)
+        if match:
+            return f"❌ I couldn't find @{match.group(1)} among the room members."
+        match = re.fullmatch(r"🎯 تحدي @(.+?): (.+)", value)
+        if match:
+            return f"🎯 Challenge for @{match.group(1)}: {match.group(2)}"
+        match = re.fullmatch(r"🏆 انتهت لعبة (.+)\n👑 الفائز: @(.+)\n💰 مبلغ الفوز: \+(.+) نقطة\n❌ الخاسر: @(.+)\n💸 مبلغ الخسارة: -(.+) نقطة", value)
+        if match:
+            return f"🏆 {match.group(1)} is over.\n👑 Winner: @{match.group(2)}\n💰 Winnings: +{match.group(3)} points\n❌ Loser: @{match.group(4)}\n💸 Loss: -{match.group(5)} points"
+        match = re.fullmatch(r"🍉 فيس @(.+)\n🤖 البوت أرسل (.+)\n❌ لم تتم المطابقة، حظاً موفقاً\.\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة", value)
+        if match:
+            return f"🍉 Face match — @{match.group(1)}\n🤖 The bot chose {match.group(2)}\n❌ No match this time. Better luck next time!\n💰 Winnings: 0 points\n💸 Loss: 0 points"
+        match = re.fullmatch(r"📈💰 البورصة\n━━━━━━━━━━━━━━\n👤 اللاعب: @(.+)\n(.+) الاختيار: (.+)\n(.+)\n🎁 المكافأة: \+(.+) نقطة\n💰 الرصيد: (.+)", value)
+        if match:
+            return f"📈💰 Stock market\n━━━━━━━━━━━━━━\n👤 Player: @{match.group(1)}\n{match.group(2)} Choice: {match.group(3)}\n{match.group(4)}\n🎁 Reward: +{match.group(5)} points\n💰 Balance: {match.group(6)}"
+        match = re.fullmatch(r"📊✨ استثمار مع البوت\n━━━━━━━━━━━━\n👤 اللاعب: @(.+)\n(.+)\n🎁 المكافأة: \+(.+) نقطة\n💰 الرصيد: (.+)", value)
+        if match:
+            return f"📊✨ Investment with the bot\n━━━━━━━━━━━━\n👤 Player: @{match.group(1)}\n{match.group(2)}\n🎁 Reward: +{match.group(3)} points\n💰 Balance: {match.group(4)}"
+        match = re.fullmatch(r"🕵️💰 تمت السرقة بنجاح!\n👤 السارق: @(.+)\n🎯 الضحية: @(.+)\n💸 المسروق: 500 نقطة\n🎁 @(.+) حصل على \+500 نقطة\.\n💰 رصيد السارق: (.+)", value)
+        if match:
+            return f"🕵️💰 The steal succeeded!\n👤 Thief: @{match.group(1)}\n🎯 Victim: @{match.group(2)}\n💸 Stolen: 500 points\n🎁 @{match.group(3)} received +500 points.\n💰 Thief's balance: {match.group(4)}"
+        match = re.fullmatch(r"@(.+) لديه حصانه من السرقه", value)
+        if match:
+            return f"@{match.group(1)} is protected from being robbed."
+        match = re.fullmatch(r"❌ رصيدك غير كافٍ\. رصيدك: (.+)", value)
+        if match:
+            return f"❌ Not enough points. Your balance: {match.group(1)}."
+        match = re.fullmatch(r"🛡️ حماية الغرفة شغالة\. حد التكرار: (\d+) رسائل\.", value)
+        if match:
+            return f"🛡️ Room protection is enabled. Repetition limit: {match.group(1)} messages."
+        match = re.fullmatch(r"(🛡️ تم تشغيل|⛔ تم إيقاف) حماية (.+)\.\n🏠 الغرفة: (.+)", value)
+        if match:
+            state = "enabled" if match.group(1).startswith("🛡️") else "disabled"
+            label = {
+                "حماية الغرفة من السب": "profanity protection",
+                "حماية الغرفة من الفلود": "flood protection",
+                "حماية الدخول والخروج": "repeated join/leave protection",
+                "حظر الحسابات بلا صورة": "blocking accounts without a profile photo",
+            }.get(match.group(2), match.group(2))
+            return f"{match.group(1)[:2]} {label.capitalize()} {state}.\n🏠 Room: {match.group(3)}"
+        match = re.fullmatch(r"🚫 \[حماية الفلود\] تم حظر IP سريعاً للحسابات التالية: (.+)", value)
+        if match:
+            return f"🚫 [Flood protection] IP-banned the following accounts after a rapid join attack: {match.group(1)}"
+        match = re.fullmatch(r"🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر \(من 2 إلى 50\)\.", value)
+        if match:
+            return "🔢 Send the allowed number of repeated messages before a ban (2–50)."
         # Keep names, numbers and URLs intact while translating the most common labels.
-        replacements = {
-            "تم تشغيل الأغنية": "Song started", "الأغنية": "song", "في البث": "in the live broadcast",
-            "جاري تجهيز طلب الأغنية": "Preparing the song request", "تم نشر الصورة بنجاح": "Image posted successfully",
-            "أوامر البوت": "Bot commands", "اختر لغة البوت للغرف المحددة": "Choose the bot language for the selected rooms",
-            "العربية": "Arabic", "عدد الغرف": "Rooms", "أرسلت طلبات الدخول": "Join requests sent",
-            "انتظر تأكيد الخادم": "Wait for server confirmation", "تم قبول طلب دخول الغرفة": "Room join request accepted",
-            "وداعاً نلتقي مرة أخرى": "Goodbye, see you again", "مرحبا لقد عدت ادري وحشتكم": "Hello, I am back; I know you missed me",
-        }
+        cached = getattr(self, "_english_room_replacements", None)
+        if cached is None:
+            cached = {
+                "تم تشغيل الأغنية": "Song started", "الأغنية": "song", "في البث": "in the live broadcast",
+                "جاري تجهيز طلب الأغنية": "Preparing the song request", "تم نشر الصورة بنجاح": "Image posted successfully",
+                "أوامر البوت": "Bot commands", "اختر لغة البوت للغرف المحددة": "Choose the bot language for the selected rooms",
+                "العربية": "Arabic", "عدد الغرف": "Rooms", "أرسلت طلبات الدخول": "Join requests sent",
+                "انتظر تأكيد الخادم": "Wait for server confirmation", "تم قبول طلب دخول الغرفة": "Room join request accepted",
+                "وداعاً نلتقي مرة أخرى": "Goodbye, see you again", "مرحبا لقد عدت ادري وحشتكم": "Hello, I am back; I know you missed me",
+                "لعبة العملة": "Coin toss", "اختيارك:": "Your choice:", "النتيجة:": "Result:",
+                "وجه": "Heads", "كتابة": "Tails", "فزت!": "You won!", "لم تفز هذه المرة.": "You didn't win this time.",
+                "عجلة الحظ": "Lucky wheel", "دارت العجلة وتوقفت على:": "The wheel landed on:",
+                "مبلغ الفوز:": "Winnings:", "مبلغ الخسارة:": "Loss:", "رصيدك:": "Your balance:",
+                "الرصيد:": "Balance:", "نقطة": "points", "نقاط": "points", "المكافأة:": "Reward:",
+                "لعبة الصناديق": "Box game", "اخترت الصندوق": "You chose box", "الصندوق الرابح:": "Winning box:",
+                "الصندوق الرابح كان:": "The winning box was:", "ربحت!": "You won!", "لم تربح.": "You didn't win.",
+                "أرسل الرقم فقط": "Send the number only", "صندوق ": "Box ",
+                "لعبة الكؤوس": "Cup game", "اختر الكوب:": "Choose a cup:", "اخترت الكوب": "You chose cup",
+                "الكأس الصحيح:": "Correct cup:", "وجدت الجائزة!": "You found the prize!", "الجائزة كانت في الكوب:": "The prize was under cup:", "الكوب الخطأ.": "Wrong cup.",
+                "معركة الوحش": "Monster battle", "قوتك:": "Your strength:", "قوة الوحش:": "Monster strength:",
+                "هزمت الوحش!": "You defeated the monster!", "الوحش هزمك.": "The monster defeated you.", "تعادل مع الوحش — لا توجد جائزة.": "It's a tie with the monster — no prize.",
+                "لعبة البركان": "Volcano game", "خرجت الجائزة من البركان!": "The prize erupted from the volcano!", "انفجر البركان ولم تجد جائزة.": "The volcano erupted, but there was no prize.",
+                "صيد الطائر": "Bird hunt", "ظهر:": "Appeared:", "عصفور": "Sparrow", "نسر": "Eagle", "بومة": "Owl", "ببغاء": "Parrot", "لم يظهر طائر": "No bird appeared",
+                "لعبة النجمة": "Star game", "حظك:": "Your luck:", "عادية": "Regular", "لامعة": "Shiny", "نادرة": "Rare", "أسطورية": "Legendary", "لم تلتقط نجماً": "You caught no star",
+                "بنك مليون": "Million Bank", "جاري البحث عن الجائزة...": "Searching for the prize...", "جاري البحث عن مليار...": "Searching for the billion...",
+                "🏆 فزت بـ ": "🏆 You won ", "🤖 البوت فاز!": "🤖 The bot won!", "🤝 تعادل!": "🤝 It's a tie!",
+                "طاولة": "Table game", "أونو": "UNO", "أنت:": "You:", "البوت:": "Bot:",
+                "اللاعب:": "Player:", "الاختيار:": "Choice:", "لا تتم المطابقة، حظاً موفقاً.": "No match. Better luck next time.",
+                "تعذر": "Could not", "لا يوجد": "No", "انتهت": "Ended", "انتظر دورك": "Please wait for your turn",
+                "تحتاج ": "You need ", "للمشاركة في ": " to play ", "رصيدك غير كافٍ": "Not enough points",
+                "حصل على حصانة": "is protected", "جاري البحث عن الضحية...": "Searching for a target...",
+                "حاول سرقة": "tried to rob", "فشلت السرقة": "The robbery failed", "المسروق": "the target",
+                "مفلس.": "has no points.", "رصيده:": "Their balance:", "تم إبلاغ الشرطة!": "The police were notified!",
+                "لم تتم السرقة.": "The robbery failed.", "تمت السرقة بنجاح!": "The robbery succeeded!",
+                "السارق:": "Thief:", "الضحية:": "Victim:", "المسروق:": "Stolen:", "حصل على +": "received +",
+                "رصيد السارق:": "Thief's balance:", "المستخدم:": "User:", "لا يوجد عضو آخر متاح": "No other eligible member is available",
+                "انضم اللاعب.": "Player joined.", "باقي ": "", "لاعبين ثم تبدأ اللعبة.": " players needed before the game starts.",
+                "بدأت اللعبة": "The game started", "اللاعبون:": "Players:", "دور ": "Turn: ", "اللاعب": "Player",
+                "أرسل رقم الخيار": "Send the option number", "انتهى وقت الاختيار.": "Selection timed out.",
+                "الاختيار: ": "Choice: ", "النتيجة: ": "Result: ", "غير صحيح.": "Invalid.",
+                "لم تتم المطابقة": "No match", "تمت المطابقة": "It's a match", "حظاً موفقاً": "Better luck next time",
+                "مبروك": "Congratulations", "فاز": "won", "فائز": "Winner", "الخاسر": "Loser",
+                "ربحت": "You won", "خسرت": "You lost", "نجحت وربحت": "You succeeded and won",
+                "لم تنجح هذه المرة.": "You didn't win this time.", "اختر": "Choose", "الطريقة:": "How to play:",
+                "الانتظار:": "Wait:", "دقيقة واحدة": "one minute", "دقائق": "minutes", "دقيقة": "minute",
+                "ثانية": "seconds", "ثواني": "seconds", "قبل بدء لعبة": "before starting the game",
+                "المستثمر:": "Investor:", "الربح:": "Profit:", "الخسارة:": "Loss:", "استثمار مع البوت": "Bot investment",
+                "حياة سعيدة مليئة بالفرح.": "a happy life full of joy.", "نتمنى لكما": "Wishing you both",
+                "لم أجد عضواً آخر متاحاً للزواج حالياً.": "I couldn't find another available player for a wedding right now.",
+                "لم أجد عضواً آخر حاضراً في هذه الغرفة.": "I couldn't find another player in this room.",
+                "الشخصية المشهورة:": "Celebrity:", "لغز ": "Riddle ", "الإجابة:": "Answer:",
+                "الجواب:": "Answer:", "انتهى وقت الاختيار.": "Selection time is over.",
+                "طلبت:": "You asked for:", "فشلت": "Failed", "نجحت": "Succeeded", "انتهت لعبة": "Game ended:",
+                "المبلغ غير صحيح.": "Invalid amount.", "لاعباً": "players", "لاعبين": "players", "مع البوت": "against the bot",
+                "ابدأ": "Start", "اكتب rool": "type rool", "اكتب join": "type join",
+            }
+            self._english_room_replacements = cached
+        replacements = cached
         for ar, en in replacements.items():
             value = value.replace(ar, en)
         return value
@@ -12386,7 +12607,7 @@ class TalkinBot:
                 d.text((cx,cy),str(i+1),fill=(255,255,255),font=_gift_font("1",18),anchor="mm")
 
         # Title and final winner badge. The winner photo is embedded in the final image.
-        title="لودو"
+        title="Ludo" if state.get("lang") == "en" else "لودو"
         d.rounded_rectangle((ox,18,ox+15*cell,oy-5),radius=16,fill=(16,30,45),outline=(230,190,75),width=3)
         d.text((ox+15*cell//2,42),title,fill=(245,205,80),font=_gift_font("1",30),anchor="mm")
         if winner_name:
@@ -12402,7 +12623,7 @@ class TalkinBot:
             avatar = _load_sender_avatar(winner_photo, 72) if winner_photo else None
             if avatar is not None:
                 _paste_avatar_safe(img, avatar, (ox+20, panel_y0+14))
-            d.text((ox+15*cell//2, panel_y0+31), "🏆 الفائز",
+            d.text((ox+15*cell//2, panel_y0+31), "🏆 Winner" if state.get("lang") == "en" else "🏆 الفائز",
                    fill=(245,205,80), font=_gift_font("1",22), anchor="ma")
             d.text((ox+15*cell//2, panel_y0+70), f"@{str(winner_name).lstrip('@')}",
                    fill=(255,255,255), font=_gift_font("1",26), anchor="ma")
@@ -12420,9 +12641,10 @@ class TalkinBot:
         if low in ("لودو","ludo") and not game:
             if not self._board_game_cooldown_notice(room, sender):
                 return True
-            game={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
+            room_language = getattr(self, "room_languages", {}).get(_norm_room(room))
+            game={"players":[sender],"tokens":{sender:0},"lang":room_language or ("en" if low=="ludo" else "ar"),"turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
             self.ludo_games[key]=game; self._schedule_board_game_timeout(key, game, "لودو")
-            self.send_room_text(room,"🎲 Ludo: choose players 1-4. Type 1/2/3/4." if low=="ludo" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين"); return True
+            self.send_room_text(room,"🎲 Ludo — choose 1–4 players.\n1 = You vs. the bot; 2–4 = multiplayer.\nOther players type join. When the game starts, type rool on your turn to roll the die and move. First token to the finish wins." if game["lang"] == "en" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين\nاكتب join للانضمام، ثم rool عند دورك لرمي النرد وتحريك القطعة. أول لاعب يصل للنهاية يفوز."); return True
         if not game:return False
         origin_room = str(game.get("origin_room") or next(iter(game.get("rooms", {room})), room))
         game["origin_room"] = origin_room
@@ -12942,14 +13164,48 @@ class TalkinBot:
             elif idx >= len(page_sections) - 1:
                 text += "\n\n✅ انتهت أقسام هذه القائمة."
         if room and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
-            text = {
-                1: "📋 Admin commands\n━━━━━━━━━━━━\nkick@name — remove a member\nban@name — ban a member\nleave room — leave and rejoin (primary master only)\njoin@room_name — enter a room\ninv — invite room members\ninvmsg@message — change the invitation message",
-                2: "🎵 Music and reactions\n━━━━━━━━━━━━\nplay song / music song — play a song\nstop music — stop the current song\nlk@code — like\nlv@code — love\ndl@code — dislike\ncm@code message — comment\nreport@code message — report",
-                3: "🎮 Games\n━━━━━━━━━━━━\nrock paper scissors, investment, luck, coin@heads, wheel, box, cup, monster, volcano, bird, star, table, uno\n\nType ns for the next list.",
-                4: "🎁 Gifts and publishing\n━━━━━━━━━━━━\ngv — gifts\npost@description / publish@description — publish an image\nSend the image after the command.",
-                5: "💰 Points\n━━━━━━━━━━━━\npoints — your balance\ntop — leaderboard\nsb@name@amount — transfer points",
-                6: "🚪 Rooms and welcomes\n━━━━━━━━━━━━\njoin@room_name — enter a room\nmyrooms — connected rooms\nleave room — leave and rejoin\ninv — invite members\ninvmsg@message — change invitation text",
-            }.get(int(page), text)
+            english = {
+                1: [
+                    "📋 Admin — moderation\n━━━━━━━━━━━━\nkick@name / kick name — kick a member\nban@name / ban name — ban a member\nub@name / unban name — unban a member\n.u — undo the bot’s last action",
+                    "📋 Admin — roles\n━━━━━━━━━━━━\nm@name — make a member\na@name / admin name — make an admin\no@name / owner name — make an owner\n+creator@name — add a room creator\n-creator@name — remove a room creator",
+                    "📋 Admin — verification and VIP\n━━━━━━━━━━━━\nvi@name — verify a user\nuns@name — remove verification\nvip@name / unvip@name — manage VIP status\nverify all — verify room members",
+                    "🛡️ Admin — protection\n━━━━━━━━━━━━\nprotection@room — open room protection settings\nprotection status — show protection status\nenable protection / disable protection — toggle room protection\nType protection to see numbered options.",
+                    "📋 Admin — filter and publishing\n━━━━━━━━━━━━\nmf@on / mf@off — enable/disable the word filter\n+mf@word / -mf@word — add/remove a filtered word\nl@mf — list filtered words\nmbp@name — remove a publishing ban",
+                    "📋 Admin — advanced commands\n━━━━━━━━━━━━\nstatus — bot status\nram / cpu — resource status\nmyrooms — connected rooms\njoin all — rejoin saved rooms\ninv / invite — invite members from this room",
+                ],
+                2: [
+                    "🎵 Music\n━━━━━━━━━━━━\n.sa song name / play song name — play music\nstop music / stop — stop the current song\nsher@name — share the current song",
+                    "❤️ Reactions, photos and lookalikes\n━━━━━━━━━━━━\nlk@code — like | lv@code — love | dl@code — dislike\ncm@code text — comment | report@code text — report\nmy photo / lookalike@name — safe image search",
+                ],
+                3: [
+                    "🎮 Games — solo games\n━━━━━━━━━━━━\nrock / paper / scissors — play against the bot\ninvestment, luck, coin@heads/tails, wheel\nbox@1-3, cup@1-3, monster, volcano, bird, star\ntable, uno\nType ns for the next games list.",
+                    "🎮 Games — wagers\n━━━━━━━━━━━━\nbet@amount — wager | duel@amount — duel\nmyluck@amount — luck wager\ninvestment@amount — investment game\nChoose the stake after the game command.",
+                    "🎮 Games — bank and rewards\n━━━━━━━━━━━━\nbank million — million bank | billion — billion game\nfarm@item — plant a crop | stock — choose a market\nface@name — face game\nType ns for the next games list.",
+                    "🎲 Room games — Ludo and Snake & Ladders\n━━━━━━━━━━━━\nludo — start Ludo; choose 1–4 players\n1 = play against the bot; 2–4 = multiplayer\nOther players type join. When the game starts, the player whose turn it is types rool to roll the die and move. First token to the finish wins.\nsnake — start Snake & Ladders; type join to enter.\nType ns for the next games list.",
+                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nfishing, lightning, ruby, crash, detector\nMultiplayer games need other players to join.\nType ns for the next games list.",
+                    "🏏 Cricket\n━━━━━━━━━━━━\nMaster: start cricket game / stop cricket game.\nVerified players: .cr 1, choose 1–4 players, then each player types join. Choose 1 (bat) or 2 (defend), then send a score from 0 to 6 for each ball.\nType ns to return to the first game list.",
+                ],
+                4: [
+                    "🎁 Gifts\n━━━━━━━━━━━━\nsa@number@name — send a gift\ngifts / gv — open the gift menu\nThe sender and recipient must be eligible; gift cost is deducted from points.",
+                    "📢 Publishing\n━━━━━━━━━━━━\npost or publish — prepare an image post\npost@description / publish@description — add a caption\nSend the image when prompted. Publishing follows the room’s permissions and content filter.",
+                ],
+                5: [
+                    "💰 Points and leaderboards\n━━━━━━━━━━━━\npoints — your balance and game stats\ntop — leaderboard\ntop bet / top duel / top investment — game leaderboards",
+                    "💸 Point transfers\n━━━━━━━━━━━━\nsb@name@amount — transfer from your balance\nExample: sb@ahmed@1000\nTransfers are limited to eligible users and deduct points from the sender.",
+                ],
+                6: [
+                    "🚪 Rooms\n━━━━━━━━━━━━\njoin@room_name — join a room, then select its language\nmyrooms — list connected rooms\nleave room — leave and rejoin (primary master only)\ninv / invite — invite members from this room\ninvmsg@text — change invitation text",
+                    "🏠 Room messages, welcomes and protection\n━━━━━━━━━━━━\nsay text — make the bot speak\n+sr@trigger@reply — add an auto-reply (master)\nswc@on / swc@off — toggle welcome messages\nprotection — open protection settings\nType ns for the next room list.",
+                ],
+            }
+            page_english = english.get(int(page), [])
+            if page_english:
+                idx = max(1, min(int(part), len(page_english))) - 1
+                text = page_english[idx]
+                if idx < len(page_english) - 1:
+                    text += "\n\nType ns for the next section."
+                elif int(page) == 3:
+                    text += "\n\nType ns to return to the first game list."
         # a3 is intentionally one single message: the 13 bot-vs-bot games
         # must never be split into two chat bubbles. Other help sections keep
         # the normal safe line batching.
@@ -12969,6 +13225,8 @@ class TalkinBot:
         sections = _help_sections_from_messages().get(3, [])
         if not sections:
             return False
+        if room and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            return self._send_help_section(room=room, page=3, part=part)
         idx = max(1, min(int(part), len(sections))) - 1
         text = sections[idx]
         # The first A3 page already contains its exact navigation footer.
@@ -13019,6 +13277,8 @@ class TalkinBot:
 
         if _body_low in ("اوامر", "الاوامر", "help", "مساعدة"):
             menu = _command_menu_for(_is_primary_master(sender), is_private=is_private)
+            if room and not is_private and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+                menu = "📚 Talkin bot commands\n━━━━━━━━━━━━\na2 — Music and reactions\na3 — Games\na4 — Gifts and publishing\na5 — Points\na6 — Rooms and welcomes\n━━━━━━━━━━━━\nType a2–a6 to open a section."
             if is_private:
                 self.send_private_text(sender, menu)
             elif room:
@@ -13141,6 +13401,8 @@ class TalkinBot:
         repeat_last_command = str(body or "").strip().casefold() == ".u"
         security_command = bool(
             re.match(r"^(?:تشغيل|إيقاف) الحماية$", str(body or "").strip(), re.I)
+            or str(body or "").strip().casefold() in {"protection", "room protection", "protection status", "room protection status", "enable protection", "enable room protection", "disable protection", "disable room protection"}
+            or re.match(r"^(?:protection|room protection)(?:@|\s+).+", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
             or str(body or "").strip().casefold() in {"حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "l@mfb"}
             or re.match(r"^(?:amf|[-+]amf)@.+$", str(body or "").strip(), re.I)
@@ -14088,7 +14350,7 @@ class TalkinBot:
             return True
 
         # Protection status: report actual persisted room protection switches.
-        if low in ("حالة الحماية", "حاله الحمايه", "حالة حماية", "حاله حماية"):
+        if low in ("حالة الحماية", "حاله الحمايه", "حالة حماية", "حاله حماية", "protection status", "room protection status"):
             target_room = str(room or self.room or "").strip()
             if not target_room:
                 self.send_private_text(sender, "⚠️ لا توجد غرفة محددة لفحص الحماية.")
@@ -14098,16 +14360,28 @@ class TalkinBot:
             pcfg = _room_protection_cfg(target_room)
             mcfg = _room_moderation_config(target_room)
             bot_prot = bool(getattr(self, "bot_protection_enabled", _bot_protection_enabled()))
-            self.send_private_text(
-                sender,
-                f"🛡️ حالة الحماية — {target_room}\n"
-                f"• حماية الغرفة: {'🟢 شغالة' if mcfg.get('enabled') else '🔴 متوقفة'}\n"
-                f"• فلتر الكلمات: {'🟢 شغال' if pcfg.get('swear') else '🔴 متوقف'}\n"
-                f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('repeat') else '🔴 متوقفة'}\n"
-                f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
-                f"• حد التكرار: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
-                f"• حماية البوت الداخلية: {'🟢 شغالة' if bot_prot else '🔴 متوقفة'}"
-            )
+            if getattr(self, "room_languages", {}).get(_norm_room(target_room)) == "en":
+                protection_state = lambda enabled: "🟢 Enabled" if enabled else "🔴 Disabled"
+                status_text = (
+                    f"🛡️ Protection status — {target_room}\n"
+                    f"• Room protection: {protection_state(mcfg.get('enabled'))}\n"
+                    f"• Profanity filter: {protection_state(pcfg.get('swear'))}\n"
+                    f"• Repeated-message protection: {protection_state(pcfg.get('repeat'))}\n"
+                    f"• Join/leave protection: {protection_state(pcfg.get('flood'))}\n"
+                    f"• Repetition limit: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
+                    f"• Internal bot protection: {protection_state(bot_prot)}"
+                )
+            else:
+                status_text = (
+                    f"🛡️ حالة الحماية — {target_room}\n"
+                    f"• حماية الغرفة: {'🟢 شغالة' if mcfg.get('enabled') else '🔴 متوقفة'}\n"
+                    f"• فلتر الكلمات: {'🟢 شغال' if pcfg.get('swear') else '🔴 متوقف'}\n"
+                    f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('repeat') else '🔴 متوقفة'}\n"
+                    f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
+                    f"• حد التكرار: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
+                    f"• حماية البوت الداخلية: {'🟢 شغالة' if bot_prot else '🔴 متوقفة'}"
+                )
+            self.send_private_text(sender, status_text)
             return True
 
         # Overall bot health/status for the master. This is diagnostic, not a
@@ -14234,7 +14508,7 @@ class TalkinBot:
 
         # The protection menu and all of its numbered settings are private and
         # restricted to the configured primary master.
-        protection_match = re.fullmatch(r"(?:حماية|حمايه|حماية الغرفة|حمايه الغرفه)(?:@([^@]+)|\s+(.+))?", text, re.I)
+        protection_match = re.fullmatch(r"(?:حماية|حمايه|حماية الغرفة|حمايه الغرفه|protection|room protection)(?:@([^@]+)|\s+(.+))?", text, re.I)
         if protection_match:
             room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
                                           or _room_manager(self, room, sender)))
@@ -14353,7 +14627,7 @@ class TalkinBot:
                 self.send_private_text(sender,"\n".join(lines))
             return True
 
-        if low in ("تشغيل الحماية", "تشغيل الحمايه", "الحماية تشغيل", "الحمايه تشغيل"):
+        if low in ("تشغيل الحماية", "تشغيل الحمايه", "الحماية تشغيل", "الحمايه تشغيل", "enable protection", "enable room protection"):
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
                                 or _room_manager(self, room, sender)):
                 return True
@@ -14361,7 +14635,7 @@ class TalkinBot:
             _save_room_protection(room, swear=True, flood=True)
             self.send_room_text(room, f"🛡️ حماية الغرفة شغالة. حد التكرار: {cfg['repeat_limit']} رسائل.")
             return True
-        if low in ("إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "الحماية إيقاف", "الحمايه ايقاف"):
+        if low in ("إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "الحماية إيقاف", "الحمايه ايقاف", "disable protection", "disable room protection"):
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
                                 or _room_manager(self, room, sender)):
                 return True
