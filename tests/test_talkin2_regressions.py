@@ -264,6 +264,88 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertIn("سلام يا left_user", sent[0][1])
 
 
+class CommandLanguageAndReconnectRegressions(unittest.TestCase):
+    def test_room_reply_language_follows_each_sender_command_both_directions(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {
+            bot_module._norm_room("ArabicRoom"): "ar",
+            bot_module._norm_room("EnglishRoom"): "en",
+        }
+        bot._english_room_exact_translations = {"رد عربي": "English reply"}
+        observed = []
+
+        def inspect_language(result):
+            event = result["room_event"]
+            room = event[13]
+            observed.append((bot._effective_room_language(room),
+                             bot._localize_room_text(room, "رد عربي")))
+
+        bot._handle_room_event_impl = inspect_language
+        bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "help", 13: "ArabicRoom"}})
+        bot.handle_room_event({"room_event": {1: "text", 2: "Bob", 6: "مساعدة", 13: "EnglishRoom"}})
+
+        self.assertEqual(observed, [("en", "English reply"), ("ar", "رد عربي")])
+        self.assertEqual(bot._effective_room_language("ArabicRoom"), "ar")
+        self.assertEqual(bot._effective_room_language("EnglishRoom"), "en")
+
+    def test_numeric_game_choice_inherits_the_players_last_command_language(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("Hall"): "ar"}
+        observed = []
+        bot._handle_room_event_impl = lambda result: observed.append(
+            bot._effective_room_language(result["room_event"][13])
+        )
+        bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "ludo", 13: "Hall"}})
+        bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "1", 13: "Hall"}})
+        self.assertEqual(observed, ["en", "en"])
+
+    def test_auto_rejoin_stops_after_five_attempts_in_the_window(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = set()
+        bot._pending_room_joins = {}
+        bot._intentional_leaves = set()
+        bot.blocked_rooms = set()
+        bot._auto_rejoin_lock = threading.Lock()
+        bot._auto_rejoin_pending = set()
+        bot._auto_rejoin_state = {}
+        bot._connection_generation = 1
+        bot._room_bulk_lock = threading.RLock()
+        bot.log = lambda *_args: None
+        attempts = []
+        bot.join_room = lambda room, **kwargs: attempts.append((room, kwargs)) or True
+
+        class ImmediateThread:
+            def __init__(self, target=None, **_kwargs):
+                self.target = target
+            def start(self):
+                self.target()
+
+        with patch.object(bot_module.threading, "Thread", ImmediateThread), patch.object(
+            bot_module.time, "sleep", lambda *_args: None
+        ):
+            for _ in range(7):
+                bot._schedule_auto_rejoin("Hall", delay=0)
+        self.assertEqual(len(attempts), 5)
+
+    def test_new_socket_clears_stale_room_join_acknowledgements(self):
+        class Timer:
+            cancelled = False
+            def cancel(self):
+                self.cancelled = True
+
+        timer = Timer()
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = {"Hall"}
+        bot._pending_room_joins = {"hall": {"timer": timer}}
+        bot._auto_rejoin_pending = {"hall"}
+        bot._auto_rejoin_lock = threading.Lock()
+        bot._reset_room_connection_state()
+        self.assertEqual(bot.connected_rooms, set())
+        self.assertEqual(bot._pending_room_joins, {})
+        self.assertEqual(bot._auto_rejoin_pending, set())
+        self.assertTrue(timer.cancelled)
+
+
 class RoomExclusionRegressions(unittest.TestCase):
     def test_unauthorized_room_is_persisted_skipped_and_only_manual_join_clears_it(self):
         class NoOpTimer:
@@ -1486,10 +1568,103 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         }
         bot.log = lambda *_args: None
 
-        result = bot._music_fast_source("fast song")
+        sources = iter(bot._music_fast_sources("fast song"))
+        result = next(sources)
+        alternate = next(sources)
 
         self.assertTrue(audius_started.wait(1))
         self.assertEqual(result["url"], "https://cdn.example/fast.mp3")
+        self.assertEqual(alternate["url"], "https://cdn.example/slow.mp3")
+        self.assertIn("direct", bot._music_source_latency_ewma)
+        self.assertIn("Audius", bot._music_source_latency_ewma)
+
+    def test_normal_music_uses_next_fast_source_if_first_media_send_is_rejected(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        candidates = [
+            {"url": "https://cdn.example/first.mp3", "title": "Song", "duration": 30, "source": "first"},
+            {"url": "https://cdn.example/second.mp3", "title": "Song", "duration": 30, "source": "second"},
+        ]
+        bot._music_fast_sources = lambda _query: iter(candidates)
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append(("text", room, text))
+        def send_media(room, url, kind, duration=0):
+            sent.append(("media", room, url, kind, duration))
+            return url.endswith("second.mp3")
+        bot.send_room_media = send_media
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: None
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_spotify_track_metadata", side_effect=AssertionError("plain title must not wait for Spotify")), patch.object(
+            bot_module, "_public_base_url", lambda: "https://bot.example"
+        ), patch.object(bot_module, "_record_media_publication", lambda *_args: None), patch.object(
+            bot_module.threading, "Thread", ImmediateThread
+        ):
+            self.assertTrue(bot.handle_music_command("Hall", ".sa Fast Song", "Tester", with_reactions=False))
+
+        media_urls = [item[2] for item in sent if item[0] == "media"]
+        self.assertEqual(media_urls, ["https://cdn.example/first.mp3", "https://cdn.example/second.mp3"])
+        self.assertEqual(bot.music_current[bot_module._norm_user("Tester")]["url"], "https://cdn.example/second.mp3")
+
+    def test_live_music_moves_to_next_source_when_fastest_cannot_start(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot.music_current = {}
+        bot.reaction_targets = {}
+        bot._last_live_play_status_by_room = {}
+        bot._music_fast_sources = lambda _query: iter([
+            {"url": "https://cdn.example/first-live.mp3", "title": "Song", "duration": 30, "source": "first"},
+            {"url": "https://cdn.example/second-live.mp3", "title": "Song", "duration": 30, "source": "second"},
+        ])
+        bot._bot_is_room_owner = lambda _room: True
+        attempts = []
+        def play(room, url, duration=0):
+            attempts.append(url)
+            started = url.endswith("second-live.mp3")
+            bot._last_live_play_status_by_room[room] = "started" if started else "failed"
+            return started
+        bot._play_music_in_live_room = play
+        bot.send_room_text = lambda *_args: True
+        bot.log = lambda *_args: None
+        bot.report_master_error = lambda *_args: None
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(bot_module, "_public_base_url", lambda: "https://bot.example"), patch.object(
+            bot_module, "_record_media_publication", lambda *_args: None
+        ), patch.object(bot_module.threading, "Thread", ImmediateThread):
+            self.assertTrue(bot.handle_music_command("Hall", ".sa Fast Song", "Tester", with_reactions=False, live_stream=True))
+        self.assertEqual(attempts, ["https://cdn.example/first-live.mp3", "https://cdn.example/second-live.mp3"])
+
+    def test_queued_live_track_resolves_alternate_excluding_failed_url(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        calls = []
+        fallback = {"url": "https://cdn.example/backup.mp3", "source": "backup", "duration": 45}
+        def sources(query, exclude_urls=None):
+            calls.append((query, set(exclude_urls or ())))
+            return iter([fallback])
+        bot._music_fast_sources = sources
+        track = {
+            "url": "https://cdn.example/failed.mp3",
+            "fallback_search_query": "song artist",
+            "fallback_source_iterator": iter(()),
+            "attempted_source_urls": {"https://cdn.example/failed.mp3"},
+        }
+        result = bot._next_music_fallback_source("Hall", track)
+        self.assertEqual(result, fallback)
+        self.assertEqual(calls, [("song artist", {"https://cdn.example/failed.mp3"})])
 
     def test_spotify_link_is_resolved_before_playable_source_search(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

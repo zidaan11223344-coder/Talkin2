@@ -2408,6 +2408,19 @@ def _looks_like_bot_command(text):
         or normalized_low in normalized_games
     )
 
+
+def _detect_text_language(text):
+    """Detect the language from the first alphabetic character in a message."""
+    for char in unicodedata.normalize("NFKC", str(text or "")):
+        if not char.isalpha():
+            continue
+        codepoint = ord(char)
+        if 0x0600 <= codepoint <= 0x06FF:
+            return "ar"
+        if (0x0041 <= codepoint <= 0x005A) or (0x0061 <= codepoint <= 0x007A):
+            return "en"
+    return None
+
 def _auto_reply_key(value):
     """Normalize an automatic-reply trigger for natural Arabic input."""
     text = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
@@ -6065,26 +6078,59 @@ class TalkinBot:
             )
 
     def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
-        """Auto rejoin a room immediately when kicked or removed."""
+        """Rejoin after a departure with bounded attempts and exponential backoff."""
         if not room:
             return
         room_key = _norm_room(room)
+        if room_key in getattr(self, "blocked_rooms", set()):
+            return
+        if room_key in getattr(self, "_intentional_leaves", set()):
+            return
+        pending_join = getattr(self, "_pending_room_joins", {}).get(room_key)
+        if pending_join:
+            started = float(pending_join.get("started") or 0)
+            if time.time() - started < max(30.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20")) + 5.0):
+                self.log(f"[AUTO_REJOIN] room join is already pending; skip {room}")
+                return
         if not hasattr(self, "_auto_rejoin_lock"):
             self._auto_rejoin_lock = threading.Lock()
         if not hasattr(self, "_auto_rejoin_pending"):
             self._auto_rejoin_pending = set()
+        if not hasattr(self, "_auto_rejoin_state"):
+            self._auto_rejoin_state = {}
+        now = time.monotonic()
         with self._auto_rejoin_lock:
             if room_key in self._auto_rejoin_pending:
                 return
+            state = self._auto_rejoin_state.setdefault(room_key, {"attempts": [], "joined_at": 0.0})
+            if state.get("joined_at") and now - float(state["joined_at"]) >= 120.0:
+                state["attempts"] = []
+            recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
+            if len(recent_attempts) >= 5:
+                state["attempts"] = recent_attempts
+                self.log(f"[AUTO_REJOIN] stopping after 5 attempts in 15 minutes: {room}")
+                return
+            state["attempts"] = recent_attempts + [now]
+            delay = max(float(delay), min(60.0, 1.2 * (2 ** len(recent_attempts))))
+            generation = int(getattr(self, "_connection_generation", 0))
             self._auto_rejoin_pending.add(room_key)
         def _rejoin_worker():
             try:
                 time.sleep(delay)
+                if generation != int(getattr(self, "_connection_generation", 0)):
+                    self.log(f"[AUTO_REJOIN] stale connection worker cancelled: {room}")
+                    return
                 if any(_norm_room(r) == room_key for r in getattr(self, "connected_rooms", set())):
                     self.log(f"[AUTO_REJOIN] already connected; skip {room}")
                     return
+                if room_key in getattr(self, "_pending_room_joins", {}):
+                    self.log(f"[AUTO_REJOIN] pending join already exists; skip {room}")
+                    return
                 self.log(f"[AUTO_REJOIN] Attempting to rejoin {room}...")
                 with self._room_bulk_lock:
+                    if generation != int(getattr(self, "_connection_generation", 0)):
+                        self.log(f"[AUTO_REJOIN] connection changed before join; cancel {room}")
+                        return
                     self.join_room(room, force=True)
             except Exception as e:
                 self.log(f"[AUTO_REJOIN] Rejoin failed for {room}:", repr(e))
@@ -6104,6 +6150,20 @@ class TalkinBot:
         if not room:
             return False
         room_norm = _norm_room(room)
+        pending = getattr(self, "_pending_room_joins", {}).get(room_norm)
+        if pending:
+            pending_age = time.time() - float(pending.get("started") or 0)
+            pending_timeout = max(30.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20")) + 5.0)
+            if pending_age < pending_timeout:
+                self.log("[ROOM] duplicate join suppressed while acknowledgement is pending:", room)
+                return False
+            stale_timer = pending.get("timer")
+            if stale_timer:
+                try:
+                    stale_timer.cancel()
+                except Exception:
+                    pass
+            self._pending_room_joins.pop(room_norm, None)
         # Forced automatic rejoin may bypass debounce, but it must not bypass a
         # server-confirmed ban. Only a user-requested join clears that ban.
         if force or requested_by:
@@ -6536,7 +6596,7 @@ class TalkinBot:
 
     def _localize_room_text(self, room, text):
         """Localize common bot notices for rooms selected as English."""
-        if getattr(self, "room_languages", {}).get(_norm_room(room)) != "en":
+        if self._effective_room_language(room) != "en":
             return str(text or "")
         value = str(text or "")
         # English text needs no processing. Arabic rooms returned above already;
@@ -6791,6 +6851,60 @@ class TalkinBot:
         for ar, en in replacements.items():
             value = value.replace(ar, en)
         return value
+
+    def _active_room_language_override(self, room):
+        context = getattr(self, "_room_response_language_context", None)
+        active = getattr(context, "active", None) if context is not None else None
+        if active and active[0] == _norm_room(room):
+            return active[1]
+        return None
+
+    def _effective_room_language(self, room):
+        """Use the current command's language, falling back to the room setting."""
+        override = self._active_room_language_override(room)
+        if override in ("ar", "en"):
+            return override
+        return getattr(self, "room_languages", {}).get(_norm_room(room), "ar")
+
+    def _push_room_language_override(self, room, language):
+        if language not in ("ar", "en"):
+            return None
+        context = getattr(self, "_room_response_language_context", None)
+        if context is None:
+            context = self._room_response_language_context = threading.local()
+        previous = getattr(context, "active", None)
+        context.active = (_norm_room(room), language)
+        return context, previous
+
+    @staticmethod
+    def _restore_room_language_override(token):
+        if token is None:
+            return
+        context, previous = token
+        if previous is None:
+            try:
+                del context.active
+            except AttributeError:
+                pass
+        else:
+            context.active = previous
+
+    def _capture_room_response_language(self, room, command_text=""):
+        active = self._active_room_language_override(room)
+        if active:
+            return active
+        detected = _detect_text_language(command_text)
+        return detected or self._effective_room_language(room)
+
+    def _localized_room_worker(self, room, language, worker):
+        """Wrap a background worker so its replies keep the originating language."""
+        def run():
+            token = self._push_room_language_override(room, language)
+            try:
+                return worker()
+            finally:
+                self._restore_room_language_override(token)
+        return run
 
     def send_room_text(self, room: str, text: str):
         text = self._localize_room_text(room, text)
@@ -8485,9 +8599,31 @@ class TalkinBot:
                     time.sleep(0.25)
                 if getattr(self, f"_livekit_active_{room}", False):
                     first_frame = self._feed_livekit_audio(room, str(track["url"]), int(track.get("duration") or 0))
+                    while not first_frame:
+                        alternative = self._next_music_fallback_source(room, track)
+                        if not alternative:
+                            break
+                        alternative_url = str(alternative.get("url") or "").strip()
+                        if not alternative_url:
+                            continue
+                        track["url"] = alternative_url
+                        track["duration"] = int(alternative.get("duration") or track.get("duration") or 0)
+                        first_frame = self._feed_livekit_audio(
+                            room, alternative_url, int(track.get("duration") or 0)
+                        )
+                        self.log("[MUSIC] LiveKit fallback source tested:",
+                                 alternative.get("source"), "started=", first_frame, "room=", room)
                     status = getattr(self, "_last_live_play_status_by_room", {})
                     if first_frame:
                         status[room] = "started"
+                        requester_name = str(track.get("requester") or "").strip()
+                        music_current = getattr(self, "music_current", {})
+                        if requester_name:
+                            current = music_current.get(_norm_user(requester_name), {})
+                            current.update(url=str(track.get("url") or ""),
+                                           duration=int(track.get("duration") or 0),
+                                           created_at=time.time())
+                            music_current[_norm_user(requester_name)] = current
                         self.send_room_text(room, "تم تشغيل الطلب في البث")
                     else:
                         status[room] = "failed"
@@ -9909,12 +10045,25 @@ class TalkinBot:
             self.log("[MUSIC] direct live source failed:", " | ".join(errors[-6:]))
         return None
 
-    def _music_fast_source(self, query):
-        """Race Audius and direct extractor lookups; use the first playable URL."""
+    def _music_fast_sources(self, query, exclude_urls=None):
+        """Yield valid source URLs in measured response-time order."""
         q = str(query or "").strip()
         if not q:
-            return None
+            return
+        excluded = {str(url or "").strip() for url in (exclude_urls or ())}
         results = queue.Queue()
+        def record_source_latency(source_label, elapsed):
+            lock = getattr(self, "_music_source_latency_lock", None)
+            if lock is None:
+                lock = self._music_source_latency_lock = threading.Lock()
+            with lock:
+                stats = getattr(self, "_music_source_latency_ewma", None)
+                if stats is None:
+                    stats = self._music_source_latency_ewma = {}
+                old_latency = stats.get(source_label)
+                stats[source_label] = float(elapsed) if old_latency is None else (
+                    0.7 * float(old_latency) + 0.3 * float(elapsed)
+                )
         tasks = (
             ("Audius", self._audius_live_source),
             ("direct", self._music_live_source),
@@ -9926,10 +10075,16 @@ class TalkinBot:
                 continue
 
             def run_lookup(source_label=label, source_resolver=resolver):
+                lookup_started = time.monotonic()
                 try:
-                    results.put((source_label, source_resolver(q), None))
+                    result = source_resolver(q)
+                    elapsed = time.monotonic() - lookup_started
+                    record_source_latency(source_label, elapsed)
+                    results.put((source_label, result, None, elapsed))
                 except Exception as exc:
-                    results.put((source_label, None, exc))
+                    elapsed = time.monotonic() - lookup_started
+                    record_source_latency(source_label, elapsed)
+                    results.put((source_label, None, exc, elapsed))
                 finally:
                     _MUSIC_SOURCE_SEMAPHORE.release()
 
@@ -9945,12 +10100,13 @@ class TalkinBot:
 
         remaining_sources = launched
         deadline = started_at + max(0.5, MUSIC_FAST_LOOKUP_TIMEOUT)
+        yielded_urls = set(excluded)
         while remaining_sources:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:
-                label, result, error = results.get(timeout=remaining)
+                label, result, error, elapsed = results.get(timeout=remaining)
             except queue.Empty:
                 break
             remaining_sources -= 1
@@ -9960,14 +10116,45 @@ class TalkinBot:
             if not isinstance(result, dict) or not str(result.get("url") or "").strip():
                 continue
             value = dict(result)
+            source_url = str(value.get("url") or "").strip()
+            if source_url in yielded_urls:
+                continue
+            yielded_urls.add(source_url)
             value.setdefault("source", label)
             value.setdefault("uploader", label)
+            value["resolver_latency_seconds"] = round(float(elapsed), 4)
+            stats = getattr(self, "_music_source_latency_ewma", {})
             self.log(
-                "[MUSIC] fastest playable source:", label,
-                f"in {time.monotonic() - started_at:.2f}s",
+                "[MUSIC] source measured:", label,
+                f"resolver={float(elapsed):.2f}s, EWMA={stats[label]:.2f}s",
             )
-            return value
-        self.log("[MUSIC] fast source lookup timed out/empty:", q[:100])
+            yield value
+        if not yielded_urls - excluded:
+            self.log("[MUSIC] fast source lookup timed out/empty:", q[:100])
+
+    def _music_fast_source(self, query):
+        """Backward-compatible helper returning the currently fastest source."""
+        return next(self._music_fast_sources(query), None)
+
+    def _next_music_fallback_source(self, room, track):
+        """Resolve another measured source after a live track fails to start."""
+        if not isinstance(track, dict):
+            return None
+        attempted = set(track.get("attempted_source_urls") or ())
+        current = str(track.get("url") or "").strip()
+        if current:
+            attempted.add(current)
+        sources = track.get("fallback_source_iterator")
+        candidate = next(sources, None) if sources is not None else None
+        if candidate is None and track.get("fallback_search_query"):
+            sources = self._music_fast_sources(
+                track["fallback_search_query"], exclude_urls=attempted
+            )
+            track["fallback_source_iterator"] = sources
+            candidate = next(sources, None)
+        if candidate:
+            track["attempted_source_urls"] = attempted
+            return candidate
         return None
 
     def _music_download(self,query):
@@ -10212,11 +10399,15 @@ class TalkinBot:
         detail = " | ".join(errors[-10:])
         raise RuntimeError("تعذر تنزيل ملف صوت من المصادر المتاحة." + (f" تفاصيل: {detail[:1200]}" if detail else ""))
 
-    def handle_music_command(self,room,text,requester,private_to="",broadcast_all=False,with_reactions=True,room_output=True,live_stream=False):
-        raw=text.strip()
-        if not raw.lower().startswith(".sa "): return False
-        query=raw[4:].strip()
-        if not query: self.send_room_text(room,"❌ اكتب: .sa اسم الأغنية"); return True
+    def handle_music_command(self, room, text, requester, private_to="", broadcast_all=False,
+                             with_reactions=True, room_output=True, live_stream=False):
+        raw = str(text or "").strip()
+        if not raw.lower().startswith(".sa "):
+            return False
+        query = raw[4:].strip()
+        if not query:
+            self.send_room_text(room, "❌ اكتب: .sa اسم الأغنية")
+            return True
         if live_stream and not self._bot_is_room_owner(room):
             role = self._bot_room_role(room) or "غير معروفة"
             self.send_room_text(
@@ -10226,69 +10417,160 @@ class TalkinBot:
                 f"📌 الرتبة الحالية: {role}"
             )
             return True
-        now=time.time(); last=self.music_last.get(requester,0)
-        if now-last<MUSIC_COOLDOWN: self.send_room_text(room,f"⏳ انتظر {int(MUSIC_COOLDOWN-(now-last))+1} ثانية."); return True
-        self.music_last[requester]=now
+        now = time.time()
+        last = self.music_last.get(requester, 0)
+        if now - last < MUSIC_COOLDOWN:
+            self.send_room_text(room, f"⏳ انتظر {int(MUSIC_COOLDOWN - (now - last)) + 1} ثانية.")
+            return True
+        self.music_last[requester] = now
+        response_language = self._capture_room_response_language(room, raw)
+
         def worker():
             try:
                 public_base = _public_base_url()
-                spotify = _spotify_track_metadata(query)
+                # A regular song title is already searched by the audio
+                # providers; do not add a serial Spotify API round-trip first.
+                spotify_link = bool(re.search(r"(?:open\.spotify\.com/|spotify:)", query, re.I))
+                spotify = _spotify_track_metadata(query) if spotify_link else None
                 search_query = str((spotify or {}).get("search_query") or query).strip()
                 if spotify:
                     self.log("[MUSIC] Spotify metadata resolved:", spotify.get("title"), "—", spotify.get("artist"))
+
+                fast_sources = iter(self._music_fast_sources(search_query))
+                attempted_urls = set()
                 info = None
                 path = None
                 url = ""
+                duration = 0
+                title = search_query
+                artist = "Music"
+                music_published = False
+                live_started = False
+                live_queued = False
+                published_rooms = []
+
+                def set_source(source_info, local_path=None):
+                    nonlocal info, path, url, duration, title, artist
+                    info = dict(source_info or {})
+                    path = local_path
+                    duration = int(info.get("duration") or 0)
+                    title = str(info.get("title") or search_query)
+                    artist = str(info.get("uploader") or info.get("channel") or info.get("source") or "Music")
+                    if path is not None:
+                        url = (public_base.rstrip("/") + "/media/" + Path(path).name) if public_base else str(path)
+                    else:
+                        url = str(info.get("url") or "").strip()
+
                 if live_stream:
-                    # Race direct streaming sources; only fall back to a full
-                    # download if neither resolver finds a playable URL quickly.
-                    direct = self._music_fast_source(search_query)
-                    direct_url = str((direct or {}).get("url") or "").strip()
-                    if direct and direct_url:
-                        info = direct
-                        url = direct_url
-                        duration = int(direct.get("duration") or 0)
-                        title = str(direct.get("title") or search_query)
-                        artist = str(direct.get("uploader") or direct.get("source") or "Music")
-                        self.log("[MUSIC] live source=fast-race title=", title, "room=", room)
-                    else:
+                    for candidate in fast_sources:
+                        candidate_url = str(candidate.get("url") or "").strip()
+                        if not candidate_url or candidate_url in attempted_urls:
+                            continue
+                        attempted_urls.add(candidate_url)
+                        set_source(candidate)
+                        live_started = bool(self._play_music_in_live_room(room, url, duration))
+                        live_status = getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed")
+                        live_queued = live_status == "queued"
+                        if live_started or live_queued:
+                            self.log("[MUSIC] selected measured source:", candidate.get("source"),
+                                     "latency=", candidate.get("resolver_latency_seconds"), "room=", room)
+                            if live_queued:
+                                pending = getattr(self, "_pending_live_tracks", {}).get(room)
+                                if isinstance(pending, dict):
+                                    pending["fallback_search_query"] = search_query
+                                    pending["fallback_source_iterator"] = fast_sources
+                                    pending["attempted_source_urls"] = set(attempted_urls)
+                                    pending["requester"] = requester
+                            break
+                        self.log("[MUSIC] playback rejected source; trying next:", candidate.get("source"), room)
+
+                    if not live_started and not live_queued:
                         info, path = self._music_download(search_query)
-                        title = str(info.get("title") or search_query)
-                        artist = str(info.get("uploader") or info.get("channel") or "YouTube")
-                        duration = int(info.get("duration") or 0)
-                        url = public_base + "/media/" + path.name if public_base else str(path)
-                        self.log("[MUSIC] live source=local-fallback title=", title, "room=", room)
+                        set_source(info, path)
+                        live_started = bool(self._play_music_in_live_room(room, str(path), duration))
+                        live_status = getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed")
+                        live_queued = live_status == "queued"
+                        if not live_started and not live_queued:
+                            raise RuntimeError("تعذر بدء تشغيل الصوت من جميع المصادر السريعة والاحتياطية")
+                        self.log("[MUSIC] selected downloaded fallback", "room=", room)
                 else:
-                    # Race Audius against direct audio extraction; avoid
-                    # serial network waits and full downloads where possible.
-                    fast = self._music_fast_source(search_query)
-                    fast_url = str((fast or {}).get("url") or "").strip()
-                    if fast and fast_url and len(fast_url) <= 500:
-                        info = fast
-                        url = fast_url
-                        duration = int(fast.get("duration") or 0)
-                        title = str(fast.get("title") or search_query)
-                        artist = str(fast.get("uploader") or fast.get("source") or "Music")
-                        self.log("[MUSIC] normal source=fast-race title=", title, "room=", room)
-                    elif public_base:
-                        info, path = self._music_download(search_query)
-                        title = str(info.get("title") or search_query)
-                        artist = str(info.get("uploader") or info.get("channel") or "YouTube")
-                        duration = int(info.get("duration") or 0)
-                        url = public_base + "/media/" + path.name
-                        self.log("[MUSIC] normal source=local-public-media title=", title, "room=", room)
+                    if broadcast_all:
+                        target_rooms = [str(item).strip() for item in (self._active_rooms() or []) if str(item).strip()]
+                        if room:
+                            room_name = str(room).strip()
+                            target_rooms = [room_name] + [target for target in target_rooms
+                                                         if target.casefold() != room_name.casefold()]
                     else:
-                        raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
+                        target_rooms = [str(room or "").strip()] if str(room or "").strip() else []
+                    pending_rooms = list(target_rooms)
+                    first_success_info = None
+                    for candidate in fast_sources:
+                        candidate_url = str(candidate.get("url") or "").strip()
+                        if not candidate_url or candidate_url in attempted_urls or not pending_rooms:
+                            continue
+                        attempted_urls.add(candidate_url)
+                        set_source(candidate)
+                        accepted_rooms = []
+                        for target_room in pending_rooms:
+                            try:
+                                sent = self.send_room_media(target_room, url, "audio", duration)
+                                if sent is False:
+                                    raise RuntimeError("Talkin لم يقبل حزمة الصوت")
+                                accepted_rooms.append(target_room)
+                            except Exception as exc:
+                                self.log("[MUSIC] source playback rejected:", candidate.get("source"),
+                                         target_room, repr(exc))
+                        if accepted_rooms:
+                            if first_success_info is None:
+                                first_success_info = dict(candidate)
+                            published_rooms.extend(accepted_rooms)
+                            pending_rooms = [target for target in pending_rooms if target not in accepted_rooms]
+                            self.log("[MUSIC] selected measured source:", candidate.get("source"),
+                                     "latency=", candidate.get("resolver_latency_seconds"),
+                                     "rooms=", len(accepted_rooms))
+                    if pending_rooms:
+                        if not public_base:
+                            raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
+                        downloaded_info, downloaded_path = self._music_download(search_query)
+                        downloaded_path = Path(downloaded_path)
+                        downloaded_url = public_base.rstrip("/") + "/media/" + downloaded_path.name
+                        downloaded_duration = int((downloaded_info or {}).get("duration") or 0)
+                        accepted_download_rooms = []
+                        for target_room in pending_rooms:
+                            try:
+                                sent = self.send_room_media(target_room, downloaded_url, "audio", downloaded_duration)
+                                if sent is False:
+                                    raise RuntimeError("Talkin لم يقبل حزمة الصوت الاحتياطية")
+                                accepted_download_rooms.append(target_room)
+                            except Exception as exc:
+                                self.log("[MUSIC] downloaded fallback rejected:", target_room, repr(exc))
+                        if accepted_download_rooms:
+                            if first_success_info is None:
+                                first_success_info = dict(downloaded_info or {})
+                                info = dict(downloaded_info or {})
+                                path = downloaded_path
+                                url = downloaded_url
+                                duration = downloaded_duration
+                                title = str(info.get("title") or search_query)
+                                artist = str(info.get("uploader") or info.get("channel") or "YouTube")
+                            published_rooms.extend(accepted_download_rooms)
+                            pending_rooms = [target for target in pending_rooms if target not in accepted_download_rooms]
+                    if pending_rooms and not published_rooms:
+                        raise RuntimeError("تعذر إرسال الصوت إلى أي غرفة متصلة")
+                    if pending_rooms:
+                        self.log("[MUSIC] audio reached some rooms; fallback failed for remaining rooms:", pending_rooms)
+                    if first_success_info is not None and info is None:
+                        set_source(first_success_info)
+                    music_published = bool(published_rooms)
+
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
                     "url": url, "duration": duration, "created_at": time.time(),
                 }
                 if with_reactions:
-                    # One code identifies this whole song; lk/lv/dl/cm/report
-                    # still distinguish the requested reaction.
                     music_code = uuid.uuid4().hex[:4]
                     music_codes = {kind: music_code for kind in ("like", "love", "dislike", "comment", "report")}
-                    caption=_message_template(
+                    caption = _message_template(
                         "music", "broadcast",
                         "🎵 تشغيل الأغنية\n👤 الناشر: @{requester_name}\n🎶 اسم الأغنية: {title}\n🏠 الغرفة: {room}\n━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
                         requester_name=requester, title=title, artist=artist,
@@ -10301,82 +10583,42 @@ class TalkinBot:
                         "publisher": requester, "kind": "music",
                         "title": title, "description": title, "created_at": time.time(),
                     }
+                elif live_stream:
+                    caption = "🎶 تم تشغيل الأغنية في البث\n📡 بث مباشر"
                 else:
-                    # For live/broadcast playback, always use the compact
-                    # success card requested for the broadcast.  This is also
-                    # used as a safety net if the publication path sends the
-                    # caption directly instead of the live confirmation below.
-                    if live_stream:
-                        # نجاح البث: رسالة قصيرة جدًا، وفي غرفة البث الحالية فقط.
-                        caption="🎶 تم تشغيل الأغنية في البث\n📡 بث مباشر"
-                    else:
-                        caption=(f"🎶 تم تشغيل الأغنية\n━━━━━━━━━━━━\n"
-                                 f"🎵 العنوان: {title}\n🎤 الطلب: @{requester}\n"
-                                 f"📡 المصدر: {artist or 'Music'}")
+                    caption = (f"🎶 تم تشغيل الأغنية\n━━━━━━━━━━━━\n"
+                               f"🎵 العنوان: {title}\n🎤 الطلب: @{requester}\n"
+                               f"📡 المصدر: {artist or 'Music'}")
 
-                # في وضع البث نمرر رابط Audius مباشرة أو الملف المحلي القديم.
-                # لا نرفع الأغنية إلى PUBLIC_BASE_URL عندما يكون المصدر Audius.
-                live_source = url if (live_stream and path is None) else (str(path) if live_stream else url)
-                live_started = self._play_music_in_live_room(room, live_source, duration) if live_stream else False
-                music_published = False
-                # البث الحي لا يُعامل كنشر عادي: لا ترسل رسالة نجاح البث إلى كل الغرف.
                 if live_stream:
                     if live_started:
-                        # أرسل نجاح التشغيل إلى غرفة البث الحالية فقط.
                         self.send_room_text(room, "🎶 تم تشغيل الطلب في البث\n🎵 تم تشغيل الأغنية في البث فعلياً\n📡 بث مباشر")
-                    elif getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed") == "queued":
+                        music_published = True
+                    elif live_queued:
                         self.send_room_text(room, "📡 بث مباشر\n⏳ جاري تشغيل الأغنية...")
+                        music_published = True
                     else:
-                        self.send_room_text(room, "❌ تعذر تشغيل الأغنية في البث؛ تم استخدام المصدر الاحتياطي إن توفر.")
-                    music_published = live_started or getattr(self, "_last_live_play_status_by_room", {}).get(room) == "queued"
+                        raise RuntimeError("تعذر بدء تشغيل البث من جميع المصادر")
                 else:
-                    # The previous normal `.sa` path prepared a URL and a
-                    # caption but never sent the audio media packet itself.
-                    if broadcast_all:
-                        # `.sa` is global: use the complete active-room union
-                        # instead of only connected_rooms, which can be stale
-                        # or incomplete after reconnecting the bot.
-                        target_rooms = [
-                            str(item).strip()
-                            for item in (self._active_rooms() or [])
-                            if str(item).strip()
-                        ]
-                        if room:
-                            room_name = str(room).strip()
-                            target_rooms = [room_name] + [
-                                target for target in target_rooms
-                                if target.casefold() != room_name.casefold()
-                            ]
-                    else:
-                        target_rooms = [str(room or "").strip()] if str(room or "").strip() else []
-                    published_rooms = []
-                    for target_room in target_rooms:
+                    # Audio has already been accepted; send captions afterward
+                    # so source failure never produces a false success card.
+                    for target_room in published_rooms:
                         try:
-                            sent = self.send_room_media(target_room, url, "audio", duration)
-                            if sent is False:
-                                raise RuntimeError("Talkin لم يقبل حزمة الصوت")
-                            music_published = True
-                            published_rooms.append(target_room)
+                            self.send_room_text(target_room, caption)
                         except Exception as exc:
-                            self.log("[MUSIC] room audio send failed:", target_room, repr(exc))
-                    # Queue audio packets to every room first; captions are
-                    # secondary and must not hold up another room's playback.
-                    if caption:
-                        for target_room in published_rooms:
-                            try:
-                                self.send_room_text(target_room, caption)
-                            except Exception as exc:
-                                self.log("[MUSIC] room caption send failed:", target_room, repr(exc))
-                    if not music_published:
-                        raise RuntimeError("تعذر إرسال الصوت إلى أي غرفة متصلة")
+                            self.log("[MUSIC] room caption send failed:", target_room, repr(exc))
                 if music_published:
                     _record_media_publication("music", title, requester, room)
-            except Exception as e:
-                self.log("[MUSIC] request failed:", repr(e), "room=", room)
+            except Exception as exc:
+                self.log("[MUSIC] request failed:", repr(exc), "room=", room)
                 if room_output:
                     self.send_room_text(room, "❌ تعذر جلب الأغنية.")
+
         self.send_room_text(room, f"⏳ جاري تجهيز طلب الأغنية\n@{requester}")
-        threading.Thread(target=worker, name="music-request", daemon=True).start()
+        threading.Thread(
+            target=self._localized_room_worker(room, response_language, worker),
+            name="music-request", daemon=True,
+        ).start()
         return True
 
     def share_last_music(self, sender: str, target: str, room: str = ""):
@@ -11476,6 +11718,7 @@ class TalkinBot:
                 return True
             busy.add(key); self._user_picture_busy = busy
             self.send_room_text(room, f"🔎 جاري البحث عن صوره {target}...")
+            response_language = self._capture_room_response_language(room, text)
             def worker():
                 try:
                     recent = getattr(self, "_user_picture_recent", {})
@@ -11521,7 +11764,8 @@ class TalkinBot:
                 finally:
                     try: busy.discard(key)
                     except Exception: pass
-            threading.Thread(target=worker, name="user-picture-search", daemon=True).start()
+            threading.Thread(target=self._localized_room_worker(room, response_language, worker),
+                             name="user-picture-search", daemon=True).start()
             return True
         if low not in {"صورتي", "صورتك"}:
             return False
@@ -11530,6 +11774,7 @@ class TalkinBot:
             self.send_room_text(room, f"⏳ @{sender} جاري البحث عن صورتك..."); return True
         busy.add(key); self._random_picture_busy = busy
         self.send_room_text(room, f"🔎 جاري البحث عن صورتك يا @{sender}...")
+        response_language = self._capture_room_response_language(room, text)
         def worker():
             try:
                 recent = getattr(self, "_random_picture_recent", {}); room_key = str(room)
@@ -11563,7 +11808,8 @@ class TalkinBot:
             finally:
                 try: busy.discard(key)
                 except Exception: pass
-        threading.Thread(target=worker, name="random-picture-search", daemon=True).start()
+        threading.Thread(target=self._localized_room_worker(room, response_language, worker),
+                         name="random-picture-search", daemon=True).start()
         return True
 
     def _handle_lookalike_command(self, room, body, sender):
@@ -11591,6 +11837,7 @@ class TalkinBot:
         busy.add(key)
         self._lookalike_busy = busy
         self.send_room_text(room, f"🔎 جاري البحث عن شبيه @{target}...")
+        response_language = self._capture_room_response_language(room, text)
 
         def worker():
             try:
@@ -11648,7 +11895,8 @@ class TalkinBot:
                 except Exception:
                     pass
 
-        threading.Thread(target=worker, name="lookalike-search", daemon=True).start()
+        threading.Thread(target=self._localized_room_worker(room, response_language, worker),
+                         name="lookalike-search", daemon=True).start()
         return True
 
     def _send_steal_image(self, room, game_key, winner_name=""):
@@ -12106,6 +12354,7 @@ class TalkinBot:
             is_ludo_choice = raw in {"1", "2", "3", "4", "١", "٢", "٣", "٤"} and bool(ludo_game)
             if not (has_pending_choice or has_pending_stock or is_ludo_choice):
                 return False
+        response_language = self._capture_room_response_language(room, text)
         def worker():
             try:
                 self.handle_game_command(room, text, sender_name)
@@ -12118,7 +12367,7 @@ class TalkinBot:
         if not getattr(self, "_replaying_bot_action", False):
             self._remember_bot_action(room, text, sender_name, is_private=False)
         threading.Thread(
-            target=worker,
+            target=self._localized_room_worker(room, response_language, worker),
             name="game-command",
             daemon=True,
         ).start()
@@ -12467,7 +12716,7 @@ class TalkinBot:
         timer.start()
 
     def _snake_command(self,room,sender,raw):
-        key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=(getattr(self, "room_languages", {}).get(_norm_room(room)) == "en" or low in ("snake","snakes and ladders","سناكي"))
+        key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=(self._effective_room_language(room) == "en" or low in ("snake","snakes and ladders","سناكي"))
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
             if not self._board_game_cooldown_notice(room, sender, "snake"):
@@ -12693,7 +12942,7 @@ class TalkinBot:
         if low in ("لودو","ludo") and not game:
             if not self._board_game_cooldown_notice(room, sender):
                 return True
-            room_language = getattr(self, "room_languages", {}).get(_norm_room(room))
+            room_language = self._effective_room_language(room)
             game={"players":[sender],"tokens":{sender:0},"lang":room_language or ("en" if low=="ludo" else "ar"),"turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
             self.ludo_games[key]=game; self._schedule_board_game_timeout(key, game, "لودو")
             self.send_room_text(room,"🎲 Ludo — choose 1–4 players.\n1 = You vs. the bot; 2–4 = multiplayer.\nOther players type join. When the game starts, type rool on your turn to roll the die and move. First token to the finish wins." if game["lang"] == "en" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين\nاكتب join للانضمام، ثم rool عند دورك لرمي النرد وتحريك القطعة. أول لاعب يصل للنهاية يفوز."); return True
@@ -12799,13 +13048,13 @@ class TalkinBot:
     def _marriage_game(self, room, sender):
         candidates=self._fun_room_members(room, sender)
         if not candidates:
-            if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            if self._effective_room_language(room) == "en":
                 self.send_room_text(room, f"💍 @{sender}, no other player is available for the wedding game right now.")
             else:
                 self.send_room_text(room, f"💍 @{sender} لم أجد عضواً آخر متاحاً للزواج حالياً.")
             return True
         partner=secrets.choice(candidates)
-        if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+        if self._effective_room_language(room) == "en":
             self.send_room_text(room, f"💍 Congratulations, @{sender}! Your spouse is @{partner} ❤️\nWishing you both a happy life full of joy.")
             return True
         sentence=(f"زوجتك هي @{partner}" if secrets.randbelow(2) == 0
@@ -12816,7 +13065,7 @@ class TalkinBot:
 
     def _social_pair_game(self, room, sender, command):
         candidates = self._fun_room_members(room, sender)
-        english = getattr(self, "room_languages", {}).get(_norm_room(room)) == "en"
+        english = self._effective_room_language(room) == "en"
         if not candidates:
             self.send_room_text(room, f"🤝 @{sender}, no other player is available in this room." if english else f"🤝 @{sender} لم أجد عضواً آخر حاضراً في هذه الغرفة.")
             return True
@@ -12867,6 +13116,7 @@ class TalkinBot:
         busy.add(key)
         self._celebrity_partner_busy = busy
         self.send_room_text(room, "🔎 جاري البحث عن صورة شخصية مشهورة مناسبة...")
+        response_language = self._capture_room_response_language(room)
 
         def worker():
             try:
@@ -12893,8 +13143,8 @@ class TalkinBot:
                 if sent is False:
                     self.send_room_text(room, "❌ تعذر إرسال الصورة إلى الغرفة.")
                     return
-                label = ("your wife" if gender == "female" else "your husband") if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en" else ("زوجتك" if gender == "female" else "زوجك")
-                if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+                label = ("your wife" if gender == "female" else "your husband") if self._effective_room_language(room) == "en" else ("زوجتك" if gender == "female" else "زوجك")
+                if self._effective_room_language(room) == "en":
                     self.send_room_text(room, f"💞 @{sender}, {label} is the celebrity {name} ❤️")
                     return
                 self.send_room_text(room, f"💞 @{sender}، {label} هي الشخصية المشهورة: {name} ❤️")
@@ -12907,11 +13157,14 @@ class TalkinBot:
             finally:
                 busy.discard(key)
 
-        threading.Thread(target=worker, name="celebrity-partner-search", daemon=True).start()
+        threading.Thread(
+            target=self._localized_room_worker(room, response_language, worker),
+            name="celebrity-partner-search", daemon=True,
+        ).start()
         return True
 
     def _fun_game(self, room, sender, command):
-        if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+        if self._effective_room_language(room) == "en":
             options = {
                 "تحدي": ["Send a kind message to someone in the room.", "Write one thing you love today.", "Compliment someone you haven't talked to much.", "Tell a short joke for everyone."],
                 "لغز": [("What has teeth but cannot bite?", "A comb."), ("What moves without legs?", "Time."), ("What gets bigger the more you take away?", "A hole.")],
@@ -13259,7 +13512,7 @@ class TalkinBot:
                 text += "\n\n📌 للقائمة التالية اكتب ns"
             elif idx >= len(page_sections) - 1:
                 text += "\n\n✅ انتهت أقسام هذه القائمة."
-        if room and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+        if room and self._effective_room_language(room) == "en":
             english = {
                 1: [
                     "📋 Admin — moderation\n━━━━━━━━━━━━\nkick@name / kick name — kick a member\nban@name / ban name — ban a member\nub@name / unban name — unban a member\n.u — undo the bot’s last action",
@@ -13321,7 +13574,7 @@ class TalkinBot:
         sections = _help_sections_from_messages().get(3, [])
         if not sections:
             return False
-        if room and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+        if room and self._effective_room_language(room) == "en":
             return self._send_help_section(room=room, page=3, part=part)
         idx = max(1, min(int(part), len(sections))) - 1
         text = sections[idx]
@@ -13373,7 +13626,7 @@ class TalkinBot:
 
         if _body_low in ("اوامر", "الاوامر", "help", "مساعدة"):
             menu = _command_menu_for(_is_primary_master(sender), is_private=is_private)
-            if room and not is_private and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            if room and not is_private and self._effective_room_language(room) == "en":
                 menu = "📚 Talkin bot commands\n━━━━━━━━━━━━\na2 — Music and reactions\na3 — Games\na4 — Gifts and publishing\na5 — Points\na6 — Rooms and welcomes\n━━━━━━━━━━━━\nType a2–a6 to open a section."
             if is_private:
                 self.send_private_text(sender, menu)
@@ -14481,7 +14734,7 @@ class TalkinBot:
             pcfg = _room_protection_cfg(target_room)
             mcfg = _room_moderation_config(target_room)
             bot_prot = bool(getattr(self, "bot_protection_enabled", _bot_protection_enabled()))
-            if getattr(self, "room_languages", {}).get(_norm_room(target_room)) == "en":
+            if self._effective_room_language(target_room) == "en":
                 protection_state = lambda enabled: "🟢 Enabled" if enabled else "🔴 Disabled"
                 status_text = (
                     f"🛡️ Protection status — {target_room}\n"
@@ -16385,6 +16638,40 @@ class TalkinBot:
             self.log("[JOINLEAVE] auto-unban failed", repr(exc))
 
     def handle_room_event(self, result):
+        event = (result.get("room_event") or {}) if isinstance(result, dict) else {}
+        event_type = str(event.get(1, ""))
+        room = str(event.get(13, getattr(self, "room", "")) or "")
+        body = str(event.get(6, "") or "")
+        if event_type != "text" or not body:
+            return self._handle_room_event_impl(result)
+
+        detected = _detect_text_language(body)
+        key = (_norm_room(room), _norm_user(event.get(22, "") or event.get(2, "")))
+        recent = getattr(self, "_recent_room_command_languages", None)
+        if recent is None:
+            recent = self._recent_room_command_languages = {}
+        if detected and _looks_like_bot_command(body):
+            recent[key] = (detected, time.monotonic())
+            if len(recent) > 2048:
+                cutoff = time.monotonic() - 600.0
+                self._recent_room_command_languages = {
+                    saved_key: entry for saved_key, entry in recent.items()
+                    if entry[1] >= cutoff
+                }
+                recent = self._recent_room_command_languages
+        language = detected
+        if language is None and re.fullmatch(r"[0-9٠-٩]", body.strip()):
+            previous = recent.get(key)
+            if previous and time.monotonic() - previous[1] <= 180.0:
+                language = previous[0]
+
+        token = self._push_room_language_override(room, language)
+        try:
+            return self._handle_room_event_impl(result)
+        finally:
+            self._restore_room_language_override(token)
+
+    def _handle_room_event_impl(self, result):
         event = result.get("room_event") or {}
         if not hasattr(self, "blocked_rooms"):
             self.blocked_rooms = set()
@@ -16622,6 +16909,17 @@ class TalkinBot:
                 self.connected_rooms.add(room)
             self.last_joined_room = room
             rnorm = _norm_room(room)
+            rejoin_state = getattr(self, "_auto_rejoin_state", {}).get(rnorm)
+            if rejoin_state is not None:
+                rejoin_state["joined_at"] = time.monotonic()
+            auto_pending = getattr(self, "_auto_rejoin_pending", None)
+            if auto_pending is not None:
+                lock = getattr(self, "_auto_rejoin_lock", None)
+                if lock is None:
+                    auto_pending.discard(rnorm)
+                else:
+                    with lock:
+                        auto_pending.discard(rnorm)
             pending_join = self._pending_room_joins.pop(rnorm, None)
             if pending_join and pending_join.get("timer"):
                 pending_join["timer"].cancel()
@@ -17493,11 +17791,33 @@ class TalkinBot:
         self.last_error = str(error)
         self.log("[WS] error:", error)
 
+    def _reset_room_connection_state(self):
+        """Discard acknowledgements and delayed join workers from an old socket."""
+        self._connection_generation = int(getattr(self, "_connection_generation", 0)) + 1
+        getattr(self, "connected_rooms", set()).clear()
+        pending = getattr(self, "_pending_room_joins", {})
+        for item in list(pending.values()):
+            timer = item.get("timer") if isinstance(item, dict) else None
+            if timer:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+        pending.clear()
+        auto_pending = getattr(self, "_auto_rejoin_pending", None)
+        lock = getattr(self, "_auto_rejoin_lock", None)
+        if auto_pending is not None:
+            if lock is None:
+                auto_pending.clear()
+            else:
+                with lock:
+                    auto_pending.clear()
+
     def on_close(self, ws, code, msg):
         # These are rooms connected to THIS WebSocket session. Once it closes,
         # none of them may be reported by "غرفي" until the server confirms
         # them again after reconnect. The historical list remains on disk.
-        self.connected_rooms.clear()
+        self._reset_room_connection_state()
         self.log("[WS] closed:", code, msg)
 
     def bootstrap_after_connect(self):
@@ -17593,7 +17913,7 @@ class TalkinBot:
             ).start()
     def run_once(self):
         # Start a fresh live-room view for this WebSocket session.
-        self.connected_rooms.clear()
+        self._reset_room_connection_state()
         self.authenticate()
         # Android saves AuthResult.server into SharedPreferences and then
         # Client uses that saved server for the WebSocket. Do the same:
