@@ -6639,6 +6639,9 @@ class TalkinBot:
         match = re.fullmatch(r"🎯 تحدي @(.+?): (.+)", value)
         if match:
             return f"🎯 Challenge for @{match.group(1)}: {match.group(2)}"
+        match = re.fullmatch(r"🏆 فاز @(.+?) بلعبة السلم والثعبان!\n🎲 الرول الأخير: (\d+)\n📍 وصل إلى الخانة 100\.\n💰 جائزة الفوز: \+([\d,]+) نقطة\n💳 رصيده الآن: ([\d,]+) نقطة", value)
+        if match:
+            return f"🏆 @{match.group(1)} won Snake & Ladders!\n🎲 Final roll: {match.group(2)}\n📍 Reached square 100.\n💰 Prize: +{match.group(3)} points\n💳 New balance: {match.group(4)} points"
         match = re.fullmatch(r"🏆 انتهت لعبة (.+)\n👑 الفائز: @(.+)\n💰 مبلغ الفوز: \+(.+) نقطة\n❌ الخاسر: @(.+)\n💸 مبلغ الخسارة: -(.+) نقطة", value)
         if match:
             return f"🏆 {match.group(1)} is over.\n👑 Winner: @{match.group(2)}\n💰 Winnings: +{match.group(3)} points\n❌ Loser: @{match.group(4)}\n💸 Loss: -{match.group(5)} points"
@@ -6735,6 +6738,12 @@ class TalkinBot:
                 "طلبت:": "You asked for:", "فشلت": "Failed", "نجحت": "Succeeded", "انتهت لعبة": "Game ended:",
                 "المبلغ غير صحيح.": "Invalid amount.", "لاعباً": "players", "لاعبين": "players", "مع البوت": "against the bot",
                 "ابدأ": "Start", "اكتب rool": "type rool", "اكتب join": "type join",
+                "بدأت لعبة السلم والثعبان! جاري البحث عن خصم. للمشاركة اكتب join": "Snake & Ladders started! Waiting for an opponent. Type join to participate.",
+                "وقف الرول على": "rolled", "وانتقل من": "and moved from", "إلى": "to",
+                "بلعبة السلم والثعبان!": "won Snake & Ladders!", "الرول الأخير:": "Final roll:",
+                "وصل إلى الخانة 100.": "Reached square 100.", "رصيده الآن:": "New balance:",
+                "🎮 لديك لعبة السلم والثعبان شغالة بالفعل في غرفة:": "🎮 You already have a Snake & Ladders game running in room:",
+                "🐍 توجد لعبة السلم والثعبان شغالة بالفعل في غرفة:": "🐍 A Snake & Ladders game is already running in room:",
             }
             self._english_room_replacements = cached
         replacements = cached
@@ -12415,7 +12424,7 @@ class TalkinBot:
         timer.start()
 
     def _snake_command(self,room,sender,raw):
-        key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=low in ("snake","سناكي")
+        key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=(getattr(self, "room_languages", {}).get(_norm_room(room)) == "en" or low in ("snake","snakes and ladders","سناكي"))
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
             if not self._board_game_cooldown_notice(room, sender, "snake"):
@@ -12747,9 +12756,15 @@ class TalkinBot:
     def _marriage_game(self, room, sender):
         candidates=self._fun_room_members(room, sender)
         if not candidates:
-            self.send_room_text(room, f"💍 @{sender} لم أجد عضواً آخر متاحاً للزواج حالياً.")
+            if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+                self.send_room_text(room, f"💍 @{sender}, no other player is available for the wedding game right now.")
+            else:
+                self.send_room_text(room, f"💍 @{sender} لم أجد عضواً آخر متاحاً للزواج حالياً.")
             return True
         partner=secrets.choice(candidates)
+        if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            self.send_room_text(room, f"💍 Congratulations, @{sender}! Your spouse is @{partner} ❤️\nWishing you both a happy life full of joy.")
+            return True
         sentence=(f"زوجتك هي @{partner}" if secrets.randbelow(2) == 0
                   else f"زوجك هو @{partner}")
         self.send_room_text(room, f"💍 مبروك @{sender}! {sentence} ❤️\n"
@@ -12758,12 +12773,30 @@ class TalkinBot:
 
     def _social_pair_game(self, room, sender, command):
         candidates = self._fun_room_members(room, sender)
+        english = getattr(self, "room_languages", {}).get(_norm_room(room)) == "en"
         if not candidates:
-            self.send_room_text(room, f"🤝 @{sender} لم أجد عضواً آخر حاضراً في هذه الغرفة.")
+            self.send_room_text(room, f"🤝 @{sender}, no other player is available in this room." if english else f"🤝 @{sender} لم أجد عضواً آخر حاضراً في هذه الغرفة.")
             return True
         partner = secrets.choice(candidates)
         score = secrets.randbelow(101)
         kind = str(command or "").replace("ة", "ه")
+        if english:
+            labels = {"خطبه": "your fiancé", "خطيب": "your fiancé", "حبك": "your love match", "عدو": "your playful rival", "صديق": "your closest friend", "زاحف": "the biggest chatterbox", "خروف": "the room's playful scapegoat"}
+            label = labels.get(kind, "your match")
+            if kind in {"خطبه", "خطيب"}:
+                result = f"💍 Lovely news, @{sender}: your fiancé is @{partner}. Wishing you both happiness!"
+            elif kind == "حبك":
+                result = f"❤️ @{sender}, {label} is @{partner} — compatibility: {score}%. Looks like a great match!"
+            elif kind == "عدو":
+                result = f"😼 @{sender}, {label} today is @{partner} ({score}%). Make peace with a laugh!"
+            elif kind == "صديق":
+                result = f"🫶 @{sender}, your closest friend today is @{partner} — friendship score: {score}%!"
+            elif kind == "زاحف":
+                result = f"🦎 @{sender}, today's biggest chatterbox is @{partner} — score: {score}% (just for fun)."
+            else:
+                result = f"🐑 @{sender}, the room's playful scapegoat is @{partner} ({score}%). It's all a joke!"
+            self.send_room_text(room, result)
+            return True
         if kind in {"خطبه", "خطيب"}:
             result = f"💍 خبرٌ جميل يا @{sender}: خطيبك هو @{partner}.\nنتمنى لكما أياماً مليئة بالمودة والفرح."
         elif kind == "حبك":
@@ -12817,7 +12850,10 @@ class TalkinBot:
                 if sent is False:
                     self.send_room_text(room, "❌ تعذر إرسال الصورة إلى الغرفة.")
                     return
-                label = "زوجتك" if gender == "female" else "زوجك"
+                label = ("your wife" if gender == "female" else "your husband") if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en" else ("زوجتك" if gender == "female" else "زوجك")
+                if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+                    self.send_room_text(room, f"💞 @{sender}, {label} is the celebrity {name} ❤️")
+                    return
                 self.send_room_text(room, f"💞 @{sender}، {label} هي الشخصية المشهورة: {name} ❤️")
             except Exception as exc:
                 self.log("[CELEBRITY_PARTNER] failed:", repr(exc))
@@ -12832,6 +12868,23 @@ class TalkinBot:
         return True
 
     def _fun_game(self, room, sender, command):
+        if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            options = {
+                "تحدي": ["Send a kind message to someone in the room.", "Write one thing you love today.", "Compliment someone you haven't talked to much.", "Tell a short joke for everyone."],
+                "لغز": [("What has teeth but cannot bite?", "A comb."), ("What moves without legs?", "Time."), ("What gets bigger the more you take away?", "A hole.")],
+                "حظي": ["Your luck is great today — try something new!", "Luck is smiling on you; go for it.", "A calm, lovely day is ahead.", "A nice surprise may arrive soon."],
+                "مزاج": ["Your mood: joyful and full of positive energy 😄", "Your mood: calm and relaxed 🌿", "Your mood: adventurous and excited 🔥", "Your mood: laughing and chatting 😂"],
+            }
+            value = secrets.choice(options[command])
+            label = {"تحدي": "Challenge", "لغز": "Riddle", "حظي": "My luck", "مزاج": "Mood"}[command]
+            if command == "لغز":
+                question, answer = value
+                self.send_room_text(room, f"🧩 Riddle for @{sender}\n{question}\n✅ Answer: {answer}")
+            elif command == "تحدي":
+                self.send_room_text(room, f"🎯 Challenge for @{sender}: {value}")
+            else:
+                self.send_room_text(room, f"✨ {label} for @{sender}: {value}")
+            return True
         options={
             "تحدي": ["أرسل كلمة طيبة لعضو في الغرفة.", "اكتب أول شيء تحبه اليوم.", "امدح شخصاً لم تتحدث معه كثيراً.", "اكتب نكتة قصيرة للجميع."],
             "لغز": [("شيء له أسنان ولا يعض، ما هو؟", "المشط"), ("ما الشيء الذي يمشي بلا أرجل؟", "الوقت"), ("ما الذي كلما أخذت منه كبر؟", "الحفرة")],

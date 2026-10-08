@@ -77,6 +77,29 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertIn("Tails", translated)
         self.assertFalse(any("\u0600" <= char <= "\u06ff" for char in translated))
 
+    def test_snake_and_social_games_follow_the_room_language(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        bot.snake_games = {}
+        bot._board_game_cooldown_notice = lambda *_args, **_kwargs: True
+        bot._schedule_board_game_timeout = lambda *_args, **_kwargs: None
+        bot._send_game_cover = lambda *_args, **_kwargs: None
+        starts = []
+        bot._broadcast_game_start = lambda text, _game: starts.append(text)
+        self.assertTrue(bot._snake_command("EnglishRoom", "player1", "ثعبان"))
+        self.assertEqual(bot.snake_games["snake:EnglishRoom"]["lang"], "en")
+        self.assertIn("Snake & Ladders started", starts[0])
+
+        bot.room_users = {"EnglishRoom": {"player1": "member", "player2": "member"}}
+        messages = []
+        bot.send_room_text = lambda room, text: messages.append(text)
+        with patch.object(bot_module.secrets, "choice", return_value="player2"), patch.object(
+            bot_module.secrets, "randbelow", return_value=78
+        ):
+            self.assertTrue(bot._social_pair_game("EnglishRoom", "player1", "حبك"))
+        self.assertIn("compatibility: 78%", messages[0])
+        self.assertFalse(any("\u0600" <= char <= "\u06ff" for char in messages[0]))
+
     def test_distinct_joining_users_are_not_deduplicated(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         first_join = ("user_joined", "North", "", "", "", "", "account_a", "")
