@@ -1275,26 +1275,86 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(text(6), "North")
         self.assertEqual(text(7), "https://cdn.example/song.mp3")
 
-    def test_oversized_game_result_is_split_into_room_messages_not_telegram(self):
+    def test_oversized_game_result_is_dropped_not_split_or_routed(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         packets = []
+        reports = []
         bot.send_query = lambda payload: packets.append(payload)
         bot.log = lambda *_args: None
+        bot._report_oversize_delivery = lambda *args: reports.append(args)
         bot._send_long_text_to_telegram = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("game results should stay in the room")
+            AssertionError("oversized messages must not be routed to Telegram")
         )
         text = "🏆 انتهت مباراة الكركيت\n" + "\n".join(
             f"💰 @Player{i} +200,000 نقطة — جائزة الفريق الأول والثاني" for i in range(20)
         )
 
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "300"}):
-            self.assertTrue(bot._send_text_packets("room_message", text, room="North"))
+            self.assertFalse(bot._send_text_packets("room_message", text, room="North"))
 
-        self.assertGreater(len(packets), 1)
-        decoded = [bot_module.decode_message(packet) for packet in packets]
-        self.assertTrue(all(len(packet) <= 300 for packet in packets))
-        self.assertTrue(all(fields[6][0].decode("utf-8") == "North" for fields in decoded))
-        self.assertEqual("".join(fields[5][0].decode("utf-8") for fields in decoded), text)
+        self.assertEqual(packets, [])
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0][2], "North")
+        self.assertGreater(reports[0][3], 300)
+
+    def test_send_query_drops_oversized_media_or_text_without_telegram(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        reports = []
+        bot.ws = type("FakeWebSocket", (), {"send_binary": lambda _self, payload: sent.append(payload)})()
+        bot.log = lambda *_args: None
+        bot._report_oversize_delivery = lambda *args: reports.append(args)
+        bot._send_long_text_to_telegram = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized text must not be routed to Telegram")
+        )
+        bot._send_long_media_to_telegram = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized media must not be routed to Telegram")
+        )
+        payload = bot_module.encode_query(
+            "room_message", type_="text", body="x" * 2000, room="North"
+        )
+
+        # Even an accidental high setting cannot raise the hard 1008-byte cap.
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "5000"}):
+            self.assertFalse(bot.send_query(payload))
+
+        self.assertEqual(sent, [])
+        self.assertEqual(len(reports), 1)
+        self.assertGreater(reports[0][3], 1008)
+
+    def test_games_command_opens_the_a3_catalog_and_sets_ns_navigation(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.stock_pending = {}
+        bot.help_pages = {}
+        bot.help_page_part = {}
+        bot.help_game_part = {}
+        bot._room_list_commands = lambda *_args: False
+        bot._snake_command = lambda *_args: False
+        bot._ludo_command = lambda *_args: False
+        bot._handle_pending_bot_choice = lambda *_args: False
+        sent = []
+        bot._send_text_packets = lambda packet_type, text, **kwargs: sent.append(
+            (packet_type, text, kwargs)
+        ) or True
+
+        with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_looks_like_bot_command", return_value=True
+        ):
+            self.assertTrue(bot.handle_game_command("North", "العاب", "Player"))
+
+        key = ("North", bot_module._norm_user("Player"))
+        self.assertEqual(bot.help_pages[key], 3)
+        self.assertEqual(bot.help_page_part[key], 1)
+        self.assertEqual(bot.help_game_part[key], 1)
+        self.assertEqual(sent[0][0], "room_message")
+        self.assertEqual(sent[0][1], bot_module._default_help_sections()[3][0])
+        self.assertIn("13.", sent[0][1])
+        self.assertIn("اكتب ns", sent[0][1])
+        self.assertTrue(
+            bot._handle_management_command_impl("North", "ns", "Player", is_private=False)
+        )
+        self.assertEqual(bot.help_page_part[key], 2)
+        self.assertEqual(sent[1][1].split("\n\n📌", 1)[0], bot_module._default_help_sections()[3][1])
 
     def test_normal_song_request_broadcasts_to_all_active_rooms(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

@@ -880,6 +880,15 @@ def encode_query(action: str, *, type_: str = None, length: str = None,
     return bytes(out)
 
 
+def _ws_payload_limit():
+    """Return the configured payload limit, capped at the known safe ceiling."""
+    try:
+        configured = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+    except (TypeError, ValueError):
+        configured = 1008
+    return max(1, min(1008, configured))
+
+
 def encode_live_invitation(inviter: str, target: str, token: str,
                            room_id: str, room_name: str, invitation_id: str) -> bytes:
     """Encode the manual Talkin live invitation packet captured from the app.
@@ -5871,10 +5880,8 @@ class TalkinBot:
             f"\n📍 النوع: {context}{location}"
             f"\n❌ التفاصيل: {detail}"
         )
-        # Keep this diagnostic in the bot log only. Do not send the verbose
-        # "تم تجاهل إرسال رسالة كبيرة..." notice to Telegram. For oversized
-        # text messages, send the original message itself to Telegram from
-        # send_query/_send_text_packets instead.
+        # Oversize reports stay in the local log only. The rejected packet
+        # itself is never relayed to a room or to Telegram.
         self.log("[WS_OVERSIZE_HANDLED]", master_msg.replace("\n", " | "))
 
     def send_query(self, payload: bytes):
@@ -5882,86 +5889,24 @@ class TalkinBot:
             raise RuntimeError("WebSocket is not connected")
 
         # Never pass an oversized protobuf packet to RawWebSocket. The server
-        # closes the whole connection with 1009, so handle it locally instead.
-        max_bytes = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+        # closes the whole connection with 1009, so drop it locally instead.
+        max_bytes = _ws_payload_limit()
         payload = bytes(payload)
         if len(payload) > max_bytes:
             packet_type = ""
             target = ""
             room = ""
-            body = ""
             try:
                 fields = decode_message(payload)
                 packet_type = as_text((fields.get(1) or [b""])[0])
                 target = as_text((fields.get(4) or [b""])[0])
-                body = as_text((fields.get(5) or [b""])[0])
                 room = as_text((fields.get(6) or [b""])[0])
             except Exception as exc:
                 self.log("[WS_OVERSIZE] decode failed:", repr(exc))
-
-            media_type = ""
-            media_url = ""
-            try:
-                media_type = as_text((fields.get(2) or [b""])[0]).strip().lower()
-                media_url = as_text((fields.get(7) or [b""])[0]).strip()
-                if not media_url:
-                    media_url = _extract_media_url_universal(fields, body)
-            except Exception as exc:
-                self.log("[WS_OVERSIZE] media extraction failed:", repr(exc))
-
-            # Text: send the ORIGINAL complete text to Telegram.
-            if packet_type in {"chat_message", "room_message"} and body:
-                telegram_title = "رسالة طويلة من البوت"
-                if packet_type == "room_message" and room:
-                    telegram_title = f"رسالة طويلة من غرفة: {room}"
-                elif packet_type == "chat_message" and target:
-                    telegram_title = f"رسالة طويلة إلى: @{target}"
-                try:
-                    telegram_sent = bool(self._send_long_text_to_telegram(body, title=telegram_title))
-                except Exception as exc:
-                    telegram_sent = False
-                    self.log("[TELEGRAM] oversized text routing failed:", repr(exc))
-                if telegram_sent:
-                    self.log("[WS_OVERSIZE] long text routed to Telegram")
-                else:
-                    self._report_oversize_delivery(
-                        packet_type, target, room, len(payload),
-                        "تعذر إرسال الرسالة الطويلة إلى Telegram"
-                    )
-                return False
-
-            # Media/file: the WebSocket packet itself may be oversized even
-            # though the actual file is referenced by a URL. Download that
-            # original file and send it to Telegram as a document. This keeps
-            # the full file intact and prevents Talkin from receiving a packet
-            # large enough to close the connection.
-            if packet_type in {"chat_message", "room_message"} and media_url and media_type in {
-                "file", "image", "photo", "picture", "video", "audio", "voice", "document", "media"
-            }:
-                telegram_title = "ملف كبير من البوت"
-                if packet_type == "room_message" and room:
-                    telegram_title = f"ملف كبير من غرفة: {room}"
-                elif packet_type == "chat_message" and target:
-                    telegram_title = f"ملف كبير إلى: @{target}"
-                try:
-                    telegram_sent = bool(self._send_long_media_to_telegram(
-                        media_url, title=telegram_title, media_type=media_type
-                    ))
-                except Exception as exc:
-                    telegram_sent = False
-                    self.log("[TELEGRAM] oversized media routing failed:", repr(exc))
-                if telegram_sent:
-                    self.log("[WS_OVERSIZE] media/file routed to Telegram")
-                else:
-                    self._report_oversize_delivery(
-                        packet_type, target, room, len(payload),
-                        "تعذر إرسال الملف الكبير إلى Telegram"
-                    )
-                return False
-
-            # No recoverable text/media body. Keep only a local diagnostic;
-            # never send the old verbose oversized-packet notice to Telegram.
-            self._report_oversize_delivery(packet_type, target, room, len(payload), "حزمة WebSocket تجاوزت 1008 بايت")
+            self._report_oversize_delivery(
+                packet_type, target, room, len(payload),
+                "تم تجاهل الحزمة محلياً لأنها تجاوزت الحد الآمن؛ لم تُرسل إلى الغرفة أو Telegram",
+            )
             return False
 
         # Keep a compact trace of the live protocol. This is intentionally
@@ -6390,18 +6335,13 @@ class TalkinBot:
         return False
 
     def _long_text_notice(self, packet_type, kwargs):
-        if packet_type == "chat_message" and kwargs.get("to"):
-            return self.send_private_text(
-                str(kwargs.get("to")),\
-                "📨 الرسالة طويلة؛ تم إرسالها إلى Telegram لتجنب فصل البوت."
-            )
         room = str(kwargs.get("room") or "").strip()
-        if room:
-            return self._send_text_packets_small_notice(
-                "room_message", room,
-                "📨 الرسالة طويلة؛ تم إرسالها إلى Telegram لتجنب فصل البوت."
-            )
-        return True
+        target = str(kwargs.get("to") or "").strip()
+        self.log(
+            "[WS_OVERSIZE] dropped locally; no Telegram forwarding:",
+            packet_type, room or target,
+        )
+        return False
 
     def _send_text_packets_small_notice(self, packet_type, room, text):
         payload = {"type_": "text", "body": str(text)[:220]}
@@ -6444,12 +6384,12 @@ class TalkinBot:
         return chunks
 
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
-        """Send text safely; oversized packets are ignored and routed to Telegram."""
+        """Send text within the WebSocket cap; drop oversized messages locally."""
         text = str(text or "")
         if not text:
             return True
 
-        limit = int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008"))
+        limit = _ws_payload_limit()
 
         def make_payload(value):
             payload = dict(kwargs)
@@ -6457,59 +6397,19 @@ class TalkinBot:
             payload["body"] = value
             return encode_query(packet_type, **payload)
 
-        # Measure the COMPLETE WebSocket/protobuf payload, not just text bytes.
-        if len(make_payload(text)) <= limit:
-            self.send_query(make_payload(text))
+        # Measure the complete WebSocket/protobuf payload, not just text bytes.
+        packet = make_payload(text)
+        if len(packet) <= limit:
+            self.send_query(packet)
             return True
 
-        # Game results belong in the room where the match happened. Keep them
-        # visible there by splitting into protocol-safe text packets instead of
-        # quietly routing the result to Telegram as a long-text attachment.
-        if packet_type == "room_message" and self._is_game_result_text(text):
-            chunks = self._split_text_to_payload_limit(text, make_payload, limit)
-            if chunks:
-                try:
-                    for chunk in chunks:
-                        self.send_query(make_payload(chunk))
-                    self.log("[WS_OVERSIZE] game result split into room packets", len(chunks))
-                    return True
-                except Exception as exc:
-                    self.log("[WS_OVERSIZE] game result room chunk failed:", repr(exc))
-                    return False
-
-        # The complete message is too large for Talkin/WebSocket. Do NOT
-        # split it into visible Talkin messages. Route the original full text
-        # to Telegram instead. This keeps the WebSocket connection safe from
-        # close code 1009 without sending an error message to Talkin users.
-        telegram_title = "رسالة طويلة من البوت"
-        if packet_type == "room_message":
-            room_name = str(kwargs.get("room") or "").strip()
-            if room_name:
-                telegram_title = f"رسالة طويلة من غرفة: {room_name}"
-        elif packet_type == "chat_message":
-            target_name = str(kwargs.get("to") or "").strip()
-            if target_name:
-                telegram_title = f"رسالة طويلة إلى: @{target_name}"
-
-        telegram_sent = False
-        try:
-            telegram_sent = bool(self._send_long_text_to_telegram(text, title=telegram_title))
-        except Exception as exc:
-            self.log("[TELEGRAM] oversized message routing failed:", repr(exc))
-
-        if telegram_sent:
-            self.log("[WS_OVERSIZE] long message routed to Telegram")
-        else:
-            # Telegram was unavailable/failed; report the failure to the master
-            # and keep the bot alive without sending an oversized WebSocket packet.
-            self._report_oversize_delivery(
-                packet_type,
-                str(kwargs.get("to") or ""),
-                str(kwargs.get("room") or ""),
-                len(make_payload(text)),
-                "تعذر إرسال الرسالة الطويلة إلى Telegram"
-            )
-
+        self._report_oversize_delivery(
+            packet_type,
+            str(kwargs.get("to") or ""),
+            str(kwargs.get("room") or ""),
+            len(packet),
+            "تم تجاهل الرسالة محلياً لأنها تجاوزت الحد الآمن؛ لم تُرسل إلى الغرفة أو Telegram",
+        )
         return False
 
     def _send_help_chunks(self, packet_type: str, text: str, limit: int = 320, **kwargs):
@@ -10559,25 +10459,20 @@ class TalkinBot:
             self.log("[GAME] winner card send failed:", game_key, repr(exc))
             return False
 
-    def game_help(self, room):
-        self.send_room_text(room, "🎮✨ ألعاب البوت\n━━━━━━━━━━━━\n"
-            "🎲 رهان@المبلغ أو رهان المبلغ — تحدي لاعب ضد لاعب، والفائز عشوائي.\n"
-            "⚔️ مضاربة@المبلغ أو مضاربة المبلغ — مواجهة عشوائية عادلة.\n"
-            "🍀 حظ — لعبة عشوائية مع البوت.\n"
-            "🎯 حظ@المبلغ — حظ عشوائي بمبلغ ضد البوت.\n"
-            "🎯 حظي@المبلغ أو حظي المبلغ — تحدي حظ لاعب ضد لاعب.\n"
-            "📊 استثمار@المبلغ — استثمار لاعب ضد لاعب مثل الرهان.\n"
-            "🎰 مليار — فرصة عشوائية للفوز بمليار نقطة.\n"
-            "🏦 بنك مليون — فرصة عشوائية للفوز بمليون نقطة بنفس النظام.\n"
-            "🌱 زرع — حتى 5 محاصيل نشطة لكل مستخدم، وكل نوع مرة واحدة فقط.\n"
-            "📈 بورصة — اختر 1 ذهب، 2 نفط، 3 معادن ثم أرسل الرقم، والجائزة نقاط حسب حركة السوق.\n"
-            "🆕 سنارة | برق | ياقوت | صدام | كاشف — ألعاب عالمية، الجائزة 500 نقطة.\n"
-            "🐎 حصانه — يحصّن المستخدم من السرقة لمدة دقيقة.\n"
-            "🕵️ اسرق — اختر عضوًا عشوائيًا من الموجودين حالياً في نفس الغرفة وحاول سرقة 500 نقطة منه.\n"
-            "💞 زواج | زوجتي | زوجي — شريك من الغرفة أو صورة شخصية مشهورة.\n"
-            "💍 خطبة | حبك | عدو | صديق | زاحف | خروف — نتائج مرحة من أعضاء الغرفة الحاضرين.\n"
-            "🏆 توب رهان | توب مضاربة | توب حظي | توب استثمار\n"
-            "🤖 ألعاب جديدة مع البوت — عملة | عجلة | صندوق@1..3 | كوب@1..3 | وحش | بركان | طائر | نجم.\n"            "📝 ألعاب البوت الجديدة نصية فقط وبدون أي صور.")
+    def game_help(self, room, sender=None):
+        """Open the canonical A3 game catalog and let ns page through it."""
+        if sender:
+            if not hasattr(self, "help_pages"):
+                self.help_pages = {}
+            if not hasattr(self, "help_page_part"):
+                self.help_page_part = {}
+            if not hasattr(self, "help_game_part"):
+                self.help_game_part = {}
+            key = (str(room or ""), _norm_user(sender))
+            self.help_pages[key] = 3
+            self.help_page_part[key] = 1
+            self.help_game_part[key] = 1
+        return self._send_game_help_section(room=room, part=1)
 
     def _game_balance_ok(self, username, amount):
         return _get_points(username) >= int(amount)
@@ -12753,7 +12648,7 @@ class TalkinBot:
             self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
             return True
         if low in ("العاب","ألعاب","لعب","games","game"):
-            self.game_help(room); return True
+            self.game_help(room, sender_name); return True
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
