@@ -5318,20 +5318,26 @@ class TalkinBot:
         """Load departure-trigger replies from their own file, separate from auto replies."""
         self.departure_replies_file = DATA_DIR / "departure_replies.json"
         data = _load_local_json(self.departure_replies_file, {})
+        self.departure_farewell_enabled = bool(
+            data.get("farewell_enabled", data.get("enabled", True))
+        ) if isinstance(data, dict) else True
         raw = data.get("replies", {}) if isinstance(data, dict) else {}
         fixed = {}
         if isinstance(raw, dict):
             for trigger, replies in raw.items():
                 key = _auto_reply_key(trigger)
                 values = [str(item).strip() for item in (replies if isinstance(replies, list) else [replies]) if str(item).strip()]
-                if key in {"ب", "ت", "ق"} and values:
+                if len(key) == 1 and values:
                     fixed[key] = values
         self.departure_replies = fixed
 
     def _save_departure_replies(self):
         _save_local_json(
             getattr(self, "departure_replies_file", DATA_DIR / "departure_replies.json"),
-            {"replies": getattr(self, "departure_replies", {})},
+            {
+                "farewell_enabled": bool(getattr(self, "departure_farewell_enabled", True)),
+                "replies": getattr(self, "departure_replies", {}),
+            },
         )
 
     def _auto_reply_variants(self, trigger):
@@ -5401,11 +5407,23 @@ class TalkinBot:
         return self._render_auto_reply(reply, username, room)
 
     def _departure_reply_text(self, trigger, username, room):
-        defaults = {"ب": "🌀 في الخلاط", "ت": "⚰️ في التابوت", "ق": "❤️ بقلبي"}
+        defaults = {
+            "ب": "🌀 في الخلاط", "ت": "⚰️ في التابوت",
+            "ح": "⚰️ في التابوت", "ق": "❤️ بقلبي",
+        }
         choices = getattr(self, "departure_replies", {}).get(trigger, [])
         if isinstance(choices, str):
             choices = [choices]
-        template = secrets.choice(choices) if choices else defaults.get(trigger, "👋 غادرنا بالسلامة")
+        if choices:
+            template = secrets.choice(choices)
+        elif trigger in defaults:
+            # The established single-letter reactions remain active even when
+            # the generic farewell is switched off.
+            template = defaults[trigger]
+        elif getattr(self, "departure_farewell_enabled", True):
+            template = "👋 غادرنا بالسلامة"
+        else:
+            return ""
         name = str(username or "").strip().lstrip("@")
         text = str(template).replace("{username}", name).replace("{room}", str(room or "")).strip()
         if "{username}" not in str(template) and name:
@@ -5421,7 +5439,9 @@ class TalkinBot:
         if not username:
             self.send_room_text(room, "📭 لم يغادر أحد من هذه الغرفة بعد.")
             return True
-        self.send_room_text(room, self._departure_reply_text(trigger, username, room))
+        reply = self._departure_reply_text(trigger, username, room)
+        if reply:
+            self.send_room_text(room, reply)
         return True
 
     def log(self, *args):
@@ -7584,6 +7604,7 @@ class TalkinBot:
         setattr(self, f"_livekit_audio_feeding_{room}", True)
         first_frame = threading.Event()
         setattr(self, f"_livekit_first_frame_event_{room}", first_frame)
+        required_start_frames = 6
         state = {"ok": False, "frames": 0, "error": ""}
 
         def _run():
@@ -7645,11 +7666,11 @@ class TalkinBot:
                     state["frames"] += 1
                     if state["frames"] == 1:
                         self.log("[LIVEKIT] first PCM frame accepted:", room, "bytes=", len(chunk))
-                    # Do not report success until a short real burst has entered
-                    # the LiveKit source. This avoids a false positive where the
-                    # first frame is accepted but the publisher remains effectively
-                    # silent.
-                    if state["frames"] >= 4 and not first_frame.is_set():
+                    # The caller waits for this exact burst threshold before
+                    # checking state["frames"]. Signaling earlier than the
+                    # success threshold caused a race: audio began playing, but
+                    # the command reported that no real audio arrived.
+                    if state["frames"] >= required_start_frames and not first_frame.is_set():
                         first_frame.set()
                 self.log("[LIVEKIT] audio feeder finished:", room, "ok=", state["ok"], "error=", state["error"][:300])
             except FileNotFoundError as exc:
@@ -7673,10 +7694,9 @@ class TalkinBot:
                 setattr(self, f"_livekit_audio_proc_{room}", None)
 
         threading.Thread(target=_run, name=f"livekit-audio-{room}", daemon=True).start()
-        # Wait for a short burst of actual PCM frames, not only one frame.
-        # This prevents a false "تم التشغيل" message when the publisher is silent.
+        # Wait for the same real PCM burst threshold that signals readiness.
         first_frame.wait(timeout=5)
-        if state["frames"] >= 6:
+        if state["frames"] >= required_start_frames:
             self.log("[LIVEKIT] real audio burst captured successfully:", room, "frames=", state["frames"])
             return True
         self.log("[LIVEKIT] no sufficient audio burst captured:", room, "frames=", state["frames"], state["error"])
@@ -11730,6 +11750,7 @@ class TalkinBot:
         victim_balance = _get_points(victim)
         if self._steal_protected(victim):
             self.send_room_text(room, f"@{victim} لديه حصانه من السرقه")
+            self._send_game_winner_card("اسرق_فشل", sender, [room])
             return True
         if victim_balance < 500:
             self.send_room_text(
@@ -11751,6 +11772,7 @@ class TalkinBot:
                 f"❌ لم تتم السرقة.\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
             )
             _record_game(sender, "steal", 0, 500)
+            self._send_game_winner_card("اسرق_فشل", sender, [room])
             return True
 
         _add_points(victim, -500)
@@ -13269,7 +13291,7 @@ class TalkinBot:
                 ],
                 6: [
                     "🚪 Rooms\n━━━━━━━━━━━━\njoin@room_name — join a room, then select its language\nmyrooms — list connected rooms\nleave room — leave and rejoin (primary master only)\ninv / invite — invite members from this room\ninvmsg@text — change invitation text",
-                    "🏠 Room messages, welcomes and protection\n━━━━━━━━━━━━\nsay text — make the bot speak\n+sr@trigger@reply — add an auto-reply (master)\nswc@on / swc@off — toggle welcome messages\nprotection — open protection settings\nType ns for the next room list.",
+                    "🏠 Room messages, welcomes and protection\n━━━━━━━━━━━━\nsay text — make the bot speak\n+sr@trigger@reply — add an auto-reply (master)\nswc@on / swc@off — toggle welcome messages\nfarewell@on / farewell@off — toggle the generic farewell; letter replies stay enabled\nprotection — open protection settings\nType ns for the next room list.",
                 ],
             }
             page_english = english.get(int(page), [])
@@ -14385,6 +14407,20 @@ class TalkinBot:
         text=str(body or "").strip()
         low=text.casefold()
         if self._room_list_commands(room, text, sender, is_private):
+            return True
+
+        departure_toggle = re.fullmatch(r"(?:ds|توديع|وداع|farewell)@(on|off)", text, re.I)
+        if departure_toggle:
+            if not _is_master_name(sender):
+                self.send_private_text(sender, "🔒 تشغيل أو إيقاف توديع المغادرين مخصص للماستر.")
+                return True
+            self.departure_farewell_enabled = departure_toggle.group(1).casefold() == "on"
+            self._save_departure_replies()
+            self.send_private_text(
+                sender,
+                "✅ تم تشغيل رسالة الوداع الافتراضية." if self.departure_farewell_enabled
+                else "⛔ تم إيقاف رسالة الوداع الافتراضية؛ مفاتيح ب/ح/ق والردود المخصصة ما زالت تعمل.",
+            )
             return True
 
         # Master-only recovery command. Use @ separators so decorated names

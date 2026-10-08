@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import tempfile
+import sys
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -191,6 +193,21 @@ class IncomingEventDedupRegressions(unittest.TestCase):
             )
         self.assertEqual(bot._fun_room_members("NORTH", "sender"), ["north_user"])
 
+    def test_failed_steal_sends_failure_card_not_success_card(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent_text, cards = [], []
+        bot._game_cooldown_notice = lambda *_args: True
+        bot._room_member_usernames_for_steal = lambda *_args: ["victim"]
+        bot._steal_protected = lambda *_args: False
+        bot.send_room_text = lambda room, text: sent_text.append((room, text))
+        bot._send_game_winner_card = lambda key, winner, rooms: cards.append((key, winner, rooms))
+        with patch.object(bot_module, "_get_points", return_value=1000), patch.object(
+            bot_module, "_record_game"
+        ), patch.object(bot_module.secrets, "randbelow", return_value=95):
+            self.assertTrue(bot._steal_game("North", "thief"))
+        self.assertTrue(any("لم تتم السرقة" in text for _room, text in sent_text))
+        self.assertEqual(cards, [("اسرق_فشل", "thief", ["North"])])
+
     def test_social_pair_game_uses_only_live_members_in_the_same_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {
@@ -221,7 +238,7 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertEqual(bot.departure_replies, {"ق": ["بقلبي"]})
         self.assertEqual(bot.auto_replies["hello"]["replies"], ["legacy"])
         self.assertEqual(saved[0][0], "departure_replies.json")
-        self.assertEqual(saved[0][1], {"replies": {"ق": ["بقلبي"]}})
+        self.assertEqual(saved[0][1], {"farewell_enabled": True, "replies": {"ق": ["بقلبي"]}})
         with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
             bot_module, "_save_local_json", side_effect=lambda path, value: saved.append((Path(path).name, value))
         ):
@@ -1804,6 +1821,108 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertIn("start cricket game", sections[3][5])
         self.assertNotIn("bl@", sections[1][0])
         self.assertNotIn("حظر بكل الغرف", sections[1][0])
+
+
+    def test_audio_start_waits_for_the_same_frame_count_it_requires_for_success(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.stop_event = threading.Event()
+        bot.log = lambda *_args: None
+
+        class FakeSource:
+            def capture_frame(self, _frame):
+                return None
+
+        class FakeLoop:
+            @staticmethod
+            def is_closed():
+                return False
+
+        reached_four_frames = threading.Event()
+        allow_remaining_frames = threading.Event()
+
+        class FakeStdout:
+            def __init__(self):
+                self.read_count = 0
+
+            def read(self, size):
+                self.read_count += 1
+                if self.read_count == 5:
+                    reached_four_frames.set()
+                    if not allow_remaining_frames.wait(timeout=2):
+                        return b""
+                if self.read_count <= 6:
+                    return b"\x00" * size
+                return b""
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = FakeStdout()
+                self.stderr = types.SimpleNamespace(read=lambda: b"")
+
+            def kill(self):
+                pass
+
+            def wait(self, **_kwargs):
+                pass
+
+        process = FakeProcess()
+        bot._livekit_source_Hall = FakeSource()
+        bot._livekit_loop_Hall = FakeLoop()
+        livekit_module = types.ModuleType("livekit")
+        livekit_module.rtc = types.SimpleNamespace(AudioFrame=lambda **_kwargs: object())
+        result = []
+
+        with patch.object(bot_module.subprocess, "Popen", return_value=process), patch.dict(
+            sys.modules, {"livekit": livekit_module}
+        ):
+            caller = threading.Thread(
+                target=lambda: result.append(bot._feed_livekit_audio("Hall", "https://audio.test/song.mp3", 20)),
+                daemon=True,
+            )
+            caller.start()
+            self.assertTrue(reached_four_frames.wait(timeout=2))
+            time.sleep(0.05)
+            self.assertTrue(caller.is_alive(), "must wait for all required audio frames")
+            allow_remaining_frames.set()
+            caller.join(timeout=3)
+
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(result, [True])
+
+
+    def test_master_can_disable_and_enable_departure_replies_persistently(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+            bot._room_list_commands = lambda *_args: False
+            bot.departure_replies = {"س": ["عاد بسلامة"]}
+            bot.departure_farewell_enabled = True
+            bot.departure_replies_file = Path(temp) / "departure_replies.json"
+            replies = []
+            bot.send_private_text = lambda _to, text: replies.append(text)
+            bot._last_departed_user_by_room = {bot_module._norm_room("Room"): "leaver"}
+            room_replies = []
+            bot.send_room_text = lambda _room, text: room_replies.append(text)
+
+            with patch.object(bot_module, "_is_master_name", return_value=True):
+                self.assertTrue(bot._handle_management_command_impl("", "توديع@off", "Master", is_private=True))
+            self.assertFalse(bot.departure_farewell_enabled)
+            self.assertTrue(bot._handle_departure_reply_command("Room", "س"))
+            self.assertEqual(room_replies, ["👤 leaver عاد بسلامة"])
+            self.assertTrue(bot._handle_departure_reply_command("Room", "x"))
+            self.assertEqual(len(room_replies), 1)
+            for trigger in ("ب", "ح", "ق"):
+                self.assertTrue(bot._handle_departure_reply_command("Room", trigger))
+            self.assertEqual(len(room_replies), 4)
+            saved = bot_module._load_local_json(bot.departure_replies_file, {})
+            self.assertFalse(saved["farewell_enabled"])
+            self.assertEqual(saved["replies"], {"س": ["عاد بسلامة"]})
+
+            with patch.object(bot_module, "_is_master_name", return_value=True):
+                self.assertTrue(bot._handle_management_command_impl("", "ds@on", "Master", is_private=True))
+            self.assertTrue(bot.departure_farewell_enabled)
+            self.assertTrue(bot._handle_departure_reply_command("Room", "x"))
+            self.assertEqual(len(room_replies), 5)
+            self.assertIn("غادرنا بالسلامة", room_replies[-1])
 
     def test_cricket_requires_saved_verification_even_when_global_gate_is_disabled(self):
         with patch.object(bot_module, "VERIFICATION_ENABLED", False), patch.object(
