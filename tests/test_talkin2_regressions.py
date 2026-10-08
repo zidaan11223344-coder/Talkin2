@@ -13,7 +13,123 @@ from cricket_integration import CricketIntegration
 from cricket_result import render_result_image
 
 
+class ProfileStatusRegressions(unittest.TestCase):
+    def test_requested_default_profile_status_is_sent_whole_under_ws_limit(self):
+        expected = (
+            '<B><H2><p style="background-color:#FFFFFF;">\n'
+            '<font color=#8B6508>☕️ COFFEE BOT</font><br>\n'
+            '<font color=#007C91>🛡️ بوت حماية وألعاب وأغاني</font><br>\n'
+            '<font color=#247A00>🛡️ Protection, Games & Music Bot</font><br>\n'
+            '<font color=#A9005B>🎮 الألعاب والأوامر: a1 • a2 • a3 • a4 • a5 • a6</font><br>\n'
+            '<font color=#71368A>🎮 GAMES & COMMANDS: a1 • a2 • a3 • a4 • a5 • a6</font><br>\n'
+            '<font color=#B05A00>🚪 دخول@اسم الغرفة</font><br>\n'
+            '<font color=#8B3A00>🌐 اختر اللغة: 1 أو 2</font><br>\n'
+            '<font color=#007A45>🚪 join@room</font><br>\n'
+            '<font color=#005C4B>🌐 Choose language: 1 or 2</font><br>\n'
+            '<font color=#8B0000>♟️ MASTER:</font><br>\n'
+            '<font color=#8B0000>∫♚∫اݪـــۛــ⃮ـۿــ𓏺𓏺ـيّـــّٰـبــۃ∫♚∫</font>\n'
+            '</p></H2></B>'
+        )
+        self.assertEqual(bot_module.BOT_BASE_STATUS, expected)
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_query = lambda payload: sent.append(payload)
+        bot.log = lambda *_args: None
+        self.assertTrue(bot._set_profile_status(bot_module.BOT_BASE_STATUS))
+        self.assertEqual(len(sent), 1)
+        self.assertLessEqual(len(sent[0]), bot_module._ws_payload_limit())
+        fields = bot_module.decode_message(sent[0])
+        self.assertEqual(bot_module.as_text(fields[5][0]), expected)
+        self.assertNotIn(11, fields)
+
+
 class IncomingEventDedupRegressions(unittest.TestCase):
+    def test_english_game_catalogs_and_protection_menu_are_localized(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        sent = []
+        bot._send_text_packets = lambda packet, text, **kwargs: sent.append(text) or True
+        bot._send_help_chunks = lambda packet, text, **kwargs: sent.append(text) or True
+
+        for page, count in ((1, 6), (2, 2), (3, 6), (4, 2), (5, 2), (6, 2)):
+            for part in range(1, count + 1):
+                bot._send_help_section(room="EnglishRoom", page=page, part=part)
+        self.assertTrue(any("First token to the finish wins" in text for text in sent))
+        self.assertTrue(any("protection@room" in text.lower() for text in sent))
+        self.assertFalse(any(any("\u0600" <= char <= "\u06ff" for char in text) for text in sent))
+
+        arabic_menu = (
+            "🛡️ قائمة حماية الغرفة\n━━━━━━━━━━━━\n"
+            "1️⃣ تشغيل حماية الغرفة من السب\n2️⃣ إيقاف حماية الغرفة من السب\n"
+            "3️⃣ تشغيل حماية الفلود (هجوم الدخول المتزامن + حظر IP)\n4️⃣ إيقاف حماية الفلود\n"
+            "5️⃣ تشغيل حماية الدخول والخروج (تكرار الدخول)\n6️⃣ إيقاف حماية الدخول والخروج\n"
+            "7️⃣ تعيين حد رسائل الفلود\n8️⃣ تشغيل حظر الحسابات بلا صورة\n"
+            "9️⃣ إيقاف حظر الحسابات بلا صورة\n━━━━━━━━━━━━\n📌 أرسل رقم الخيار الآن."
+        )
+        translated = bot._localize_room_text("EnglishRoom", arabic_menu)
+        self.assertIn("Room protection settings", translated)
+        self.assertNotIn("حماية", translated)
+
+    def test_ludo_dynamic_results_are_english_only_for_english_rooms(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        english = bot._localize_room_text(
+            "EnglishRoom", "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين"
+        )
+        self.assertIn("How to play", english)
+        self.assertIn("type rool", english)
+        result = bot._localize_room_text("EnglishRoom", "🎯 الآن دور @player1، اكتب rool.")
+        self.assertEqual(result, "🎯 @player1, it is your turn — type rool to roll.")
+        arabic_bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        arabic_bot.room_languages = {bot_module._norm_room("ArabicRoom"): "ar"}
+        original = "🎯 الآن دور @player1، اكتب rool."
+        self.assertEqual(arabic_bot._localize_room_text("ArabicRoom", original), original)
+
+        game_bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        game_bot._ludo_lock = threading.RLock()
+        game_bot.ludo_games = {}
+        game_bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        game_bot._board_game_cooldown_notice = lambda *_args, **_kwargs: True
+        game_bot._schedule_board_game_timeout = lambda *_args, **_kwargs: None
+        sent = []
+        game_bot.send_room_text = lambda room, text: sent.append(text)
+        self.assertTrue(game_bot._ludo_command_unlocked("EnglishRoom", "player1", "لودو"))
+        self.assertEqual(game_bot.ludo_games["ludo:EnglishRoom"]["lang"], "en")
+        self.assertIn("First token to the finish wins", sent[0])
+
+    def test_common_game_result_templates_translate_to_english(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        coin = "🪙 لعبة العملة\n━━━━━━━━━━━━━━\n@player\n🎯 اختيارك: وجه\n🪙 النتيجة: كتابة\n🏆 فزت!\n🎁 +1,000 نقطة\n💰 رصيدك: 1,000"
+        translated = bot._localize_room_text("EnglishRoom", coin)
+        self.assertIn("Coin toss", translated)
+        self.assertIn("Heads", translated)
+        self.assertIn("Tails", translated)
+        self.assertFalse(any("\u0600" <= char <= "\u06ff" for char in translated))
+
+    def test_snake_and_social_games_follow_the_room_language(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_languages = {bot_module._norm_room("EnglishRoom"): "en"}
+        bot.snake_games = {}
+        bot._board_game_cooldown_notice = lambda *_args, **_kwargs: True
+        bot._schedule_board_game_timeout = lambda *_args, **_kwargs: None
+        bot._send_game_cover = lambda *_args, **_kwargs: None
+        starts = []
+        bot._broadcast_game_start = lambda text, _game: starts.append(text)
+        self.assertTrue(bot._snake_command("EnglishRoom", "player1", "ثعبان"))
+        self.assertEqual(bot.snake_games["snake:EnglishRoom"]["lang"], "en")
+        self.assertIn("Snake & Ladders started", starts[0])
+
+        bot.room_users = {"EnglishRoom": {"player1": "member", "player2": "member"}}
+        messages = []
+        bot.send_room_text = lambda room, text: messages.append(text)
+        with patch.object(bot_module.secrets, "choice", return_value="player2"), patch.object(
+            bot_module.secrets, "randbelow", return_value=78
+        ):
+            self.assertTrue(bot._social_pair_game("EnglishRoom", "player1", "حبك"))
+        self.assertIn("compatibility: 78%", messages[0])
+        self.assertFalse(any("\u0600" <= char <= "\u06ff" for char in messages[0]))
+
     def test_distinct_joining_users_are_not_deduplicated(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         first_join = ("user_joined", "North", "", "", "", "", "account_a", "")
@@ -106,6 +222,11 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertEqual(bot.auto_replies["hello"]["replies"], ["legacy"])
         self.assertEqual(saved[0][0], "departure_replies.json")
         self.assertEqual(saved[0][1], {"replies": {"ق": ["بقلبي"]}})
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_save_local_json", side_effect=lambda path, value: saved.append((Path(path).name, value))
+        ):
+            self.assertTrue(bot._handle_management_command_impl("", "+ds@س@سلام", "Master", is_private=True))
+        self.assertEqual(bot.departure_replies["س"], ["سلام"])
 
     def test_departure_command_uses_last_user_and_dedicated_reply(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -116,6 +237,14 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertTrue(bot._handle_departure_reply_command("North", "ق"))
         self.assertIn("left_user", sent[0][1])
         self.assertIn("بقلبي", sent[0][1])
+    def test_departure_command_accepts_any_single_character_key(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._last_departed_user_by_room = {bot_module._norm_room("North"): "left_user"}
+        bot.departure_replies = {"س": ["سلام يا {username}"]}
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        self.assertTrue(bot._handle_departure_reply_command("North", "س"))
+        self.assertIn("سلام يا left_user", sent[0][1])
 
 
 class RoomExclusionRegressions(unittest.TestCase):

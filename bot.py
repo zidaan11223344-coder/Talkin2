@@ -352,14 +352,14 @@ BOT_MASTER = (os.getenv("BOT_MASTER") or os.getenv("MASTER_USERNAME") or "").str
 PRIMARY_BOT_ID = (os.getenv("PRIMARY_BOT_ID") or "").strip()
 INVITE_SENDER_NAME = os.getenv("INVITE_SENDER_NAME", "السفير").strip() or "السفير"
 GROUP_TO_JOIN = (os.getenv("GROUP_TO_JOIN") or os.getenv("FIRST_ROOM") or "").strip()
-# Startup room policy:
-# OFF (default) = enter only GROUP_TO_JOIN/FIRST_ROOM at startup.
-# ON = restore every room saved in tracked_rooms.json plus GROUP_TO_JOIN.
+# Startup room policy: normal bot deployments restore every room saved in
+# tracked_rooms.json plus GROUP_TO_JOIN after each connection/reconnection.
+# MASTER_SERVICE deployments retain their separate no-room behavior.
 AUTO_JOIN_ALL_ROOMS = (
     os.getenv("AUTO_JOIN_ALL_ROOMS")
     or os.getenv("JOIN_ALL_ROOMS")
     or os.getenv("AUTO_JOIN_ROOMS")
-    or "off"
+    or "on"
 ).strip().casefold() in {"1", "true", "yes", "on", "enable", "enabled"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
@@ -415,11 +415,19 @@ MASTER_DISPLAY_NAME = os.getenv(
     "MASTER_DISPLAY_NAME", "ۦاݪــۛـسـ𓆩♛𓆪ـۧۦـ۫فـيــ۫ـۧر𝁤𝆬𝃛"
 ).strip()
 DEFAULT_BOT_BASE_STATUS = (
-    '<B><H4><div style="background-color:#000000;padding:10px;text-align:center;">'
-    '<font color="#5DE2E7">بوت حماية وألعاب وأغاني</font><br>'
-    '<font color="#B388FF">لمعرفة الألعاب والأوامر أرسل: a1 a2 a3 a4 a5 a6</font><br>'
-    '<font color="#FF6EC7">لدخول الغرف أرسل: دخول@اسم الغرفة</font><br>'
-    '<font color="#FF3B30">الماستر: ۦاݪــۛـسـ𓆩♛𓆪ـۧۦـ۫فـيــ۫ـۧر𝁤𝆬𝃛</font></div></H4></B>'
+    '<B><H2><p style="background-color:#FFFFFF;">\n'
+    '<font color=#8B6508>☕️ COFFEE BOT</font><br>\n'
+    '<font color=#007C91>🛡️ بوت حماية وألعاب وأغاني</font><br>\n'
+    '<font color=#247A00>🛡️ Protection, Games & Music Bot</font><br>\n'
+    '<font color=#A9005B>🎮 الألعاب والأوامر: a1 • a2 • a3 • a4 • a5 • a6</font><br>\n'
+    '<font color=#71368A>🎮 GAMES & COMMANDS: a1 • a2 • a3 • a4 • a5 • a6</font><br>\n'
+    '<font color=#B05A00>🚪 دخول@اسم الغرفة</font><br>\n'
+    '<font color=#8B3A00>🌐 اختر اللغة: 1 أو 2</font><br>\n'
+    '<font color=#007A45>🚪 join@room</font><br>\n'
+    '<font color=#005C4B>🌐 Choose language: 1 or 2</font><br>\n'
+    '<font color=#8B0000>♟️ MASTER:</font><br>\n'
+    '<font color=#8B0000>∫♚∫اݪـــۛــ⃮ـۿــ𓏺𓏺ـيّـــّٰـبــۃ∫♚∫</font>\n'
+    '</p></H2></B>'
 )
 
 BOT_BASE_STATUS = os.getenv("BOT_BASE_STATUS", DEFAULT_BOT_BASE_STATUS).strip()
@@ -2098,9 +2106,9 @@ def _is_ns_command(text):
 
 
 def _is_publish_command(text):
-    """Recognize only the current publish commands: بوست / انشر."""
+    """Recognize Arabic and English image-publication commands."""
     value = str(text or "").strip()
-    return bool(re.fullmatch(r"(?:بوست|انشر)(?:@.*)?", value, re.I | re.S))
+    return bool(re.fullmatch(r"(?:بوست|انشر|post|publish)(?:@.*)?", value, re.I | re.S))
 
 
 def _publish_description(text):
@@ -2109,6 +2117,28 @@ def _publish_description(text):
     if "@" not in value:
         return ""
     return value.split("@", 1)[1].strip()
+
+def _fit_text_to_packet(packet_type, text, **kwargs):
+    """Trim user-controlled text so the complete protobuf stays <= 1008 bytes."""
+    value = str(text or "")
+    # 1008 is the Talkin gateway hard ceiling, not merely the local tuning
+    # value.  Keep user content below it even when WS_MAX_MESSAGE_BYTES is set
+    # higher for another transport.
+    limit = min(1008, _ws_payload_limit())
+    if len(encode_query(packet_type, type_="text", body=value, **kwargs)) <= limit:
+        return value
+    suffix = "…"
+    lo, hi = 0, len(value)
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = value[:mid].rstrip() + suffix
+        if len(encode_query(packet_type, type_="text", body=candidate, **kwargs)) <= limit:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best or suffix
 
 
 def _norm_user(name):
@@ -2360,7 +2390,7 @@ def _looks_like_bot_command(text):
         "sa@", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "دخول@", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
@@ -2430,7 +2460,7 @@ def _looks_like_admin_command(text):
     prefixes = (
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "msb@",
-        "i@", "inv", "دعوات", "invite", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
+        "i@", "inv", "دعوات", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
     return low.startswith(prefixes)
@@ -5136,6 +5166,12 @@ class TalkinBot:
         self.invite_thread = None
         self.invite_lock = threading.Lock()
         self.invite_message_template = "يوجد معجب مخفي في {room}"
+        stored_languages = _load_local_json(DATA_DIR / "room_languages.json", {})
+        self.room_languages = {
+            _norm_room(room): ("en" if str(language).strip().lower() in {"en", "english", "2"} else "ar")
+            for room, language in (stored_languages.items() if isinstance(stored_languages, dict) else [])
+            if _norm_room(room)
+        }
         self.blocked_rooms = set(_persistent_blocked_rooms())
         self._blocked_room_reasons = {}
         self.known_rooms = {
@@ -5369,7 +5405,7 @@ class TalkinBot:
         choices = getattr(self, "departure_replies", {}).get(trigger, [])
         if isinstance(choices, str):
             choices = [choices]
-        template = secrets.choice(choices) if choices else defaults[trigger]
+        template = secrets.choice(choices) if choices else defaults.get(trigger, "👋 غادرنا بالسلامة")
         name = str(username or "").strip().lstrip("@")
         text = str(template).replace("{username}", name).replace("{room}", str(room or "")).strip()
         if "{username}" not in str(template) and name:
@@ -5378,7 +5414,7 @@ class TalkinBot:
 
     def _handle_departure_reply_command(self, room, body):
         trigger = _auto_reply_key(body)
-        if trigger not in {"ب", "ت", "ق"}:
+        if len(trigger) != 1:
             return False
         last = getattr(self, "_last_departed_user_by_room", {})
         username = last.get(_norm_room(room), "") if isinstance(last, dict) else ""
@@ -6012,10 +6048,19 @@ class TalkinBot:
         """Auto rejoin a room immediately when kicked or removed."""
         if not room:
             return
+        room_key = _norm_room(room)
+        if not hasattr(self, "_auto_rejoin_lock"):
+            self._auto_rejoin_lock = threading.Lock()
+        if not hasattr(self, "_auto_rejoin_pending"):
+            self._auto_rejoin_pending = set()
+        with self._auto_rejoin_lock:
+            if room_key in self._auto_rejoin_pending:
+                return
+            self._auto_rejoin_pending.add(room_key)
         def _rejoin_worker():
-            time.sleep(delay)
             try:
-                if any(_norm_room(r) == _norm_room(room) for r in getattr(self, "connected_rooms", set())):
+                time.sleep(delay)
+                if any(_norm_room(r) == room_key for r in getattr(self, "connected_rooms", set())):
                     self.log(f"[AUTO_REJOIN] already connected; skip {room}")
                     return
                 self.log(f"[AUTO_REJOIN] Attempting to rejoin {room}...")
@@ -6023,6 +6068,9 @@ class TalkinBot:
                     self.join_room(room, force=True)
             except Exception as e:
                 self.log(f"[AUTO_REJOIN] Rejoin failed for {room}:", repr(e))
+            finally:
+                with self._auto_rejoin_lock:
+                    self._auto_rejoin_pending.discard(room_key)
         threading.Thread(target=_rejoin_worker, name=f"auto-rejoin-{room}", daemon=True).start()
 
     def join_room(self, room: str, force: bool = False, requested_by: str = ""):
@@ -6046,6 +6094,7 @@ class TalkinBot:
                 except Exception:
                     pass
         if requested_by:
+            getattr(self, "_intentional_leaves", set()).discard(room_norm)
             self.blocked_rooms.discard(room_norm)
             getattr(self, "_blocked_room_reasons", {}).pop(room_norm, None)
             getattr(self, "_blocked_room_notices", set()).discard(room_norm)
@@ -6452,7 +6501,267 @@ class TalkinBot:
                     time.sleep(0.05)
         return sent
 
+    def _localize_room_text(self, room, text):
+        """Localize common bot notices for rooms selected as English."""
+        if getattr(self, "room_languages", {}).get(_norm_room(room)) != "en":
+            return str(text or "")
+        value = str(text or "")
+        # English text needs no processing. Arabic rooms returned above already;
+        # therefore translation work is limited to Arabic-bearing text in English rooms.
+        if not any("\u0600" <= char <= "\u06ff" for char in value):
+            return value
+        cached = getattr(self, "_english_room_exact_translations", None)
+        if cached is None:
+            cached = {
+                "📡 بث مباشر\n⏳ جاري تشغيل الأغنية...": "📡 Live broadcast\n⏳ Starting the song...",
+                "🎶 تم تشغيل الأغنية في البث\n📡 بث مباشر": "🎶 The request is now playing in the live broadcast\n📡 Live broadcast",
+                "❌ تعذر تشغيل الأغنية في البث؛ تم استخدام المصدر الاحتياطي إن توفر.": "❌ Could not play the song in the live broadcast.",
+                "🖼️ تم استلام أمر النشر. أرسل الصورة الآن خلال دقيقتين في الروم أو الخاص، وسيتم نشرها في جميع الغرف.": "🖼️ Publish request received. Send the image within two minutes; it will be posted in all rooms.",
+                "✅ تم تغيير نص الدعوة إلى": "✅ Invitation message changed to",
+                "📭 لا توجد غرف متصلة فعلياً حالياً.": "📭 No rooms are currently connected.",
+                "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين": "🎲 Ludo — choose the number of players:\n1 = You vs. the bot\n2 = 2 players\n3 = 3 players\n4 = 4 players\n\nHow to play: type 1–4 to set the player count. Other players type join. On your turn, type rool to roll the die and move your token. First to reach the finish wins.",
+                "⚠️ هذه اللعبة مع البوت. لا تحتاج join.": "⚠️ This game is against the bot. No one needs to type join.",
+                "❌ اختر عدد اللاعبين أولاً: 1 أو 2 أو 3 أو 4.": "❌ Choose the number of players first: 1, 2, 3, or 4.",
+                "⏳ ما زلنا ننتظر اكتمال عدد اللاعبين.": "⏳ Waiting for enough players to join.",
+                "⏳ انتظر دورك.": "⏳ Please wait for your turn.",
+                "🚫 قائمة الحماية لصانع الغرفة أو الماستر فقط.": "🚫 Room protection settings are available only to the room creator or the bot master.",
+                "🛡️ قائمة حماية الغرفة\n━━━━━━━━━━━━\n1️⃣ تشغيل حماية الغرفة من السب\n2️⃣ إيقاف حماية الغرفة من السب\n3️⃣ تشغيل حماية الفلود (هجوم الدخول المتزامن + حظر IP)\n4️⃣ إيقاف حماية الفلود\n5️⃣ تشغيل حماية الدخول والخروج (تكرار الدخول)\n6️⃣ إيقاف حماية الدخول والخروج\n7️⃣ تعيين حد رسائل الفلود\n8️⃣ تشغيل حظر الحسابات بلا صورة\n9️⃣ إيقاف حظر الحسابات بلا صورة\n━━━━━━━━━━━━\n📌 أرسل رقم الخيار الآن.": "🛡️ Room protection settings\n━━━━━━━━━━━━\n1️⃣ Enable profanity protection\n2️⃣ Disable profanity protection\n3️⃣ Enable flood protection (mass-join attack + IP ban)\n4️⃣ Disable flood protection\n5️⃣ Enable repeated join/leave protection\n6️⃣ Disable repeated join/leave protection\n7️⃣ Set the flood message limit\n8️⃣ Block accounts without a profile photo\n9️⃣ Stop blocking accounts without a profile photo\n━━━━━━━━━━━━\n📌 Send the option number now.",
+                "🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر (من 2 إلى 50).": "🔢 Send the allowed number of repeated messages before a ban (2–50).",
+                "⛔ حماية الغرفة متوقفة.": "⛔ Room protection is disabled.",
+                "🛑 الألعاب متوقفة في هذه الغرفة حالياً.": "🛑 Games are currently disabled in this room.",
+                "✅ قائمة صناع الغرفة فارغة.": "✅ The room creator list is empty.",
+                "❌ اختر محصولاً من قائمة زرع.": "❌ Choose a crop from the farm list.",
+                "⏳ لديك 5 محاصيل قيد الزراعة حالياً. احصد أحدها أولاً ثم ازرع محصولاً جديداً.": "⏳ You already have 5 crops growing. Harvest one before planting another.",
+                "❌ المبلغ غير صحيح.": "❌ Invalid amount.",
+                "❌ اختر 1 أو 2 أو 3 فقط.": "❌ Choose 1, 2, or 3 only.",
+                "❌ الصيغة: .صوره اسم_المستخدم": "❌ Usage: .photo username",
+                "❌ لم أجد صورة مناسبة حالياً.": "❌ I couldn't find a suitable image right now.",
+                "❌ وجدت صورة لكن تعذر تحميلها حالياً.": "❌ I found an image, but couldn't download it.",
+                "❌ تعذر تحميل الصورة من المصادر المتاحة حالياً.": "❌ Couldn't download an image from the available sources.",
+                "❌ رابط الصور العام غير مضبوط في إعدادات البوت.": "❌ The public image URL is not configured.",
+                "❌ تعذر البحث عن الصورة حالياً.": "❌ Image search is temporarily unavailable.",
+                "❌ الصيغة: شبيه@اسم_المستخدم": "❌ Usage: lookalike@username",
+                "❌ فشلت السرقة: لا يوجد عضو آخر متاح للسرقة حالياً.": "❌ The steal game failed: no other eligible room member is available.",
+                "❌ اختر 1 أو 2 فقط.\n\u20661.\u2069 وجه\n\u20662.\u2069 كتابة": "❌ Choose 1 or 2 only.\n1. Heads\n2. Tails",
+                "🐍 تم انضمام اللاعب. اكتب rool للعب.": "🐍 Player joined. Type rool to play.",
+                "⏳ اللعبة ما زالت تنتظر لاعباً ثانياً.\n👥 اكتب join أولاً، وبعدها يبدأ الرول.": "⏳ The game is waiting for a second player.\n👥 Type join first; rolling starts once they join.",
+                "🔎 جاري البحث عن صورة شخصية مشهورة مناسبة...": "🔎 Searching for a suitable celebrity image...",
+                "❌ تعذر العثور على صورة مناسبة الآن؛ جرّب مرة أخرى لاحقاً.": "❌ Couldn't find a suitable image. Please try again later.",
+                "❌ تعذر عرض الصورة لأن رابط الوسائط العام غير مضبوط.": "❌ Couldn't show the image because the public media URL is not configured.",
+                "❌ تعذر إرسال الصورة إلى الغرفة.": "❌ Couldn't send the image to the room.",
+                "❌ تعذر البحث عن صورة مناسبة حالياً.": "❌ Image search is temporarily unavailable.",
+                "🛑 الألعاب متوقفة في هذه الغرفة حالياً.": "🛑 Games are currently disabled in this room.",
+                "🎉 ألعاب التسلية: زواج، تحدي، لغز، حظي، مزاج": "🎉 Fun games: marriage, challenge, riddle, my luck, mood",
+                "⌛ انتهت مهلة البورصة. اكتب بورصة من جديد.": "⌛ The stock-market choice timed out. Type stock to try again.",
+                "🔒 هذا الأمر مخصص للماستر فقط.": "🔒 This command is for the bot master only.",
+                "🌱 ازرع محصولاً آخر.\n📖 الطريقة: اكتب زرع ثم @ ثم رمز المحصول.\nمثال: زرع@🍐\n💡 لا يمكن زراعة نفس النوع مرتين في نفس الوقت.": "🌱 Plant another crop.\n📖 Type farm@ followed by the crop symbol.\nExample: farm@🍐\n💡 You cannot grow the same crop twice at once.",
+                "🌱 ازرع محصولاً آخر.\n📖 الطريقة: زرع@رمز_المحصول\nمثال: زرع@🍐\n💡 لا يمكن زراعة نفس النوع مرتين في نفس الوقت.": "🌱 Plant another crop.\n📖 Use farm@crop_symbol.\nExample: farm@🍐\n💡 You cannot grow the same crop twice at once.",
+                "📈💰 البورصة\n━━━━━━━━━━━━━━\n1️⃣ 🥇 ذهب\n2️⃣ 🛢️ نفط\n3️⃣ ⛏️ معادن\n\n🎯 أرسل رقم الخيار 1 أو 2 أو 3.\n⌛ لديك دقيقتان لاختيارك.": "📈💰 Stock market\n━━━━━━━━━━━━━━\n1️⃣ 🥇 Gold\n2️⃣ 🛢️ Oil\n3️⃣ ⛏️ Metals\n\n🎯 Send 1, 2, or 3 to choose.\n⌛ You have two minutes to choose.",
+                "🐍 تم انضمام اللاعب. اكتب rool للعب.": "🐍 Player joined. Type rool to play.",
+            }
+            self._english_room_exact_translations = cached
+        exact = cached
+        if value in exact:
+            return exact[value]
+        # Ludo has dynamic player names and scores; translate full message
+        # templates while preserving those values exactly.
+        match = re.fullmatch(r"🎲 تم اختيار لودو لـ (\d+) لاعبين\.\n👥 اكتب join للانضمام — نحتاج (\d+) لاعباً إضافياً\.\n📌 يبدأ اللعب بعد اكتمال العدد، ثم اكتب rool\.", value)
+        if match:
+            return f"🎲 Ludo set for {match.group(1)} players.\n👥 Type join to enter — {match.group(2)} more player(s) needed.\n📌 The game starts when all players join; type rool on your turn to roll."
+        match = re.fullmatch(r"🎮 لديك لعبة لودو شغالة بالفعل في غرفة: (.+)\n✏️ اكتب اسم اللعبة لبدء لعبة جديدة\.", value)
+        if match:
+            return f"🎮 You already have a Ludo game running in {match.group(1)}.\n✏️ Type ludo to start a new game."
+        match = re.fullmatch(r"🎲 توجد لعبة لودو شغالة بالفعل في غرفة: (.+)\. اختر العدد أو اكتب join/انضمام\.", value)
+        if match:
+            return f"🎲 A Ludo game is already running in {match.group(1)}. Choose the player count or type join."
+        match = re.fullmatch(r"🤖 بدأت لعبة لودو مع البوت! أنت تبدأ أولاً، اكتب rool للعب\.", value)
+        if match:
+            return "🤖 Ludo vs. the bot has started! You go first. Type rool to roll the die."
+        match = re.fullmatch(r"🎲 بدأت لعبة لودو!\n👥 اللاعبون: (.+)\n🎯 دور (.+)، اكتب rool\.", value)
+        if match:
+            return f"🎲 Ludo has started!\n👥 Players: {match.group(1)}\n🎯 {match.group(2)} goes first — type rool to roll."
+        match = re.fullmatch(r"✅ انضم اللاعب\.\n👥 باقي (\d+) لاعب/لاعبين ثم تبدأ اللعبة\.", value)
+        if match:
+            return f"✅ Player joined.\n👥 {match.group(1)} more player(s) needed before the game starts."
+        match = re.fullmatch(r"🎲 @(.+?) وقف الرول على (\d+) وانتقل من المربع (\d+) إلى (\d+)\.", value)
+        if match:
+            return f"🎲 @{match.group(1)} rolled {match.group(2)} and moved from space {match.group(3)} to {match.group(4)}."
+        match = re.fullmatch(r"🤖 البوت رمى (\d+) وانتقل من المربع (\d+) إلى (\d+)\.\n🎯 الآن دور @(.+)، اكتب rool\.", value)
+        if match:
+            return f"🤖 The bot rolled {match.group(1)} and moved from space {match.group(2)} to {match.group(3)}.\n🎯 @{match.group(4)}, it is your turn — type rool."
+        match = re.fullmatch(r"🎯 الآن دور @(.+)، اكتب rool\.", value)
+        if match:
+            return f"🎯 @{match.group(1)}, it is your turn — type rool to roll."
+        match = re.fullmatch(r"🏆 مبروك! فاز @(.+?) بلعبة لودو\.\n🎲 الرول الأخير: (\d+)\n📍 وصل إلى نهاية المسار\.\n💰 جائزة الفوز: \+([\d,]+) نقطة\n💳 رصيده الآن: ([\d,]+) نقطة", value)
+        if match:
+            return f"🏆 Congratulations, @{match.group(1)} won Ludo!\n🎲 Final roll: {match.group(2)}\n📍 Reached the finish.\n💰 Prize: +{match.group(3)} points\n💳 New balance: {match.group(4)} points"
+        match = re.fullmatch(r"🛡️ حماية الغرفة شغالة\. حد التكرار: (\d+) رسائل\.", value)
+        if match:
+            return f"🛡️ Room protection is enabled. Repetition limit: {match.group(1)} messages."
+        match = re.fullmatch(r"🛡️ تم تشغيل حماية الغرفة من السب\.|⛔ تم إيقاف حماية الغرفة من السب\.|🛡️ تم تشغيل حماية الغرفة من الفلود\.|⛔ تم إيقاف حماية الغرفة من الفلود\.|🛡️ تم تشغيل حماية الدخول والخروج\.|⛔ تم إيقاف حماية الدخول والخروج\.|🛡️ تم تشغيل حظر الحسابات بلا صورة\.|⛔ تم إيقاف حظر الحسابات بلا صورة\.", value)
+        if match:
+            protection_messages = {
+                "🛡️ تم تشغيل حماية الغرفة من السب.": "🛡️ Profanity protection enabled.",
+                "⛔ تم إيقاف حماية الغرفة من السب.": "⛔ Profanity protection disabled.",
+                "🛡️ تم تشغيل حماية الغرفة من الفلود.": "🛡️ Flood protection enabled.",
+                "⛔ تم إيقاف حماية الغرفة من الفلود.": "⛔ Flood protection disabled.",
+                "🛡️ تم تشغيل حماية الدخول والخروج.": "🛡️ Repeated join/leave protection enabled.",
+                "⛔ تم إيقاف حماية الدخول والخروج.": "⛔ Repeated join/leave protection disabled.",
+                "🛡️ تم تشغيل حظر الحسابات بلا صورة.": "🛡️ Blocking accounts without a profile photo enabled.",
+                "⛔ تم إيقاف حظر الحسابات بلا صورة.": "⛔ Blocking accounts without a profile photo disabled.",
+            }
+            return protection_messages[value]
+        match = re.fullmatch(r"✅ تم ضبط حماية التكرار في (.+) على (\d+) رسائل متتالية\.", value)
+        if match:
+            return f"✅ Repetition protection for {match.group(1)} is set to {match.group(2)} consecutive messages."
+        match = re.fullmatch(r"✅ تم اعتماد حد الفلود: (\d+) رسائل متكررة في الغرفة: (.+)", value)
+        if match:
+            return f"✅ Flood limit set to {match.group(1)} repeated messages in room {match.group(2)}."
+        match = re.fullmatch(r"🐎🛡️ @(.+?) حصل على حصانة!\n━━━━━━━━━━━━\n⏱️ الحماية من السرقة: دقيقة واحدة\n🔓 تنتهي بعد 60 ثانية\.\n━━━━━━━━━━━━", value)
+        if match:
+            return f"🐎🛡️ @{match.group(1)} is protected from stealing for one minute.\n🔓 Protection expires in 60 seconds."
+        match = re.fullmatch(r"⌛ انتهت لعبة (.+) تلقائياً لعدم وجود تفاعل لمدة دقيقتين\.", value)
+        if match:
+            return f"⌛ {match.group(1)} ended automatically after two minutes without activity."
+        match = re.fullmatch(r"⏳ @(.+?) انتظر (.+) قبل بدء لعبة (.+)\.\n🎮 الفاصل بين لعبتي (.+) لنفس اللاعب هو 4 دقائق\.", value)
+        if match:
+            return f"⏳ @{match.group(1)}, wait {match.group(2)} before starting {match.group(3)} again.\n🎮 The cooldown for the same player and game is 4 minutes."
+        match = re.fullmatch(r"⏳ @(.+?) لديك لعبة (.+) شغالة حالياً\.\n🎯 ما زالت تبحث عن منافس\.\n⌛ مدة البحث دقيقتان فقط، وبعدها تُلغى تلقائياً إذا لم يدخل منافس\.", value)
+        if match:
+            return f"⏳ @{match.group(1)}, your {match.group(2)} game is already waiting.\n🎯 Looking for an opponent.\n⌛ It will be cancelled after two minutes if nobody joins."
+        match = re.fullmatch(r"❌ تحتاج (.+) نقطة للمشاركة في (.+)\. رصيدك: (.+)", value)
+        if match:
+            return f"❌ You need {match.group(1)} points to play {match.group(2)}. Your balance: {match.group(3)}."
+        match = re.fullmatch(r"🌱 تم زرع (.+) بنجاح!\n⏱️ الانتظار: (.+) دقيقة\n🎁 المكافأة: (.+) نقطة\n📩 عند اكتمال الزراعة ستصلك النتيجة تلقائياً في الخاص\.", value)
+        if match:
+            return f"🌱 {match.group(1)} planted successfully!\n⏱️ Growing time: {match.group(2)} minutes\n🎁 Reward: {match.group(3)} points\n📩 You'll receive the result in a private message when it's ready."
+        match = re.fullmatch(r"❌ رصيدك غير كافٍ\. رصيدك: (.+)", value)
+        if match:
+            return f"❌ Not enough points. Your balance: {match.group(1)}."
+        match = re.fullmatch(r"⏰ @(.+?) انتهى وقت الاختيار\. أرسل أمر اللعبة من جديد\.", value)
+        if match:
+            return f"⏰ @{match.group(1)}, the selection timed out. Send the game command again."
+        match = re.fullmatch(r"❌ لم أجد @(.+?) ضمن أعضاء الغرفة\.", value)
+        if match:
+            return f"❌ I couldn't find @{match.group(1)} among the room members."
+        match = re.fullmatch(r"🎯 تحدي @(.+?): (.+)", value)
+        if match:
+            return f"🎯 Challenge for @{match.group(1)}: {match.group(2)}"
+        match = re.fullmatch(r"🏆 فاز @(.+?) بلعبة السلم والثعبان!\n🎲 الرول الأخير: (\d+)\n📍 وصل إلى الخانة 100\.\n💰 جائزة الفوز: \+([\d,]+) نقطة\n💳 رصيده الآن: ([\d,]+) نقطة", value)
+        if match:
+            return f"🏆 @{match.group(1)} won Snake & Ladders!\n🎲 Final roll: {match.group(2)}\n📍 Reached square 100.\n💰 Prize: +{match.group(3)} points\n💳 New balance: {match.group(4)} points"
+        match = re.fullmatch(r"🏆 انتهت لعبة (.+)\n👑 الفائز: @(.+)\n💰 مبلغ الفوز: \+(.+) نقطة\n❌ الخاسر: @(.+)\n💸 مبلغ الخسارة: -(.+) نقطة", value)
+        if match:
+            return f"🏆 {match.group(1)} is over.\n👑 Winner: @{match.group(2)}\n💰 Winnings: +{match.group(3)} points\n❌ Loser: @{match.group(4)}\n💸 Loss: -{match.group(5)} points"
+        match = re.fullmatch(r"🍉 فيس @(.+)\n🤖 البوت أرسل (.+)\n❌ لم تتم المطابقة، حظاً موفقاً\.\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة", value)
+        if match:
+            return f"🍉 Face match — @{match.group(1)}\n🤖 The bot chose {match.group(2)}\n❌ No match this time. Better luck next time!\n💰 Winnings: 0 points\n💸 Loss: 0 points"
+        match = re.fullmatch(r"📈💰 البورصة\n━━━━━━━━━━━━━━\n👤 اللاعب: @(.+)\n(.+) الاختيار: (.+)\n(.+)\n🎁 المكافأة: \+(.+) نقطة\n💰 الرصيد: (.+)", value)
+        if match:
+            return f"📈💰 Stock market\n━━━━━━━━━━━━━━\n👤 Player: @{match.group(1)}\n{match.group(2)} Choice: {match.group(3)}\n{match.group(4)}\n🎁 Reward: +{match.group(5)} points\n💰 Balance: {match.group(6)}"
+        match = re.fullmatch(r"📊✨ استثمار مع البوت\n━━━━━━━━━━━━\n👤 اللاعب: @(.+)\n(.+)\n🎁 المكافأة: \+(.+) نقطة\n💰 الرصيد: (.+)", value)
+        if match:
+            return f"📊✨ Investment with the bot\n━━━━━━━━━━━━\n👤 Player: @{match.group(1)}\n{match.group(2)}\n🎁 Reward: +{match.group(3)} points\n💰 Balance: {match.group(4)}"
+        match = re.fullmatch(r"🕵️💰 تمت السرقة بنجاح!\n👤 السارق: @(.+)\n🎯 الضحية: @(.+)\n💸 المسروق: 500 نقطة\n🎁 @(.+) حصل على \+500 نقطة\.\n💰 رصيد السارق: (.+)", value)
+        if match:
+            return f"🕵️💰 The steal succeeded!\n👤 Thief: @{match.group(1)}\n🎯 Victim: @{match.group(2)}\n💸 Stolen: 500 points\n🎁 @{match.group(3)} received +500 points.\n💰 Thief's balance: {match.group(4)}"
+        match = re.fullmatch(r"@(.+) لديه حصانه من السرقه", value)
+        if match:
+            return f"@{match.group(1)} is protected from being robbed."
+        match = re.fullmatch(r"❌ رصيدك غير كافٍ\. رصيدك: (.+)", value)
+        if match:
+            return f"❌ Not enough points. Your balance: {match.group(1)}."
+        match = re.fullmatch(r"🛡️ حماية الغرفة شغالة\. حد التكرار: (\d+) رسائل\.", value)
+        if match:
+            return f"🛡️ Room protection is enabled. Repetition limit: {match.group(1)} messages."
+        match = re.fullmatch(r"(🛡️ تم تشغيل|⛔ تم إيقاف) حماية (.+)\.\n🏠 الغرفة: (.+)", value)
+        if match:
+            state = "enabled" if match.group(1).startswith("🛡️") else "disabled"
+            label = {
+                "حماية الغرفة من السب": "profanity protection",
+                "حماية الغرفة من الفلود": "flood protection",
+                "حماية الدخول والخروج": "repeated join/leave protection",
+                "حظر الحسابات بلا صورة": "blocking accounts without a profile photo",
+            }.get(match.group(2), match.group(2))
+            return f"{match.group(1)[:2]} {label.capitalize()} {state}.\n🏠 Room: {match.group(3)}"
+        match = re.fullmatch(r"🚫 \[حماية الفلود\] تم حظر IP سريعاً للحسابات التالية: (.+)", value)
+        if match:
+            return f"🚫 [Flood protection] IP-banned the following accounts after a rapid join attack: {match.group(1)}"
+        match = re.fullmatch(r"🔢 أرسل عدد الرسائل المتكررة المسموح بها قبل الحظر \(من 2 إلى 50\)\.", value)
+        if match:
+            return "🔢 Send the allowed number of repeated messages before a ban (2–50)."
+        # Keep names, numbers and URLs intact while translating the most common labels.
+        cached = getattr(self, "_english_room_replacements", None)
+        if cached is None:
+            cached = {
+                "تم تشغيل الأغنية": "Song started", "الأغنية": "song", "في البث": "in the live broadcast",
+                "جاري تجهيز طلب الأغنية": "Preparing the song request", "تم نشر الصورة بنجاح": "Image posted successfully",
+                "أوامر البوت": "Bot commands", "اختر لغة البوت للغرف المحددة": "Choose the bot language for the selected rooms",
+                "العربية": "Arabic", "عدد الغرف": "Rooms", "أرسلت طلبات الدخول": "Join requests sent",
+                "انتظر تأكيد الخادم": "Wait for server confirmation", "تم قبول طلب دخول الغرفة": "Room join request accepted",
+                "وداعاً نلتقي مرة أخرى": "Goodbye, see you again", "مرحبا لقد عدت ادري وحشتكم": "Hello, I am back; I know you missed me",
+                "لعبة العملة": "Coin toss", "اختيارك:": "Your choice:", "النتيجة:": "Result:",
+                "وجه": "Heads", "كتابة": "Tails", "فزت!": "You won!", "لم تفز هذه المرة.": "You didn't win this time.",
+                "عجلة الحظ": "Lucky wheel", "دارت العجلة وتوقفت على:": "The wheel landed on:",
+                "مبلغ الفوز:": "Winnings:", "مبلغ الخسارة:": "Loss:", "رصيدك:": "Your balance:",
+                "الرصيد:": "Balance:", "نقطة": "points", "نقاط": "points", "المكافأة:": "Reward:",
+                "لعبة الصناديق": "Box game", "اخترت الصندوق": "You chose box", "الصندوق الرابح:": "Winning box:",
+                "الصندوق الرابح كان:": "The winning box was:", "ربحت!": "You won!", "لم تربح.": "You didn't win.",
+                "أرسل الرقم فقط": "Send the number only", "صندوق ": "Box ",
+                "لعبة الكؤوس": "Cup game", "اختر الكوب:": "Choose a cup:", "اخترت الكوب": "You chose cup",
+                "الكأس الصحيح:": "Correct cup:", "وجدت الجائزة!": "You found the prize!", "الجائزة كانت في الكوب:": "The prize was under cup:", "الكوب الخطأ.": "Wrong cup.",
+                "معركة الوحش": "Monster battle", "قوتك:": "Your strength:", "قوة الوحش:": "Monster strength:",
+                "هزمت الوحش!": "You defeated the monster!", "الوحش هزمك.": "The monster defeated you.", "تعادل مع الوحش — لا توجد جائزة.": "It's a tie with the monster — no prize.",
+                "لعبة البركان": "Volcano game", "خرجت الجائزة من البركان!": "The prize erupted from the volcano!", "انفجر البركان ولم تجد جائزة.": "The volcano erupted, but there was no prize.",
+                "صيد الطائر": "Bird hunt", "ظهر:": "Appeared:", "عصفور": "Sparrow", "نسر": "Eagle", "بومة": "Owl", "ببغاء": "Parrot", "لم يظهر طائر": "No bird appeared",
+                "لعبة النجمة": "Star game", "حظك:": "Your luck:", "عادية": "Regular", "لامعة": "Shiny", "نادرة": "Rare", "أسطورية": "Legendary", "لم تلتقط نجماً": "You caught no star",
+                "بنك مليون": "Million Bank", "جاري البحث عن الجائزة...": "Searching for the prize...", "جاري البحث عن مليار...": "Searching for the billion...",
+                "🏆 فزت بـ ": "🏆 You won ", "🤖 البوت فاز!": "🤖 The bot won!", "🤝 تعادل!": "🤝 It's a tie!",
+                "طاولة": "Table game", "أونو": "UNO", "أنت:": "You:", "البوت:": "Bot:",
+                "اللاعب:": "Player:", "الاختيار:": "Choice:", "لا تتم المطابقة، حظاً موفقاً.": "No match. Better luck next time.",
+                "تعذر": "Could not", "لا يوجد": "No", "انتهت": "Ended", "انتظر دورك": "Please wait for your turn",
+                "تحتاج ": "You need ", "للمشاركة في ": " to play ", "رصيدك غير كافٍ": "Not enough points",
+                "حصل على حصانة": "is protected", "جاري البحث عن الضحية...": "Searching for a target...",
+                "حاول سرقة": "tried to rob", "فشلت السرقة": "The robbery failed", "المسروق": "the target",
+                "مفلس.": "has no points.", "رصيده:": "Their balance:", "تم إبلاغ الشرطة!": "The police were notified!",
+                "لم تتم السرقة.": "The robbery failed.", "تمت السرقة بنجاح!": "The robbery succeeded!",
+                "السارق:": "Thief:", "الضحية:": "Victim:", "المسروق:": "Stolen:", "حصل على +": "received +",
+                "رصيد السارق:": "Thief's balance:", "المستخدم:": "User:", "لا يوجد عضو آخر متاح": "No other eligible member is available",
+                "انضم اللاعب.": "Player joined.", "باقي ": "", "لاعبين ثم تبدأ اللعبة.": " players needed before the game starts.",
+                "بدأت اللعبة": "The game started", "اللاعبون:": "Players:", "دور ": "Turn: ", "اللاعب": "Player",
+                "أرسل رقم الخيار": "Send the option number", "انتهى وقت الاختيار.": "Selection timed out.",
+                "الاختيار: ": "Choice: ", "النتيجة: ": "Result: ", "غير صحيح.": "Invalid.",
+                "لم تتم المطابقة": "No match", "تمت المطابقة": "It's a match", "حظاً موفقاً": "Better luck next time",
+                "مبروك": "Congratulations", "فاز": "won", "فائز": "Winner", "الخاسر": "Loser",
+                "ربحت": "You won", "خسرت": "You lost", "نجحت وربحت": "You succeeded and won",
+                "لم تنجح هذه المرة.": "You didn't win this time.", "اختر": "Choose", "الطريقة:": "How to play:",
+                "الانتظار:": "Wait:", "دقيقة واحدة": "one minute", "دقائق": "minutes", "دقيقة": "minute",
+                "ثانية": "seconds", "ثواني": "seconds", "قبل بدء لعبة": "before starting the game",
+                "المستثمر:": "Investor:", "الربح:": "Profit:", "الخسارة:": "Loss:", "استثمار مع البوت": "Bot investment",
+                "حياة سعيدة مليئة بالفرح.": "a happy life full of joy.", "نتمنى لكما": "Wishing you both",
+                "لم أجد عضواً آخر متاحاً للزواج حالياً.": "I couldn't find another available player for a wedding right now.",
+                "لم أجد عضواً آخر حاضراً في هذه الغرفة.": "I couldn't find another player in this room.",
+                "الشخصية المشهورة:": "Celebrity:", "لغز ": "Riddle ", "الإجابة:": "Answer:",
+                "الجواب:": "Answer:", "انتهى وقت الاختيار.": "Selection time is over.",
+                "طلبت:": "You asked for:", "فشلت": "Failed", "نجحت": "Succeeded", "انتهت لعبة": "Game ended:",
+                "المبلغ غير صحيح.": "Invalid amount.", "لاعباً": "players", "لاعبين": "players", "مع البوت": "against the bot",
+                "ابدأ": "Start", "اكتب rool": "type rool", "اكتب join": "type join",
+                "بدأت لعبة السلم والثعبان! جاري البحث عن خصم. للمشاركة اكتب join": "Snake & Ladders started! Waiting for an opponent. Type join to participate.",
+                "وقف الرول على": "rolled", "وانتقل من": "and moved from", "إلى": "to",
+                "بلعبة السلم والثعبان!": "won Snake & Ladders!", "الرول الأخير:": "Final roll:",
+                "وصل إلى الخانة 100.": "Reached square 100.", "رصيده الآن:": "New balance:",
+                "🎮 لديك لعبة السلم والثعبان شغالة بالفعل في غرفة:": "🎮 You already have a Snake & Ladders game running in room:",
+                "🐍 توجد لعبة السلم والثعبان شغالة بالفعل في غرفة:": "🐍 A Snake & Ladders game is already running in room:",
+            }
+            self._english_room_replacements = cached
+        replacements = cached
+        for ar, en in replacements.items():
+            value = value.replace(ar, en)
+        return value
+
     def send_room_text(self, room: str, text: str):
+        text = self._localize_room_text(room, text)
+        text = _fit_text_to_packet("room_message", text, room=room)
         if getattr(self._master_reply_local, "tracking", False):
             self._master_reply_local.replied = True
         if getattr(self._silent_master_local, "active", False):
@@ -8142,7 +8451,15 @@ class TalkinBot:
                 while not getattr(self, f"_livekit_active_{room}", False) and time.time() < wait_until:
                     time.sleep(0.25)
                 if getattr(self, f"_livekit_active_{room}", False):
-                    self._feed_livekit_audio(room, str(track["url"]), int(track.get("duration") or 0))
+                    first_frame = self._feed_livekit_audio(room, str(track["url"]), int(track.get("duration") or 0))
+                    status = getattr(self, "_last_live_play_status_by_room", {})
+                    if first_frame:
+                        status[room] = "started"
+                        self.send_room_text(room, "تم تشغيل الطلب في البث")
+                    else:
+                        status[room] = "failed"
+                        self.send_room_text(room, "تعذر تشغيل الطلب في البث؛ لم يصل صوت فعلي.")
+                    self._last_live_play_status_by_room = status
                 else:
                     self.log("[LIVEKIT] لم تصبح جلسة Publisher جاهزة ضمن المهلة:", room)
                 self.send_query(encode_query(
@@ -9025,7 +9342,9 @@ class TalkinBot:
                     if self.send_private_invite(username, room):
                         count += 1
                     # Small pacing gap, but never blocks the WebSocket reader.
-                    time.sleep(0.08)
+                    # Avoid a burst of private-message packets for large rooms;
+                    # aggressive invitation loops can trigger gateway disconnects.
+                    time.sleep(max(0.1, float(os.getenv("INVITE_SEND_INTERVAL_SECONDS", "0.4"))))
                 except Exception as e:
                     self.log("[INV] failed for", username, repr(e))
 
@@ -9973,7 +10292,7 @@ class TalkinBot:
                 if live_stream:
                     if live_started:
                         # أرسل نجاح التشغيل إلى غرفة البث الحالية فقط.
-                        self.send_room_text(room, "🎶 تم تشغيل الأغنية في البث\n📡 بث مباشر")
+                        self.send_room_text(room, "🎶 تم تشغيل الطلب في البث\n🎵 تم تشغيل الأغنية في البث فعلياً\n📡 بث مباشر")
                     elif getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed") == "queued":
                         self.send_room_text(room, "📡 بث مباشر\n⏳ جاري تشغيل الأغنية...")
                     else:
@@ -10113,12 +10432,14 @@ class TalkinBot:
             # WebSocket when fallback profile actions are sent back-to-back.
             action = PROFILE_STATUS_ACTION
             try:
-                self.send_query(encode_query(
-                    action,
-                    type_="status",
-                    body=status,
-                    value=status,
-                ))
+                payload = encode_query(action, type_="status", body=status, value=status)
+                if len(payload) > _ws_payload_limit():
+                    # Long HTML statuses must fit the hard 1008-byte Talkin
+                    # frame limit. The status text is identical in either
+                    # field; use the canonical body field rather than send an
+                    # oversized packet that would be rejected by the gateway.
+                    payload = encode_query(action, type_="status", body=status)
+                self.send_query(payload)
                 self.log("[PROFILE] status update sent via", action)
                 sent = True
                 if PROFILE_STATUS_VERIFY:
@@ -12113,7 +12434,7 @@ class TalkinBot:
         timer.start()
 
     def _snake_command(self,room,sender,raw):
-        key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=low in ("snake","سناكي")
+        key=f"snake:{_norm_room(room)}"; low=str(raw or "").strip().casefold(); english=(getattr(self, "room_languages", {}).get(_norm_room(room)) == "en" or low in ("snake","snakes and ladders","سناكي"))
         game=self.snake_games.get(key)
         if low in ("ثعبان","snake","سناكي") and not game:
             if not self._board_game_cooldown_notice(room, sender, "snake"):
@@ -12305,7 +12626,7 @@ class TalkinBot:
                 d.text((cx,cy),str(i+1),fill=(255,255,255),font=_gift_font("1",18),anchor="mm")
 
         # Title and final winner badge. The winner photo is embedded in the final image.
-        title="لودو"
+        title="Ludo" if state.get("lang") == "en" else "لودو"
         d.rounded_rectangle((ox,18,ox+15*cell,oy-5),radius=16,fill=(16,30,45),outline=(230,190,75),width=3)
         d.text((ox+15*cell//2,42),title,fill=(245,205,80),font=_gift_font("1",30),anchor="mm")
         if winner_name:
@@ -12321,7 +12642,7 @@ class TalkinBot:
             avatar = _load_sender_avatar(winner_photo, 72) if winner_photo else None
             if avatar is not None:
                 _paste_avatar_safe(img, avatar, (ox+20, panel_y0+14))
-            d.text((ox+15*cell//2, panel_y0+31), "🏆 الفائز",
+            d.text((ox+15*cell//2, panel_y0+31), "🏆 Winner" if state.get("lang") == "en" else "🏆 الفائز",
                    fill=(245,205,80), font=_gift_font("1",22), anchor="ma")
             d.text((ox+15*cell//2, panel_y0+70), f"@{str(winner_name).lstrip('@')}",
                    fill=(255,255,255), font=_gift_font("1",26), anchor="ma")
@@ -12339,9 +12660,10 @@ class TalkinBot:
         if low in ("لودو","ludo") and not game:
             if not self._board_game_cooldown_notice(room, sender):
                 return True
-            game={"players":[sender],"tokens":{sender:0},"lang":"en" if low=="ludo" else "ar","turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
+            room_language = getattr(self, "room_languages", {}).get(_norm_room(room))
+            game={"players":[sender],"tokens":{sender:0},"lang":room_language or ("en" if low=="ludo" else "ar"),"turn":0,"created":time.time(),"rooms":{room},"origin_room":room,"max_players":0,"bot":False,"started":False,"last_roll_at":0.0}
             self.ludo_games[key]=game; self._schedule_board_game_timeout(key, game, "لودو")
-            self.send_room_text(room,"🎲 Ludo: choose players 1-4. Type 1/2/3/4." if low=="ludo" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين"); return True
+            self.send_room_text(room,"🎲 Ludo — choose 1–4 players.\n1 = You vs. the bot; 2–4 = multiplayer.\nOther players type join. When the game starts, type rool on your turn to roll the die and move. First token to the finish wins." if game["lang"] == "en" else "🎲 لودو: اختر عدد اللاعبين\n1 مع البوت\n2 لاعبين\n3 لاعبين\n4 لاعبين\nاكتب join للانضمام، ثم rool عند دورك لرمي النرد وتحريك القطعة. أول لاعب يصل للنهاية يفوز."); return True
         if not game:return False
         origin_room = str(game.get("origin_room") or next(iter(game.get("rooms", {room})), room))
         game["origin_room"] = origin_room
@@ -12444,9 +12766,15 @@ class TalkinBot:
     def _marriage_game(self, room, sender):
         candidates=self._fun_room_members(room, sender)
         if not candidates:
-            self.send_room_text(room, f"💍 @{sender} لم أجد عضواً آخر متاحاً للزواج حالياً.")
+            if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+                self.send_room_text(room, f"💍 @{sender}, no other player is available for the wedding game right now.")
+            else:
+                self.send_room_text(room, f"💍 @{sender} لم أجد عضواً آخر متاحاً للزواج حالياً.")
             return True
         partner=secrets.choice(candidates)
+        if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            self.send_room_text(room, f"💍 Congratulations, @{sender}! Your spouse is @{partner} ❤️\nWishing you both a happy life full of joy.")
+            return True
         sentence=(f"زوجتك هي @{partner}" if secrets.randbelow(2) == 0
                   else f"زوجك هو @{partner}")
         self.send_room_text(room, f"💍 مبروك @{sender}! {sentence} ❤️\n"
@@ -12455,12 +12783,30 @@ class TalkinBot:
 
     def _social_pair_game(self, room, sender, command):
         candidates = self._fun_room_members(room, sender)
+        english = getattr(self, "room_languages", {}).get(_norm_room(room)) == "en"
         if not candidates:
-            self.send_room_text(room, f"🤝 @{sender} لم أجد عضواً آخر حاضراً في هذه الغرفة.")
+            self.send_room_text(room, f"🤝 @{sender}, no other player is available in this room." if english else f"🤝 @{sender} لم أجد عضواً آخر حاضراً في هذه الغرفة.")
             return True
         partner = secrets.choice(candidates)
         score = secrets.randbelow(101)
         kind = str(command or "").replace("ة", "ه")
+        if english:
+            labels = {"خطبه": "your fiancé", "خطيب": "your fiancé", "حبك": "your love match", "عدو": "your playful rival", "صديق": "your closest friend", "زاحف": "the biggest chatterbox", "خروف": "the room's playful scapegoat"}
+            label = labels.get(kind, "your match")
+            if kind in {"خطبه", "خطيب"}:
+                result = f"💍 Lovely news, @{sender}: your fiancé is @{partner}. Wishing you both happiness!"
+            elif kind == "حبك":
+                result = f"❤️ @{sender}, {label} is @{partner} — compatibility: {score}%. Looks like a great match!"
+            elif kind == "عدو":
+                result = f"😼 @{sender}, {label} today is @{partner} ({score}%). Make peace with a laugh!"
+            elif kind == "صديق":
+                result = f"🫶 @{sender}, your closest friend today is @{partner} — friendship score: {score}%!"
+            elif kind == "زاحف":
+                result = f"🦎 @{sender}, today's biggest chatterbox is @{partner} — score: {score}% (just for fun)."
+            else:
+                result = f"🐑 @{sender}, the room's playful scapegoat is @{partner} ({score}%). It's all a joke!"
+            self.send_room_text(room, result)
+            return True
         if kind in {"خطبه", "خطيب"}:
             result = f"💍 خبرٌ جميل يا @{sender}: خطيبك هو @{partner}.\nنتمنى لكما أياماً مليئة بالمودة والفرح."
         elif kind == "حبك":
@@ -12514,7 +12860,10 @@ class TalkinBot:
                 if sent is False:
                     self.send_room_text(room, "❌ تعذر إرسال الصورة إلى الغرفة.")
                     return
-                label = "زوجتك" if gender == "female" else "زوجك"
+                label = ("your wife" if gender == "female" else "your husband") if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en" else ("زوجتك" if gender == "female" else "زوجك")
+                if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+                    self.send_room_text(room, f"💞 @{sender}, {label} is the celebrity {name} ❤️")
+                    return
                 self.send_room_text(room, f"💞 @{sender}، {label} هي الشخصية المشهورة: {name} ❤️")
             except Exception as exc:
                 self.log("[CELEBRITY_PARTNER] failed:", repr(exc))
@@ -12529,6 +12878,23 @@ class TalkinBot:
         return True
 
     def _fun_game(self, room, sender, command):
+        if getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            options = {
+                "تحدي": ["Send a kind message to someone in the room.", "Write one thing you love today.", "Compliment someone you haven't talked to much.", "Tell a short joke for everyone."],
+                "لغز": [("What has teeth but cannot bite?", "A comb."), ("What moves without legs?", "Time."), ("What gets bigger the more you take away?", "A hole.")],
+                "حظي": ["Your luck is great today — try something new!", "Luck is smiling on you; go for it.", "A calm, lovely day is ahead.", "A nice surprise may arrive soon."],
+                "مزاج": ["Your mood: joyful and full of positive energy 😄", "Your mood: calm and relaxed 🌿", "Your mood: adventurous and excited 🔥", "Your mood: laughing and chatting 😂"],
+            }
+            value = secrets.choice(options[command])
+            label = {"تحدي": "Challenge", "لغز": "Riddle", "حظي": "My luck", "مزاج": "Mood"}[command]
+            if command == "لغز":
+                question, answer = value
+                self.send_room_text(room, f"🧩 Riddle for @{sender}\n{question}\n✅ Answer: {answer}")
+            elif command == "تحدي":
+                self.send_room_text(room, f"🎯 Challenge for @{sender}: {value}")
+            else:
+                self.send_room_text(room, f"✨ {label} for @{sender}: {value}")
+            return True
         options={
             "تحدي": ["أرسل كلمة طيبة لعضو في الغرفة.", "اكتب أول شيء تحبه اليوم.", "امدح شخصاً لم تتحدث معه كثيراً.", "اكتب نكتة قصيرة للجميع."],
             "لغز": [("شيء له أسنان ولا يعض، ما هو؟", "المشط"), ("ما الشيء الذي يمشي بلا أرجل؟", "الوقت"), ("ما الذي كلما أخذت منه كبر؟", "الحفرة")],
@@ -12860,6 +13226,49 @@ class TalkinBot:
                 text += "\n\n📌 للقائمة التالية اكتب ns"
             elif idx >= len(page_sections) - 1:
                 text += "\n\n✅ انتهت أقسام هذه القائمة."
+        if room and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            english = {
+                1: [
+                    "📋 Admin — moderation\n━━━━━━━━━━━━\nkick@name / kick name — kick a member\nban@name / ban name — ban a member\nub@name / unban name — unban a member\n.u — undo the bot’s last action",
+                    "📋 Admin — roles\n━━━━━━━━━━━━\nm@name — make a member\na@name / admin name — make an admin\no@name / owner name — make an owner\n+creator@name — add a room creator\n-creator@name — remove a room creator",
+                    "📋 Admin — verification and VIP\n━━━━━━━━━━━━\nvi@name — verify a user\nuns@name — remove verification\nvip@name / unvip@name — manage VIP status\nverify all — verify room members",
+                    "🛡️ Admin — protection\n━━━━━━━━━━━━\nprotection@room — open room protection settings\nprotection status — show protection status\nenable protection / disable protection — toggle room protection\nType protection to see numbered options.",
+                    "📋 Admin — filter and publishing\n━━━━━━━━━━━━\nmf@on / mf@off — enable/disable the word filter\n+mf@word / -mf@word — add/remove a filtered word\nl@mf — list filtered words\nmbp@name — remove a publishing ban",
+                    "📋 Admin — advanced commands\n━━━━━━━━━━━━\nstatus — bot status\nram / cpu — resource status\nmyrooms — connected rooms\njoin all — rejoin saved rooms\ninv / invite — invite members from this room",
+                ],
+                2: [
+                    "🎵 Music\n━━━━━━━━━━━━\n.sa song name / play song name — play music\nstop music / stop — stop the current song\nsher@name — share the current song",
+                    "❤️ Reactions, photos and lookalikes\n━━━━━━━━━━━━\nlk@code — like | lv@code — love | dl@code — dislike\ncm@code text — comment | report@code text — report\nmy photo / lookalike@name — safe image search",
+                ],
+                3: [
+                    "🎮 Games — solo games\n━━━━━━━━━━━━\nrock / paper / scissors — play against the bot\ninvestment, luck, coin@heads/tails, wheel\nbox@1-3, cup@1-3, monster, volcano, bird, star\ntable, uno\nType ns for the next games list.",
+                    "🎮 Games — wagers\n━━━━━━━━━━━━\nbet@amount — wager | duel@amount — duel\nmyluck@amount — luck wager\ninvestment@amount — investment game\nChoose the stake after the game command.",
+                    "🎮 Games — bank and rewards\n━━━━━━━━━━━━\nbank million — million bank | billion — billion game\nfarm@item — plant a crop | stock — choose a market\nface@name — face game\nType ns for the next games list.",
+                    "🎲 Room games — Ludo and Snake & Ladders\n━━━━━━━━━━━━\nludo — start Ludo; choose 1–4 players\n1 = play against the bot; 2–4 = multiplayer\nOther players type join. When the game starts, the player whose turn it is types rool to roll the die and move. First token to the finish wins.\nsnake — start Snake & Ladders; type join to enter.\nType ns for the next games list.",
+                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nfishing, lightning, ruby, crash, detector\nMultiplayer games need other players to join.\nType ns for the next games list.",
+                    "🏏 Cricket\n━━━━━━━━━━━━\nMaster: start cricket game / stop cricket game.\nVerified players: .cr 1, choose 1–4 players, then each player types join. Choose 1 (bat) or 2 (defend), then send a score from 0 to 6 for each ball.\nType ns to return to the first game list.",
+                ],
+                4: [
+                    "🎁 Gifts\n━━━━━━━━━━━━\nsa@number@name — send a gift\ngifts / gv — open the gift menu\nThe sender and recipient must be eligible; gift cost is deducted from points.",
+                    "📢 Publishing\n━━━━━━━━━━━━\npost or publish — prepare an image post\npost@description / publish@description — add a caption\nSend the image when prompted. Publishing follows the room’s permissions and content filter.",
+                ],
+                5: [
+                    "💰 Points and leaderboards\n━━━━━━━━━━━━\npoints — your balance and game stats\ntop — leaderboard\ntop bet / top duel / top investment — game leaderboards",
+                    "💸 Point transfers\n━━━━━━━━━━━━\nsb@name@amount — transfer from your balance\nExample: sb@ahmed@1000\nTransfers are limited to eligible users and deduct points from the sender.",
+                ],
+                6: [
+                    "🚪 Rooms\n━━━━━━━━━━━━\njoin@room_name — join a room, then select its language\nmyrooms — list connected rooms\nleave room — leave and rejoin (primary master only)\ninv / invite — invite members from this room\ninvmsg@text — change invitation text",
+                    "🏠 Room messages, welcomes and protection\n━━━━━━━━━━━━\nsay text — make the bot speak\n+sr@trigger@reply — add an auto-reply (master)\nswc@on / swc@off — toggle welcome messages\nprotection — open protection settings\nType ns for the next room list.",
+                ],
+            }
+            page_english = english.get(int(page), [])
+            if page_english:
+                idx = max(1, min(int(part), len(page_english))) - 1
+                text = page_english[idx]
+                if idx < len(page_english) - 1:
+                    text += "\n\nType ns for the next section."
+                elif int(page) == 3:
+                    text += "\n\nType ns to return to the first game list."
         # a3 is intentionally one single message: the 13 bot-vs-bot games
         # must never be split into two chat bubbles. Other help sections keep
         # the normal safe line batching.
@@ -12879,6 +13288,8 @@ class TalkinBot:
         sections = _help_sections_from_messages().get(3, [])
         if not sections:
             return False
+        if room and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+            return self._send_help_section(room=room, page=3, part=part)
         idx = max(1, min(int(part), len(sections))) - 1
         text = sections[idx]
         # The first A3 page already contains its exact navigation footer.
@@ -12929,6 +13340,8 @@ class TalkinBot:
 
         if _body_low in ("اوامر", "الاوامر", "help", "مساعدة"):
             menu = _command_menu_for(_is_primary_master(sender), is_private=is_private)
+            if room and not is_private and getattr(self, "room_languages", {}).get(_norm_room(room)) == "en":
+                menu = "📚 Talkin bot commands\n━━━━━━━━━━━━\na2 — Music and reactions\na3 — Games\na4 — Gifts and publishing\na5 — Points\na6 — Rooms and welcomes\n━━━━━━━━━━━━\nType a2–a6 to open a section."
             if is_private:
                 self.send_private_text(sender, menu)
             elif room:
@@ -13051,6 +13464,8 @@ class TalkinBot:
         repeat_last_command = str(body or "").strip().casefold() == ".u"
         security_command = bool(
             re.match(r"^(?:تشغيل|إيقاف) الحماية$", str(body or "").strip(), re.I)
+            or str(body or "").strip().casefold() in {"protection", "room protection", "protection status", "room protection status", "enable protection", "enable room protection", "disable protection", "disable room protection"}
+            or re.match(r"^(?:protection|room protection)(?:@|\s+).+", str(body or "").strip(), re.I)
             or re.match(r"^mr@\d+$", str(body or "").strip(), re.I)
             or str(body or "").strip().casefold() in {"حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "l@mfb"}
             or re.match(r"^(?:amf|[-+]amf)@.+$", str(body or "").strip(), re.I)
@@ -13074,7 +13489,7 @@ class TalkinBot:
                     sender, _norm_ch, response_room=response_room, is_private=is_private
                 )
 
-        join_command = bool(re.match(r"^دخول\s*@\s*.+$", str(body or "").strip(), re.I))
+        join_command = bool(re.match(r"^(?:دخول|join)\s*@\s*.+$", str(body or "").strip(), re.I))
         join_all_command = str(body or "").strip().casefold() in {"دخول الكل", "دخولكل", "join all"}
         verification_manager_command = _is_verification_manager_command(body)
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
@@ -13291,6 +13706,7 @@ class TalkinBot:
             self.room_languages={}
         for target in rooms:
             self.room_languages[_norm_room(target)]=lang
+        _save_local_json(DATA_DIR / "room_languages.json", self.room_languages)
         # Run in the background so the WebSocket reader remains responsive;
         # the worker itself serializes every join and waits for its ACK.
         threading.Thread(
@@ -13997,7 +14413,7 @@ class TalkinBot:
             return True
 
         # Protection status: report actual persisted room protection switches.
-        if low in ("حالة الحماية", "حاله الحمايه", "حالة حماية", "حاله حماية"):
+        if low in ("حالة الحماية", "حاله الحمايه", "حالة حماية", "حاله حماية", "protection status", "room protection status"):
             target_room = str(room or self.room or "").strip()
             if not target_room:
                 self.send_private_text(sender, "⚠️ لا توجد غرفة محددة لفحص الحماية.")
@@ -14007,16 +14423,28 @@ class TalkinBot:
             pcfg = _room_protection_cfg(target_room)
             mcfg = _room_moderation_config(target_room)
             bot_prot = bool(getattr(self, "bot_protection_enabled", _bot_protection_enabled()))
-            self.send_private_text(
-                sender,
-                f"🛡️ حالة الحماية — {target_room}\n"
-                f"• حماية الغرفة: {'🟢 شغالة' if mcfg.get('enabled') else '🔴 متوقفة'}\n"
-                f"• فلتر الكلمات: {'🟢 شغال' if pcfg.get('swear') else '🔴 متوقف'}\n"
-                f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('repeat') else '🔴 متوقفة'}\n"
-                f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
-                f"• حد التكرار: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
-                f"• حماية البوت الداخلية: {'🟢 شغالة' if bot_prot else '🔴 متوقفة'}"
-            )
+            if getattr(self, "room_languages", {}).get(_norm_room(target_room)) == "en":
+                protection_state = lambda enabled: "🟢 Enabled" if enabled else "🔴 Disabled"
+                status_text = (
+                    f"🛡️ Protection status — {target_room}\n"
+                    f"• Room protection: {protection_state(mcfg.get('enabled'))}\n"
+                    f"• Profanity filter: {protection_state(pcfg.get('swear'))}\n"
+                    f"• Repeated-message protection: {protection_state(pcfg.get('repeat'))}\n"
+                    f"• Join/leave protection: {protection_state(pcfg.get('flood'))}\n"
+                    f"• Repetition limit: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
+                    f"• Internal bot protection: {protection_state(bot_prot)}"
+                )
+            else:
+                status_text = (
+                    f"🛡️ حالة الحماية — {target_room}\n"
+                    f"• حماية الغرفة: {'🟢 شغالة' if mcfg.get('enabled') else '🔴 متوقفة'}\n"
+                    f"• فلتر الكلمات: {'🟢 شغال' if pcfg.get('swear') else '🔴 متوقف'}\n"
+                    f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('repeat') else '🔴 متوقفة'}\n"
+                    f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
+                    f"• حد التكرار: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
+                    f"• حماية البوت الداخلية: {'🟢 شغالة' if bot_prot else '🔴 متوقفة'}"
+                )
+            self.send_private_text(sender, status_text)
             return True
 
         # Overall bot health/status for the master. This is diagnostic, not a
@@ -14143,7 +14571,7 @@ class TalkinBot:
 
         # The protection menu and all of its numbered settings are private and
         # restricted to the configured primary master.
-        protection_match = re.fullmatch(r"(?:حماية|حمايه|حماية الغرفة|حمايه الغرفه)(?:@([^@]+)|\s+(.+))?", text, re.I)
+        protection_match = re.fullmatch(r"(?:حماية|حمايه|حماية الغرفة|حمايه الغرفه|protection|room protection)(?:@([^@]+)|\s+(.+))?", text, re.I)
         if protection_match:
             room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
                                           or _room_manager(self, room, sender)))
@@ -14262,7 +14690,7 @@ class TalkinBot:
                 self.send_private_text(sender,"\n".join(lines))
             return True
 
-        if low in ("تشغيل الحماية", "تشغيل الحمايه", "الحماية تشغيل", "الحمايه تشغيل"):
+        if low in ("تشغيل الحماية", "تشغيل الحمايه", "الحماية تشغيل", "الحمايه تشغيل", "enable protection", "enable room protection"):
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
                                 or _room_manager(self, room, sender)):
                 return True
@@ -14270,7 +14698,7 @@ class TalkinBot:
             _save_room_protection(room, swear=True, flood=True)
             self.send_room_text(room, f"🛡️ حماية الغرفة شغالة. حد التكرار: {cfg['repeat_limit']} رسائل.")
             return True
-        if low in ("إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "الحماية إيقاف", "الحمايه ايقاف"):
+        if low in ("إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "الحماية إيقاف", "الحمايه ايقاف", "disable protection", "disable room protection"):
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
                                 or _room_manager(self, room, sender)):
                 return True
@@ -14721,6 +15149,13 @@ class TalkinBot:
             else: self.send_room_text(room, msg)
             return True
 
+        # Joining one or multiple rooms: Arabic and English forms.
+        m_join_en = re.fullmatch(r"join\s*@\s*(.+)", text, re.I | re.S)
+        if m_join_en:
+            rooms = [x.strip() for x in m_join_en.group(1).strip().split() if x.strip()]
+            if rooms:
+                self._begin_join_rooms_language(sender, rooms, response_room=room if not is_private else "", is_private=is_private)
+            return True
         # Joining one or multiple rooms: دخول@مشاعر ادم نبض ... (متاح لأي عضو بالغرفة)
         m_join = re.fullmatch(r"دخول\s*@\s*(.+)", text, re.I | re.S)
         if m_join:
@@ -14748,6 +15183,7 @@ class TalkinBot:
                 self.room_languages = {}
             for target in rooms:
                 self.room_languages[_norm_room(target)] = "ar"
+            _save_local_json(DATA_DIR / "room_languages.json", self.room_languages)
             threading.Thread(
                 target=self._join_rooms_serially, args=(rooms, sender),
                 daemon=True, name="serial-room-join-command",
@@ -15235,6 +15671,21 @@ class TalkinBot:
                 is_private=is_private,
             )
             return True
+        if low in ("خروج", "leave", "exit", "غادر", "leave room") and room and not is_private:
+            if not _is_primary_master(sender):
+                self.send_room_text(room, "🔒 هذا الأمر مخصص للماستر الأساسي فقط.")
+                return True
+            target = room
+            self.send_room_text(target, "وداعاً نلتقي مرة أخرى")
+            def _cycle_current_room():
+                try:
+                    self.leave_room(target)
+                    time.sleep(max(0.5, float(os.getenv("ROOM_CYCLE_DELAY_SECONDS", "1.0"))))
+                    self.join_room(target, force=True, requested_by=sender)
+                except Exception as exc:
+                    self.log("[ROOM] master cycle failed:", target, repr(exc))
+            threading.Thread(target=_cycle_current_room, daemon=True, name="master-room-cycle").start()
+            return True
         if low in ("خروج","leave","exit") or low.startswith(("خروج ","leave ","exit ")):
             parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
             if target:
@@ -15244,8 +15695,12 @@ class TalkinBot:
                 rooms=self.leave_all_rooms()
                 self.send_private_text(sender,f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
             return True
-        if low.startswith("invmsg") or low.startswith("رسالةدعوة"):
-            parts=text.split(None,1); template=parts[1].strip() if len(parts)==2 else "يوجد معجب مخفي في {room}"
+        if (low.startswith("invmsg") or low.startswith("رسالةدعوة")
+                or low.startswith("invite message") or low.startswith("invmsg@")):
+            if "@" in text:
+                template = text.split("@", 1)[1].strip()
+            else:
+                parts=text.split(None,1); template=parts[1].strip() if len(parts)==2 else "يوجد معجب مخفي في {room}"
             if "{room}" not in template:
                 template = template.rstrip() + " {room}"
             self.invite_message_template=template
@@ -15378,8 +15833,8 @@ class TalkinBot:
                 self.send_private_text(sender, "🔒 إضافة ردود المغادرة مخصصة للماستر.")
                 return True
             trigger, reply = _auto_reply_key(m_ds.group(1)), m_ds.group(2).strip()
-            if trigger not in {"ب", "ت", "ق"} or not reply:
-                self.send_private_text(sender, "❌ الصيغة: +ds@ب أو ت أو ق@الرد")
+            if len(trigger) != 1 or not reply:
+                self.send_private_text(sender, "❌ الصيغة: +ds@أي_حرف@الرد (مثال: +ds@س@الرد)")
                 return True
             replies = getattr(self, "departure_replies", {})
             variants = list(replies.get(trigger, []))
@@ -15538,7 +15993,7 @@ class TalkinBot:
         if not pending: return False
         if time.time()-pending.get("created_at",0)>120:
             self.publish_pending.pop(key,None); self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر بوست أو انشر من جديد."); return True
-        desc=pending.get("description",description or "")
+        desc=_fit_text_to_packet("room_message", str(pending.get("description", description or ""))[:500], room=room)
         if _is_publish_banned(sender):
             self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
             self.publish_pending.pop(key,None)
@@ -15695,7 +16150,7 @@ class TalkinBot:
         if not pending: return False
         if time.time()-pending.get("created_at",0)>120:
             self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر بوست أو انشر من جديد."); return True
-        desc=pending.get("description",description or "")
+        desc=_fit_text_to_packet("room_message", str(pending.get("description", description or ""))[:500], room=room)
         if _is_publish_banned(sender):
             self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
             self.publish_pending.pop(key,None)
@@ -16035,6 +16490,10 @@ class TalkinBot:
                 departed = self._last_departed_user_by_room = {}
             departed[_norm_room(room)] = username
             if _norm_user(username) == _norm_user(BOT_ID):
+                self.connected_rooms = {
+                    connected for connected in self.connected_rooms
+                    if _norm_room(connected) != _norm_room(room)
+                }
                 if getattr(self, "_intentional_leaves", None) and _norm_room(room) in self._intentional_leaves:
                     self.log(f"[USER_LEFT_DETECTED] Bot left {room} intentionally; skipping auto-rejoin.")
                 else:
@@ -16052,6 +16511,10 @@ class TalkinBot:
                 if changed_role in ("kicked", "outcast"):
                     self.room_users[room].pop(changed_user, None)
                     if _norm_user(changed_user) == _norm_user(BOT_ID):
+                        self.connected_rooms = {
+                            connected for connected in self.connected_rooms
+                            if _norm_room(connected) != _norm_room(room)
+                        }
                         self.log(f"[KICK_DETECTED] Bot was removed from {room}; rejoining automatically...")
                         self._schedule_auto_rejoin(room)
                 else:
@@ -16119,6 +16582,7 @@ class TalkinBot:
             requester = str((pending_join or {}).get("requested_by", "") or "").strip()
             if requester:
                 self.send_private_text(requester, f"✅ أكد الخادم دخول البوت إلى الغرفة: {room}")
+                self.send_room_text(room, "مرحبا لقد عدت ادري وحشتكم🙂😋")
         elif event_type in (
             "room_full", "room_unauthorized", "room_wrong_password",
             "room_needs_captcha", "room_needs_password", "room_membership_required",
@@ -16472,12 +16936,16 @@ class TalkinBot:
             if not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, frm, is_private=False)
             return
-        if body.strip().startswith((".تشغيل ", "بث ")):
+        if (body.strip().startswith((".تشغيل ", "بث "))
+                or re.match(r"^(?:play|music|song)\s+.+$", body.strip(), re.I)):
             if not is_verified:
                 self.send_room_text(room, f"🔒 @{frm} غير موثّق لتشغيل الأغاني.\n{_verification_notice()}")
                 return
             is_room_broadcast = body.strip().startswith("بث ")
-            command = body.replace(".تشغيل ", ".sa ", 1) if not is_room_broadcast else body.replace("بث ", ".sa ", 1)
+            if re.match(r"^(?:play|music|song)\s+", body.strip(), re.I):
+                command = ".sa " + re.split(r"\s+", body.strip(), maxsplit=1)[1]
+            else:
+                command = body.replace(".تشغيل ", ".sa ", 1) if not is_room_broadcast else body.replace("بث ", ".sa ", 1)
             # بث means broadcast to every room connected to this bot;
             # .تشغيل remains local to the room where it was requested.
             if self.handle_music_command(
@@ -16830,9 +17298,13 @@ class TalkinBot:
                     if m_share:
                         self.share_last_music(frm, m_share.group(1))
                         return
-                    if body.strip().startswith((".تشغيل ", "بث ")):
+                    if (body.strip().startswith((".تشغيل ", "بث "))
+                            or re.match(r"^(?:play|music|song)\s+.+$", body.strip(), re.I)):
                         is_room_broadcast = body.strip().startswith("بث ")
-                        command = body.replace(".تشغيل ", ".sa ", 1) if not is_room_broadcast else body.replace("بث ", ".sa ", 1)
+                        if re.match(r"^(?:play|music|song)\s+", body.strip(), re.I):
+                            command = ".sa " + re.split(r"\s+", body.strip(), maxsplit=1)[1]
+                        else:
+                            command = body.replace(".تشغيل ", ".sa ", 1) if not is_room_broadcast else body.replace("بث ", ".sa ", 1)
                         if self.handle_music_command(
                                 self.room, command, frm,
                                 broadcast_all=not is_room_broadcast,
@@ -16923,9 +17395,11 @@ class TalkinBot:
                             else:
                                 rooms = self.leave_all_rooms()
                                 self.send_private_text(BOT_MASTER, f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
-                        elif cmd in ("invmsg", "رسالةدعوة") and arg:
-                            self.invite_message_template = arg
-                            self.send_private_text(frm, f"✅ تم تغيير رسالة الدعوة إلى: {arg}")
+                        elif (cmd in ("invmsg", "رسالةدعوة") and arg) or body.casefold().startswith("invmsg@"):
+                            self.invite_message_template = (body.split("@", 1)[1].strip() if body.casefold().startswith("invmsg@") else arg)
+                            if "{room}" not in self.invite_message_template:
+                                self.invite_message_template = self.invite_message_template.rstrip() + " {room}"
+                            self.send_private_text(frm, f"✅ تم تغيير رسالة الدعوة إلى: {self.invite_message_template}")
                         elif cmd in ("a@", "admin") and arg:
                             target = arg.lstrip("@").strip()
                             self.request_admin_action(ctx_room, target, "admin", frm, announce_room=True)
@@ -17046,15 +17520,13 @@ class TalkinBot:
         # Manual `.دخول غرفي` is independent and always joins the saved list.
         if MASTER_SERVICE_ENABLED:
             rooms_to_restore = set()
-        elif AUTO_JOIN_ALL_ROOMS:
+        else:
             rooms_to_restore = {
                 str(r).strip() for r in self.known_rooms
                 if str(r).strip()
             }
             if self.room:
                 rooms_to_restore.add(str(self.room).strip())
-        else:
-            rooms_to_restore = {str(self.room).strip()} if self.room else set()
         if rooms_to_restore:
             threading.Thread(
                 target=self._join_rooms_serially,
