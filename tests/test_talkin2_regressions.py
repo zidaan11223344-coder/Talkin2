@@ -106,6 +106,11 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertEqual(bot.auto_replies["hello"]["replies"], ["legacy"])
         self.assertEqual(saved[0][0], "departure_replies.json")
         self.assertEqual(saved[0][1], {"replies": {"ق": ["بقلبي"]}})
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_save_local_json", side_effect=lambda path, value: saved.append((Path(path).name, value))
+        ):
+            self.assertTrue(bot._handle_management_command_impl("", "+ds@س@سلام", "Master", is_private=True))
+        self.assertEqual(bot.departure_replies["س"], ["سلام"])
 
     def test_departure_command_uses_last_user_and_dedicated_reply(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -116,6 +121,14 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertTrue(bot._handle_departure_reply_command("North", "ق"))
         self.assertIn("left_user", sent[0][1])
         self.assertIn("بقلبي", sent[0][1])
+    def test_departure_command_accepts_any_single_character_key(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._last_departed_user_by_room = {bot_module._norm_room("North"): "left_user"}
+        bot.departure_replies = {"س": ["سلام يا {username}"]}
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        self.assertTrue(bot._handle_departure_reply_command("North", "س"))
+        self.assertIn("سلام يا left_user", sent[0][1])
 
 
 class RoomExclusionRegressions(unittest.TestCase):
