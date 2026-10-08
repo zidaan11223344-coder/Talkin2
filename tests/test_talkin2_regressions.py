@@ -191,6 +191,20 @@ class RoomExclusionRegressions(unittest.TestCase):
 
 
 class RawWebSocketTransportRegressions(unittest.TestCase):
+    def test_send_binary_enforces_absolute_1008_byte_cap(self):
+        class FakeSocket:
+            def __init__(self):
+                self.sent = []
+            def sendall(self, payload):
+                self.sent.append(payload)
+
+        ws = bot_module.RawWebSocket.__new__(bot_module.RawWebSocket)
+        ws.sock = FakeSocket()
+        ws._send_lock = bot_module.threading.Lock()
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "5000"}), patch("builtins.print"):
+            ws.send_binary(b"x" * 1009)
+        self.assertEqual(ws.sock.sent, [])
+
     def test_transient_eagain_waits_for_readability_and_continues(self):
         class FakeSocket:
             def __init__(self):
@@ -1377,7 +1391,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(text(6), "North")
         self.assertEqual(text(7), "https://cdn.example/song.mp3")
 
-    def test_oversized_game_result_is_routed_whole_to_telegram_not_websocket(self):
+    def test_oversized_game_result_is_dropped_locally_without_telegram_or_websocket(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         packets = []
         bot.send_query = lambda payload: packets.append(payload)
@@ -1396,9 +1410,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertFalse(bot._send_text_packets("room_message", text, room="North"))
 
         self.assertEqual(packets, [])
-        self.assertEqual(telegram, [(text, "رسالة طويلة من غرفة: North")])
+        self.assertEqual(telegram, [])
 
-    def test_send_query_hard_caps_payload_at_1008_and_routes_text_to_telegram(self):
+    def test_send_query_hard_caps_payload_at_1008_and_drops_text_locally(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         sent = []
         telegram = []
@@ -1412,7 +1426,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertFalse(bot.send_query(payload))
 
         self.assertEqual(sent, [])
-        self.assertEqual(telegram, [(text, "رسالة طويلة من غرفة: North")])
+        self.assertEqual(telegram, [])
 
     def test_games_command_opens_the_a3_catalog_and_sets_ns_navigation(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

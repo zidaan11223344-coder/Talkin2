@@ -5880,10 +5880,8 @@ class TalkinBot:
             f"\n📍 النوع: {context}{location}"
             f"\n❌ التفاصيل: {detail}"
         )
-        # Keep this diagnostic in the bot log only. Do not send the verbose
-        # "تم تجاهل إرسال رسالة كبيرة..." notice to Telegram. For oversized
-        # text messages, send the original message itself to Telegram from
-        # send_query/_send_text_packets instead.
+        # Keep this diagnostic local only: oversized packets are dropped and
+        # must never be forwarded to Telegram or the Talkin WebSocket.
         self.log("[WS_OVERSIZE_HANDLED]", master_msg.replace("\n", " | "))
 
     def send_query(self, payload: bytes):
@@ -5898,79 +5896,17 @@ class TalkinBot:
             packet_type = ""
             target = ""
             room = ""
-            body = ""
             try:
                 fields = decode_message(payload)
                 packet_type = as_text((fields.get(1) or [b""])[0])
                 target = as_text((fields.get(4) or [b""])[0])
-                body = as_text((fields.get(5) or [b""])[0])
                 room = as_text((fields.get(6) or [b""])[0])
             except Exception as exc:
                 self.log("[WS_OVERSIZE] decode failed:", repr(exc))
-
-            media_type = ""
-            media_url = ""
-            try:
-                media_type = as_text((fields.get(2) or [b""])[0]).strip().lower()
-                media_url = as_text((fields.get(7) or [b""])[0]).strip()
-                if not media_url:
-                    media_url = _extract_media_url_universal(fields, body)
-            except Exception as exc:
-                self.log("[WS_OVERSIZE] media extraction failed:", repr(exc))
-
-            # Text: send the ORIGINAL complete text to Telegram.
-            if packet_type in {"chat_message", "room_message"} and body:
-                telegram_title = "رسالة طويلة من البوت"
-                if packet_type == "room_message" and room:
-                    telegram_title = f"رسالة طويلة من غرفة: {room}"
-                elif packet_type == "chat_message" and target:
-                    telegram_title = f"رسالة طويلة إلى: @{target}"
-                try:
-                    telegram_sent = bool(self._send_long_text_to_telegram(body, title=telegram_title))
-                except Exception as exc:
-                    telegram_sent = False
-                    self.log("[TELEGRAM] oversized text routing failed:", repr(exc))
-                if telegram_sent:
-                    self.log("[WS_OVERSIZE] long text routed to Telegram")
-                else:
-                    self._report_oversize_delivery(
-                        packet_type, target, room, len(payload),
-                        "تعذر إرسال الرسالة الطويلة إلى Telegram"
-                    )
-                return False
-
-            # Media/file: the WebSocket packet itself may be oversized even
-            # though the actual file is referenced by a URL. Download that
-            # original file and send it to Telegram as a document. This keeps
-            # the full file intact and prevents Talkin from receiving a packet
-            # large enough to close the connection.
-            if packet_type in {"chat_message", "room_message"} and media_url and media_type in {
-                "file", "image", "photo", "picture", "video", "audio", "voice", "document", "media"
-            }:
-                telegram_title = "ملف كبير من البوت"
-                if packet_type == "room_message" and room:
-                    telegram_title = f"ملف كبير من غرفة: {room}"
-                elif packet_type == "chat_message" and target:
-                    telegram_title = f"ملف كبير إلى: @{target}"
-                try:
-                    telegram_sent = bool(self._send_long_media_to_telegram(
-                        media_url, title=telegram_title, media_type=media_type
-                    ))
-                except Exception as exc:
-                    telegram_sent = False
-                    self.log("[TELEGRAM] oversized media routing failed:", repr(exc))
-                if telegram_sent:
-                    self.log("[WS_OVERSIZE] media/file routed to Telegram")
-                else:
-                    self._report_oversize_delivery(
-                        packet_type, target, room, len(payload),
-                        "تعذر إرسال الملف الكبير إلى Telegram"
-                    )
-                return False
-
-            # No recoverable text/media body. Keep only a local diagnostic;
-            # never send the old verbose oversized-packet notice to Telegram.
-            self._report_oversize_delivery(packet_type, target, room, len(payload), "حزمة WebSocket تجاوزت 1008 بايت")
+            self._report_oversize_delivery(
+                packet_type, target, room, len(payload),
+                f"حزمة WebSocket تجاوزت الحد الصلب ({max_bytes} بايت)؛ أُسقطت محلياً"
+            )
             return False
 
         # Keep a compact trace of the live protocol. This is intentionally
@@ -6424,7 +6360,7 @@ class TalkinBot:
             return False
 
     def _send_text_packets(self, packet_type: str, text: str, **kwargs):
-        """Send text safely; route any complete oversized message to Telegram."""
+        """Send text only when its full protobuf packet fits the hard limit."""
         text = str(text or "")
         if not text:
             return True
@@ -6442,38 +6378,15 @@ class TalkinBot:
             self.send_query(make_payload(text))
             return True
 
-        # Do not split any oversized text into Talkin packets. Route the full
-        # original message (game results included) to Telegram instead, keeping
-        # the WebSocket connection safe from close code 1009.
-        telegram_title = "رسالة طويلة من البوت"
-        if packet_type == "room_message":
-            room_name = str(kwargs.get("room") or "").strip()
-            if room_name:
-                telegram_title = f"رسالة طويلة من غرفة: {room_name}"
-        elif packet_type == "chat_message":
-            target_name = str(kwargs.get("to") or "").strip()
-            if target_name:
-                telegram_title = f"رسالة طويلة إلى: @{target_name}"
-
-        telegram_sent = False
-        try:
-            telegram_sent = bool(self._send_long_text_to_telegram(text, title=telegram_title))
-        except Exception as exc:
-            self.log("[TELEGRAM] oversized message routing failed:", repr(exc))
-
-        if telegram_sent:
-            self.log("[WS_OVERSIZE] long message routed to Telegram")
-        else:
-            # Telegram was unavailable/failed; report the failure to the master
-            # and keep the bot alive without sending an oversized WebSocket packet.
-            self._report_oversize_delivery(
-                packet_type,
-                str(kwargs.get("to") or ""),
-                str(kwargs.get("room") or ""),
-                len(make_payload(text)),
-                "تعذر إرسال الرسالة الطويلة إلى Telegram"
-            )
-
+        # Drop complete oversized messages locally instead of splitting them,
+        # forwarding them to Telegram, or passing them to the WebSocket.
+        self._report_oversize_delivery(
+            packet_type,
+            str(kwargs.get("to") or ""),
+            str(kwargs.get("room") or ""),
+            len(make_payload(text)),
+            f"حزمة النص تجاوزت الحد الصلب ({limit} بايت)؛ أُسقطت محلياً",
+        )
         return False
 
     def _send_help_chunks(self, packet_type: str, text: str, limit: int = 320, **kwargs):
