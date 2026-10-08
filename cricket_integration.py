@@ -69,10 +69,11 @@ class CricketIntegration:
         self._broadcast_cursor = self.game.latest_event_id("")
 
         # Start from the last persisted room events so a restart does not replay
-        # an entire match. The live match itself is re-prompted on first contact.
-        match = self.game.current()
-        if isinstance(match, dict):
+        # any match. Every live room pair is re-prompted on first contact.
+        matches = self.game.matches()
+        if matches:
             self._resume_pending = True
+        for match in matches:
             for room in self._match_rooms(match):
                 key = self._room_key(room)
                 try:
@@ -94,19 +95,21 @@ class CricketIntegration:
         return " ".join(str(room or "").strip().casefold().split())
 
     @staticmethod
-    def _match_rooms(match: dict | None) -> list[str]:
-        if not isinstance(match, dict):
-            return []
+    def _match_rooms(match: dict | list[dict] | None) -> list[str]:
+        match_list = match if isinstance(match, list) else [match]
         rooms: list[str] = []
         seen: set[str] = set()
-        for item in match.get("rooms", []):
-            if not isinstance(item, dict):
+        for current in match_list:
+            if not isinstance(current, dict):
                 continue
-            name = str(item.get("name") or "").strip()
-            key = CricketIntegration._room_key(name)
-            if name and key not in seen:
-                seen.add(key)
-                rooms.append(name)
+            for item in current.get("rooms", []):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                key = CricketIntegration._room_key(name)
+                if name and key not in seen:
+                    seen.add(key)
+                    rooms.append(name)
         return rooms
 
     def _asset_url(self, filename: str) -> str:
@@ -168,7 +171,10 @@ class CricketIntegration:
     def _prime_new_room_cursor(self, room: str, match: dict | None) -> None:
         """Skip historical events when a room joins an already-open match."""
         room_key = self._room_key(room)
-        if not room_key or not isinstance(match, dict):
+        if not room_key:
+            return
+        if not isinstance(match, dict):
+            self._cursors[room_key] = self.game.latest_event_id(room)
             return
         current_rooms = {self._room_key(item) for item in self._match_rooms(match)}
         if room_key not in current_rooms:
@@ -187,7 +193,7 @@ class CricketIntegration:
         # Events are generated independently for both room keys. Deliver them
         # together after each action so the opposing team receives its prompt.
         rooms = self._match_rooms(previous_match)
-        rooms.extend(self._match_rooms(self.game.current()))
+        rooms.extend(self._match_rooms(self.game.current(fallback_room) if fallback_room else None))
         if fallback_room:
             rooms.append(str(fallback_room).strip())
         self.deliver_rooms(rooms, skip_text_event_ids_by_room=skip_text_event_ids_by_room)
@@ -196,56 +202,57 @@ class CricketIntegration:
         if not self._resume_pending:
             return
         self._resume_pending = False
-        match = self.game.current()
-        if not isinstance(match, dict):
-            return
-        stage = str(match.get("stage") or "")
-        turn_messages = {}
-        pending_bowler_key = ""
-        pending_bowler_name = ""
-        if stage == "live":
-            choices = match.get("choices") or {}
-            if choices.get("bat") and not choices.get("bowl"):
-                batting = str(match.get("batting_team") or "attack")
-                bowling = "defense" if batting == "attack" else "attack"
-                try:
-                    bowler = self.game._next_player(match, bowling, batting=False)
-                    bowl_room = self.game._room_for_team(match, bowling)
-                    pending_bowler_key = str((bowl_room or {}).get("key") or "")
-                    pending_bowler_name = str(bowler or "")
-                except Exception as exc:
-                    self.log("[CRICKET] resume bowler lookup failed", repr(exc))
-            else:
-                try:
-                    turn_messages = self.game._turn_messages(match)
-                except Exception as exc:
-                    self.log("[CRICKET] resume turn lookup failed", repr(exc))
-        for item in match.get("rooms", []):
-            if not isinstance(item, dict):
-                continue
-            room = str(item.get("name") or "").strip()
-            if not room:
-                continue
+        for match in self.game.matches():
+            stage = str(match.get("stage") or "")
+            turn_messages = {}
+            pending_bowler_key = ""
+            pending_bowler_name = ""
             if stage == "live":
-                if pending_bowler_key:
-                    if str(item.get("key") or "") == pending_bowler_key:
-                        prompt = f"🛡️ استؤنفت الكرة؛ دورك يا @{pending_bowler_name}. أرسل 0 إلى 6"
-                    else:
-                        prompt = "✅ حُفظ اختيار الهجوم لهذه الكرة؛ انتظر رد فريق الدفاع."
+                choices = match.get("choices") or {}
+                if choices.get("bat") and not choices.get("bowl"):
+                    batting = str(match.get("batting_team") or "attack")
+                    bowling = "defense" if batting == "attack" else "attack"
+                    try:
+                        bowler = self.game._next_player(match, bowling, batting=False)
+                        bowl_room = self.game._room_for_team(match, bowling)
+                        pending_bowler_key = str((bowl_room or {}).get("key") or "")
+                        pending_bowler_name = str(bowler or "")
+                    except Exception as exc:
+                        self.log("[CRICKET] resume bowler lookup failed", repr(exc))
                 else:
-                    prompt = str(turn_messages.get(item.get("key")) or "").strip()
-                text = "🔄 استؤنفت مباراة الكركيت بعد إعادة تشغيل البوت.\n" + prompt
-            elif stage == "setup":
-                text = "🔄 استؤنف إعداد الكركيت. اختر عدد اللاعبين من 1 إلى 4."
-            elif stage == "teams":
-                text = "🔄 استؤنفت المباراة. ترسل غرفة الإعداد 1 للهجوم أو 2 للدفاع؛ ويُعيّن دور الغرفة الثانية تلقائيًا."
-            else:
-                target = int(match.get("target_players") or 1)
-                text = f"🔄 استؤنفت قائمة الكركيت؛ المطلوب {target} لاعب(ين) في كل غرفة. أرسل Join للانضمام."
-            try:
-                self.send_room_text(room, text)
-            except Exception as exc:
-                self.log("[CRICKET] resume prompt failed", room, repr(exc))
+                    try:
+                        turn_messages = self.game._turn_messages(match)
+                    except Exception as exc:
+                        self.log("[CRICKET] resume turn lookup failed", repr(exc))
+            for item in match.get("rooms", []):
+                if not isinstance(item, dict):
+                    continue
+                room = str(item.get("name") or "").strip()
+                if not room:
+                    continue
+                if stage == "live":
+                    if pending_bowler_key:
+                        if str(item.get("key") or "") == pending_bowler_key:
+                            prompt = f"🛡️ استؤنفت الكرة؛ دورك يا @{pending_bowler_name}. أرسل 0 إلى 6"
+                        else:
+                            prompt = "✅ حُفظ اختيار الهجوم لهذه الكرة؛ انتظر رد فريق الدفاع."
+                    else:
+                        prompt = str(turn_messages.get(item.get("key")) or "").strip()
+                    text = "🔄 استؤنفت مباراة الكركيت بعد إعادة تشغيل البوت.\n" + prompt
+                elif stage == "setup":
+                    text = f"🔄 استؤنف إعداد المباراة {self.game._match_code(match)}. اختر عدد اللاعبين من 1 إلى 4."
+                elif stage == "teams":
+                    text = f"🔄 استؤنفت المباراة {self.game._match_code(match)}. ترسل غرفة الإعداد 1 للهجوم أو 2 للدفاع؛ ويُعيّن دور الغرفة الثانية تلقائيًا."
+                else:
+                    target = int(match.get("target_players") or 1)
+                    text = (
+                        f"🔄 استؤنفت قائمة المباراة {self.game._match_code(match)}؛ المطلوب {target} لاعب(ين) في كل غرفة. "
+                        f"الغرفة الثانية تنضم بـ Join@{self.game._match_code(match)}."
+                    )
+                try:
+                    self.send_room_text(room, text)
+                except Exception as exc:
+                    self.log("[CRICKET] resume prompt failed", room, repr(exc))
 
     def _send_private(self, sender: str, room: str, text: str) -> None:
         if self.send_private_text:
@@ -261,14 +268,14 @@ class CricketIntegration:
             self._send_private(sender, room, "❌ لم أجد غرفة متصلة لبدء لعبة الكركيت.")
             return True
 
-        previous_match = self.game.current()
+        previous_match = self.game.matches()
         result = self.game.set_enabled(room, enabled)
         if str(result or "").startswith(("❌", "⛔")) and enabled:
             self._send_private(sender, room, str(result))
             return True
 
         if enabled:
-            if previous_match is None:
+            if not previous_match:
                 confirmation = "✅ تم تشغيل ملفات لعبة الكركيت. أرسل .cr 1 داخل الغرفة لفتح إعداد المباراة للأعضاء."
             else:
                 confirmation = "✅ ملفات لعبة الكركيت مفعّلة؛ المباراة المفتوحة مستمرة دون تغيير."
@@ -278,7 +285,7 @@ class CricketIntegration:
                 return True
             confirmation = "⛔ تم إيقاف لعبة الكركيت وإلغاء المباراة المفتوحة."
 
-        self._deliver_transition(previous_match, room)
+        self._deliver_transition(previous_match)
         self._send_private(sender, room, confirmation)
         return True
 
@@ -286,7 +293,7 @@ class CricketIntegration:
         if not self.is_verified(sender):
             self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
             return True
-        previous_match = self.game.current()
+        previous_match = self.game.current(room)
         result = (self.game.begin_bot_setup(room, reset_existing=True)
                   if bot_match else self.game.begin_setup(room, reset_existing=True))
         self._reply_error(room, result)
@@ -301,7 +308,7 @@ class CricketIntegration:
         if not self.is_verified(sender):
             self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
             return True
-        previous_match = self.game.current()
+        previous_match = self.game.current(room)
         if isinstance(previous_match, dict) and previous_match.get("stage") == "setup":
             result = self.game.select_player_count(room, player_count)
         else:
@@ -316,7 +323,10 @@ class CricketIntegration:
         control = self._control_key(text)
         room = str(room or "").strip()
         sender = str(sender or "").strip().lstrip("@")
-        defer_resume = not is_private and low in {"join", "انضمام"}
+        join_code_match = re.fullmatch(r"(?:join|انضمام)(?:@|\s+)([a-z0-9]{4,8})", low, re.I)
+        join_code = join_code_match.group(1).upper() if join_code_match else ""
+        join_command = low in {"join", "انضمام"} or bool(join_code_match)
+        defer_resume = not is_private and join_command
         if not defer_resume:
             self._resume_after_restart()
 
@@ -329,7 +339,7 @@ class CricketIntegration:
                 if not self.is_verified(sender):
                     self.send_room_text(room, "🔒 إيقاف مباراة الكركيت متاح للأعضاء الموثقين فقط.")
                     return True
-                previous_match = self.game.current()
+                previous_match = self.game.current(room)
                 result = self.game.cancel_match(room)
                 self._reply_error(room, result)
                 if not str(result or "").startswith(("❌", "⛔", "📭")):
@@ -374,19 +384,21 @@ class CricketIntegration:
         if is_private:
             return False
 
-        match = self.game.current()
-        if not isinstance(match, dict):
+        match = self.game.current(room)
+        if join_command and not isinstance(match, dict):
+            match = self.game.match_for_join(room, join_code)
+        if not isinstance(match, dict) and not join_command:
             return False
 
-        stage = str(match.get("stage") or "")
+        stage = str((match or {}).get("stage") or "")
         room_key = self._room_key(room)
         participant_keys = {
             self._room_key(item.get("name"))
-            for item in match.get("rooms", [])
+            for item in (match or {}).get("rooms", [])
             if isinstance(item, dict) and item.get("name")
         }
         is_action = (
-            low in {"join", "انضمام"}
+            join_command
             or (stage == "setup" and low in {"1", "2", "3", "4"})
             or (stage == "lobby" and low in {"bot", "بوت", "ضد البوت", "solo", "vs bot"})
             or (stage == "teams" and low in {"1", "2"})
@@ -404,13 +416,13 @@ class CricketIntegration:
         previous_match = match
         result: str | None = None
         skip_text_event_ids_by_room: dict[str, set[int]] = {}
-        if low in {"join", "انضمام"}:
+        if join_command:
             self._prime_new_room_cursor(room, previous_match)
-            result = self.game.join(room, sender)
+            result = self.game.join(room, sender, code=join_code)
             if result is None:
                 # Confirm the committed Join before any team-wide announcements,
                 # image delivery, or restart prompts can delay the player.
-                updated_match = self.game.current() or {}
+                updated_match = self.game.current(room) or {}
                 participants = [item for item in updated_match.get("rooms", []) if isinstance(item, dict)]
                 team_index = next(
                     (index for index, item in enumerate(participants)

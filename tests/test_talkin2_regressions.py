@@ -240,6 +240,26 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertIn("N1", integration.game.current()["rooms"][0]["players"])
             self.assertTrue(any("اكتمل الفريق الأول" in text for _, text in room_messages[1:]))
 
+    def test_legacy_single_match_state_is_migrated_to_matches_map(self):
+        with tempfile.TemporaryDirectory() as temp:
+            game = CricketGame(Path(temp) / "cricket_state.json")
+            legacy_match = {
+                "id": "legacy-match",
+                "stage": "lobby",
+                "target_players": 1,
+                "setup_room": "north",
+                "mode": "rooms",
+                "rooms": [{"key": "north", "name": "North", "players": []}],
+                "teams": {},
+            }
+            game.state.mutate(lambda data: data.update(enabled=True, match=legacy_match))
+            self.assertEqual(game.current("North")["id"], "legacy-match")
+            self.assertIsNone(game.join("North", "N1"))
+            saved = game.state.load()
+            self.assertIsNone(saved["match"])
+            self.assertIn("legacy-match", saved["matches"])
+            self.assertEqual(saved["matches"]["legacy-match"]["rooms"][0]["players"], ["N1"])
+
     def test_private_master_toggle_and_cross_room_turn_delivery(self):
         with tempfile.TemporaryDirectory() as temp:
             room_messages, private_messages, media_messages = [], [], []
@@ -459,6 +479,87 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertEqual(match["stage"], "teams")
             self.assertEqual([len(item["players"]) for item in match["rooms"]], [1, 1])
 
+    def test_independent_simultaneous_room_matches_support_one_through_four_players(self):
+        for count in range(1, 5):
+            with self.subTest(players_per_room=count), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / f"count-{count}"
+                root.mkdir()
+                messages, private, media = [], [], []
+                integration = self.make_integration(root, messages, private, media)
+                integration.game.set_enabled("Master", True)
+
+                for room, prefix in (("North", "N"), ("East", "E")):
+                    captain = f"{prefix}1"
+                    integration.handle(room, captain, ".cr 1")
+                    integration.handle(room, captain, str(count))
+                    for index in range(1, count + 1):
+                        integration.handle(room, f"{prefix}{index}", "Join")
+
+                north_match = integration.game.current("North")
+                east_match = integration.game.current("East")
+                north_code = north_match["join_code"]
+                east_code = east_match["join_code"]
+                self.assertNotEqual(north_match["id"], east_match["id"])
+                self.assertNotEqual(north_code, east_code)
+
+                # A room must not accidentally join the neighboring match's code.
+                wrong_code = next(code for code in ("000000", "FFFFFF", "ABCDEF", "123456")
+                                  if code not in {north_code, east_code})
+                integration.handle("South", "S1", f"Join@{wrong_code}")
+                self.assertIsNone(integration.game.current("South"))
+
+                # A bare Join cannot guess between simultaneous waiting games.
+                integration.handle("South", "S1", "Join")
+                self.assertTrue(any("توجد عدة مباريات انتظار" in text for room, text in messages if room == "South"))
+
+                for index in range(1, count + 1):
+                    integration.handle("South", f"S{index}", f"Join@{north_code}")
+                    integration.handle("West", f"W{index}", f"Join@{east_code}")
+
+                self.assertEqual(integration.game.current("North")["stage"], "teams")
+                self.assertEqual(integration.game.current("East")["stage"], "teams")
+                self.assertEqual(
+                    [len(item["players"]) for item in integration.game.current("North")["rooms"]],
+                    [count, count],
+                )
+                self.assertEqual(
+                    [len(item["players"]) for item in integration.game.current("East")["rooms"]],
+                    [count, count],
+                )
+
+                integration.handle("North", "N1", "1")
+                integration.handle("East", "E1", "2")
+                self.assertEqual(integration.game.current("North")["stage"], "live")
+                self.assertEqual(integration.game.current("East")["stage"], "live")
+                self.assertEqual(integration.game.current("North")["batting_team"], "attack")
+                self.assertEqual(integration.game.current("East")["batting_team"], "defense")
+
+                resumed_messages, resumed_private, resumed_media = [], [], []
+                restarted = self.make_integration(
+                    root, resumed_messages, resumed_private, resumed_media,
+                )
+                self.assertEqual(len(restarted.game.matches()), 2)
+                restarted._resume_after_restart()
+                self.assertEqual(
+                    {room for room, _ in resumed_messages},
+                    {"North", "South", "East", "West"},
+                )
+
+                # Resolve one ball in each match, and prove the other game's state is untouched.
+                integration.handle("North", "N1", "1")
+                integration.handle("South", "S1", "2")
+                self.assertEqual(integration.game.current("North")["balls"], 1)
+                self.assertEqual(integration.game.current("East")["balls"], 0)
+                integration.handle("East", "E1", "2")
+                integration.handle("West", "W1", "3")
+                self.assertEqual(integration.game.current("North")["balls"], 1)
+                self.assertEqual(integration.game.current("East")["balls"], 1)
+
+                for room, other_pair in (("North", ("East", "West")), ("South", ("East", "West")),
+                                         ("East", ("North", "South")), ("West", ("North", "South"))):
+                    room_text = "\n".join(text for target, text in messages if target == room)
+                    self.assertFalse(any(name in room_text for name in other_pair))
+
     def test_numbers_in_non_participating_room_are_not_cricket_actions(self):
         with tempfile.TemporaryDirectory() as temp:
             messages, private, media = [], [], []
@@ -517,10 +618,10 @@ class CricketIntegrationRegressions(unittest.TestCase):
             first_team_announcements = [
                 (room, text) for room, text in room_messages if "اكتمل الفريق الأول" in text
             ]
-            self.assertEqual({room for room, _ in first_team_announcements}, {"North", "South", "Lobby"})
-            self.assertEqual(len(first_team_announcements), 3)
-            for _, text in first_team_announcements:
-                self.assertIn("North (2 لاعبين): @N1، @N2", text)
+            self.assertEqual({room for room, _ in first_team_announcements}, {"North"})
+            self.assertEqual(len(first_team_announcements), 1)
+            self.assertIn("North (2 لاعبين): @N1، @N2", first_team_announcements[0][1])
+            self.assertIn("رمز هذه المباراة", first_team_announcements[0][1])
             self.assertEqual(integration.game.current()["stage"], "lobby")
 
             for player in ("S1", "S2"):
@@ -605,7 +706,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
 
             def resolve_wicket(batter):
                 def mutate(data):
-                    current = data["match"]
+                    current = integration.game._match_for_room(data, "North")
                     integration.game._resolve_ball(
                         data, current, integration.game._participants(current),
                         {"value": 4, "room_key": "north", "room": "North", "sender": batter},
@@ -651,7 +752,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             setup_text = room_messages[-1][1]
             self.assertIn("إعداد مباراة الكركيت", setup_text)
             self.assertIn("اختر عدد اللاعبين داخل هذه الغرفة فقط", setup_text)
-            self.assertIn("غرفة أخرى Join", setup_text)
+            self.assertIn("Join@", setup_text)
             integration.handle("Room", "Verified", ".cr 2")
             self.assertEqual(integration.game.current()["stage"], "lobby")
             integration.handle("Room", "Guest", "Join")
