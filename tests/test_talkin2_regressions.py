@@ -13,6 +13,36 @@ from cricket_integration import CricketIntegration
 from cricket_result import render_result_image
 
 
+class ProfileStatusRegressions(unittest.TestCase):
+    def test_requested_default_profile_status_is_sent_whole_under_ws_limit(self):
+        expected = (
+            '<B><H2><p style="background-color:#FFFFFF;">\n'
+            '<font color=#8B6508>☕️ COFFEE BOT</font><br>\n'
+            '<font color=#007C91>🛡️ بوت حماية وألعاب وأغاني</font><br>\n'
+            '<font color=#247A00>🛡️ Protection, Games & Music Bot</font><br>\n'
+            '<font color=#A9005B>🎮 الألعاب والأوامر: a1 • a2 • a3 • a4 • a5 • a6</font><br>\n'
+            '<font color=#71368A>🎮 GAMES & COMMANDS: a1 • a2 • a3 • a4 • a5 • a6</font><br>\n'
+            '<font color=#B05A00>🚪 دخول@اسم الغرفة</font><br>\n'
+            '<font color=#8B3A00>🌐 اختر اللغة: 1 أو 2</font><br>\n'
+            '<font color=#007A45>🚪 join@room</font><br>\n'
+            '<font color=#005C4B>🌐 Choose language: 1 or 2</font><br>\n'
+            '<font color=#8B0000>♟️ MASTER:</font><br>\n'
+            '<font color=#8B0000>∫♚∫اݪـــۛــ⃮ـۿــ𓏺𓏺ـيّـــّٰـبــۃ∫♚∫</font>\n'
+            '</p></H2></B>'
+        )
+        self.assertEqual(bot_module.BOT_BASE_STATUS, expected)
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_query = lambda payload: sent.append(payload)
+        bot.log = lambda *_args: None
+        self.assertTrue(bot._set_profile_status(bot_module.BOT_BASE_STATUS))
+        self.assertEqual(len(sent), 1)
+        self.assertLessEqual(len(sent[0]), bot_module._ws_payload_limit())
+        fields = bot_module.decode_message(sent[0])
+        self.assertEqual(bot_module.as_text(fields[5][0]), expected)
+        self.assertNotIn(11, fields)
+
+
 class IncomingEventDedupRegressions(unittest.TestCase):
     def test_english_game_catalogs_and_protection_menu_are_localized(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

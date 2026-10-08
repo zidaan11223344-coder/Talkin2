@@ -415,11 +415,19 @@ MASTER_DISPLAY_NAME = os.getenv(
     "MASTER_DISPLAY_NAME", "ۦاݪــۛـسـ𓆩♛𓆪ـۧۦـ۫فـيــ۫ـۧر𝁤𝆬𝃛"
 ).strip()
 DEFAULT_BOT_BASE_STATUS = (
-    '<B><H4><div style="background-color:#000000;padding:10px;text-align:center;">'
-    '<font color="#5DE2E7">بوت حماية وألعاب وأغاني</font><br>'
-    '<font color="#B388FF">لمعرفة الألعاب والأوامر أرسل: a1 a2 a3 a4 a5 a6</font><br>'
-    '<font color="#FF6EC7">لدخول الغرف أرسل: دخول@اسم الغرفة</font><br>'
-    '<font color="#FF3B30">الماستر: ۦاݪــۛـسـ𓆩♛𓆪ـۧۦـ۫فـيــ۫ـۧر𝁤𝆬𝃛</font></div></H4></B>'
+    '<B><H2><p style="background-color:#FFFFFF;">\n'
+    '<font color=#8B6508>☕️ COFFEE BOT</font><br>\n'
+    '<font color=#007C91>🛡️ بوت حماية وألعاب وأغاني</font><br>\n'
+    '<font color=#247A00>🛡️ Protection, Games & Music Bot</font><br>\n'
+    '<font color=#A9005B>🎮 الألعاب والأوامر: a1 • a2 • a3 • a4 • a5 • a6</font><br>\n'
+    '<font color=#71368A>🎮 GAMES & COMMANDS: a1 • a2 • a3 • a4 • a5 • a6</font><br>\n'
+    '<font color=#B05A00>🚪 دخول@اسم الغرفة</font><br>\n'
+    '<font color=#8B3A00>🌐 اختر اللغة: 1 أو 2</font><br>\n'
+    '<font color=#007A45>🚪 join@room</font><br>\n'
+    '<font color=#005C4B>🌐 Choose language: 1 or 2</font><br>\n'
+    '<font color=#8B0000>♟️ MASTER:</font><br>\n'
+    '<font color=#8B0000>∫♚∫اݪـــۛــ⃮ـۿــ𓏺𓏺ـيّـــّٰـبــۃ∫♚∫</font>\n'
+    '</p></H2></B>'
 )
 
 BOT_BASE_STATUS = os.getenv("BOT_BASE_STATUS", DEFAULT_BOT_BASE_STATUS).strip()
@@ -10424,12 +10432,14 @@ class TalkinBot:
             # WebSocket when fallback profile actions are sent back-to-back.
             action = PROFILE_STATUS_ACTION
             try:
-                self.send_query(encode_query(
-                    action,
-                    type_="status",
-                    body=status,
-                    value=status,
-                ))
+                payload = encode_query(action, type_="status", body=status, value=status)
+                if len(payload) > _ws_payload_limit():
+                    # Long HTML statuses must fit the hard 1008-byte Talkin
+                    # frame limit. The status text is identical in either
+                    # field; use the canonical body field rather than send an
+                    # oversized packet that would be rejected by the gateway.
+                    payload = encode_query(action, type_="status", body=status)
+                self.send_query(payload)
                 self.log("[PROFILE] status update sent via", action)
                 sent = True
                 if PROFILE_STATUS_VERIFY:
