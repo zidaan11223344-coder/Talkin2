@@ -18112,6 +18112,12 @@ class TalkinBot:
                         self.master_last_seen = time.time()
                     if body and self._handle_master_process_command(frm, body, is_private=True):
                         return
+                    # The standalone master account is a four-option support
+                    # service, not a second games/music/invitations bot. Route
+                    # every external private message through that menu before
+                    # the ordinary bot feature handlers below.
+                    if MASTER_SERVICE_ENABLED and self._handle_master_account_service(frm, body):
+                        return
                     cricket_room = (
                         self.room
                         or getattr(self, "last_joined_room", "")
@@ -18120,10 +18126,6 @@ class TalkinBot:
                     if body and self._cricket.handle(cricket_room, frm, body, is_private=True):
                         return
                     if body and self._monitor_command(frm, body):
-                        return
-                    # When this process is the master account, it owns the
-                    # private service flow and performs verification itself.
-                    if MASTER_SERVICE_ENABLED and self._handle_master_account_service(frm, body):
                         return
                     # The primary bot does not show the master-service menu.
                     # That menu belongs exclusively to the standalone master
