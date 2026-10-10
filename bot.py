@@ -3434,6 +3434,26 @@ def _point_transfer_history(username, limit=10):
     return list(reversed(rows[-max(1, int(limit)):]))
 
 
+def _all_point_transfer_history(page=1, page_size=8):
+    """Return one newest-first page from the bot-wide transfer audit log."""
+    _points_data()  # Ensure the v2 snapshot/history cache is initialized.
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = max(1, min(50, int(page_size)))
+    except (TypeError, ValueError):
+        page_size = 8
+    with _GAME_STATE_LOCK:
+        rows = [dict(entry) for entry in (_POINTS_TRANSFER_CACHE or []) if isinstance(entry, dict)]
+    rows.reverse()
+    total = len(rows)
+    pages = max(1, (total + page_size - 1) // page_size)
+    start = (page - 1) * page_size
+    return rows[start:start + page_size], total, pages
+
+
 def _fmt_points(value):
     """Compact point balances for chat: 1k -> 1k and 1k,000,000 -> 1m."""
     if value is None:
@@ -15557,7 +15577,46 @@ class TalkinBot:
         if low in ("نقاطي","points"):
             self.send_private_text(sender, _points_summary_text(sender))
             return True
-        if low in ("سجل التحويل", "سجل تحويلاتي", "transfer history", "transfer log"):
+        transfer_log = re.fullmatch(r"(?:سجل التحويل|transfer history|transfer log)(?:\s+(\d+))?", text, re.I)
+        if transfer_log:
+            english = _detect_text_language(text) == "en"
+            if not _is_master_name(sender):
+                message = "🔒 سجل تحويلات جميع المستخدمين مخصص للماستر فقط." if not english else "🔒 The bot-wide transfer log is for the master only."
+                self.send_private_text(sender, message)
+                return True
+            page = int(transfer_log.group(1) or "1")
+            rows, total, pages = _all_point_transfer_history(page=page, page_size=8)
+            if page > pages:
+                message = (f"⚠️ رقم الصفحة غير موجود. اختر صفحة من 1 إلى {pages}." if not english
+                           else f"⚠️ Page not found. Choose a page from 1 to {pages}.")
+            elif not rows:
+                message = "📒 لا توجد تحويلات مسجلة على البوت حتى الآن." if not english else "📒 No transfers are recorded on this bot yet."
+            else:
+                title = (f"📒 سجل التحويلات العام — صفحة {page}/{pages} — الإجمالي {total}" if not english
+                         else f"📒 Bot-wide transfer log — page {page}/{pages} — {total} total")
+                lines = [title, "━━━━━━━━━━━━"]
+                for index, entry in enumerate(rows, start=(page - 1) * 8 + 1):
+                    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(entry.get("timestamp", 0) or 0)))
+                    source = str(entry.get("sender") or "?").replace("\n", " ").replace("\r", " ")
+                    target = str(entry.get("recipient") or "?").replace("\n", " ").replace("\r", " ")
+                    detail = f"{when} | @{source} → @{target} | {_fmt_points(entry.get('amount'))}"
+                    source_after = entry.get("sender_balance_after")
+                    target_after = entry.get("recipient_balance_after")
+                    if source_after is not None and target_after is not None:
+                        detail += f" | {_fmt_points(source_after)} → {_fmt_points(target_after)}"
+                    reason = str(entry.get("reason") or "").replace("\n", " ").replace("\r", " ")
+                    if reason:
+                        detail += f" | {reason}"
+                    lines.append(f"{index}. {detail}")
+                lines.append("━━━━━━━━━━━━")
+                lines.append((f"الصفحة التالية: سجل التحويل {page + 1}" if page < pages else "هذه أحدث التحويلات.") if not english
+                             else (f"Next page: transfer history {page + 1}" if page < pages else "You are viewing the latest transfers."))
+                message = "\n".join(lines)
+            # The complete cross-user audit log is always private, even when
+            # the master invokes it from a room.
+            self.send_private_text(sender, message)
+            return True
+        if low in ("سجل تحويلاتي", "my transfer history"):
             rows = _point_transfer_history(sender, 10)
             english = _detect_text_language(text) == "en"
             if not rows:
@@ -15573,8 +15632,6 @@ class TalkinBot:
                         detail = f"From @{entry.get('sender')}" if english else f"من @{entry.get('sender')}"
                     lines.append(f"{when} — {detail}: {_fmt_points(entry.get('amount'))}")
                 message = "\n".join(lines)
-            # Personal financial history is sent privately, even when the
-            # command was typed in a public room.
             self.send_private_text(sender, message)
             return True
         game_record_aliases = {

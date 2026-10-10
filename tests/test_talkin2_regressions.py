@@ -2358,6 +2358,55 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
             self.assertFalse(bot._route_active_board_game_join("North", "Player", "join"))
         self.assertEqual(routed, [])
 
+    def test_bot_wide_transfer_history_is_newest_first_and_paginated(self):
+        history = [
+            {"sender": "A", "recipient": "B", "amount": n, "timestamp": n}
+            for n in range(1, 18)
+        ]
+        with patch.object(bot_module, "_points_data", return_value={}), patch.object(
+            bot_module, "_POINTS_TRANSFER_CACHE", history
+        ):
+            page1, total, pages = bot_module._all_point_transfer_history(page=1, page_size=8)
+            page2, total2, pages2 = bot_module._all_point_transfer_history(page=2, page_size=8)
+            page3, _, _ = bot_module._all_point_transfer_history(page=3, page_size=8)
+        self.assertEqual((total, pages), (17, 3))
+        self.assertEqual((total2, pages2), (17, 3))
+        self.assertEqual([row["amount"] for row in page1], list(range(17, 9, -1)))
+        self.assertEqual([row["amount"] for row in page2], list(range(9, 1, -1)))
+        self.assertEqual([row["amount"] for row in page3], [1])
+
+    def test_global_transfer_log_is_master_only_and_always_private(self):
+        guest = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        guest._room_list_commands = lambda *_args: False
+        guest_replies = []
+        guest.send_private_text = lambda who, text: guest_replies.append((who, text))
+        with patch.object(bot_module, "_is_master_name", return_value=False), patch.object(
+            bot_module, "_all_point_transfer_history"
+        ) as get_log:
+            self.assertTrue(guest._handle_management_command_impl("Room", "سجل التحويل", "Guest", is_private=False))
+        self.assertFalse(get_log.called)
+        self.assertEqual(guest_replies[0][0], "Guest")
+        self.assertIn("للماستر فقط", guest_replies[0][1])
+
+        master = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        master._room_list_commands = lambda *_args: False
+        master_replies = []
+        master.send_private_text = lambda who, text: master_replies.append((who, text))
+        history_entry = {
+            "sender": "Sender", "recipient": "Recipient", "amount": 1000,
+            "timestamp": 1700000000, "sender_balance_after": 3000,
+            "recipient_balance_after": 5000, "reason": "transfer", "id": "transaction-id",
+        }
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_all_point_transfer_history", return_value=([history_entry], 1, 1)
+        ) as get_log:
+            self.assertTrue(master._handle_management_command_impl("Room", "transfer history", "Master", is_private=False))
+        get_log.assert_called_once_with(page=1, page_size=8)
+        self.assertEqual(master_replies[0][0], "Master")
+        self.assertIn("@Sender → @Recipient", master_replies[0][1])
+        self.assertIn("1k", master_replies[0][1])
+        self.assertIn("1/1", master_replies[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()
