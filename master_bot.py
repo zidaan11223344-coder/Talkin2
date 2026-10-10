@@ -33,6 +33,7 @@ os.environ["BOT_ID"] = master_id
 os.environ["BOT_PWD"] = master_pwd
 os.environ["BOT_MASTER"] = master_id
 os.environ["MASTER_SERVICE_ENABLED"] = "1"
+os.environ["TELEGRAM_POLL_ENABLED"] = "0"  # The primary bot alone consumes getUpdates.
 os.environ["GROUP_TO_JOIN"] = ""
 os.environ["FIRST_ROOM"] = ""
 os.environ.setdefault("PRIMARY_BOT_ID", os.getenv("PRIMARY_BOT_ID", "").strip())

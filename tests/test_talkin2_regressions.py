@@ -2282,6 +2282,51 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertNotIn(bot_module._norm_user(sender), bot.publish_pending)
         self.assertTrue(any("استقبال الأوامر" in text for _user, text in replies))
 
+    def test_stream_member_event_initializes_missing_room_roster(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {}
+        bot._stream_member_cache = {}
+        with patch.object(bot_module, "_remember_roster") as remember:
+            self.assertTrue(bot._cache_stream_member_event({
+                2: "member", 8: "member", 13: "NewRoom", 14: "12345", 42: True,
+            }))
+        self.assertEqual(bot.room_users["NewRoom"]["member"], "member")
+        remember.assert_called_once()
+
+    def test_room_join_event_initializes_missing_room_roster(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.room_users = {}
+        bot.known_rooms = set()
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot._master_online_rooms = set()
+        bot._room_entry_times = {}
+        bot._room_entry_users = {}
+        bot.custom_welcome_enabled = False
+        bot.custom_welcomes = {}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        with patch.object(bot_module, "_room_protection_cfg", return_value={}), patch.object(
+            bot_module, "_save_persistent_rooms"
+        ), patch.object(bot_module, "_remember_roster"), patch.object(
+            bot_module, "_join_welcome_message", return_value=None
+        ):
+            bot._handle_room_event_impl({"room_event": {1: "user_joined", 8: "member", 13: "NewRoom", 22: "Member"}})
+        self.assertEqual(bot.room_users["NewRoom"]["Member"], "member")
+
+    def test_telegram_poll_loop_is_inert_when_this_process_is_not_the_owner(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        api_calls = []
+        bot._telegram_api = lambda *args, **kwargs: api_calls.append((args, kwargs))
+        with patch.object(bot_module, "TELEGRAM_BOT_TOKEN", "test-token"), patch.object(
+            bot_module, "TELEGRAM_POLL_ENABLED", False
+        ):
+            bot._telegram_poll_loop()
+        self.assertEqual(api_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

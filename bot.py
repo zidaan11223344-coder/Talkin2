@@ -478,6 +478,7 @@ def _start_master_process():
         env["GROUP_TO_JOIN"] = ""
         env["FIRST_ROOM"] = ""
         env["PRIMARY_BOT_ID"] = BOT_ID
+        env["TELEGRAM_POLL_ENABLED"] = "0"
         # Keep the master isolated from primary BOT_ID/BOT_PWD values.
         env.pop("BOT_ID", None)
         env.pop("BOT_PWD", None)
@@ -562,6 +563,7 @@ TELEGRAM_VARIABLE_COMMANDS = {
     ).split(",") if x.strip()
 }
 TELEGRAM_POLL_SECONDS = max(1.0, float(os.getenv("TELEGRAM_POLL_SECONDS", "2")))
+TELEGRAM_POLL_ENABLED = os.getenv("TELEGRAM_POLL_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 TELEGRAM_LOG_FILE = Path(os.getenv("TELEGRAM_LOG_FILE", str(DATA_DIR / "bot_runtime.log"))).expanduser()
 TELEGRAM_CHAT_FILE = Path(os.getenv("TELEGRAM_CHAT_FILE", str(DATA_DIR / "telegram_chat_id.json"))).expanduser()
 # Route very long Talkin messages to Telegram instead of sending them over the
@@ -5915,7 +5917,7 @@ class TalkinBot:
 
     def _telegram_poll_loop(self):
         """Learn the first Telegram chat_id automatically from the first message."""
-        if not TELEGRAM_BOT_TOKEN:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_POLL_ENABLED:
             return
         self.log("[TELEGRAM] polling started; waiting for first Telegram message")
         while not self.stop_event.is_set() and not self._telegram_stop.is_set():
@@ -9969,7 +9971,7 @@ class TalkinBot:
             cache_key = (_norm_room(room), _norm_user(username))
             previous = cache.get(cache_key)
             current = (role, user_id)
-            self.room_users[room][username] = role
+            self.room_users.setdefault(room, {})[username] = role
             if previous != current:
                 cache[cache_key] = current
                 self._stream_member_cache = cache
@@ -14753,7 +14755,7 @@ class TalkinBot:
         if users:
             # Category-specific lists are not complete room snapshots.
             # Merge them so L@m cannot erase owners/admins from the cache.
-            self.room_users[source_room].update({u.get("username"): u.get("role", "none") for u in users if u.get("username")})
+            self.room_users.setdefault(source_room, {}).update({u.get("username"): u.get("role", "none") for u in users if u.get("username")})
             _remember_roster(source_room, users)
 
         titles = {
@@ -17317,7 +17319,7 @@ class TalkinBot:
                     except Exception as exc:
                         self.log("[NO-PHOTO] ban failed", repr(exc))
                     return
-            self.room_users[room][username] = role or "none"
+            self.room_users.setdefault(room, {})[username] = role or "none"
             _remember_roster(room, [{"username": username, "role": role or "none"}])
             # Keep a separate history for .r. Only events received after the
             # bot's own you_joined/you_rejoined timestamp are recorded.
@@ -17350,7 +17352,7 @@ class TalkinBot:
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
 
         elif event_type == "user_left" and username:
-            self.room_users[room].pop(username, None)
+            self.room_users.get(room, {}).pop(username, None)
             departed = getattr(self, "_last_departed_user_by_room", None)
             if departed is None:
                 departed = self._last_departed_user_by_room = {}
@@ -17375,7 +17377,7 @@ class TalkinBot:
             changed_role = str(event.get(31, "") or event.get(8, "") or "").strip().lower()
             if changed_user and changed_role:
                 if changed_role in ("kicked", "outcast"):
-                    self.room_users[room].pop(changed_user, None)
+                    self.room_users.get(room, {}).pop(changed_user, None)
                     if _norm_user(changed_user) == _norm_user(BOT_ID):
                         self.connected_rooms = {
                             connected for connected in self.connected_rooms
@@ -17384,7 +17386,7 @@ class TalkinBot:
                         self.log(f"[KICK_DETECTED] Bot was removed from {room}; rejoining automatically...")
                         self._schedule_auto_rejoin(room)
                 else:
-                    self.room_users[room][changed_user] = changed_role
+                    self.room_users.setdefault(room, {})[changed_user] = changed_role
                 key = (room.casefold(), changed_user.casefold(), changed_role)
                 with self.pending_admin_lock:
                     pending = self.pending_admin_actions.pop(key, None)
@@ -18564,8 +18566,10 @@ class TalkinBot:
                 "Missing required deployment variables: " + ", ".join(missing) + ". "
                 "Add them to Railway Variables (not the source code) and redeploy."
             )
-        if TELEGRAM_BOT_TOKEN:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_POLL_ENABLED:
             threading.Thread(target=self._telegram_poll_loop, name="telegram-poll", daemon=True).start()
+        elif TELEGRAM_BOT_TOKEN:
+            self.log("[TELEGRAM] polling disabled for this process; another instance owns getUpdates")
         else:
             self.log("[TELEGRAM] TELEGRAM_BOT_TOKEN is not configured; Telegram log upload disabled")
         self._cleanup_thread = start_runtime_cleanup(self.stop_event, self)
