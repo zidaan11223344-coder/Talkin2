@@ -3454,6 +3454,47 @@ def _all_point_transfer_history(page=1, page_size=8):
     return rows[start:start + page_size], total, pages
 
 
+_POINT_TRANSFER_HISTORY_PAGE_SIZE = 8
+
+
+def _format_all_point_transfer_history_page(page=1, english=False):
+    rows, total, pages = _all_point_transfer_history(
+        page=page, page_size=_POINT_TRANSFER_HISTORY_PAGE_SIZE
+    )
+    if page > pages:
+        message = (f"⚠️ لا توجد قائمة بهذا الرقم. الصفحات من 1 إلى {pages}." if not english
+                   else f"⚠️ No list with that number. Pages range from 1 to {pages}.")
+        return message, pages
+    title = (f"📒 سجل تحويلات البوت — قائمة {page}/{pages} — الإجمالي {total}" if not english
+             else f"📒 Bot-wide transfer log — List {page}/{pages} — {total} total")
+    lines = [title, "━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("لا توجد تحويلات مسجلة على البوت حتى الآن." if not english
+                     else "No transfers are recorded on this bot yet.")
+    else:
+        for index, entry in enumerate(rows, start=(page - 1) * _POINT_TRANSFER_HISTORY_PAGE_SIZE + 1):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(entry.get("timestamp", 0) or 0)))
+            source = str(entry.get("sender") or "?").replace("\n", " ").replace("\r", " ")
+            target = str(entry.get("recipient") or "?").replace("\n", " ").replace("\r", " ")
+            detail = f"{when} | @{source} → @{target} | {_fmt_points(entry.get('amount'))}"
+            source_after = entry.get("sender_balance_after")
+            target_after = entry.get("recipient_balance_after")
+            if source_after is not None and target_after is not None:
+                detail += f" | {_fmt_points(source_after)} → {_fmt_points(target_after)}"
+            reason = str(entry.get("reason") or "").replace("\n", " ").replace("\r", " ")
+            if reason:
+                detail += f" | {reason}"
+            lines.append(f"{index}. {detail}")
+    lines.append("━━━━━━━━━━━━")
+    if page < pages:
+        lines.append((f"📌 اكتب ns لعرض قائمة {page + 1}." if not english
+                      else f"📌 Type ns to view List {page + 1}."))
+    else:
+        lines.append("هذه آخر قائمة. اكتب سجل التحويل لبدء العرض من جديد." if not english
+                     else "This is the last list. Type transfer history to start again.")
+    return "\n".join(lines), pages
+
+
 def _fmt_points(value):
     """Compact point balances for chat: 1k -> 1k and 1k,000,000 -> 1m."""
     if value is None:
@@ -11399,12 +11440,21 @@ class TalkinBot:
             self.log("[GAME] winner card skipped: no artwork", game_key)
             return False
         try:
-            winner_key = _norm_user(winner_name)
-            winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
-            if not winner_photo:
-                winner_photo = self._lookup_profile_photo(winner_name)
-            card = render_game_winner_card(game_key, winner_name, winner_photo)
-            url = f"{base}/games/{card.name}"
+            if game_key == "اسرق_فشل":
+                # The failure artwork already contains its own result design.
+                # Sending it through render_game_winner_card() incorrectly
+                # stamped a gold WINNER/name overlay onto the failure image.
+                url = self._game_public_image(image, route="assets")
+                if not url:
+                    self.log("[GAME] failure artwork URL unavailable", game_key)
+                    return False
+            else:
+                winner_key = _norm_user(winner_name)
+                winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
+                if not winner_photo:
+                    winner_photo = self._lookup_profile_photo(winner_name)
+                card = render_game_winner_card(game_key, winner_name, winner_photo)
+                url = f"{base}/games/{card.name}"
             self._verify_public_media_url(url, "image")
             rooms = []
             seen = set()
@@ -15535,6 +15585,24 @@ class TalkinBot:
             return True
         if low in ("ns","n","التالي","القائمة التالية","next"):
             key=(("__private__" if is_private else str(room)), _norm_user(sender))
+            transfer_key = _norm_user(sender)
+            transfer_pages = getattr(self, "_transfer_log_pages", {})
+            if _is_master_name(sender) and transfer_key in transfer_pages:
+                current = max(1, int(transfer_pages.get(transfer_key, 1) or 1))
+                english = bool(getattr(self, "_transfer_log_languages", {}).get(transfer_key, False))
+                next_page = current + 1
+                _rows, _total, page_count = _all_point_transfer_history(
+                    page=1, page_size=_POINT_TRANSFER_HISTORY_PAGE_SIZE
+                )
+                if next_page > page_count:
+                    transfer_pages.pop(transfer_key, None)
+                    getattr(self, "_transfer_log_languages", {}).pop(transfer_key, None)
+                    message = "📒 هذه آخر قائمة في سجل التحويل." if not english else "📒 This is the last transfer-log list."
+                else:
+                    transfer_pages[transfer_key] = next_page
+                    message, _page_count = _format_all_point_transfer_history_page(next_page, english)
+                self.send_private_text(sender, message)
+                return True
             # Do not assume a1 when ns is sent without opening a category.
             if key not in self.help_pages:
                 target = "a1 إلى a6" if (_is_primary_master(sender) and is_private) else "a2 إلى a6"
@@ -15585,33 +15653,15 @@ class TalkinBot:
                 self.send_private_text(sender, message)
                 return True
             page = int(transfer_log.group(1) or "1")
-            rows, total, pages = _all_point_transfer_history(page=page, page_size=8)
-            if page > pages:
-                message = (f"⚠️ رقم الصفحة غير موجود. اختر صفحة من 1 إلى {pages}." if not english
-                           else f"⚠️ Page not found. Choose a page from 1 to {pages}.")
-            elif not rows:
-                message = "📒 لا توجد تحويلات مسجلة على البوت حتى الآن." if not english else "📒 No transfers are recorded on this bot yet."
-            else:
-                title = (f"📒 سجل التحويلات العام — صفحة {page}/{pages} — الإجمالي {total}" if not english
-                         else f"📒 Bot-wide transfer log — page {page}/{pages} — {total} total")
-                lines = [title, "━━━━━━━━━━━━"]
-                for index, entry in enumerate(rows, start=(page - 1) * 8 + 1):
-                    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(entry.get("timestamp", 0) or 0)))
-                    source = str(entry.get("sender") or "?").replace("\n", " ").replace("\r", " ")
-                    target = str(entry.get("recipient") or "?").replace("\n", " ").replace("\r", " ")
-                    detail = f"{when} | @{source} → @{target} | {_fmt_points(entry.get('amount'))}"
-                    source_after = entry.get("sender_balance_after")
-                    target_after = entry.get("recipient_balance_after")
-                    if source_after is not None and target_after is not None:
-                        detail += f" | {_fmt_points(source_after)} → {_fmt_points(target_after)}"
-                    reason = str(entry.get("reason") or "").replace("\n", " ").replace("\r", " ")
-                    if reason:
-                        detail += f" | {reason}"
-                    lines.append(f"{index}. {detail}")
-                lines.append("━━━━━━━━━━━━")
-                lines.append((f"الصفحة التالية: سجل التحويل {page + 1}" if page < pages else "هذه أحدث التحويلات.") if not english
-                             else (f"Next page: transfer history {page + 1}" if page < pages else "You are viewing the latest transfers."))
-                message = "\n".join(lines)
+            message, pages = _format_all_point_transfer_history_page(page, english)
+            if page <= pages:
+                transfer_key = _norm_user(sender)
+                if not hasattr(self, "_transfer_log_pages") or not isinstance(self._transfer_log_pages, dict):
+                    self._transfer_log_pages = {}
+                if not hasattr(self, "_transfer_log_languages") or not isinstance(self._transfer_log_languages, dict):
+                    self._transfer_log_languages = {}
+                self._transfer_log_pages[transfer_key] = page
+                self._transfer_log_languages[transfer_key] = english
             # The complete cross-user audit log is always private, even when
             # the master invokes it from a room.
             self.send_private_text(sender, message)

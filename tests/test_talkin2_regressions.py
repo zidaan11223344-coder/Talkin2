@@ -208,6 +208,20 @@ class IncomingEventDedupRegressions(unittest.TestCase):
         self.assertTrue(any("لم تتم السرقة" in text for _room, text in sent_text))
         self.assertEqual(cards, [("اسرق_فشل", "thief", ["North"])])
 
+    def test_steal_failure_sends_original_art_without_winner_overlay(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.log = lambda *_args: None
+        bot._game_public_image = lambda path, route="games": f"https://media.test/{route}/{path.name}"
+        bot._verify_public_media_url = lambda *_args: None
+        bot.send_room_media = lambda *args: sent.append(args)
+        with patch.object(bot_module, "_public_base_url", return_value="https://media.test"), patch.object(
+            bot_module, "render_game_winner_card"
+        ) as render:
+            self.assertTrue(bot._send_game_winner_card("اسرق_فشل", "thief", ["North"]))
+        render.assert_not_called()
+        self.assertEqual(sent, [("North", "https://media.test/assets/game_steal_failure.jpg", "image")])
+
     def test_social_pair_game_uses_only_live_members_in_the_same_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {
@@ -2406,6 +2420,34 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertIn("@Sender → @Recipient", master_replies[0][1])
         self.assertIn("1k", master_replies[0][1])
         self.assertIn("1/1", master_replies[0][1])
+
+    def test_global_transfer_log_uses_list_one_then_ns_for_next_list(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_list_commands = lambda *_args: False
+        replies = []
+        bot.send_private_text = lambda who, text: replies.append((who, text))
+
+        def page_data(page, page_size):
+            self.assertEqual(page_size, bot_module._POINT_TRANSFER_HISTORY_PAGE_SIZE)
+            sender = "Newest" if page == 1 else "Older"
+            rows = [{
+                "sender": sender, "recipient": "Target", "amount": page,
+                "timestamp": 1700000000 - page, "sender_balance_after": 10,
+                "recipient_balance_after": 20, "reason": "transfer",
+            }]
+            return rows, 17, 3
+
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_all_point_transfer_history", side_effect=page_data
+        ):
+            self.assertTrue(bot._handle_management_command_impl("Room", "سجل التحويل", "Master", is_private=False))
+            self.assertTrue(bot._handle_management_command_impl("Room", "ns", "Master", is_private=False))
+        self.assertEqual(len(replies), 2)
+        self.assertIn("قائمة 1/3", replies[0][1])
+        self.assertIn("اكتب ns", replies[0][1])
+        self.assertIn("@Newest", replies[0][1])
+        self.assertIn("قائمة 2/3", replies[1][1])
+        self.assertIn("@Older", replies[1][1])
 
 
 if __name__ == "__main__":
