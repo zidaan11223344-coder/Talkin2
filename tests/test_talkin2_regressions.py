@@ -2327,6 +2327,37 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
             bot._telegram_poll_loop()
         self.assertEqual(api_calls, [])
 
+    def test_join_routes_to_active_ludo_and_snake_before_cricket(self):
+        room_key = bot_module._norm_room("North")
+        for game_key in (f"ludo:{room_key}", f"snake:{room_key}"):
+            with self.subTest(game=game_key):
+                bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                bot.ludo_games = {}
+                bot.snake_games = {}
+                if game_key.startswith("ludo:"):
+                    bot.ludo_games[game_key] = {"players": ["Host"], "started": False}
+                else:
+                    bot.snake_games[game_key] = {"players": ["Host"]}
+                routed = []
+                bot._run_game_command_async = lambda *args: routed.append(args) or True
+                with patch.object(bot_module, "_is_verified_user", return_value=True):
+                    self.assertTrue(bot._route_active_board_game_join("North", "Player", "join"))
+                self.assertEqual(routed, [("North", "join", "Player")])
+
+    def test_board_game_join_router_requires_active_game_and_verified_user(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.ludo_games = {}
+        bot.snake_games = {}
+        routed = []
+        bot._run_game_command_async = lambda *args: routed.append(args) or True
+        with patch.object(bot_module, "_is_verified_user", return_value=True):
+            self.assertFalse(bot._route_active_board_game_join("North", "Player", "join"))
+        room_key = bot_module._norm_room("North")
+        bot.snake_games[f"snake:{room_key}"] = {"players": ["Host"]}
+        with patch.object(bot_module, "_is_verified_user", return_value=False):
+            self.assertFalse(bot._route_active_board_game_join("North", "Player", "join"))
+        self.assertEqual(routed, [])
+
 
 if __name__ == "__main__":
     unittest.main()

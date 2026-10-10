@@ -12772,6 +12772,20 @@ class TalkinBot:
         return True
 
 
+    def _route_active_board_game_join(self, room, sender_name, text):
+        """Give an active Ludo/Snake join request priority over cricket's Join."""
+        command = _normalize_game_command_text(text).strip().casefold()
+        if command not in {"join", "انضمام"}:
+            return False
+        room_key = _norm_room(room)
+        ludo = getattr(self, "ludo_games", {}).get(f"ludo:{room_key}")
+        snake = getattr(self, "snake_games", {}).get(f"snake:{room_key}")
+        if not isinstance(ludo, dict) and not isinstance(snake, dict):
+            return False
+        if not _is_verified_user(sender_name):
+            return False
+        return self._run_game_command_async(room, text, sender_name)
+
     def _game_public_image(self, path, route="games"):
         base=_public_base_url()
         if not base: return ""
@@ -17735,6 +17749,11 @@ class TalkinBot:
         # canonical username in field 22 while field 2 contains a display/id;
         # prefer the canonical field so verified Join requests are recognized.
         cricket_sender = username or frm
+        # Cricket also uses the plain `Join` command and claims it even when no
+        # cricket match is running. If Ludo or Snake is active in this room,
+        # route the same command to that board game first.
+        if self._route_active_board_game_join(room, cricket_sender, body):
+            return
         if self._cricket.handle(room, cricket_sender, body, is_private=False):
             return
 
