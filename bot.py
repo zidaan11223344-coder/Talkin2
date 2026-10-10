@@ -1631,6 +1631,54 @@ class PersistentStateDatabase:
             conn.rollback(); raise
         finally: conn.close()
 
+    def mutate(self, key, default_payload, updater):
+        """Atomically read-modify-write one JSON state row across processes."""
+        conn = self._connect()
+        if not conn:
+            raise RuntimeError("persistent state database is unavailable")
+        raw_default = json.dumps(default_payload, ensure_ascii=False)
+        try:
+            with conn.cursor() as cur:
+                if RIVEN_DATABASE_KIND in {"mysql", "mariadb"}:
+                    cur.execute(
+                        "INSERT IGNORE INTO bot_state(state_key,payload,updated_at) VALUES (%s,%s,NOW())",
+                        (str(key), raw_default),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO bot_state(state_key,payload,updated_at) VALUES (%s,%s::jsonb,NOW()) ON CONFLICT(state_key) DO NOTHING",
+                        (str(key), raw_default),
+                    )
+                cur.execute("SELECT payload FROM bot_state WHERE state_key=%s FOR UPDATE", (str(key),))
+                row = cur.fetchone()
+                if not row:
+                    raise RuntimeError("persistent state row could not be locked")
+                current = row[0]
+                if isinstance(current, str):
+                    current = json.loads(current)
+                updated, result = updater(current)
+                if updated is None:
+                    conn.commit()
+                    return current, result
+                raw = json.dumps(updated, ensure_ascii=False)
+                if RIVEN_DATABASE_KIND in {"mysql", "mariadb"}:
+                    cur.execute(
+                        "UPDATE bot_state SET payload=%s, updated_at=NOW() WHERE state_key=%s",
+                        (raw, str(key)),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE bot_state SET payload=%s::jsonb, updated_at=NOW() WHERE state_key=%s",
+                        (raw, str(key)),
+                    )
+            conn.commit()
+            return updated, result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
 def _load_local_json(path, default):
     try:
         if Path(path).is_file():
@@ -1644,7 +1692,7 @@ _LOCAL_BG_CONDITION = threading.Condition()
 _LOCAL_BG_PENDING = {}
 _LOCAL_BG_WORKER_STARTED = False
 
-def _save_local_json(path, data):
+def _save_local_json(path, data, *, persist_state_db=True):
     """Atomically save local JSON without sharing one fixed .tmp file.
 
     A fixed ``file.json.tmp`` is unsafe when two game events save at the same
@@ -1664,7 +1712,9 @@ def _save_local_json(path, data):
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
-    if _STATE_DB_ENABLED:
+    # points.json is changed through PersistentStateDatabase.mutate so an old
+    # queued snapshot can never overwrite a newer balance transaction.
+    if _STATE_DB_ENABLED and persist_state_db and path.name != "points.json":
         with _STATE_DB_CONDITION:
             _STATE_DB_PENDING[str(path)] = copy.deepcopy(data)
             _STATE_DB_CONDITION.notify()
@@ -1922,6 +1972,8 @@ def _github_restore_or_seed_state():
                     local_data = _load_local_json(local, None)
                     local_has_data = bool(local_data) if isinstance(local_data, (dict, list)) else local_data not in (None, "", 0, False)
                     remote_has_data = bool(remote) if isinstance(remote, (dict, list)) else remote not in (None, "", 0, False)
+                    if name == "points.json" and remote_has_data and local_has_data:
+                        remote = _merge_points_snapshots(remote, local_data)
                     if (remote_has_data and not local_has_data) or (
                         remote_has_data and local_data != remote
                     ):
@@ -1938,6 +1990,98 @@ def _github_restore_or_seed_state():
 def _state_has_data(value):
     return bool(value) if isinstance(value, (dict, list)) else value not in (None, "", 0, False)
 
+
+def _merge_points_snapshots(authoritative, secondary):
+    """Reconcile duplicate point accounts by retaining one, highest balance.
+
+    This is intentionally defined before startup restoration runs. Distinct
+    users are retained, but duplicate snapshots are never added together.
+    """
+    def unpack(value):
+        if isinstance(value, dict) and value.get("version") == 2 and isinstance(value.get("accounts"), dict):
+            return value.get("accounts", {}), value.get("transfer_history", [])
+        return (value if isinstance(value, dict) else {}), []
+
+    def norm_exact(value):
+        raw = unicodedata.normalize("NFKC", str(value or "")).strip().lstrip("@").casefold()
+        clean = "".join(ch for ch in raw if not unicodedata.category(ch).startswith("C"))
+        return " ".join(clean.split())
+
+    def norm_alias(value):
+        raw = unicodedata.normalize("NFKC", str(value or "")).strip().lstrip("@").casefold()
+        clean = "".join(ch for ch in raw if not unicodedata.category(ch).startswith(("M", "P", "S", "C")))
+        return " ".join(clean.split())
+
+    def balance(item):
+        try:
+            return int(item.get("points", 0) or 0) if isinstance(item, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
+    base, base_history = unpack(authoritative)
+    incoming, incoming_history = unpack(secondary)
+    merged = {}
+
+    def add_record(key, item, *, allow_alias=True):
+        if not isinstance(item, dict):
+            return
+        key = str(key)
+        username = str(item.get("username") or key)
+        identity_exact = {norm_exact(key), norm_exact(username)} - {""}
+        identity_alias = {norm_alias(key), norm_alias(username)} - {""}
+        exact_matches, alias_matches = [], []
+        for old_key, old_item in merged.items():
+            old_name = str(old_item.get("username") or old_key)
+            old_exact = {norm_exact(old_key), norm_exact(old_name)} - {""}
+            old_alias = {norm_alias(old_key), norm_alias(old_name)} - {""}
+            if identity_exact & old_exact:
+                exact_matches.append(old_key)
+            elif identity_alias & old_alias:
+                alias_matches.append(old_key)
+        matches = exact_matches if exact_matches else (
+            alias_matches if allow_alias and len(alias_matches) == 1 else []
+        )
+        if not matches:
+            new_key = key
+            suffix = 1
+            while new_key in merged:
+                new_key = f"{key}__snapshot{suffix}"
+                suffix += 1
+            merged[new_key] = dict(item)
+            merged[new_key].setdefault("username", username)
+            return
+        keep_key = matches[0]
+        candidates = [(keep_key, merged[keep_key])] + [(k, merged[k]) for k in matches[1:]] + [(key, item)]
+        _winner_key, winner = max(candidates, key=lambda pair: balance(pair[1]))
+        winner = dict(winner)
+        winner["points"] = max(balance(candidate) for _k, candidate in candidates)
+        winner.setdefault("username", username)
+        merged[keep_key] = winner
+        for duplicate_key in matches[1:]:
+            merged.pop(duplicate_key, None)
+
+    for key, item in base.items():
+        # Never infer that two entries within the primary file are one user;
+        # only exact duplicate identities are safe to collapse there.
+        add_record(key, item, allow_alias=False)
+    for key, item in incoming.items():
+        add_record(key, item)
+
+    history = []
+    seen = set()
+    for entry in list(base_history if isinstance(base_history, list) else []) + list(incoming_history if isinstance(incoming_history, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        identity = entry.get("id") or (
+            entry.get("timestamp"), entry.get("sender_key"), entry.get("recipient_key"), entry.get("amount")
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        history.append(entry)
+    history.sort(key=lambda entry: int(entry.get("timestamp", 0) or 0))
+    return {"version": 2, "accounts": merged, "transfer_history": history[-1000:]}
+
 def _restore_or_seed_postgres_state():
     global _STATE_DB_HAS_DATA
     if not _STATE_DB_ENABLED or not _STATE_DB: return
@@ -1948,6 +2092,13 @@ def _restore_or_seed_postgres_state():
             remote, local = _STATE_DB.load(name), _load_local_json(path, None)
             if _state_has_data(remote):
                 _STATE_DB_HAS_DATA = True
+                if name == "points.json" and _state_has_data(local):
+                    # Lock the row and reconcile competing snapshots without
+                    # ever adding balances for the same decorated identity.
+                    remote, _ = _STATE_DB.mutate(
+                        name, remote,
+                        lambda current: (_merge_points_snapshots(current, local), None),
+                    )
                 _save_local_json(path, remote)
             elif _state_has_data(local): _STATE_DB.save(name, local)
         except Exception as exc: print(f"[STATE-DB] startup state failed for {name}: {exc}", flush=True)
@@ -2395,7 +2546,12 @@ def _looks_like_bot_command(text):
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
     )
-    prefixes = prefixes + ("bl@", "+ds@", "رهان ", "مضاربه ", "استثمار ", "حظي ")
+    prefixes = prefixes + (
+        "bl@", "+ds@", "رهان ", "مضاربه ", "استثمار ", "حظي ",
+        "سجل التحويل", "سجل تحويلاتي", "سجل المليار", "سجل مليار", "سجل المليون", "سجل مليون",
+        "transfer history", "transfer log", "billion record", "billion history", "million record", "million history",
+        "top b", "topb", "top m", "topm",
+    )
     normalized_low = low.replace("ة", "ه")
     normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
     normalized_games = {str(x).casefold().replace("ة", "ه") for x in (*GAME_COMMANDS, *GAME_COMMANDS.values())}
@@ -2532,6 +2688,7 @@ _GAME_STATS_MIGRATION_DONE = False
 _GAME_SNAPSHOT_LOCK = threading.RLock()
 _GAME_SNAPSHOT_PENDING = False
 _POINTS_CACHE = None
+_POINTS_TRANSFER_CACHE = None
 _MEDIA_STATS_LOCK = threading.RLock()
 _MEDIA_STATS_CACHE = None
 
@@ -3009,7 +3166,7 @@ def _game_level(username):
 
 
 def _game_top(game_key, limit=10):
-    rows = []
+    unique = {}
     for key, item in _game_stats_data().items():
         if not isinstance(item, dict): continue
         games = item.get("games", {})
@@ -3017,38 +3174,262 @@ def _game_top(game_key, limit=10):
         plays = int(g.get("plays", 0) or 0)
         points = int(g.get("points", 0) or 0)
         staked = int(g.get("staked", 0) or 0)
-        if plays: rows.append((points, staked, plays, item.get("username", key)))
+        if plays:
+            username = str(item.get("username") or key)
+            canonical = _game_name_key(username) or _norm_user(username)
+            row = (points, staked, plays, username)
+            previous = unique.get(canonical)
+            # Duplicate decorated records are snapshots, never additive. Keep
+            # the strongest one so rankings do not inflate a player's score.
+            if previous is None or (points, plays, staked) > (previous[0], previous[2], previous[1]):
+                unique[canonical] = row
+    rows = list(unique.values())
     rows.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
     return rows[:limit]
 
+_POINTS_STATE_VERSION = 2
+_POINT_TRANSFER_HISTORY_LIMIT = 1000
+
+
+def _decode_points_payload(payload):
+    """Read both legacy flat points.json and the single-file v2 format."""
+    if isinstance(payload, dict) and payload.get("version") == _POINTS_STATE_VERSION and isinstance(payload.get("accounts"), dict):
+        accounts = payload.get("accounts", {})
+        history = payload.get("transfer_history", [])
+        return accounts, history if isinstance(history, list) else []
+    return payload if isinstance(payload, dict) else {}, []
+
+
+def _encode_points_payload(accounts, history):
+    return {
+        "version": _POINTS_STATE_VERSION,
+        "accounts": accounts if isinstance(accounts, dict) else {},
+        "transfer_history": (history if isinstance(history, list) else [])[-_POINT_TRANSFER_HISTORY_LIMIT:],
+    }
+
+
 def _points_data():
-    global _POINTS_CACHE
+    global _POINTS_CACHE, _POINTS_TRANSFER_CACHE
     with _GAME_STATE_LOCK:
         if _POINTS_CACHE is None:
-            data = _load_local_json(POINTS_FILE, {})
-            _POINTS_CACHE = data if isinstance(data, dict) else {}
+            raw = _load_local_json(POINTS_FILE, {})
+            _POINTS_CACHE, _POINTS_TRANSFER_CACHE = _decode_points_payload(raw)
+        elif _POINTS_TRANSFER_CACHE is None:
+            raw = _load_local_json(POINTS_FILE, {})
+            _accounts, _POINTS_TRANSFER_CACHE = _decode_points_payload(raw)
         return _POINTS_CACHE
+
+
+def _points_balance(item):
+    try:
+        return int(item.get("points", 0) or 0) if isinstance(item, dict) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _points_account_candidates(data, username, *, exact_only=False):
+    wanted = _norm_user(username)
+    if not wanted or not isinstance(data, dict):
+        return []
+    exact = []
+    for key, item in data.items():
+        if not isinstance(item, dict):
+            continue
+        if _norm_user(key) == wanted or _norm_user(item.get("username")) == wanted:
+            exact.append((str(key), item))
+    if exact or exact_only:
+        return exact
+    canonical = _game_name_key(username)
+    if not canonical:
+        return []
+    aliases = []
+    for key, item in data.items():
+        if not isinstance(item, dict):
+            continue
+        stored = item.get("username") or key
+        if _game_name_key(stored) == canonical or _game_name_key(key) == canonical:
+            aliases.append((str(key), item))
+    # Only use a decorated-name fallback when it identifies one record. A
+    # fuzzy collision is never enough to choose a transfer recipient.
+    return aliases if len(aliases) == 1 else []
+
+
+def _resolve_points_account(data, username, *, exact_only=False):
+    candidates = _points_account_candidates(data, username, exact_only=exact_only)
+    if not candidates:
+        return None
+    wanted = _norm_user(username)
+    return max(
+        candidates,
+        key=lambda pair: (
+            _points_balance(pair[1]),
+            int(_norm_user(pair[0]) == wanted or _norm_user(pair[1].get("username")) == wanted),
+        ),
+    )
+
+
+def _mutate_points_state(updater):
+    """Apply a points change atomically in memory, local JSON and Riven DB."""
+    global _POINTS_CACHE, _POINTS_TRANSFER_CACHE
+    with _GAME_STATE_LOCK:
+        current_accounts = copy.deepcopy(_points_data())
+        current_history = copy.deepcopy(_POINTS_TRANSFER_CACHE or [])
+        default_payload = _encode_points_payload(current_accounts, current_history)
+
+        def apply(payload):
+            accounts, history = _decode_points_payload(payload)
+            accounts = copy.deepcopy(accounts)
+            history = copy.deepcopy(history)
+            result, changed = updater(accounts, history)
+            if not changed:
+                return None, result
+            return _encode_points_payload(accounts, history), result
+
+        if _STATE_DB_ENABLED and _STATE_DB is not None:
+            payload, result = _STATE_DB.mutate("points.json", default_payload, apply)
+            accounts, history = _decode_points_payload(payload)
+            _POINTS_CACHE = accounts
+            _POINTS_TRANSFER_CACHE = history
+            if isinstance(result, dict) and result.get("ok") is False:
+                return result
+            try:
+                _save_local_json(POINTS_FILE, payload, persist_state_db=False)
+            except Exception as exc:
+                # Riven has already committed the transaction and remains the
+                # authoritative source; the local file is only a restart cache.
+                print(f"[POINTS] local cache save failed after DB commit: {exc}", flush=True)
+            return result
+
+        payload, result = apply(default_payload)
+        if payload is None:
+            return result
+        # Persist before publishing the changed balance to the caller. If disk
+        # fails, callers must not announce an uncommitted reward/transfer.
+        _save_local_json(POINTS_FILE, payload, persist_state_db=False)
+        _POINTS_CACHE, _POINTS_TRANSFER_CACHE = _decode_points_payload(payload)
+        return result
+
+
+class PointsInsufficientError(RuntimeError):
+    """Raised when a concurrent game debit would overdraw a points account."""
+
+
+class PointsPersistenceError(RuntimeError):
+    """Raised when a points mutation cannot be durably stored."""
+
 
 def _add_points(username, amount):
     amount = int(amount)
-    key = _norm_user(username)
-    if not key:
+    display_name = str(username or "").strip().lstrip("@")
+    if not _norm_user(display_name):
         return 0
-    with _GAME_STATE_LOCK:
-        data = _points_data()
-        display_name = str(username).strip().lstrip("@")
-        item = data.get(key, {"username": display_name, "points": 0})
+
+    def update(accounts, _history):
+        resolved = _resolve_points_account(accounts, display_name)
+        if resolved:
+            key, item = resolved
+            item = dict(item)
+        else:
+            if amount < 0:
+                raise PointsInsufficientError("No saved points account for this player")
+            key = _norm_user(display_name)
+            item = {"username": display_name, "points": 0}
+        old_balance = _points_balance(item)
+        if amount < 0 and old_balance < -amount:
+            raise PointsInsufficientError("Insufficient points for this game debit")
         item["username"] = _preferred_display_name(item.get("username"), display_name)
-        item["points"] = int(item.get("points", 0) or 0) + amount
-        data[key] = item
-        snapshot = copy.deepcopy(data)
-    _queue_local_json_save(POINTS_FILE, snapshot)
-    return item["points"]
+        item["points"] = old_balance + amount
+        accounts[key] = item
+        return item["points"], True
+
+    try:
+        return _mutate_points_state(update)
+    except (PointsInsufficientError,):
+        raise
+    except Exception as exc:
+        raise PointsPersistenceError("Could not persist points mutation") from exc
+
+
+def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_source=True,
+                     require_exact_target=True, create_target_if_missing=False):
+    """Move points and append the audit entry in the same points.json commit."""
+    amount = int(amount)
+    if amount <= 0:
+        return {"ok": False, "error": "invalid_amount"}
+    sender_name = str(sender or "").strip().lstrip("@")
+    target_name = str(target or "").strip().lstrip("@")
+
+    def update(accounts, history):
+        source = _resolve_points_account(accounts, sender_name, exact_only=not allow_alias_source)
+        destination = _resolve_points_account(accounts, target_name, exact_only=require_exact_target)
+        if not destination and create_target_if_missing and _norm_user(target_name):
+            destination = (_norm_user(target_name), {"username": target_name, "points": 0})
+        if not destination:
+            return {"ok": False, "error": "target_not_found"}, False
+        if not source:
+            return {"ok": False, "error": "sender_not_found"}, False
+        source_key, source_item = source
+        target_key, target_item = destination
+        if source_key == target_key:
+            return {"ok": False, "error": "same_account"}, False
+        source_balance = _points_balance(source_item)
+        if source_balance < amount:
+            return {"ok": False, "error": "insufficient", "sender_balance": source_balance}, False
+        target_balance = _points_balance(target_item)
+        source_item = dict(source_item)
+        target_item = dict(target_item)
+        source_item["points"] = source_balance - amount
+        target_item["points"] = target_balance + amount
+        source_item["username"] = str(source_item.get("username") or sender_name)
+        target_item["username"] = str(target_item.get("username") or target_name)
+        accounts[source_key] = source_item
+        accounts[target_key] = target_item
+        entry = {
+            "id": uuid.uuid4().hex,
+            "timestamp": int(time.time()),
+            "sender": source_item["username"],
+            "sender_key": source_key,
+            "recipient": target_item["username"],
+            "recipient_key": target_key,
+            "amount": amount,
+            "sender_balance_after": source_item["points"],
+            "recipient_balance_after": target_item["points"],
+            "reason": str(reason or "transfer"),
+        }
+        history.append(entry)
+        del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
+        return {
+            "ok": True, "sender": source_item["username"], "recipient": target_item["username"],
+            "amount": amount, "sender_balance": source_item["points"],
+            "recipient_balance": target_item["points"], "transaction_id": entry["id"],
+        }, True
+
+    try:
+        return _mutate_points_state(update)
+    except Exception as exc:
+        print(f"[POINTS] transfer commit failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
 
 
 def _get_points(username):
-    item = _points_data().get(_norm_user(username), {})
-    return int(item.get("points", 0) or 0)
+    resolved = _resolve_points_account(_points_data(), username)
+    return _points_balance(resolved[1]) if resolved else 0
+
+
+def _point_transfer_history(username, limit=10):
+    data = _points_data()
+    identity = _resolve_points_account(data, username)
+    keys = {identity[0]} if identity else set()
+    norm = _norm_user(username)
+    with _GAME_STATE_LOCK:
+        history = list(_POINTS_TRANSFER_CACHE or [])
+    rows = [entry for entry in history if isinstance(entry, dict) and (
+        str(entry.get("sender_key") or "") in keys
+        or str(entry.get("recipient_key") or "") in keys
+        or _norm_user(entry.get("sender")) == norm
+        or _norm_user(entry.get("recipient")) == norm
+    )]
+    return list(reversed(rows[-max(1, int(limit)):]))
 
 
 def _fmt_points(value):
@@ -3061,10 +3442,6 @@ def _fmt_points(value):
         return str(value)
     sign = "-" if number < 0 else ""
     number = abs(number)
-    if number >= 1_000_000_000:
-        amount = number / 1_000_000_000
-        text = f"{amount:.1f}".rstrip("0").rstrip(".")
-        return f"{sign}{text}b"
     if number >= 1_000_000_000:
         amount = number / 1_000_000_000
         text = f"{amount:.1f}".rstrip("0").rstrip(".")
@@ -12023,8 +12400,15 @@ class TalkinBot:
             self._send_game_winner_card("اسرق_فشل", sender, [room])
             return True
 
-        _add_points(victim, -500)
-        thief_balance = _add_points(sender, 500)
+        transfer = _transfer_points(
+            victim, sender, 500, reason="steal", allow_alias_source=True,
+            require_exact_target=False, create_target_if_missing=True,
+        )
+        if not transfer.get("ok"):
+            self.send_room_text(room, "⚠️ تعذر اعتماد نتيجة السرقة وحفظ النقاط بأمان؛ لم يتم خصم أو إضافة أي نقاط.")
+            self._send_game_winner_card("اسرق_فشل", sender, [room])
+            return True
+        thief_balance = transfer["recipient_balance"]
         self.send_room_text(
             room,
             f"🕵️💰 تمت السرقة بنجاح!\n"
@@ -12360,6 +12744,18 @@ class TalkinBot:
                 self.handle_game_command(room, text, sender_name)
             except Exception as exc:
                 self.log("[GAME] async handler failed:", repr(exc))
+                if isinstance(exc, PointsInsufficientError):
+                    try:
+                        self.send_room_text(room, "❌ تغيّر رصيدك قبل اعتماد الرهان؛ لم تُقبل العملية. تحقق من رصيدك ثم أعد المحاولة.")
+                    except Exception:
+                        pass
+                    return
+                if isinstance(exc, PointsPersistenceError):
+                    try:
+                        self.send_room_text(room, "⚠️ تعذر حفظ تحديث النقاط في قاعدة البيانات؛ لم أعتمد مكسباً جديداً. يرجى التحقق من رصيدك قبل إعادة اللعب.")
+                    except Exception:
+                        pass
+                    return
                 try:
                     self.report_master_error("الألعاب", exc, room)
                 except Exception:
@@ -15145,6 +15541,74 @@ class TalkinBot:
         if low in ("نقاطي","points"):
             self.send_private_text(sender, _points_summary_text(sender))
             return True
+        if low in ("سجل التحويل", "سجل تحويلاتي", "transfer history", "transfer log"):
+            rows = _point_transfer_history(sender, 10)
+            english = _detect_text_language(text) == "en"
+            if not rows:
+                message = "📒 لا توجد تحويلات مسجلة لحسابك حتى الآن." if not english else "📒 No transfers are recorded for your account yet."
+            else:
+                title = "📒 Transfer history (latest 10)" if english else "📒 سجل تحويلاتك (آخر 10)"
+                lines = [title, "━━━━━━━━━━━━"]
+                for entry in rows:
+                    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(entry.get("timestamp", 0) or 0)))
+                    if _norm_user(entry.get("sender")) == _norm_user(sender):
+                        detail = f"To @{entry.get('recipient')}" if english else f"إلى @{entry.get('recipient')}"
+                    else:
+                        detail = f"From @{entry.get('sender')}" if english else f"من @{entry.get('sender')}"
+                    lines.append(f"{when} — {detail}: {_fmt_points(entry.get('amount'))}")
+                message = "\n".join(lines)
+            # Personal financial history is sent privately, even when the
+            # command was typed in a public room.
+            self.send_private_text(sender, message)
+            return True
+        game_record_aliases = {
+            "سجل المليار": ("billion", "المليار"), "سجل مليار": ("billion", "المليار"),
+            "billion record": ("billion", "Billion"), "billion history": ("billion", "Billion"),
+            "سجل المليون": ("million", "المليون"), "سجل مليون": ("million", "المليون"),
+            "million record": ("million", "Million"), "million history": ("million", "Million"),
+        }
+        if low in game_record_aliases:
+            game_key, label = game_record_aliases[low]
+            stats = _game_stats(sender, game_key)
+            english = _detect_text_language(text) == "en"
+            if english:
+                message = (f"📊 {label} game record for @{sender}\n━━━━━━━━━━━━\n"
+                           f"🎮 Plays: {stats['plays']}\n💰 Net points: {_fmt_points(stats['points'])}\n"
+                           f"🎟️ Staked: {_fmt_points(stats['staked'])}")
+            else:
+                message = (f"📊 سجل لعبة {label} لـ @{sender}\n━━━━━━━━━━━━\n"
+                           f"🎮 عدد اللعب: {stats['plays']}\n💰 صافي النقاط: {_fmt_points(stats['points'])}\n"
+                           f"🎟️ إجمالي الرهانات: {_fmt_points(stats['staked'])}")
+            (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room, message)
+            return True
+        game_top_aliases = {
+            "توب المليار": ("billion", "المليار"), "توب مليار": ("billion", "المليار"),
+            "top b": ("billion", "Billion"), "topb": ("billion", "Billion"),
+            "توب المليون": ("million", "المليون"), "توب مليون": ("million", "المليون"),
+            "top m": ("million", "Million"), "topm": ("million", "Million"),
+        }
+        if low in game_top_aliases:
+            game_key, label = game_top_aliases[low]
+            rows = _game_top(game_key)
+            english = _detect_text_language(text) == "en"
+            title = f"🏆 Top {label}" if english else f"🏆 توب {label}"
+            lines = [title, "━━━━━━━━━━━━"]
+            def _top_medal(i):
+                return {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}️⃣")
+            lines.extend(
+                f"{_top_medal(i)} @{username} — {_fmt_points(points)} points | {plays} plays"
+                if english else
+                f"{_top_medal(i)} @{username} — {_fmt_points(points)} نقطة | {plays} لعب"
+                for i, (points, _staked, plays, username) in enumerate(rows, 1)
+            )
+            if not rows:
+                lines.append("No results yet." if english else "لا توجد نتائج بعد.")
+            message = "\n".join(lines)
+            if is_private:
+                self.send_private_text(sender, message)
+            else:
+                self.send_room_text(room, message)
+            return True
         if low in ("توب الألعاب", "توب الالعاب", "top games", "games top"):
             message = _game_top10_message()
             if is_private:
@@ -15524,15 +15988,36 @@ class TalkinBot:
             if not target or amount <= 0:
                 self.send_private_text(sender, "❌ الصيغة: sb@اسم المستخدم@عدد النقاط")
                 return True
-            balance = _get_points(sender)
-            if balance < amount:
-                self.send_private_text(sender, f"❌ رصيدك غير كافٍ. رصيدك الحالي: {_fmt_points(balance)} نقطة.")
+            result = _transfer_points(sender, target, amount)
+            if not result.get("ok"):
+                error = result.get("error")
+                if error in {"target_not_found", "sender_not_found"}:
+                    message = "❌ فشل التحويل: اكتب اسم المستخدم الصحيح كما هو محفوظ في ملف النقاط. لم يتم خصم أي نقاط."
+                elif error == "insufficient":
+                    message = f"❌ رصيدك غير كافٍ. رصيدك الحالي: {_fmt_points(result.get('sender_balance'))} نقطة. لم يتم خصم شيء."
+                elif error == "same_account":
+                    message = "❌ لا يمكن تحويل النقاط إلى الحساب نفسه. لم يتم خصم أي نقاط."
+                else:
+                    message = "⚠️ تعذر حفظ التحويل بأمان؛ لم يتم تأكيده. أعد المحاولة لاحقاً."
+                if _detect_text_language(text) == "en":
+                    message = {
+                        "target_not_found": "❌ Transfer failed: enter the exact username saved in the points file. No points were deducted.",
+                        "sender_not_found": "❌ Transfer failed: your points account was not found. No points were deducted.",
+                        "insufficient": f"❌ Insufficient balance: {_fmt_points(result.get('sender_balance'))} points. Nothing was deducted.",
+                        "same_account": "❌ You cannot transfer points to the same account. No points were deducted.",
+                        "persistence_failed": "⚠️ The transfer could not be safely saved; it was not confirmed. Please retry later.",
+                    }.get(error, message)
+                self.send_private_text(sender, message)
                 return True
-            _add_points(sender, -amount)
-            new = _add_points(target, amount)
-            self.send_private_text(sender, f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{target}. رصيدك: {_fmt_points(_get_points(sender))}")
-            if _norm_user(target) != _norm_user(sender):
-                self.send_private_text(target, f"💰 إشعار تحويل: استلمت {_fmt_points(amount)} نقطة من @{sender}. رصيدك الحالي: {_fmt_points(new)}")
+            recipient = result["recipient"]
+            sender_reply = f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{recipient}. رصيدك: {_fmt_points(result['sender_balance'])}"
+            recipient_reply = f"💰 استلمت {_fmt_points(amount)} نقطة من @{result['sender']}. رصيدك الحالي: {_fmt_points(result['recipient_balance'])}"
+            if _detect_text_language(text) == "en":
+                sender_reply = f"✅ Transferred {_fmt_points(amount)} points to @{recipient}. Your balance: {_fmt_points(result['sender_balance'])}"
+                recipient_reply = f"💰 You received {_fmt_points(amount)} points from @{result['sender']}. Balance: {_fmt_points(result['recipient_balance'])}"
+            self.send_private_text(sender, sender_reply)
+            if _norm_user(recipient) != _norm_user(sender):
+                self.send_private_text(recipient, recipient_reply)
             return True
 
         # VIP users may publish images; the actual image is handled by _handle_publish_media.
@@ -16297,7 +16782,7 @@ class TalkinBot:
         return next((w for w in sorted(self.banned_words, key=lambda x: _norm_filter_text(x))
                      if _norm_filter_text(w) and _norm_filter_text(w) in normalized), None)
 
-    def _handle_publish_media(self, room, sender, media_url, description=""):
+    def _handle_publish_media_legacy(self, room, sender, media_url, description=""):
         if not media_url: return False
         # Accept the pending image from ANY room (or private chat).
         key=_norm_user(sender); pending=self.publish_pending.get(key)
@@ -16451,21 +16936,13 @@ class TalkinBot:
         return next((w for w in sorted(self.banned_words, key=lambda x: _norm_filter_text(x))
                      if _norm_filter_text(w) and _norm_filter_text(w) in normalized), None)
 
-    def _handle_publish_media(self, room, sender, media_url, description=""):
-        if not media_url: return False
-        # Accept the pending image from ANY room (or private chat).
-        key=_norm_user(sender)
-        # Claim before OCR/rendering/network work so a failure cannot leave
-        # publish_pending active and swallow later commands.
-        pending=self.publish_pending.pop(key, None)
-        if not pending: return False
-        if time.time()-pending.get("created_at",0)>120:
-            self.send_private_text(sender,"⌛ انتهت مهلة النشر، أرسل أمر بوست أو انشر من جديد."); return True
-        desc=_fit_text_to_packet("room_message", str(pending.get("description", description or ""))[:500], room=room)
+    def _publish_media_worker(self, room, sender, media_url, desc, pending):
+        """Run OCR, image rendering and room delivery off the receive thread."""
+        if not media_url or not isinstance(pending, dict):
+            return
         if _is_publish_banned(sender):
             self.send_private_text(sender,"🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
-            self.publish_pending.pop(key,None)
-            return True
+            return
         # Check both the written description and text visible inside the image.
         publish_hit = self._find_publish_filter_hit(desc)
         ocr_text = ""
@@ -16475,13 +16952,11 @@ class TalkinBot:
         if publish_hit:
             source = "الوصف" if self._find_publish_filter_hit(desc) else "الصورة"
             self.send_private_text(sender, f"🚫 تم منع النشر: تم اكتشاف كلمة محظورة في {source}.\n⛔ تم منع حسابك من النشر حتى فك المنع.")
-            self.publish_pending.pop(key,None)
             _record_filter_ban(sender,room,"محاولة نشر كلمة مسيئة",publish_hit)
             _record_publish_ban(sender,room,publish_hit)
-            return True
+            return
         source_room=str(pending.get("source_room") or room or "")
         silent_publish=bool(pending.get("silent"))
-        self.publish_pending.pop(key,None)
         # A room that rejected/banned the bot must not abort or receive this
         # publication; all other active rooms continue normally.
         rooms=self._active_rooms()
@@ -16524,7 +16999,7 @@ class TalkinBot:
 
         ok=0
         errors=[]
-        room_delay=max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
+        room_delay=max(0.02, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "0.08") or 0.08))
         with self._room_bulk_lock:
             for room_index, target in enumerate(rooms):
                 try:
@@ -16552,6 +17027,52 @@ class TalkinBot:
             self.send_private_text(sender, confirm_text)
             if errors:
                 self.send_private_text(sender, "❌ أخطاء النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors))
+        return True
+
+    def _handle_publish_media(self, room, sender, media_url, description=""):
+        """Claim an incoming image and schedule publishing without blocking commands."""
+        if not media_url:
+            return False
+        sender = str(sender or "").strip()
+        key = _norm_user(sender)
+        if not key:
+            return False
+        if not hasattr(self, "publish_pending"):
+            self.publish_pending = {}
+        claim_lock = getattr(self, "_publish_claim_lock", None)
+        if claim_lock is None:
+            claim_lock = threading.RLock()
+            self._publish_claim_lock = claim_lock
+        with claim_lock:
+            pending = self.publish_pending.pop(key, None)
+        if not pending:
+            return False
+        if time.time() - pending.get("created_at", 0) > 120:
+            self.send_private_text(sender, "⌛ انتهت مهلة النشر، أرسل أمر بوست أو انشر من جديد.")
+            return True
+        if _is_publish_banned(sender):
+            self.send_private_text(sender, "🚫 حسابك ممنوع من النشر حالياً.\n📌 لفك المنع راجع الماستر.")
+            return True
+        desc = _fit_text_to_packet(
+            "room_message", str(pending.get("description", description or ""))[:500], room=room
+        )
+        if self._find_publish_filter_hit(desc):
+            hit = self._find_publish_filter_hit(desc)
+            self.send_private_text(sender, f"🚫 تم منع النشر: الوصف يحتوي كلمة محظورة ({hit}).\n⛔ تم منع حسابك من النشر حتى فك المنع.")
+            _record_filter_ban(sender, room, "محاولة نشر كلمة مسيئة في الوصف", hit)
+            _record_publish_ban(sender, room, hit)
+            return True
+        self.send_private_text(sender, "⏳ بدأ فحص الصورة؛ سيستمر البوت في استقبال الأوامر أثناء نشرها في الغرف.")
+        def worker():
+            try:
+                self._publish_media_worker(room, sender, media_url, desc, pending)
+            except Exception as exc:
+                self.log("[PUBLISH] background media handling failed:", repr(exc))
+                try:
+                    self.send_private_text(sender, "❌ تعذر إكمال نشر الصورة. أعد المحاولة بعد التحقق من اتصال البوت.")
+                except Exception:
+                    pass
+        threading.Thread(target=worker, name="publish-image-worker", daemon=True).start()
         return True
 
     def _try_publish_pending_media(self, room, media_url, candidates=()):

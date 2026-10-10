@@ -1205,12 +1205,17 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         bot.send_room_text = lambda room, text: room_replies.append((room, text))
         bot.send_private_text = lambda user, text: private_replies.append((user, text))
         changes = []
+        transfers = []
         with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
-            bot_module, "_get_points", return_value=1000
-        ), patch.object(bot_module, "_add_points", side_effect=lambda user, amount: changes.append((user, amount)) or 900):
+            bot_module, "_transfer_points",
+            side_effect=lambda sender, target, amount: transfers.append((sender, target, amount)) or {
+                "ok": True, "sender": sender, "recipient": target, "amount": amount,
+                "sender_balance": 900, "recipient_balance": 1100,
+            },
+        ), patch.object(bot_module, "_get_points", return_value=1000):
             self.assertTrue(bot._handle_management_command_impl("North", "sb@target@100", "member"))
-        self.assertIn(("member", -100), changes)
-        self.assertIn(("target", 100), changes)
+        self.assertEqual(transfers, [("member", "target", 100)])
+        self.assertEqual(changes, [])
 
         changes.clear()
         with patch.object(bot_module, "_is_primary_master", return_value=True), patch.object(
@@ -2172,6 +2177,110 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             from PIL import Image
             with Image.open(path) as image:
                 self.assertEqual(image.size, (1500, 900))
+
+
+class PointsAndPublishingHardeningRegressions(unittest.TestCase):
+    def test_snapshot_reconciliation_keeps_only_the_highest_duplicate_balance(self):
+        merged = bot_module._merge_points_snapshots(
+            {"sourea": {"username": "sourea", "points": 5_000_000_000}},
+            {"decorated": {"username": "𝐒𝐎𝐔☀𝐑𝐄𝐀", "points": 7_000_000_000}},
+        )
+        self.assertEqual(len(merged["accounts"]), 1)
+        self.assertEqual(next(iter(merged["accounts"].values()))["points"], 7_000_000_000)
+        self.assertEqual(merged["version"], 2)
+
+    def test_snapshot_reconciliation_does_not_guess_between_ambiguous_names(self):
+        merged = bot_module._merge_points_snapshots(
+            {
+                "one": {"username": "A-B", "points": 1_000},
+                "two": {"username": "AB", "points": 2_000},
+            },
+            {"three": {"username": "A.B", "points": 3_000}},
+        )
+        self.assertEqual(len(merged["accounts"]), 3)
+
+    def test_transfer_resolves_exact_decorated_username_and_commits_both_balances(self):
+        decorated = "឵⇠\n𓆩〭〬🌸⃝ʀɛʍǟռ🥂⸼꯭᪳⃕🖇〭〬𓆪"
+        accounts = {
+            "sender": {"username": "sender", "points": 2_000_000_000},
+            "target": {"username": decorated, "points": 5_000_000_000},
+        }
+        saved = []
+        with patch.object(bot_module, "_POINTS_CACHE", None), patch.object(
+            bot_module, "_POINTS_TRANSFER_CACHE", None
+        ), patch.object(bot_module, "_STATE_DB_ENABLED", False), patch.object(
+            bot_module, "_points_data", return_value=accounts
+        ), patch.object(bot_module, "_save_local_json", side_effect=lambda path, data, **_kw: saved.append(data)):
+            result = bot_module._transfer_points("sender", decorated, 1_000_000_000)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sender_balance"], 1_000_000_000)
+        self.assertEqual(result["recipient_balance"], 6_000_000_000)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(len(saved[0]["transfer_history"]), 1)
+
+    def test_transfer_rejects_unmatched_recipient_without_creating_ghost_account(self):
+        accounts = {
+            "sender": {"username": "sender", "points": 2_000},
+            "target": {"username": "Decorated_Target", "points": 5_000},
+        }
+        saved = []
+        with patch.object(bot_module, "_POINTS_CACHE", None), patch.object(
+            bot_module, "_POINTS_TRANSFER_CACHE", None
+        ), patch.object(bot_module, "_STATE_DB_ENABLED", False), patch.object(
+            bot_module, "_points_data", return_value=accounts
+        ), patch.object(bot_module, "_save_local_json", side_effect=lambda path, data, **_kw: saved.append(data)):
+            result = bot_module._transfer_points("sender", "other_name", 100)
+        self.assertEqual(result["error"], "target_not_found")
+        self.assertEqual(saved, [])
+
+    def test_billion_and_million_records_and_leaderboards_are_available_in_both_languages(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        private = []
+        bot.send_private_text = lambda user, text: private.append((user, text))
+        bot.send_room_text = lambda room, text: private.append((room, text))
+        stats = {"plays": 3, "points": 2_000_000_000, "staked": 900_000_000}
+        top_rows = [(2_000_000_000, 900_000_000, 3, "Player")]
+        with patch.object(bot_module, "_game_stats", return_value=stats), patch.object(
+            bot_module, "_game_top", return_value=top_rows
+        ):
+            for command, expected in (
+                ("سجل المليار", "سجل لعبة المليار"),
+                ("billion history", "Billion game record"),
+                ("سجل المليون", "سجل لعبة المليون"),
+                ("million record", "Million game record"),
+                ("توب المليار", "توب المليار"),
+                ("top b", "Top Billion"),
+                ("توب المليون", "توب المليون"),
+                ("topm", "Top Million"),
+            ):
+                self.assertTrue(bot._handle_management_command_impl("North", command, "Player", is_private=True))
+                self.assertIn(expected, private[-1][1])
+
+    def test_image_publish_schedules_worker_and_returns_without_waiting(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sender = "publisher"
+        bot.publish_pending = {
+            bot_module._norm_user(sender): {"description": "hello", "created_at": time.time()}
+        }
+        bot._find_publish_filter_hit = lambda _text: None
+        replies, worker_calls, threads = [], [], []
+        bot.send_private_text = lambda user, text: replies.append((user, text))
+        bot._publish_media_worker = lambda *args: worker_calls.append(args)
+
+        class DeferredThread:
+            def __init__(self, target, **kwargs):
+                self.target, self.kwargs = target, kwargs
+                threads.append(self)
+            def start(self):
+                self.started = True
+
+        with patch.object(bot_module.threading, "Thread", DeferredThread):
+            self.assertTrue(bot._handle_publish_media("North", sender, "https://image.invalid/test.jpg"))
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(threads[0].started)
+        self.assertEqual(worker_calls, [])
+        self.assertNotIn(bot_module._norm_user(sender), bot.publish_pending)
+        self.assertTrue(any("استقبال الأوامر" in text for _user, text in replies))
 
 
 if __name__ == "__main__":
