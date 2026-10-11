@@ -2149,6 +2149,48 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot_module._is_cricket_verified_member("List_Verified"))
             self.assertTrue(bot_module._is_cricket_verified_member("Nested_Verified"))
 
+    def test_decorated_verified_name_is_recognized_by_game_and_cricket_gates(self):
+        saved_name = "✧Ａlice_𓆩✧"
+        with patch.object(bot_module, "_verified_data", return_value={
+            "old-record-key": {"username": saved_name, "verified_by": "Staff"},
+        }), patch.object(bot_module, "_vip_data", return_value={}), patch.object(
+            bot_module, "_is_master_name", return_value=False
+        ):
+            self.assertTrue(bot_module._is_verified_user("Alice"))
+            self.assertTrue(bot_module._is_cricket_verified_member("alice"))
+            self.assertEqual(
+                bot_module._verified_identity_candidate("opaque-id", "Alice"),
+                "Alice",
+            )
+            self.assertFalse(bot_module._is_verified_user("Staff"))
+
+    def test_decorated_verification_fallback_refuses_ambiguous_collisions(self):
+        records = {
+            "first": {"username": "a-b"},
+            "second": {"username": "a-b✧"},
+        }
+        self.assertFalse(bot_module._saved_identity_matches(records, "a-b!"))
+        self.assertTrue(bot_module._saved_identity_matches(records, "a-b"))
+
+    def test_vi_command_still_saves_a_new_verified_account(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_list_commands = lambda *_args, **_kwargs: False
+        sent = []
+        saved = []
+        bot.send_private_text = lambda target, message: sent.append((target, message))
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_is_verification_manager", return_value=True
+        ), patch.object(
+            bot_module, "_verified_data", return_value={}
+        ), patch.object(bot_module, "_vip_data", return_value={}), patch.object(
+            bot_module, "_save_local_json", side_effect=lambda path, data: saved.append((path, data))
+        ):
+            self.assertTrue(bot._handle_management_command_impl("", "vi@New_User", "Master", is_private=True))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0][0], bot_module.VERIFIED_FILE)
+        self.assertIn("new_user", saved[0][1])
+        self.assertIn("تم توثيق", sent[-1][1])
+
     def test_winner_awards_are_split_exactly_and_passed_to_result_card(self):
         with tempfile.TemporaryDirectory() as temp:
             awarded = []

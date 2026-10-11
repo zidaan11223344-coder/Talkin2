@@ -2644,25 +2644,98 @@ def _vip_data():
     data=_load_local_json(VIP_FILE,{})
     return data if isinstance(data,dict) else {}
 
-def _saved_identity_matches(data, name):
-    """Match a sender against legacy and current verification record shapes."""
+def _saved_identity_groups(data):
+    """Build account identity groups once; exclude audit metadata from identities."""
+    identity_fields = {"username", "user_name", "name", "display_name", "nickname", "nick", "account", "user"}
+    container_fields = {"users", "records", "accounts", "verified_users", "vip_users", "data", "list", "items", "entries", "members"}
+    metadata_fields = {
+        "verified_by", "granted_by", "approved_by", "created_at", "updated_at", "timestamp",
+        "status", "role", "permissions", "enabled", "expires_at", "requester", "request_id",
+        "version", "schema_version", "format", "type", "source", "id",
+    }
+
+    def field_key(value):
+        return re.sub(r"[\s-]+", "_", str(value or "").strip().casefold())
+
+    def collect_record_names(value, names):
+        """Read identity fields from one account record, never verifier metadata."""
+        if isinstance(value, dict):
+            for raw_key, child in value.items():
+                key = field_key(raw_key)
+                if key in metadata_fields:
+                    continue
+                if key in identity_fields:
+                    if isinstance(child, str) and child.strip():
+                        names.add(child.strip().lstrip("@"))
+                    else:
+                        collect_record_names(child, names)
+                elif isinstance(child, (dict, list, tuple, set)):
+                    collect_record_names(child, names)
+        elif isinstance(value, (list, tuple, set)):
+            for child in value:
+                if isinstance(child, str) and child.strip():
+                    names.add(child.strip().lstrip("@"))
+                else:
+                    collect_record_names(child, names)
+
+    def identity_groups(value):
+        """Group aliases by saved account so decorated collisions stay ambiguous."""
+        result = []
+        if isinstance(value, dict):
+            fields = {field_key(raw_key) for raw_key in value}
+            if fields & identity_fields:
+                names = set()
+                collect_record_names(value, names)
+                return [names] if names else []
+            for raw_key, record in value.items():
+                key = field_key(raw_key)
+                if key in metadata_fields:
+                    continue
+                if key in container_fields:
+                    result.extend(identity_groups(record))
+                elif key in identity_fields:
+                    names = set()
+                    if isinstance(record, str) and record.strip():
+                        names.add(record.strip().lstrip("@"))
+                    else:
+                        collect_record_names(record, names)
+                    if names:
+                        result.append(names)
+                else:
+                    names = {str(raw_key).strip().lstrip("@")} if str(raw_key).strip() else set()
+                    collect_record_names(record, names)
+                    if names:
+                        result.append(names)
+        elif isinstance(value, (list, tuple, set)):
+            for record in value:
+                if isinstance(record, str) and record.strip():
+                    result.append({record.strip().lstrip("@").strip()})
+                elif isinstance(record, dict):
+                    names = set()
+                    collect_record_names(record, names)
+                    if names:
+                        result.append(names)
+        return result
+
+    return identity_groups(data)
+
+
+def _saved_identity_groups_match(groups, name):
     target = _norm_user(name)
     if not target:
         return False
+    if any(_norm_user(candidate) == target for group in groups for candidate in group):
+        return True
+    canonical = _verification_name_key(name)
+    if not canonical:
+        return False
+    matches = [group for group in groups if any(_verification_name_key(candidate) == canonical for candidate in group)]
+    # Decorative-name fallback is safe only when it identifies one saved account.
+    return len(matches) == 1
 
-    def walk(value):
-        if isinstance(value, dict):
-            for stored_key, record in value.items():
-                if _norm_user(stored_key) == target:
-                    return True
-                if walk(record):
-                    return True
-            return False
-        if isinstance(value, (list, tuple, set)):
-            return any(walk(item) for item in value)
-        return isinstance(value, str) and _norm_user(value) == target
 
-    return walk(data)
+def _saved_identity_matches(data, name):
+    return _saved_identity_groups_match(_saved_identity_groups(data), name)
 
 def _is_verified_user(name):
     # When verification is disabled, treat users as passing the verification
@@ -2673,6 +2746,27 @@ def _is_verified_user(name):
                 or _saved_identity_matches(_vip_data(), name)
                 or _is_master_name(name))
 
+def _verified_identity_candidate(*names):
+    """Return the first event identity that resolves to a verified account."""
+    seen = set()
+    candidates = []
+    for name in names:
+        candidate = str(name or "").strip().lstrip("@")
+        key = _norm_user(candidate)
+        if key and key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
+    if not VERIFICATION_ENABLED:
+        return candidates[0] if candidates else ""
+    verified_groups = _saved_identity_groups(_verified_data())
+    vip_groups = _saved_identity_groups(_vip_data())
+    for candidate in candidates:
+        if (_is_master_name(candidate)
+                or _saved_identity_groups_match(verified_groups, candidate)
+                or _saved_identity_groups_match(vip_groups, candidate)):
+            return candidate
+    return ""
+
 def _is_cricket_verified_member(name):
     """Cricket participation always requires a saved verified/VIP identity."""
     return bool(_saved_identity_matches(_verified_data(), name)
@@ -2680,8 +2774,7 @@ def _is_cricket_verified_member(name):
                 or _is_master_name(name))
 
 def _is_vip_user(name):
-    key = _norm_user(name)
-    return bool(key and (key in _vip_data() or _is_master_name(name)))
+    return bool(_saved_identity_matches(_vip_data(), name) or _is_master_name(name))
 
 
 _GAME_STATE_LOCK = threading.RLock()
@@ -2753,10 +2846,29 @@ def _game_name_key(name):
     # Talkin names commonly contain ornamental symbols, tatweel, zero-width
     # joiners, and Arabic combining marks. Ignore those only for lookup; keep
     # the original spelling for the welcome text.
-    compact = "".join(char for char in raw
-                       if not unicodedata.category(char).startswith(("M", "P", "S", "C", "Z")))
+    compact = "".join(
+        char for char in raw
+        if not unicodedata.category(char).startswith(("M", "P", "S", "C", "Z"))
+        and not (0x13000 <= ord(char) <= 0x1345F)  # ornamental Egyptian-hieroglyph brackets
+    )
     compact = compact.replace("ـ", "")
     return (compact or raw).casefold()
+
+
+def _verification_name_key(name):
+    """Normalize ornamental edges without discarding meaningful inner punctuation."""
+    raw = unicodedata.normalize("NFKC", str(name or "")).strip().lstrip("@")
+    chars = [
+        char for char in raw
+        if not unicodedata.category(char).startswith(("M", "C"))
+        and char != "ـ"
+        and not (0x13000 <= ord(char) <= 0x1345F)
+    ]
+    while chars and unicodedata.category(chars[0]).startswith(("P", "S", "Z")):
+        chars.pop(0)
+    while chars and unicodedata.category(chars[-1]).startswith(("P", "S", "Z")):
+        chars.pop()
+    return " ".join("".join(chars).casefold().split())
 
 
 def _display_name_score(name):
@@ -16366,13 +16478,13 @@ class TalkinBot:
             target=text[2:].strip().lstrip("@");
             if not target: self.send_private_text(sender,"❌ الصيغة: vi@اسم المستخدم"); return True
             data=_verified_data()
-            key=_norm_user(target)
-            if key in data:
+            if _saved_identity_matches(data, target):
                 self.send_private_text(sender, f"⚠️ @{target} لديه توثيق عادي بالفعل.")
                 return True
-            if key in _vip_data():
+            if _saved_identity_matches(_vip_data(), target):
                 self.send_private_text(sender, f"⚠️ @{target} لديه توثيق VIP بالفعل.")
                 return True
+            key=_norm_user(target)
             data[key]={"username":target,"verified_by":sender,"created_at":int(time.time())}; _save_local_json(VERIFIED_FILE,data)
             # Keep the bot's normal verification notice for the verified user,
             # while the master process separately relays the result to whoever
@@ -16392,10 +16504,11 @@ class TalkinBot:
                 return True
             target=text[4:].strip().lstrip("@");
             if not target: self.send_private_text(sender,"❌ الصيغة: Vip@اسم المستخدم"); return True
-            data=_vip_data(); key=_norm_user(target)
-            if key in data:
+            data=_vip_data()
+            if _saved_identity_matches(data, target):
                 self.send_private_text(sender, f"⚠️ @{target} لديه توثيق VIP بالفعل.")
                 return True
+            key=_norm_user(target)
             data[key]={"username":target,"granted_by":sender,"created_at":int(time.time())}; _save_local_json(VIP_FILE,data)
             self.custom_welcomes[key] = {
                 "username": target,
@@ -17735,14 +17848,18 @@ class TalkinBot:
                                         "صانعي", "صناع", "صانعي الغرفة", "صناع الغرفة")
             or re.match(r"^[+-]?صانع(?:ي| الغرفة| الغرفه)?(?:@.+)?$", body.strip(), re.I)
         ))
+        verified_admin_identity = (
+            _verified_identity_candidate(username, frm, event.get(17, ""))
+            if (_looks_like_admin_command(body) or is_publish_command) else ""
+        )
         if (_looks_like_admin_command(body)
                 and not _is_master_name(frm)
                 and not is_creator_allowed
                 and not (_is_mvip_master(frm) and _is_verification_manager_command(body))
-                and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and _is_verified_user(username or frm))
-                and not (is_publish_command and _is_verified_user(username or frm))
+                and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and verified_admin_identity)
+                and not (is_publish_command and verified_admin_identity)
                 and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}):
-            if not _is_verified_user(username or frm):
+            if not verified_admin_identity:
                 self.send_room_text(room, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
             return
 
@@ -17855,7 +17972,10 @@ class TalkinBot:
         # normal bot-command verification gate. Some Talkin builds put the
         # canonical username in field 22 while field 2 contains a display/id;
         # prefer the canonical field so verified Join requests are recognized.
-        cricket_sender = username or frm
+        verified_sender = _verified_identity_candidate(username, frm, event.get(17, ""))
+        is_verified = bool(verified_sender)
+        command_sender = verified_sender or username or frm or str(event.get(17, "") or "").strip()
+        cricket_sender = command_sender
         # Cricket also uses the plain `Join` command and claims it even when no
         # cricket match is running. If Ludo or Snake is active in this room,
         # route the same command to that board game first.
@@ -17867,7 +17987,6 @@ class TalkinBot:
         # Verified users may use normal bot commands; administration remains
         # restricted to masters. Unverified command attempts receive one clear
         # notice instead of being silently ignored.
-        is_verified = _is_verified_user(username or frm)
         if (not is_verified
                 and _looks_like_bot_command(body)
                 and not re.match(r"^دخول\s*@\s*.+$", body.strip(), re.I)
@@ -17876,10 +17995,10 @@ class TalkinBot:
             return
         # Music/gifts require verification; masters are always allowed.
         if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
-            if not _is_verified_user(username or frm):
+            if not is_verified:
                 self.send_room_text(room, f"🔒 @{frm} يحتاج توثيقاً لاستخدام الهدايا.\n{_verification_notice()}")
                 return
-            if self.handle_gift_command(room, body, frm):
+            if self.handle_gift_command(room, body, command_sender):
                 if not getattr(self, "_replaying_bot_action", False):
                     self._remember_bot_action(room, body, frm, is_private=False)
                 return
@@ -17980,9 +18099,9 @@ class TalkinBot:
         if self._handle_management_command(room, body, frm):
             return
 
-        if self._run_game_command_async(room, body, frm):
+        if self._run_game_command_async(room, body, command_sender):
             if not getattr(self, "_replaying_bot_action", False):
-                self._remember_bot_action(room, body, frm, is_private=False)
+                self._remember_bot_action(room, body, command_sender, is_private=False)
             return
 
         if self._handle_departure_reply_command(room, body):
@@ -18176,6 +18295,9 @@ class TalkinBot:
                 try:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
+                    private_username = str(
+                        cm.get(22, "") or cm.get("username", "") or cm.get("sender", "") or ""
+                    ).strip()
                     if body:
                         self._remember_inflight_command(self.room, body, frm, is_private=True)
                     media_url = next(
@@ -18244,12 +18366,17 @@ class TalkinBot:
                     # the ordinary bot feature handlers below.
                     if MASTER_SERVICE_ENABLED and self._handle_master_account_service(frm, body):
                         return
+                    private_verified_sender = (
+                        _verified_identity_candidate(private_username, frm) if body else ""
+                    )
+                    private_is_verified = bool(private_verified_sender)
+                    private_command_sender = private_verified_sender or private_username or frm
                     cricket_room = (
                         self.room
                         or getattr(self, "last_joined_room", "")
                         or next(iter(getattr(self, "connected_rooms", set())), "")
                     )
-                    if body and self._cricket.handle(cricket_room, frm, body, is_private=True):
+                    if body and self._cricket.handle(cricket_room, private_command_sender, body, is_private=True):
                         return
                     if body and self._monitor_command(frm, body):
                         return
@@ -18271,15 +18398,15 @@ class TalkinBot:
                     if (body and _looks_like_admin_command(body)
                             and not _is_master_name(frm)
                             and not (_is_mvip_master(frm) and _is_verification_manager_command(body))
-                            and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and _is_verified_user(frm))
-                            and not (is_publish_command and _is_verified_user(frm))
+                            and not (re.fullmatch(r"sb@([^@]+)@(\d+)", body.strip(), re.I) and private_is_verified)
+                            and not (is_publish_command and private_is_verified)
                             and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}
                             and not re.match(r"^دخول\s*@\s*.+$", body, re.I)):
-                        if not _is_verified_user(frm):
+                        if not private_is_verified:
                             self.send_private_text(frm, f"🔒 @{frm} طلب توثيق لاستخدام أوامر البوت.\n{_verification_notice()}")
                         return
                     if (body
-                            and not _is_verified_user(frm)
+                            and not private_is_verified
                             and _looks_like_bot_command(body)
                             and not re.match(r"^دخول\s*@\s*.+$", body.strip(), re.I)
                             and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top"}):
@@ -18323,13 +18450,13 @@ class TalkinBot:
                         if self.handle_music_command(self.room, body, frm):
                             return
                     if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
-                        if _is_verified_user(frm):
-                            if self.handle_gift_command(self.room, body, frm, private_to=frm):
+                        if private_is_verified:
+                            if self.handle_gift_command(self.room, body, private_command_sender, private_to=frm):
                                 return
                         else:
                             self.send_private_text(frm, f"🔒 @{frm} يحتاج توثيقاً لاستخدام الهدايا.\n{_verification_notice()}")
                             return
-                    if body and _is_verified_user(frm) and self._run_game_command_async(self.room, body, frm):
+                    if body and private_is_verified and self._run_game_command_async(self.room, body, private_command_sender):
                         return
                     if _is_master_name(frm) and body:
                         # Reuse room command handling with the command-context room.
