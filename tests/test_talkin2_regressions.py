@@ -1238,9 +1238,52 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertTrue(bot._handle_management_command_impl("", "msb@target@100", "Master", is_private=True))
         self.assertEqual(changes, [("target", 100)])
 
+        deductions = []
+        with patch.object(bot_module, "_is_primary_master", return_value=True), patch.object(
+            bot_module, "_deduct_points",
+            side_effect=lambda target, amount, actor="": deductions.append((target, amount, actor)) or {
+                "ok": True, "username": target, "amount": amount, "balance": 900,
+            },
+        ):
+            self.assertTrue(bot._handle_management_command_impl("", "-sb@target@100", "Master", is_private=True))
+        self.assertEqual(deductions, [("target", 100, "Master")])
+        self.assertIn("900", private_replies[-1][1])
+
         with patch.object(bot_module, "_is_primary_master", return_value=True):
             self.assertTrue(bot._handle_management_command("North", "msb@target@100", "Master"))
         self.assertTrue(any("خاص البوت" in text for _, text in room_replies))
+
+        with patch.object(bot_module, "_is_primary_master", return_value=True):
+            self.assertTrue(bot._handle_management_command("North", "-sb@target@100", "Master"))
+        self.assertTrue(any("خاص البوت" in text for _, text in room_replies))
+
+        with patch.object(bot_module, "_is_primary_master", return_value=False):
+            self.assertTrue(bot._handle_management_command_impl("", "-sb@target@100", "OtherMaster", is_private=True))
+        self.assertIn("BOT_MASTER", private_replies[-1][1])
+        self.assertTrue(bot_module._looks_like_admin_command("-sb@target@100"))
+
+    def test_private_master_deduction_passes_through_management_wrapper(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_list_commands = lambda *_args, **_kwargs: False
+        bot._master_reply_local = threading.local()
+        bot._remember_bot_action = lambda *_args, **_kwargs: None
+        sent = []
+
+        def send_private(user, text):
+            sent.append((user, text))
+            if getattr(bot._master_reply_local, "tracking", False):
+                bot._master_reply_local.private_replied = True
+            return True
+
+        bot.send_private_text = send_private
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_is_primary_master", return_value=True
+        ), patch.object(bot_module, "_deduct_points", return_value={
+            "ok": True, "username": "target", "amount": 25, "balance": 75,
+        }) as deduct:
+            self.assertTrue(bot._handle_management_command("", "-sb@target@25", "Master", is_private=True))
+        deduct.assert_called_once_with("target", 25, actor="Master")
+        self.assertIn("75", sent[-1][1])
 
     def test_verified_sb_is_allowed_through_public_management_gate(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -1330,6 +1373,55 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertIn("جاري البحث", sent[0][1])
         self.assertIn("لم يحالفه الحظ", sent[1][1])
+
+    def test_million_bank_uses_one_minute_cooldown_and_five_percent_win_chance(self):
+        for roll, won in ((4, True), (5, False)):
+            with self.subTest(roll=roll):
+                bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                cooldowns, sent, awards = [], [], []
+                bot._game_cooldown_notice = lambda _room, _user, seconds, _name: cooldowns.append(seconds) or True
+                bot.send_room_text = lambda room, text: sent.append((room, text))
+                bot.user_photos = {}
+                bot._lookup_profile_photo = lambda _user: ""
+                bot.connected_rooms = set()
+                bot.log = lambda *_args: None
+                bot._game_award = lambda user, amount: awards.append((user, amount))
+                bot._send_game_winner_card = lambda *_args, **_kwargs: None
+                with patch.object(bot_module.secrets, "randbelow", return_value=roll), patch.object(
+                    bot_module, "_record_game", return_value=None
+                ):
+                    self.assertTrue(bot._million_bank_game("North", "Player"))
+                self.assertEqual(cooldowns, [60.0])
+                self.assertEqual(bool(awards), won)
+                self.assertEqual(awards, ([ ("Player", 1_000_000) ] if won else []))
+                self.assertIn("فاز بنك مليون" if won else "لم يحالفه الحظ", sent[-1][1])
+
+    def test_billion_uses_five_minute_cooldown_and_five_percent_win_chance(self):
+        for roll, won in ((4, True), (5, False)):
+            with self.subTest(roll=roll):
+                bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                cooldowns, sent, awards = [], [], []
+                bot._snake_command = lambda *_args: False
+                bot._ludo_command = lambda *_args: False
+                bot.stock_pending = {}
+                bot._handle_pending_bot_choice = lambda *_args: False
+                bot._game_cooldown_notice = lambda _room, _user, seconds, _name: cooldowns.append(seconds) or True
+                bot.send_room_text = lambda room, text: sent.append((room, text))
+                bot.send_room_media = lambda *_args: None
+                bot.user_photos = {bot_module._norm_user("Player"): "photo"}
+                bot._active_rooms = lambda: ["North"]
+                bot.log = lambda *_args: None
+                bot._game_award = lambda user, amount: awards.append((user, amount))
+                with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+                    bot_module, "_games_enabled_for_room", return_value=True
+                ), patch.object(bot_module.secrets, "randbelow", return_value=roll), patch.object(
+                    bot_module, "_record_game", return_value=None
+                ), patch.object(bot_module, "_public_base_url", return_value=""):
+                    self.assertTrue(bot.handle_game_command("North", "billion", "Player"))
+                self.assertEqual(cooldowns, [300.0])
+                self.assertEqual(bool(awards), won)
+                self.assertEqual(awards, ([ ("Player", 1_000_000_000) ] if won else []))
+                self.assertIn("تم الحصول على المليار" if won else "لم يحصل على المليار", sent[-1][1])
 
     def test_enter_my_rooms_joins_every_saved_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -2273,6 +2365,40 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertEqual(result["recipient_balance"], 6_000_000_000)
         self.assertEqual(len(saved), 1)
         self.assertEqual(len(saved[0]["transfer_history"]), 1)
+
+    def test_master_deduction_commits_exact_account_without_overdraft_and_audits_it(self):
+        accounts = {"client": {"username": "Decorated_Client", "points": 500}}
+        saved = []
+        with patch.object(bot_module, "_POINTS_CACHE", None), patch.object(
+            bot_module, "_POINTS_TRANSFER_CACHE", None
+        ), patch.object(bot_module, "_STATE_DB_ENABLED", False), patch.object(
+            bot_module, "_points_data", return_value=accounts
+        ), patch.object(
+            bot_module, "_save_local_json", side_effect=lambda path, data, **_kw: saved.append(data)
+        ):
+            result = bot_module._deduct_points("Decorated_Client", 125, actor="Master")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["balance"], 375)
+        self.assertEqual(len(saved), 1)
+        committed = saved[0]
+        self.assertEqual(committed["accounts"]["client"]["points"], 375)
+        self.assertEqual(committed["transfer_history"][-1]["reason"], "master_deduction by @Master")
+
+    def test_master_deduction_rejects_aliases_and_insufficient_balance_without_saving(self):
+        accounts = {"saved_record_key": {"username": "Decorated_Client", "points": 50}}
+        saved = []
+        with patch.object(bot_module, "_POINTS_CACHE", None), patch.object(
+            bot_module, "_POINTS_TRANSFER_CACHE", None
+        ), patch.object(bot_module, "_STATE_DB_ENABLED", False), patch.object(
+            bot_module, "_points_data", return_value=accounts
+        ), patch.object(
+            bot_module, "_save_local_json", side_effect=lambda path, data, **_kw: saved.append(data)
+        ):
+            alias = bot_module._deduct_points("Client", 10, actor="Master")
+            insufficient = bot_module._deduct_points("Decorated_Client", 51, actor="Master")
+        self.assertEqual(alias["error"], "target_not_found")
+        self.assertEqual(insufficient["error"], "insufficient")
+        self.assertEqual(saved, [])
 
     def test_transfer_rejects_unmatched_recipient_without_creating_ghost_account(self):
         accounts = {

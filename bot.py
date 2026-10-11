@@ -288,6 +288,9 @@ GAME_COMMANDS = {
     "lightning": "برق", "ruby": "ياقوت", "crash": "صدام", "detector": "كاشف", "guess who": "كاشف",
     "steal": "اسرق", "rob": "اسرق", "lookalike": "شبيه", "twin": "شبيه",
 }
+MILLION_BANK_COOLDOWN_SECONDS = 60.0
+BILLION_GAME_COOLDOWN_SECONDS = 300.0
+MONEY_GAME_WIN_CHANCE_PERCENT = 5
 
 def _normalize_game_command_text(text):
     """Translate an English game name (and common coin choices) to its Arabic command."""
@@ -2630,7 +2633,7 @@ def _looks_like_admin_command(text):
         return True
     prefixes = (
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
-        "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "msb@",
+        "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "msb@", "-sb@",
         "i@", "inv", "دعوات", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
@@ -3462,6 +3465,56 @@ def _add_points(username, amount):
         raise
     except Exception as exc:
         raise PointsPersistenceError("Could not persist points mutation") from exc
+
+
+def _deduct_points(username, amount, *, actor=""):
+    """Atomically debit one exact saved account and append an audit record."""
+    try:
+        amount = int(amount)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_amount"}
+    target_name = str(username or "").strip().lstrip("@")
+    if amount <= 0:
+        return {"ok": False, "error": "invalid_amount"}
+    if not _norm_user(target_name):
+        return {"ok": False, "error": "target_not_found"}
+
+    def update(accounts, history):
+        resolved = _resolve_points_account(accounts, target_name, exact_only=True)
+        if not resolved:
+            return {"ok": False, "error": "target_not_found"}, False
+        key, saved_item = resolved
+        balance = _points_balance(saved_item)
+        if balance < amount:
+            return {"ok": False, "error": "insufficient", "balance": balance}, False
+        item = dict(saved_item)
+        item["points"] = balance - amount
+        accounts[key] = item
+        history.append({
+            "id": uuid.uuid4().hex,
+            "timestamp": int(time.time()),
+            "sender": str(item.get("username") or target_name),
+            "sender_key": key,
+            "recipient": "system",
+            "recipient_key": "",
+            "amount": amount,
+            "sender_balance_after": item["points"],
+            "recipient_balance_after": None,
+            "reason": f"master_deduction by @{str(actor or BOT_MASTER).strip().lstrip('@')}",
+        })
+        del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
+        return {
+            "ok": True,
+            "username": str(item.get("username") or target_name),
+            "amount": amount,
+            "balance": item["points"],
+        }, True
+
+    try:
+        return _mutate_points_state(update)
+    except Exception as exc:
+        print(f"[POINTS] master deduction commit failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
 
 
 def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_source=True,
@@ -12797,7 +12850,7 @@ class TalkinBot:
         # The cooldown check itself emits the exact remaining wait time.
         # For a fresh play, send the acknowledgement immediately from the
         # worker thread before doing any reveal delay.
-        if not self._game_cooldown_notice(room, sender_name, 120.0, "بنك مليون"):
+        if not self._game_cooldown_notice(room, sender_name, MILLION_BANK_COOLDOWN_SECONDS, "بنك مليون"):
             return True
         self.send_room_text(
             room,
@@ -12806,7 +12859,7 @@ class TalkinBot:
             "🔎 جاري البحث عن الجائزة...\n"
             "━━━━━━━━━━━━━━"
         )
-        won = secrets.randbelow(100) == 0
+        won = secrets.randbelow(100) < MONEY_GAME_WIN_CHANCE_PERCENT
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
         if not won:
@@ -13945,7 +13998,7 @@ class TalkinBot:
         if game_low in ("بنك مليون", "بنك"):
             return self._million_bank_game(room, sender_name)
         if low in ("مليار","billion"):
-            if not self._game_cooldown_notice(room, sender_name, 600.0, "مليار"):
+            if not self._game_cooldown_notice(room, sender_name, BILLION_GAME_COOLDOWN_SECONDS, "مليار"):
                 return True
 
             self.send_room_text(
@@ -13956,7 +14009,7 @@ class TalkinBot:
                 f"🔎 جاري البحث عن مليار...\n"
                 f"━━━━━━━━━━━━━━"
             )
-            won = (secrets.randbelow(100) == 0)
+            won = secrets.randbelow(100) < MONEY_GAME_WIN_CHANCE_PERCENT
             reward = 1000000000 if won else 0
             _record_game(sender_name, "billion", reward, 0)
 
@@ -14374,6 +14427,17 @@ class TalkinBot:
         verification_manager_command = _is_verification_manager_command(body)
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
         master_points_transfer_command = bool(re.fullmatch(r"msb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
+        master_points_deduction_command = str(body or "").strip().casefold().startswith("-sb@")
+        if master_points_deduction_command and (not is_private or not _is_primary_master(sender)):
+            if not _is_primary_master(sender):
+                message = "🚫 أمر -sb مخصص للماستر المحدد في BOT_MASTER فقط."
+            else:
+                message = "🚫 أرسل أمر -sb في خاص البوت؛ وهو متاح للماستر المحدد في BOT_MASTER فقط."
+            if is_private:
+                self.send_private_text(sender, message)
+            elif room:
+                self.send_room_text(room, message)
+            return True
         if master_points_transfer_command and not (is_private and _is_primary_master(sender)):
             message = "🚫 أمر msb للماستر المحدد ومن خاص البوت فقط." if is_private else "🚫 أرسل أمر msb في خاص البوت، وهو متاح للماستر المحدد فقط."
             if is_private:
@@ -16215,6 +16279,48 @@ class TalkinBot:
             self.send_private_text(sender, f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{target} من رصيد الماستر.\n💳 رصيد المستلم: {_fmt_points(new)}")
             if _norm_user(target) != _norm_user(sender):
                 self.send_private_text(target, f"💰 إشعار تحويل: استلمت {_fmt_points(amount)} نقطة من الماستر. رصيدك الحالي: {_fmt_points(new)}")
+            return True
+
+        if text.casefold().startswith("-sb@"):
+            if not _is_primary_master(sender):
+                message = "🚫 أمر -sb مخصص للماستر المحدد في BOT_MASTER فقط."
+                if is_private:
+                    self.send_private_text(sender, message)
+                elif room:
+                    self.send_room_text(room, message)
+                return True
+            if not is_private:
+                if room:
+                    self.send_room_text(room, "🚫 أرسل أمر -sb في خاص البوت فقط.")
+                return True
+            match = re.fullmatch(r"-sb@([^@]+)@(\d+)", text, re.I)
+            if not match:
+                self.send_private_text(sender, "❌ الصيغة: -sb@اسم المستخدم@عدد النقاط")
+                return True
+            target, amount = match.group(1).strip().lstrip("@"), int(match.group(2))
+            result = _deduct_points(target, amount, actor=sender)
+            english = _detect_text_language(text) == "en"
+            if not result.get("ok"):
+                error = result.get("error")
+                if error == "target_not_found":
+                    message = ("❌ لم يتم الخصم: اكتب اسم العميل المطابق تماماً للاسم المحفوظ في ملف النقاط. لم يتغير أي رصيد."
+                               if not english else "❌ Deduction failed: use the exact username saved in the points file. No balance changed.")
+                elif error == "insufficient":
+                    balance = _fmt_points(result.get("balance", 0))
+                    message = (f"❌ رصيد @{target} غير كافٍ. رصيده الحالي: {balance} نقطة. لم يتم الخصم."
+                               if not english else f"❌ @{target} has insufficient points. Current balance: {balance}. Nothing was deducted.")
+                elif error == "invalid_amount":
+                    message = ("❌ يجب أن يكون عدد النقاط أكبر من صفر."
+                               if not english else "❌ The amount must be greater than zero.")
+                else:
+                    message = ("⚠️ تعذر حفظ الخصم بأمان؛ لم يتغير الرصيد. حاول لاحقاً."
+                               if not english else "⚠️ The deduction could not be saved safely; no balance changed. Try again later.")
+                self.send_private_text(sender, message)
+                return True
+            balance = _fmt_points(result["balance"])
+            message = (f"✅ تم سحب {_fmt_points(amount)} نقطة من @{result['username']}. الرصيد الجديد: {balance} نقطة."
+                       if not english else f"✅ Deducted {_fmt_points(amount)} points from @{result['username']}. New balance: {balance}.")
+            self.send_private_text(sender, message)
             return True
 
         m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
