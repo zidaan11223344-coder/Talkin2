@@ -624,31 +624,60 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertFalse(integration.game.enabled())
             self.assertIsNone(integration.game.current())
 
-    def test_cr1_starts_fresh_setup_instead_of_resuming_persisted_match(self):
+    def test_cr1_skips_archived_results_when_opening_a_new_match(self):
         with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = CricketGame(root / "cricket_state.json")
+            old.set_enabled("North", True)
+            old.state.mutate(lambda data: old._emit(
+                data, [{"key": "north", "name": "North"}],
+                "🏆 نتيجة مباراة قديمة", ("cricket_result_old.png",),
+            ))
             room_messages, private_messages, media_messages = [], [], []
-            integration = self.make_integration(Path(temp), room_messages, private_messages, media_messages)
-            integration.handle("North", "Master", ".cr 1", is_private=True)
+            integration = self.make_integration(root, room_messages, private_messages, media_messages)
+            self.assertIsNone(integration.game.current("North"))
             integration.handle("North", "N1", ".cr 1")
-            integration.handle("North", "N1", "2")
-            integration.handle("North", "N1", "Join")
-            self.assertEqual(integration.game.current()["stage"], "lobby")
-            old_match_id = integration.game.current()["id"]
-            def add_finished_match_result(data):
-                data["match"] = None
-                integration.game._emit(
-                    data, [{"key": "north", "name": "North"}],
-                    "🏆 نتيجة مباراة قديمة", ("cricket_result_old.png",),
-                )
-            integration.game.state.mutate(add_finished_match_result)
-            integration.handle("North", "N1", ".cr 1")
-            fresh = integration.game.current()
+            fresh = integration.game.current("North")
             self.assertEqual(fresh["stage"], "setup")
-            self.assertNotEqual(fresh["id"], old_match_id)
             self.assertEqual(fresh["rooms"][0]["players"], [])
             self.assertIn("إعداد مباراة الكركيت", room_messages[-1][1])
-            self.assertFalse(any("مباراة قديمة" in text for _, text in room_messages[-2:]))
+            self.assertFalse(any("مباراة قديمة" in text for _, text in room_messages))
             self.assertFalse(any("cricket_result_old.png" in url for _, url, _ in media_messages))
+            integration.handle("North", "N1", "1")
+            self.assertEqual(integration.game.current("North")["stage"], "lobby")
+            self.assertFalse(any("مباراة قديمة" in text for _, text in room_messages))
+
+    def test_cr1_does_not_cancel_an_existing_match(self):
+        with tempfile.TemporaryDirectory() as temp:
+            messages, private, media = [], [], []
+            integration = self.make_integration(Path(temp), messages, private, media)
+            integration.game.set_enabled("North", True)
+            integration.game.start("North", 2, mode="rooms")
+            old_match = integration.game.current("North")
+            messages.clear()
+            self.assertTrue(integration.handle("North", "N1", ".cr 1"))
+            current = integration.game.current("North")
+            self.assertEqual(current["id"], old_match["id"])
+            self.assertEqual(current["stage"], "lobby")
+            self.assertTrue(any("مباراة مفتوحة بالفعل" in text for _, text in messages))
+            self.assertFalse(any("أُلغيت المباراة" in text for _, text in messages))
+
+    def test_stale_terminal_match_is_ignored_when_starting_new_setup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            game = CricketGame(Path(temp) / "cricket_state.json")
+            game.state.mutate(lambda data: data.update(
+                enabled=True,
+                matches={"old-finished": {
+                    "id": "old-finished", "stage": "finished", "created_at": 1,
+                    "rooms": [{"key": "north", "name": "North", "players": ["OldPlayer"]}],
+                }},
+            ))
+            self.assertIsNone(game.begin_setup("North"))
+            current = game.current("North")
+            self.assertIsNotNone(current)
+            self.assertNotEqual(current["id"], "old-finished")
+            self.assertEqual(current["stage"], "setup")
+            self.assertEqual([match["id"] for match in game.matches()], [current["id"]])
 
     def test_join_from_second_room_skips_old_match_images(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2522,6 +2551,67 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         ):
             bot._handle_room_event_impl({"room_event": {1: "user_joined", 8: "member", 13: "NewRoom", 22: "Member"}})
         self.assertEqual(bot.room_users["NewRoom"]["Member"], "member")
+
+    def test_banning_a_member_does_not_mistake_command_actor_for_removed_bot(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.room_users = {"North": {"Target": "member"}}
+        bot.known_rooms = {"North"}
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot.connected_rooms = {"North"}
+        bot.pending_admin_lock = threading.Lock()
+        bot.pending_admin_actions = {}
+        bot.last_admin_actions = {}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        bot._schedule_auto_rejoin = lambda *_args, **_kwargs: self.fail(
+            "an ambiguous actor field must not schedule a bot rejoin"
+        )
+        bot.log = lambda *_args: None
+
+        with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
+            bot_module, "_save_persistent_rooms"
+        ):
+            bot._handle_room_event_impl({"room_event": {
+                1: "role_changed", 13: "North", 22: "test-bot",
+                31: "outcast",
+            }})
+
+        self.assertIn("North", bot.connected_rooms)
+        self.assertEqual(bot.room_users["North"].get("Target"), "member")
+
+    def test_explicit_role_change_of_bot_still_triggers_rejoin_recovery(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.room_users = {"North": {}}
+        bot.known_rooms = {"North"}
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot.connected_rooms = {"North"}
+        bot.pending_admin_lock = threading.Lock()
+        bot.pending_admin_actions = {}
+        bot.last_admin_actions = {}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        scheduled = []
+        bot._schedule_auto_rejoin = lambda room, **_kwargs: scheduled.append(room)
+        bot.log = lambda *_args: None
+
+        with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
+            bot_module, "_save_persistent_rooms"
+        ):
+            bot._handle_room_event_impl({"room_event": {
+                1: "role_changed", 13: "North", 17: "test-bot",
+                31: "outcast",
+            }})
+
+        self.assertNotIn("North", bot.connected_rooms)
+        self.assertEqual(scheduled, ["North"])
 
     def test_telegram_poll_loop_is_inert_when_this_process_is_not_the_owner(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

@@ -18374,10 +18374,17 @@ class TalkinBot:
                 self._master_online_rooms.discard(_norm_room(room))
                 self.master_online = bool(self._master_online_rooms)
         elif event_type == "role_changed":
-            # In native RoomEvent packets the affected user is field 17 and
-            # the resulting role is field 31. Field 8 is not reliable here.
-            changed_user = str(event.get(17, "") or event.get(22, "") or "").strip()
-            changed_role = str(event.get(31, "") or event.get(8, "") or "").strip().lower()
+            # In native RoomEvent packets field 17 is the affected account and
+            # field 31 is its resulting role. Field 22 can identify the actor
+            # who issued the moderation command, so never use it as a fallback:
+            # doing so can falsely mark the bot as outcast when it bans a member.
+            changed_user = str(
+                event.get(17, "") or event.get("target", "") or event.get("to", "")
+                or event.get("username", "") or event.get("user", "")
+            ).strip()
+            changed_role = str(
+                event.get(31, "") or event.get("role", "") or event.get("value", "")
+            ).strip().lower()
             if changed_user and changed_role:
                 if changed_role in ("kicked", "outcast"):
                     self.room_users.get(room, {}).pop(changed_user, None)

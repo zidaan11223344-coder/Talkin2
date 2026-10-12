@@ -94,6 +94,13 @@ class CricketIntegration:
     def _room_key(room: str) -> str:
         return " ".join(str(room or "").strip().casefold().split())
 
+    def _prime_room_cursor(self, room: str, *, force: bool = False) -> None:
+        """Skip archived room events before creating a new match in that room."""
+        name = str(room or "").strip()
+        key = self._room_key(name)
+        if name and key and (force or key not in self._cursors):
+            self._cursors[key] = self.game.latest_event_id(name)
+
     @staticmethod
     def _match_rooms(match: dict | list[dict] | None) -> list[str]:
         match_list = match if isinstance(match, list) else [match]
@@ -294,10 +301,13 @@ class CricketIntegration:
             self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
             return True
         previous_match = self.game.current(room)
-        result = (self.game.begin_bot_setup(room, reset_existing=True)
-                  if bot_match else self.game.begin_setup(room, reset_existing=True))
+        if previous_match is None:
+            self._prime_room_cursor(room, force=True)
+        result = (self.game.begin_bot_setup(room)
+                  if bot_match else self.game.begin_setup(room))
         self._reply_error(room, result)
-        self._deliver_transition(previous_match, room)
+        if result is None:
+            self._deliver_transition(previous_match, room)
         return True
 
     def _reply_error(self, room: str, result: str | None) -> None:
@@ -309,12 +319,15 @@ class CricketIntegration:
             self.send_room_text(room, "🔒 لعبة الكركيت متاحة للأعضاء الموثقين فقط.")
             return True
         previous_match = self.game.current(room)
+        if previous_match is None or previous_match.get("stage") == "setup":
+            self._prime_room_cursor(room, force=True)
         if isinstance(previous_match, dict) and previous_match.get("stage") == "setup":
             result = self.game.select_player_count(room, player_count)
         else:
             result = self.game.start(room, player_count, mode="rooms" if room_match else "solo")
         self._reply_error(room, result)
-        self._deliver_transition(previous_match, room)
+        if result is None:
+            self._deliver_transition(previous_match, room)
         return True
 
     def handle(self, room: str, sender: str, text: str, *, is_private: bool = False) -> bool:

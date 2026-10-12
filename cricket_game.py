@@ -15,6 +15,10 @@ ASSET_FILES = tuple(f"cricket_number_{number}.png" for number in range(0, 7)) + 
     "cricket_hattrick.png",
 )
 BOT_TEAM_KEY = "__sboot_cricket_bot__"
+_TERMINAL_MATCH_STAGES = {
+    "finished", "complete", "completed", "ended", "over", "closed",
+    "cancelled", "canceled", "result", "done",
+}
 
 
 def _blank() -> dict[str, Any]:
@@ -80,6 +84,7 @@ class CricketGame:
             str(match_id): match
             for match_id, match in matches.items()
             if isinstance(match, dict)
+            and str(match.get("stage") or "").casefold() not in _TERMINAL_MATCH_STAGES
         }
         matches.clear()
         matches.update(normalized)
@@ -328,7 +333,7 @@ class CricketGame:
 
         return self.state.mutate(mutate)
 
-    def begin_bot_setup(self, room: str, *, reset_existing: bool = True) -> str | None:
+    def begin_bot_setup(self, room: str, *, reset_existing: bool = False) -> str | None:
         """Open a fresh player-count setup for a match against Talkin2."""
         room_name, room_key = str(room or "").strip(), _key(room)
 
