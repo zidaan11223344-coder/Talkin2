@@ -305,6 +305,14 @@ try:
     STOCK_MARKET_SETTLEMENT_SECONDS = max(1.0, float(os.getenv("STOCK_MARKET_SETTLEMENT_SECONDS", "60") or 60))
 except (TypeError, ValueError):
     STOCK_MARKET_SETTLEMENT_SECONDS = 60.0
+try:
+    STOCK_MARKET_PLAYER_COOLDOWN_SECONDS = max(0.0, float(os.getenv("STOCK_MARKET_PLAYER_COOLDOWN_SECONDS", "120") or 120))
+except (TypeError, ValueError):
+    STOCK_MARKET_PLAYER_COOLDOWN_SECONDS = 120.0
+try:
+    FISHING_SHOT_COOLDOWN_SECONDS = max(0.0, float(os.getenv("FISHING_SHOT_COOLDOWN_SECONDS", "120") or 120))
+except (TypeError, ValueError):
+    FISHING_SHOT_COOLDOWN_SECONDS = 120.0
 STOCK_MARKET_ASSETS = {
     1: {"icon": "🥇", "ar": "الذهب", "en": "Gold"},
     2: {"icon": "🥈", "ar": "الفضة", "en": "Silver"},
@@ -6024,6 +6032,7 @@ class TalkinBot:
         self._stock_market_round_seq = 0
         self._stock_market_next_announcement = 0.0
         self._stock_market_seen = set()
+        self._stock_market_user_cooldowns = {}
         self._dragon_hunters_lock = threading.RLock()
         saved_dragon_hunters = _load_local_json(DRAGON_HUNTERS_FILE, {})
         saved_hunters = saved_dragon_hunters.get("hunters", {}) if isinstance(saved_dragon_hunters, dict) else {}
@@ -6052,6 +6061,7 @@ class TalkinBot:
         self._fishing_event_seq = 0
         self._fishing_pending_shots = set()
         self._fishing_shots = set()
+        self._fishing_cooldowns = {}
         self._fishing_dragon_pending = ""
         self._fishing_dragon_caught = False
         self.fruit_games = {}
@@ -12478,6 +12488,9 @@ class TalkinBot:
         lock = getattr(self, "_fishing_lock", None)
         if lock is None:
             self._fishing_lock = lock = threading.RLock()
+        previous_cooldown = None
+        previous_cooldown_present = False
+        cooldown_remaining = 0.0
         with lock:
             event = getattr(self, "_fishing_event", None)
             if not isinstance(event, dict) or now < float(event.get("started_at", 0)) or now >= float(event.get("ends_at", 0)):
@@ -12486,13 +12499,29 @@ class TalkinBot:
                 event_id = int(event.get("id", 0))
             shot_key = (event_id, user_key)
             pending = getattr(self, "_fishing_pending_shots", set())
+            cooldowns = getattr(self, "_fishing_cooldowns", {})
+            if not isinstance(cooldowns, dict):
+                cooldowns = {}
+            last_shot = float(cooldowns.get(user_key, 0) or 0)
             if shot_key in pending:
                 busy = True
+                dragon = False
+            elif FISHING_SHOT_COOLDOWN_SECONDS > 0 and last_shot and now - last_shot < FISHING_SHOT_COOLDOWN_SECONDS:
+                busy = False
+                cooldown_remaining = FISHING_SHOT_COOLDOWN_SECONDS - (now - last_shot)
                 dragon = False
             else:
                 busy = False
                 pending.add(shot_key)
                 self._fishing_pending_shots = pending
+                previous_cooldown_present = user_key in cooldowns
+                previous_cooldown = cooldowns.get(user_key)
+                cooldowns[user_key] = now
+                if len(cooldowns) > 2048:
+                    cooldowns = {key: stamp for key, stamp in cooldowns.items() if now - float(stamp or 0) < 3600}
+                    self._fishing_cooldowns = cooldowns
+                else:
+                    self._fishing_cooldowns = cooldowns
                 dragon_pending = str(getattr(self, "_fishing_dragon_pending", "") or "")
                 dragon = event_id is not None and not bool(getattr(self, "_fishing_dragon_caught", False)) and not dragon_pending
                 if dragon:
@@ -12504,13 +12533,22 @@ class TalkinBot:
             text = "⏳ جاري احتساب محاولتك، أعد الإرسال بعد لحظة." if language != "en" else "⏳ Your shot is processing; retry in a moment."
             self.send_room_text(room, text)
             return True
+        if cooldown_remaining > 0:
+            seconds = max(1, int(cooldown_remaining + 0.999))
+            text = (
+                f"⏳ فاصل الصيد دقيقتان؛ انتظر {seconds} ثانية قبل المحاولة التالية."
+                if language != "en" else
+                f"⏳ There is a 2-minute cooldown between shots; try again in {seconds} seconds."
+            )
+            self.send_room_text(room, text)
+            return True
 
         animals = (
             ("🐇", "أرنب بري", "Wild rabbit", 5_000),
-            ("🦊", "ثعلب", "Fox", 10_000),
-            ("🦌", "غزال", "Deer", 20_000),
-            ("🐗", "خنزير بري", "Wild boar", 50_000),
-            ("🐻", "دب", "Bear", 100_000),
+            ("🦊", "ثعلب", "Fox", 5_000),
+            ("🦌", "غزال", "Deer", 5_000),
+            ("🐗", "خنزير بري", "Wild boar", 5_000),
+            ("🐻", "دب", "Bear", 5_000),
         )
         emoji, animal_ar, animal_en, reward = (
             ("🐉", "التنين النادر", "Rare dragon", 1_000_000)
@@ -12522,6 +12560,12 @@ class TalkinBot:
             self.log("[FISHING] reward persistence failed:", username, repr(exc))
             with lock:
                 self._fishing_pending_shots.discard(shot_key)
+                cooldowns = getattr(self, "_fishing_cooldowns", {})
+                if isinstance(cooldowns, dict) and cooldowns.get(user_key) == now:
+                    if previous_cooldown_present:
+                        cooldowns[user_key] = previous_cooldown
+                    else:
+                        cooldowns.pop(user_key, None)
                 if dragon and getattr(self, "_fishing_dragon_pending", "") == user_key:
                     self._fishing_dragon_pending = ""
             text = "❌ تعذر حفظ المكافأة الآن؛ لم تُحتسب المحاولة، أعد شوت بعد قليل." if language == "ar" else "❌ The reward could not be saved; your shot was not counted. Please retry shortly."
@@ -12641,12 +12685,12 @@ class TalkinBot:
             return (
                 "📈 Stock market\n1️⃣ 🥇 Gold  2️⃣ 🥈 Silver  3️⃣ 🛢️ Oil  4️⃣ 🏞️ Land\n"
                 "Send a number then the amount, or type `gold 100000`.\n"
-                "⏱️ Result in 1 minute: 10–50% profit or loss."
+                "⏱️ Result in 1 minute: 10–50% profit or loss.\n⏳ 2-minute cooldown between investments."
             )
         return (
             "📈 البورصة\n1️⃣ 🥇 ذهب  2️⃣ 🥈 فضة  3️⃣ 🛢️ نفط  4️⃣ 🏞️ أرض\n"
             "أرسل رقم الخيار ثم المبلغ، أو اكتب `ذهب 100000`.\n"
-            "⏱️ النتيجة بعد دقيقة: ربح أو خسارة من 10% إلى 50%."
+            "⏱️ النتيجة بعد دقيقة: ربح أو خسارة من 10% إلى 50%.\n⏳ فاصل دقيقتين بين كل استثمار."
         )
 
     def _stock_market_is_open(self, now=None):
@@ -12708,38 +12752,66 @@ class TalkinBot:
             self.send_room_text(room, "❌ الحد الأدنى للاستثمار 10 نقاط." if language != "en" else "❌ The minimum investment is 10 points.")
             return True
         now = time.time()
+        user_key = _norm_user(sender)
+        previous_cooldown = None
+        previous_cooldown_present = False
+        cooldown_remaining = 0.0
         with self._stock_market_lock:
-            event = self.stock_market_round
-            if not event or now >= float(event.get("ends_at", 0) or 0) or (
-                expected_round_id is not None and str(expected_round_id) != str(event.get("id"))
-            ):
-                closed = True
-                round_id = None
-            else:
+            cooldowns = getattr(self, "_stock_market_user_cooldowns", {})
+            if not isinstance(cooldowns, dict):
+                cooldowns = {}
+            last_investment = float(cooldowns.get(user_key, 0) or 0)
+            if STOCK_MARKET_PLAYER_COOLDOWN_SECONDS > 0 and last_investment and now - last_investment < STOCK_MARKET_PLAYER_COOLDOWN_SECONDS:
+                cooldown_remaining = STOCK_MARKET_PLAYER_COOLDOWN_SECONDS - (now - last_investment)
                 closed = False
-                round_id = event.get("id")
-            if closed:
+                round_id = None
+                duplicate = False
                 investment = None
             else:
-                seen_key = (str(round_id), _norm_user(sender))
-                if seen_key in self._stock_market_seen:
-                    duplicate = True
+                event = self.stock_market_round
+                if not event or now >= float(event.get("ends_at", 0) or 0) or (
+                    expected_round_id is not None and str(expected_round_id) != str(event.get("id"))
+                ):
+                    closed = True
+                    round_id = None
+                else:
+                    closed = False
+                    round_id = event.get("id")
+                if closed:
                     investment = None
                 else:
-                    duplicate = False
-                    investment = {
-                        "id": uuid.uuid4().hex,
-                        "event_id": round_id,
-                        "username": str(sender).strip().lstrip("@"),
-                        "room": str(room or ""),
-                        "asset": asset,
-                        "amount": amount,
-                        "started_at": now,
-                        "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
-                        "status": "pending_debit",
-                    }
-                    self.stock_investments.append(investment)
-                    self._stock_market_seen.add(seen_key)
+                    seen_key = (str(round_id), user_key)
+                    if seen_key in self._stock_market_seen:
+                        duplicate = True
+                        investment = None
+                    else:
+                        duplicate = False
+                        previous_cooldown_present = user_key in cooldowns
+                        previous_cooldown = cooldowns.get(user_key)
+                        cooldowns[user_key] = now
+                        self._stock_market_user_cooldowns = cooldowns
+                        investment = {
+                            "id": uuid.uuid4().hex,
+                            "event_id": round_id,
+                            "username": str(sender).strip().lstrip("@"),
+                            "room": str(room or ""),
+                            "asset": asset,
+                            "amount": amount,
+                            "started_at": now,
+                            "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
+                            "status": "pending_debit",
+                        }
+                        self.stock_investments.append(investment)
+                        self._stock_market_seen.add(seen_key)
+        if cooldown_remaining > 0:
+            seconds = max(1, int(cooldown_remaining + 0.999))
+            text = (
+                f"⏳ فاصل البورصة دقيقتان؛ انتظر {seconds} ثانية قبل الاستثمار التالي."
+                if language != "en" else
+                f"⏳ There is a 2-minute cooldown between investments; try again in {seconds} seconds."
+            )
+            self.send_room_text(room, text)
+            return True
         if closed:
             self.send_room_text(room, "⌛ انتهت جولة البورصة؛ انتظر الإعلان التالي أو اكتب بورصة لبدء جولة." if language != "en" else "⌛ This market round has closed. Wait for the next announcement or type stock to start a round.")
             return True
@@ -12752,6 +12824,12 @@ class TalkinBot:
             with self._stock_market_lock:
                 self.stock_investments = [row for row in self.stock_investments if row.get("id") != investment["id"]]
                 self._stock_market_seen.discard((str(round_id), _norm_user(sender)))
+                cooldowns = getattr(self, "_stock_market_user_cooldowns", {})
+                if isinstance(cooldowns, dict) and cooldowns.get(user_key) == now:
+                    if previous_cooldown_present:
+                        cooldowns[user_key] = previous_cooldown
+                    else:
+                        cooldowns.pop(user_key, None)
             self.log("[STOCK] could not save pending investment:", repr(exc))
             self.send_room_text(room, "❌ تعذر حفظ الاستثمار، لم يُخصم أي رصيد." if language != "en" else "❌ The investment could not be saved; no points were deducted.")
             return True
@@ -12763,6 +12841,12 @@ class TalkinBot:
             with self._stock_market_lock:
                 self.stock_investments = [row for row in self.stock_investments if row.get("id") != investment["id"]]
                 self._stock_market_seen.discard((str(round_id), _norm_user(sender)))
+                cooldowns = getattr(self, "_stock_market_user_cooldowns", {})
+                if isinstance(cooldowns, dict) and cooldowns.get(user_key) == now:
+                    if previous_cooldown_present:
+                        cooldowns[user_key] = previous_cooldown
+                    else:
+                        cooldowns.pop(user_key, None)
             try:
                 self._save_stock_investments()
             except Exception as exc:
@@ -14921,7 +15005,7 @@ class TalkinBot:
                     "🎮 Games — wagers\n━━━━━━━━━━━━\nbet@amount — wager | duel@amount — duel\nmyluck@amount — luck wager\ninvestment@amount — investment game\nChoose the stake after the game command.",
                     "🎮 Games — bank and rewards\n━━━━━━━━━━━━\nbank million — million bank | billion — billion game\nfarm@item — plant a crop | stock — choose a market\nface@name — face game\nType ns for the next games list.",
                     "🎲 Room games — Ludo and Snake & Ladders\n━━━━━━━━━━━━\nludo — start Ludo; choose 1–4 players\n1 = play against the bot; 2–4 = multiplayer\nOther players type join. When the game starts, the player whose turn it is types rool to roll the die and move. First token to the finish wins.\nsnake — start Snake & Ladders; type join to enter.\nType ns for the next games list.",
-                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nShot — catch ordinary animals anytime; the first shot after the trip announcement catches the 1,000,000-point dragon.\nlightning, ruby, crash, detector\nType ns for the next games list.",
+                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nShot — one shot every 2 minutes; each ordinary animal pays 5,000 points. The first shot after a trip announcement catches the 1,000,000-point dragon.\nlightning, ruby, crash, detector\nType ns for the next games list.",
                     "🏏 Cricket\n━━━━━━━━━━━━\nMaster: start cricket game / stop cricket game.\nVerified players: .cr 1, choose 1–4 players, then each player types join. Choose 1 (bat) or 2 (defend), then send a score from 0 to 6 for each ball.\nType ns to return to the first game list.",
                 ],
                 4: [
