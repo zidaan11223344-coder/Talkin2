@@ -291,8 +291,43 @@ GAME_COMMANDS = {
     "steal": "اسرق", "rob": "اسرق", "lookalike": "شبيه", "twin": "شبيه",
 }
 MILLION_BANK_COOLDOWN_SECONDS = 60.0
-BILLION_GAME_COOLDOWN_SECONDS = 300.0
+try:
+    BILLION_GAME_COOLDOWN_SECONDS = max(1.0, float(os.getenv("BILLION_GAME_COOLDOWN_SECONDS", "60") or 60))
+except (TypeError, ValueError):
+    BILLION_GAME_COOLDOWN_SECONDS = 60.0
 MONEY_GAME_WIN_CHANCE_PERCENT = 5
+
+STOCK_MARKET_INTERVAL_SECONDS = 600.0
+STOCK_MARKET_SETTLEMENT_SECONDS = 300.0
+STOCK_MARKET_ASSETS = {
+    1: {"icon": "🥇", "ar": "الذهب", "en": "Gold"},
+    2: {"icon": "🥈", "ar": "الفضة", "en": "Silver"},
+    3: {"icon": "🛢️", "ar": "النفط", "en": "Oil"},
+    4: {"icon": "🏞️", "ar": "الأرض", "en": "Land"},
+}
+
+def _parse_stock_market_order(text):
+    """Parse direct orders such as ذهب 100000, gold@100000, or 1@100000."""
+    value = str(text or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    asset_words = {
+        "ذهب": 1, "الذهب": 1, "gold": 1,
+        "فضة": 2, "الفضة": 2, "فضه": 2, "الفضه": 2, "silver": 2,
+        "نفط": 3, "النفط": 3, "oil": 3,
+        "أرض": 4, "ارض": 4, "الأرض": 4, "الارض": 4, "land": 4,
+    }
+    asset_pattern = "|".join(sorted((re.escape(word) for word in asset_words), key=len, reverse=True))
+    match = re.fullmatch(rf"(?:(?:بورصة|بورصه|stock|market)\s*[@ ]*)?({asset_pattern})\s*[@ ]+([0-9][0-9,]*)", value, re.I)
+    if match:
+        asset_name = match.group(1).casefold()
+        return asset_words.get(asset_name), int(match.group(2).replace(",", ""))
+    match = re.fullmatch(r"(?:بورصة|بورصه|stock|market)\s*[@ ]*([1-4])\s*[@ ]+([0-9][0-9,]*)", value, re.I)
+    if match:
+        return int(match.group(1)), int(match.group(2).replace(",", ""))
+    match = re.fullmatch(r"([1-4])\s*[@ ]+([0-9][0-9,]*)", value, re.I)
+    if match:
+        return int(match.group(1)), int(match.group(2).replace(",", ""))
+    return None
+
 
 def _normalize_game_command_text(text):
     """Translate an English game name (and common coin choices) to its Arabic command."""
@@ -591,6 +626,7 @@ GAME_STATS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_stats.duplicates-backup.json"
 GAME_LEVELS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_levels.duplicates-backup.json"
 GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
 CROP_PLOTS_FILE = DATA_DIR / "crop_plots.json"
+STOCK_MARKET_FILE = DATA_DIR / "stock_market_investments.json"
 TRACKED_ROOMS_FILE = DATA_DIR / "tracked_rooms.json"
 BLOCKED_ROOMS_FILE = DATA_DIR / "blocked_rooms.json"
 ROOM_USERS_FILE = DATA_DIR / "room_users.json"
@@ -3469,6 +3505,59 @@ def _add_points(username, amount):
         raise PointsPersistenceError("Could not persist points mutation") from exc
 
 
+def _apply_points_delta_once(username, delta, transaction_id, reason):
+    """Atomically apply one idempotent game debit/credit and audit it."""
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_amount"}
+    display_name = str(username or "").strip().lstrip("@")
+    txid = str(transaction_id or "").strip()
+    if not _norm_user(display_name) or not txid or delta == 0:
+        return {"ok": False, "error": "invalid_transaction"}
+
+    def update(accounts, history):
+        if any(isinstance(row, dict) and str(row.get("id") or "") == txid for row in history):
+            existing = _resolve_points_account(accounts, display_name)
+            return {"ok": True, "already_applied": True,
+                    "balance": _points_balance(existing[1]) if existing else 0}, False
+        resolved = _resolve_points_account(accounts, display_name)
+        if not resolved:
+            if delta < 0:
+                return {"ok": False, "error": "target_not_found"}, False
+            key = _norm_user(display_name)
+            item = {"username": display_name, "points": 0}
+        else:
+            key, saved = resolved
+            item = dict(saved)
+        old_balance = _points_balance(item)
+        if delta < 0 and old_balance < -delta:
+            return {"ok": False, "error": "insufficient", "balance": old_balance}, False
+        new_balance = old_balance + delta
+        item["username"] = _preferred_display_name(item.get("username"), display_name)
+        item["points"] = new_balance
+        accounts[key] = item
+        positive = delta > 0
+        history.append({
+            "id": txid, "timestamp": int(time.time()),
+            "sender": "stock_market" if positive else item["username"],
+            "sender_key": "" if positive else key,
+            "recipient": item["username"] if positive else "stock_market",
+            "recipient_key": key if positive else "",
+            "amount": abs(delta), "sender_balance_after": None if positive else new_balance,
+            "recipient_balance_after": new_balance if positive else None,
+            "reason": str(reason or "stock_market"),
+        })
+        del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
+        return {"ok": True, "already_applied": False, "balance": new_balance}, True
+
+    try:
+        return _mutate_points_state(update)
+    except Exception as exc:
+        print(f"[POINTS] idempotent game mutation failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
+
+
 def _deduct_points(username, amount, *, actor=""):
     """Atomically debit one exact saved account and append an audit record."""
     try:
@@ -3685,6 +3774,22 @@ def _fmt_points(value):
         text = f"{amount:.1f}".rstrip("0").rstrip(".")
         return f"{sign}{text}k"
     return f"{sign}{number}"
+
+
+def _money_game_win_text(game, username, language="ar"):
+    """Short, bilingual winner announcement for the million/billion games."""
+    game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
+    name = str(username or "").strip().lstrip("@")
+    amount = "1b" if game == "billion" else "1m"
+    stars = "⭐" * 9
+    if language == "en":
+        title = "billion" if game == "billion" else "million"
+        return (f"🏆✨ Congratulations! You got the {title}! ✨🏆\n\n"
+                f"✅ {name}\n💰 Prize: +{amount} points\n🎉 Congrats, champ!\n{stars}")
+    title = "المليار" if game == "billion" else "المليون"
+    return (f"🏆✨ مبروك! تم الحصول على {title} ✨🏆\n\n"
+            f"✅ {name}\n💰 مبلغ الفوز: +{amount} نقطة\n🎉 مبروك يا بطل!\n{stars}")
+
 
 DEFAULT_REPLY_MESSAGES = {
     "master_silent": "",
@@ -4069,6 +4174,22 @@ def _auto_ban_candidate(bot, room, sender, event_role=None):
     }
     return role_key not in protected_roles
 
+
+def _profanity_ban_candidate(bot, room, sender, event_role=None):
+    """Ban any non-staff user for profanity, even if the roster omits their role."""
+    if not sender or _is_master_name(sender) or _is_room_creator(room, sender):
+        return False
+    role, _known = _room_role(bot, room, sender, event_role)
+    role_key = re.sub(r"[\s_-]+", "", role.casefold())
+    protected_roles = {
+        "owner", "creator", "roomowner", "roomcreator", "host", "superadmin",
+        "admin", "roomadmin", "administrator", "moderator", "roommoderator",
+        "supermoderator", "moder", "mod", "supervisor",
+        "مشرف", "مشرفين", "ادمن", "إداري", "اونر", "أونر", "صانع", "صانعي",
+        "صانعالغرفة", "صانعالغرفه", "مالك", "مدير",
+    }
+    return role_key not in protected_roles
+
 def _join_flood_candidates(bot, room, username, event_role=None, now=None):
     """Return new accounts to IP-ban for a fast or sustained join burst.
 
@@ -4180,7 +4301,7 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
-            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — stock/market\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n39. شوت — تبدأ رحلة صيد كل 10 دقائق؛ محاولة لكل لاعب، وجائزة التنين مليون نقطة.\n📌 اكتب ns لقائمة الكركيت.',
+            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — كل 10 دقائق: ذهب/فضة/نفط/أرض؛ مثال: ذهب 100000، النتيجة بعد 5 دقائق وربح 10–50% / stock market\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n39. شوت — تبدأ رحلة صيد كل 10 دقائق؛ محاولة لكل لاعب، وجائزة التنين مليون نقطة.\n📌 اكتب ns لقائمة الكركيت.',
             '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند اكتمال الفريق الأول يعلن البوت تفاصيل المباراة في غرفتي الفريقين فقط، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
@@ -5897,6 +6018,17 @@ class TalkinBot:
         self.help_page_part = {}
         self.pending_bot_choices = {}
         self.stock_pending = {}
+        self._stock_market_lock = threading.RLock()
+        self.stock_market_round = None
+        self._stock_market_round_seq = 0
+        self._stock_market_next_announcement = 0.0
+        self._stock_market_seen = set()
+        saved_stock = _load_local_json(STOCK_MARKET_FILE, {})
+        saved_investments = saved_stock.get("investments", []) if isinstance(saved_stock, dict) else []
+        self.stock_investments = [
+            row for row in saved_investments
+            if isinstance(row, dict) and row.get("id") and row.get("username")
+        ] if isinstance(saved_investments, list) else []
         # Global wager queues, crop timers, and fruit-match state.
         self.wager_waiting = {}
         # Global fixed-prize PvP queues: one open challenge per game name.
@@ -5924,6 +6056,7 @@ class TalkinBot:
         threading.Thread(target=self._crop_worker, name="crop-worker", daemon=True).start()
         if not MASTER_SERVICE_ENABLED:
             threading.Thread(target=self._fishing_event_worker, name="fishing-event-worker", daemon=True).start()
+            threading.Thread(target=self._stock_market_worker, name="stock-market-worker", daemon=True).start()
         self.invite_message_template = _message_template("invite", "default", "يوجد معجب مخفي في {room}")
 
     def _load_social_features(self):
@@ -7502,11 +7635,8 @@ class TalkinBot:
         return None
 
     def _effective_room_language(self, room):
-        """Use the current command's language, falling back to the room setting."""
-        override = self._active_room_language_override(room)
-        if override in ("ar", "en"):
-            return override
-        return getattr(self, "room_languages", {}).get(_norm_room(room), "ar")
+        """Use the room's saved language consistently for every room reply."""
+        return self._configured_room_language(room)
 
     def _configured_room_language(self, room):
         """Return the saved room language, ignoring command-scoped overrides."""
@@ -7536,11 +7666,10 @@ class TalkinBot:
             context.active = previous
 
     def _capture_room_response_language(self, room, command_text=""):
-        active = self._active_room_language_override(room)
-        if active:
-            return active
-        detected = _detect_text_language(command_text)
-        return detected or self._effective_room_language(room)
+        # Asynchronous results must use the room's persisted language too;
+        # otherwise a single English command could make a later result English
+        # in a room whose saved language is Arabic.
+        return self._configured_room_language(room)
 
     def _localized_room_worker(self, room, language, worker):
         """Wrap a background worker so its replies keep the originating language."""
@@ -7869,6 +7998,16 @@ class TalkinBot:
         requester = str(requester or "").strip()
         try:
             self.send_admin(room, target, operation)
+            # A ban must never remove the bot itself. If the room server drops
+            # the bot as a side effect of a moderation packet, schedule a
+            # guarded recovery; the worker skips it when the bot is still in
+            # the room and the normal 5-attempt/15-minute limit still applies.
+            if (operation == "ban" and _norm_user(target) != _norm_user(BOT_ID)
+                    and any(_norm_room(r) == _norm_room(room) for r in getattr(self, "connected_rooms", set()))):
+                try:
+                    self._schedule_auto_rejoin(room, delay=2.0)
+                except Exception as rejoin_exc:
+                    self.log(f"[MOD] fallback rejoin scheduling failed for {room}: {rejoin_exc!r}")
         except Exception as exc:
             self.log(f"[MOD] request failed room={room} target=@{target}: {exc!r}")
             if requester and not _is_master_name(requester):
@@ -12096,9 +12235,10 @@ class TalkinBot:
 
     def _crop_command(self, room, sender, raw):
         crops={
-            "🍎":(5,1000), "🍐":(10,2000), "🍊":(15,3000), "🍋":(20,4000),
-            "🍇":(25,5000), "🍉":(30,6000), "🍓":(35,7000), "🥕":(40,8000),
-            "🌽":(45,9000), "🥭":(50,10000)
+            "🍎":(5,50_000), "🍐":(10,75_000), "🍊":(15,100_000), "🍋":(20,150_000),
+            "🍇":(25,200_000), "🍉":(30,250_000), "🍓":(35,300_000), "🥕":(40,350_000),
+            "🌽":(45,400_000), "🥭":(50,450_000), "🍍":(55,500_000), "🍌":(60,600_000),
+            "🥥":(65,700_000), "🥑":(70,850_000), "🥔":(75,1_000_000)
         }
         english = self._effective_room_language(room) == "en"
         if raw.casefold()=="زرع":
@@ -12108,25 +12248,10 @@ class TalkinBot:
                 lines.extend(("📌 Plant: farm@🍎 or farm 🍎", "💡 When ready, the reward is posted in the room where you planted."))
                 self.send_room_text(room, "\n".join(lines))
                 return True
-            self.send_room_text(
-                    room,
-                "╔════════════════════╗\n"
-                "║      قائمة الزرع      ║\n"
-                "╠════════════════════╣\n"
-                "║ 🍎  5 دقائق  → 1k  ║\n"
-                "║ 🍐 10 دقائق  → 2k  ║\n"
-                "║ 🍊 15 دقيقة   → 3k  ║\n"
-                "║ 🍋 20 دقيقة   → 4k  ║\n"
-                "║ 🍇 25 دقيقة   → 5k  ║\n"
-                "║ 🍉 30 دقيقة   → 6k  ║\n"
-                "║ 🍓 35 دقيقة   → 7k  ║\n"
-                "║ 🥕 40 دقيقة   → 8k  ║\n"
-                "║ 🌽 45 دقيقة   → 9k  ║\n"
-                "║ 🥭 50 دقيقة  → 10k  ║\n"
-                "╚════════════════════╝\n"
-                "📌 للزراعة: زرع@🍎 أو زرع 🍎\n"
-                "💡 عند اكتمال الزراعة تظهر المكافأة تلقائياً في الغرفة التي زرعت فيها."
-            )
+            lines = ["🌱 قائمة المحاصيل", "━━━━━━━━━━━━"]
+            lines.extend(f"{item}: {minutes} دقيقة → {_fmt_points(reward)} نقطة" for item, (minutes, reward) in crops.items())
+            lines.extend(("📌 للزراعة: زرع@🍎 أو زرع 🍎", "💡 عند اكتمال الزراعة تظهر المكافأة في الغرفة التي زرعت فيها."))
+            self.send_room_text(room, "\n".join(lines))
             return True
         m=re.fullmatch(r"زرع[@ ](.+)", raw, re.I)
         if not m: return False
@@ -12331,10 +12456,8 @@ class TalkinBot:
         if amount < 0:
             self.send_room_text(room, "❌ المبلغ غير صحيح.")
             return True
-        # في لعبة الحظ: مبلغ الرهان يحدده اللاعب بدون سقف.
-        # الجائزة التي يدفعها البوت عند الفوز ثابتة = 10,000 نقطة فقط.
-        # لذلك إذا ربح اللاعب بعد خصم رهانه، تضاف له 10,000 نقطة،
-        # وإذا خسر يبقى خصم الرهان كما هو ولا توجد جائزة.
+        # جوائز الحظ تقع دائماً بين 5,000 و100,000 نقطة. في اللعب المدفوع
+        # لا تُصرف الجائزة إلا عند الفوز، ويبقى مبلغ الرهان مستقلاً عن الجائزة.
         with self.game_lock:
             if amount:
                 balance_before = _get_points(sender)
@@ -12349,9 +12472,9 @@ class TalkinBot:
             # الحظ المدفوع: البوت يدفع 10,000 فقط عند الفوز،
             # ولا يضرب مبلغ اللاعب في مضاعف.
             if amount:
-                reward = 10_000 if roll <= 500 else 0
+                reward = secrets.randbelow(95_001) + 5_000 if roll <= 500 else 0
             else:
-                reward = secrets.choice((10, 20, 30, 50, 100))
+                reward = secrets.randbelow(95_001) + 5_000
             if reward:
                 balance = self._game_award(sender, reward)
                 result = f"🎉 ربحت: +{_fmt_points(reward)} نقطة\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة"
@@ -12371,53 +12494,307 @@ class TalkinBot:
             self._send_game_winner_card("luck", sender, [room])
         return True
 
+    def _save_stock_investments(self):
+        with self._stock_market_lock:
+            snapshot = [dict(row) for row in self.stock_investments if isinstance(row, dict)]
+        _save_local_json(STOCK_MARKET_FILE, {"version": 1, "investments": snapshot})
+
+    def _stock_market_message(self, language):
+        if language == "en":
+            return (
+                "📈 The stock market is open! (10-minute round)\n━━━━━━━━━━━━━━\n"
+                "Choose an asset:\n1️⃣ 🥇 Gold\n2️⃣ 🥈 Silver\n3️⃣ 🛢️ Oil\n4️⃣ 🏞️ Land\n\n"
+                "Invest directly, e.g. `gold 100000`, or send 1–4 and then the amount.\n"
+                "⏱️ Result in 5 minutes. Profit is guaranteed between 10% and 50%."
+            )
+        return (
+            "📈 بدأت البورصة! (جولة كل 10 دقائق)\n━━━━━━━━━━━━━━\n"
+            "اختر نوع الاستثمار:\n1️⃣ 🥇 ذهب\n2️⃣ 🥈 فضة\n3️⃣ 🛢️ نفط\n4️⃣ 🏞️ أرض\n\n"
+            "استثمر مباشرةً مثل: ذهب 100000، أو أرسل رقم الخيار 1–4 ثم المبلغ.\n"
+            "⏱️ تظهر النتيجة بعد 5 دقائق. الربح مضمون من 10% إلى 50%."
+        )
+
+    def _stock_market_is_open(self, now=None):
+        now = time.time() if now is None else float(now)
+        event = getattr(self, "stock_market_round", None)
+        return bool(event and now < float(event.get("ends_at", 0) or 0))
+
+    def _start_stock_market_round(self, now=None, *, force=False, first_room=""):
+        now = time.time() if now is None else float(now)
+        lock = getattr(self, "_stock_market_lock", None)
+        if lock is None:
+            self._stock_market_lock = lock = threading.RLock()
+        with lock:
+            current = getattr(self, "stock_market_round", None)
+            if not force and current and now < float(current.get("ends_at", 0) or 0):
+                return current
+            self._stock_market_round_seq = int(getattr(self, "_stock_market_round_seq", 0)) + 1
+            event = {
+                "id": self._stock_market_round_seq,
+                "started_at": now,
+                "ends_at": now + STOCK_MARKET_INTERVAL_SECONDS,
+            }
+            self.stock_market_round = event
+            self._stock_market_seen = set()
+            self._stock_market_next_announcement = now + STOCK_MARKET_INTERVAL_SECONDS
+        rooms = {str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}
+        if first_room:
+            rooms.add(str(first_room).strip())
+        for target_room in sorted(rooms, key=str.casefold):
+            language = self._configured_room_language(target_room)
+            self.send_room_text(target_room, self._stock_market_message(language))
+        return event
+
+    def _stock_market_worker(self):
+        while not self.stop_event.is_set():
+            try:
+                now = time.time()
+                next_announcement = float(getattr(self, "_stock_market_next_announcement", 0) or 0)
+                if now >= next_announcement and getattr(self, "connected_rooms", set()):
+                    self._start_stock_market_round(now, force=True)
+                self._process_stock_market_investments(now)
+            except Exception as exc:
+                self.log("[STOCK] worker iteration failed; will retry:", repr(exc))
+            self.stop_event.wait(2.0)
+
+    def _stock_market_invest(self, room, sender, asset, amount, *, expected_round_id=None):
+        try:
+            asset = int(asset)
+            amount = int(amount)
+        except (TypeError, ValueError):
+            asset, amount = 0, 0
+        language = self._configured_room_language(room)
+        if asset not in STOCK_MARKET_ASSETS or amount <= 0:
+            self.send_room_text(room, "❌ أرسل مبلغاً صحيحاً أكبر من صفر." if language != "en" else "❌ Enter a valid amount greater than zero.")
+            return True
+        now = time.time()
+        with self._stock_market_lock:
+            event = self.stock_market_round
+            if not event or now >= float(event.get("ends_at", 0) or 0) or (
+                expected_round_id is not None and str(expected_round_id) != str(event.get("id"))
+            ):
+                closed = True
+                round_id = None
+            else:
+                closed = False
+                round_id = event.get("id")
+            if closed:
+                investment = None
+            else:
+                seen_key = (str(round_id), _norm_user(sender))
+                if seen_key in self._stock_market_seen:
+                    duplicate = True
+                    investment = None
+                else:
+                    duplicate = False
+                    investment = {
+                        "id": uuid.uuid4().hex,
+                        "event_id": round_id,
+                        "username": str(sender).strip().lstrip("@"),
+                        "room": str(room or ""),
+                        "asset": asset,
+                        "amount": amount,
+                        "started_at": now,
+                        "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
+                        "status": "pending_debit",
+                    }
+                    self.stock_investments.append(investment)
+                    self._stock_market_seen.add(seen_key)
+        if closed:
+            self.send_room_text(room, "⌛ انتهت جولة البورصة؛ انتظر الإعلان التالي أو اكتب بورصة لبدء جولة." if language != "en" else "⌛ This market round has closed. Wait for the next announcement or type stock to start a round.")
+            return True
+        if investment is None:
+            self.send_room_text(room, "⚠️ استثمرت مرة واحدة في هذه الجولة؛ انتظر النتيجة أو الجولة التالية." if language != "en" else "⚠️ You already invested in this round. Wait for the result or next round.")
+            return True
+        try:
+            self._save_stock_investments()
+        except Exception as exc:
+            with self._stock_market_lock:
+                self.stock_investments = [row for row in self.stock_investments if row.get("id") != investment["id"]]
+                self._stock_market_seen.discard((str(round_id), _norm_user(sender)))
+            self.log("[STOCK] could not save pending investment:", repr(exc))
+            self.send_room_text(room, "❌ تعذر حفظ الاستثمار، لم يُخصم أي رصيد." if language != "en" else "❌ The investment could not be saved; no points were deducted.")
+            return True
+        debit = _apply_points_delta_once(
+            sender, -amount, f"stock-market-debit:{investment['id']}",
+            f"stock market investment in {STOCK_MARKET_ASSETS[asset]['en']}",
+        )
+        if not debit.get("ok"):
+            with self._stock_market_lock:
+                self.stock_investments = [row for row in self.stock_investments if row.get("id") != investment["id"]]
+                self._stock_market_seen.discard((str(round_id), _norm_user(sender)))
+            try:
+                self._save_stock_investments()
+            except Exception as exc:
+                self.log("[STOCK] failed to remove rejected investment:", repr(exc))
+            if debit.get("error") == "insufficient":
+                text = f"❌ رصيدك لا يكفي لاستثمار {_fmt_points(amount)} نقطة." if language != "en" else f"❌ You do not have enough points to invest {_fmt_points(amount)}."
+            else:
+                text = "❌ تعذر خصم مبلغ الاستثمار بأمان؛ لم تُعتمد العملية." if language != "en" else "❌ The investment debit could not be committed safely."
+            self.send_room_text(room, text)
+            return True
+        with self._stock_market_lock:
+            for row in self.stock_investments:
+                if row.get("id") == investment["id"]:
+                    row["status"] = "active"
+                    break
+        try:
+            self._save_stock_investments()
+        except Exception as exc:
+            # The durable pending_debit record is recoverable because the debit
+            # itself has a stable transaction id and cannot be applied twice.
+            self.log("[STOCK] active state save deferred; recovery will reconcile:", repr(exc))
+        data = STOCK_MARKET_ASSETS[asset]
+        if language == "en":
+            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ The result will be posted here in 5 minutes."
+        else:
+            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ ستظهر النتيجة هنا بعد 5 دقائق."
+        self.send_room_text(room, text)
+        return True
+
+    def _process_stock_market_investments(self, now=None):
+        now = time.time() if now is None else float(now)
+        with self._stock_market_lock:
+            pending = [dict(row) for row in self.stock_investments if isinstance(row, dict)]
+        settled = 0
+        for row in pending:
+            investment_id = str(row.get("id") or "")
+            username = str(row.get("username") or "")
+            try:
+                amount = int(row.get("amount", 0) or 0)
+                asset = int(row.get("asset", 0) or 0)
+                due_at = float(row.get("due_at", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not investment_id or not username or amount <= 0 or asset not in STOCK_MARKET_ASSETS:
+                continue
+            status = str(row.get("status") or "pending_debit")
+            if status == "pending_debit":
+                debit = _apply_points_delta_once(
+                    username, -amount, f"stock-market-debit:{investment_id}",
+                    f"stock market investment in {STOCK_MARKET_ASSETS[asset]['en']}",
+                )
+                if not debit.get("ok"):
+                    if debit.get("error") == "persistence_failed":
+                        continue
+                    with self._stock_market_lock:
+                        self.stock_investments = [item for item in self.stock_investments if item.get("id") != investment_id]
+                    try:
+                        self._save_stock_investments()
+                    except Exception:
+                        pass
+                    continue
+                with self._stock_market_lock:
+                    for item in self.stock_investments:
+                        if item.get("id") == investment_id:
+                            item["status"] = "active"
+                            break
+                try:
+                    self._save_stock_investments()
+                except Exception as exc:
+                    self.log("[STOCK] recovery state save failed:", repr(exc))
+                status = "active"
+            if now < due_at:
+                continue
+            if status != "paying":
+                profit_percent = secrets.randbelow(41) + 10
+                profit = max(1, (amount * profit_percent + 99) // 100)
+                with self._stock_market_lock:
+                    for item in self.stock_investments:
+                        if item.get("id") == investment_id:
+                            item.update(status="paying", profit_percent=profit_percent, profit=profit)
+                            row = dict(item)
+                            break
+            else:
+                profit_percent = int(row.get("profit_percent", 10) or 10)
+                profit = int(row.get("profit", max(1, (amount * profit_percent + 99) // 100)) or 0)
+            try:
+                self._save_stock_investments()
+            except Exception as exc:
+                self.log("[STOCK] payout state save failed; retrying:", repr(exc))
+                continue
+            payout = amount + profit
+            credit = _apply_points_delta_once(
+                username, payout, f"stock-market-payout:{investment_id}",
+                f"stock market principal plus {profit_percent}% profit",
+            )
+            if not credit.get("ok"):
+                self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, credit.get("error"))
+                continue
+            _record_game(username, "stock_market", profit, amount)
+            room = str(row.get("room") or "")
+            language = self._configured_room_language(room)
+            data = STOCK_MARKET_ASSETS[asset]
+            if language == "en":
+                result_text = (
+                    f"📈 Investment result: {data['icon']} {data['en']}\n"
+                    f"💰 Invested: {_fmt_points(amount)} points\n📊 Profit: {profit_percent}% (+{_fmt_points(profit)})\n"
+                    f"✅ Returned to your balance: +{_fmt_points(payout)} points\n💳 Balance: {_fmt_points(credit['balance'])}"
+                )
+            else:
+                result_text = (
+                    f"📈 نتيجة استثمار البورصة: {data['icon']} {data['ar']}\n"
+                    f"💰 مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n📊 نسبة الربح: {profit_percent}% (+{_fmt_points(profit)})\n"
+                    f"✅ المبلغ المعاد إلى رصيدك: +{_fmt_points(payout)} نقطة\n💳 الرصيد: {_fmt_points(credit['balance'])}"
+                )
+            if room:
+                try:
+                    self.send_room_text(room, result_text)
+                except Exception as exc:
+                    self.log("[STOCK] result delivery failed:", repr(exc))
+            with self._stock_market_lock:
+                self.stock_investments = [item for item in self.stock_investments if item.get("id") != investment_id]
+            try:
+                self._save_stock_investments()
+            except Exception as exc:
+                # If removal could not be saved, the payout transaction id makes
+                # the next retry harmless and no points can be paid twice.
+                with self._stock_market_lock:
+                    if not any(item.get("id") == investment_id for item in self.stock_investments):
+                        self.stock_investments.append(dict(row))
+                self.log("[STOCK] settled investment cleanup deferred:", repr(exc))
+            settled += 1
+        return settled
+
     def _stock_exchange_game(self, room, sender, choice=None):
-        """Free stock exchange game: choose gold, oil, or minerals by number."""
+        """Open the current investment market or collect an asset choice."""
         key = (_norm_room(room), _norm_user(sender))
+        now = time.time()
         if choice is None:
             if not self._game_cooldown_notice(room, sender, 40.0, "بورصة"):
                 return True
-            self.stock_pending[key] = {"room": room, "user": sender, "created": time.time()}
-            self.send_room_text(room, "📈💰 البورصة\n━━━━━━━━━━━━━━\n1️⃣ 🥇 ذهب\n2️⃣ 🛢️ نفط\n3️⃣ ⛏️ معادن\n\n🎯 أرسل رقم الخيار 1 أو 2 أو 3.\n⌛ لديك دقيقتان لاختيارك.")
+            already_open = self._stock_market_is_open(now)
+            event = self.stock_market_round if already_open else None
+            if not already_open:
+                event = self._start_stock_market_round(now, first_room=room)
+            self.stock_pending[key] = {
+                "kind": "market_choice", "room": room, "user": sender,
+                "created": now, "event_id": event["id"],
+            }
+            if already_open:
+                self.send_room_text(room, self._stock_market_message(self._configured_room_language(room)))
             return True
-        try: choice = int(choice)
-        except Exception: choice = 0
-        if choice not in (1,2,3):
-            self.send_room_text(room, "❌ اختر 1 أو 2 أو 3 فقط.")
+        try:
+            choice = int(choice)
+        except (TypeError, ValueError):
+            choice = 0
+        if choice not in STOCK_MARKET_ASSETS:
+            self.send_room_text(room, "❌ اختر 1 أو 2 أو 3 أو 4." if self._configured_room_language(room) != "en" else "❌ Choose 1, 2, 3, or 4.")
             return True
-        self.stock_pending.pop(key, None)
-        names={1:("🥇","الذهب"),2:("🛢️","النفط"),3:("⛏️","المعادن")}
-        icon,name=names[choice]
-        # بورصة بدون رهان مالي: اللاعب يختار سلعة، ثم يحصل على مكافأة
-        # نقاط متغيرة حسب حركة السوق، كما لو كانت صفقة بورصة مصغرة.
-        market = {
-            1: [(0,20),(20,20),(50,25),(100,20),(150,10),(200,5)],
-            2: [(0,25),(20,20),(50,20),(100,20),(150,10),(200,5)],
-            3: [(0,30),(20,20),(50,20),(100,15),(150,10),(200,5)],
+        event = self.stock_market_round
+        if not event or not self._stock_market_is_open(now):
+            self.stock_pending.pop(key, None)
+            self.send_room_text(room, "⌛ انتهت جولة البورصة؛ اكتب بورصة لبدء جولة جديدة." if self._configured_room_language(room) != "en" else "⌛ The market round has closed; type stock to start another round.")
+            return True
+        self.stock_pending[key] = {
+            "kind": "market_amount", "room": room, "user": sender,
+            "created": now, "event_id": event["id"], "asset": choice,
         }
-        outcomes=market[choice]
-        roll=secrets.randbelow(100) + 1
-        acc=0
-        reward=0
-        for amount, chance in outcomes:
-            acc += chance
-            if roll <= acc:
-                reward=amount
-                break
-        if reward >= 200:
-            result="📈🚀 صعود قوي للسوق!"
-        elif reward >= 100:
-            result="📈💹 ارتفاع جيد وتحقيق ربح ممتاز."
-        elif reward >= 50:
-            result="📊 ارتفاع متوسط في السعر."
-        elif reward > 0:
-            result="📉 حركة بسيطة وربح محدود."
+        data = STOCK_MARKET_ASSETS[choice]
+        if self._configured_room_language(room) == "en":
+            self.send_room_text(room, f"✅ Selected {data['en']} {data['icon']}. Send the investment amount (for example: 100000), or type `{data['en'].lower()} 100000`.")
         else:
-            result="📉 هبوط في السوق هذه الجولة، لا توجد أرباح."
-        balance=self._game_award(sender,reward)
-        _record_game(sender,"stock",reward,0)
-        self.send_room_text(room,f"📈💰 البورصة\n━━━━━━━━━━━━━━\n👤 اللاعب: @{sender}\n{icon} الاختيار: {name}\n{result}\n🎁 المكافأة: +{_fmt_points(reward)} نقطة\n💰 الرصيد: {_fmt_points(balance)}")
-        if reward > 0: self._send_game_winner_card("stock",sender,[room])
+            self.send_room_text(room, f"✅ اخترت {data['ar']} {data['icon']}. أرسل مبلغ الاستثمار (مثال: 100000)، أو اكتب `{data['ar']} 100000`.")
         return True
 
     def _investment_bot_game(self, room, sender):
@@ -13071,29 +13448,22 @@ class TalkinBot:
         # worker thread before doing any reveal delay.
         if not self._game_cooldown_notice(room, sender_name, MILLION_BANK_COOLDOWN_SECONDS, "بنك مليون"):
             return True
-        self.send_room_text(
-            room,
-            f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n"
-            f"✅ @{sender_name}\n"
-            "🔎 جاري البحث عن الجائزة...\n"
-            "━━━━━━━━━━━━━━"
-        )
+        english = self._configured_room_language(room) == "en"
+        if english:
+            self.send_room_text(room, f"🏦✨ Million Bank ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the prize...\n━━━━━━━━━━━━━━")
+        else:
+            self.send_room_text(room, f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن الجائزة...\n━━━━━━━━━━━━━━")
         won = secrets.randbelow(100) < MONEY_GAME_WIN_CHANCE_PERCENT
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
         if not won:
-            loss_text = (
-                "🏦 بنك مليون\n━━━━━━━━━━━━━━\n"
-                f"❌ @{sender_name} لم يحالفه الحظ هذه المرة.\n"
-                "🍀 حظاً أوفر في المحاولة القادمة!\n"
-                "━━━━━━━━━━━━━━"
-            )
+            loss_text = (f"🏦 Million Bank\n━━━━━━━━━━━━━━\n❌ {sender_name}, no luck this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
+                         if english else f"🏦 بنك مليون\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحالفه الحظ هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
             # محاولة الحصول على المليون تبقى داخل الغرفة التي أُرسلت منها.
             self.send_room_text(room, loss_text)
             return True
         self._game_award(sender_name, reward)
         winner_photo = self.user_photos.get(_norm_user(sender_name), "") or self._lookup_profile_photo(sender_name)
-        winner_text = f"🏆✨ مبروك! فاز بنك مليون ✨🏆\n━━━━━━━━━━━━━━━━\n👑 الفائز: @{sender_name}\n💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n💸 مبلغ الخسارة: 0 نقطة\n━━━━━━━━━━━━━━━━"
 
         # IMPORTANT: for the bank-win broadcast use only rooms confirmed as
         # connected in THIS WebSocket session. ``_active_rooms()`` also contains
@@ -13112,7 +13482,8 @@ class TalkinBot:
         # winner announcement and image behaviour.
         for index, target_room in enumerate(target_rooms):
             try:
-                self.send_room_text(target_room, winner_text)
+                language = self._configured_room_language(target_room)
+                self.send_room_text(target_room, _money_game_win_text("million", sender_name, language))
             except Exception as exc:
                 self.log("[GAME] bank winner text send failed:", target_room, repr(exc))
             if index + 1 < len(target_rooms):
@@ -14064,7 +14435,11 @@ class TalkinBot:
         return True
 
     def handle_game_command(self, room, text, sender_name):
+        stock_order = _parse_stock_market_order(text)
         raw=_normalize_game_command_text(text)
+        raw_digits = raw.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        if stock_order:
+            raw = "بورصة"
         if not raw or not sender_name: return False
         # Active board-game state always gets first priority.  This prevents
         # numeric Ludo choices (1-4), join and rool from being swallowed by
@@ -14079,8 +14454,14 @@ class TalkinBot:
                 self.stock_pending.pop(stock_key,None)
                 self.send_room_text(room,"⌛ انتهت مهلة البورصة. اكتب بورصة من جديد.")
                 return True
-            if re.fullmatch(r"[1-3]",raw):
-                return self._stock_exchange_game(room,sender_name,int(raw))
+            if pending_stock.get("kind") == "market_amount" and re.fullmatch(r"[0-9][0-9,]*", raw_digits):
+                self.stock_pending.pop(stock_key, None)
+                return self._stock_market_invest(
+                    room, sender_name, pending_stock.get("asset"), int(raw_digits.replace(",", "")),
+                    expected_round_id=pending_stock.get("event_id"),
+                )
+            if pending_stock.get("kind") == "market_choice" and re.fullmatch(r"[1-4]",raw_digits):
+                return self._stock_exchange_game(room,sender_name,int(raw_digits))
         if self._handle_pending_bot_choice(room, raw, sender_name):
             return True
         # Do not run the verification gate for ordinary conversation.
@@ -14141,6 +14522,9 @@ class TalkinBot:
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
+        if stock_order:
+            self.stock_pending.pop(stock_key, None)
+            return self._stock_market_invest(room, sender_name, stock_order[0], stock_order[1])
         if game_low in ("زواج", "زوجه"):
             return self._marriage_game(room, sender_name)
         if game_low == "زوجتي":
@@ -14221,15 +14605,11 @@ class TalkinBot:
         if low in ("مليار","billion"):
             if not self._game_cooldown_notice(room, sender_name, BILLION_GAME_COOLDOWN_SECONDS, "مليار"):
                 return True
-
-            self.send_room_text(
-                room,
-                f"🎰✨ لعبة المليار ✨🎰\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"✅ @{sender_name}\n"
-                f"🔎 جاري البحث عن مليار...\n"
-                f"━━━━━━━━━━━━━━"
-            )
+            english = self._configured_room_language(room) == "en"
+            if english:
+                self.send_room_text(room, f"🎰✨ Billion game ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the billion...\n━━━━━━━━━━━━━━")
+            else:
+                self.send_room_text(room, f"🎰✨ لعبة المليار ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن مليار...\n━━━━━━━━━━━━━━")
             won = secrets.randbelow(100) < MONEY_GAME_WIN_CHANCE_PERCENT
             reward = 1000000000 if won else 0
             _record_game(sender_name, "billion", reward, 0)
@@ -14242,25 +14622,14 @@ class TalkinBot:
                 if not winner_photo:
                     winner_photo = self._lookup_profile_photo(sender_name)
 
-                zeros = "⭐" * 9  # 1k,000,000 contains nine zeros.
-                winner_text = (
-                    f"🏆✨ مبروك! تم الحصول على المليار ✨🏆\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"✅ @{sender_name}\n"
-                    f"💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n"
-                    f"💸 مبلغ الخسارة: 0 نقطة\n"
-                    f"🔢 قيمة المليار: 1b\n"
-                    f"🎉 مبروك يا بطل!\n"
-                    f"{zeros}\n"
-                    f"━━━━━━━━━━━━━━━━"
-                )
                 target_rooms = self._active_rooms() or [room]
                 target_rooms = [room] + [
                     target_room for target_room in target_rooms
                     if _norm_room(target_room) != _norm_room(room)
                 ]
                 for index, target_room in enumerate(target_rooms):
-                    self.send_room_text(target_room, winner_text)
+                    language = self._configured_room_language(target_room)
+                    self.send_room_text(target_room, _money_game_win_text("billion", sender_name, language))
                     if index + 1 < len(target_rooms):
                         time.sleep(0.05)
 
@@ -14278,12 +14647,8 @@ class TalkinBot:
                 except Exception as exc:
                     self.log("[GAME] billion winner card failed:", repr(exc))
             else:
-                loss_text = (
-                    f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n"
-                    f"❌ @{sender_name} لم يحصل على المليار هذه المرة.\n"
-                    f"🍀 حظاً أوفر في المحاولة القادمة!\n"
-                    f"━━━━━━━━━━━━━━"
-                )
+                loss_text = (f"🎰🍀 Billion game\n━━━━━━━━━━━━━━\n❌ {sender_name} did not get the billion this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
+                             if english else f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحصل على المليار هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
                 self.send_room_text(room, loss_text)
             return True
         if game_low in ("حظ","الحظ","luck"):
@@ -16625,6 +16990,10 @@ class TalkinBot:
             self.send_private_text(sender,"🖼️ تم استلام أمر النشر. أرسل الصورة الآن خلال دقيقتين في الروم أو الخاص، وسيتم نشرها في جميع الغرف." + (f"\n📝 الوصف: {desc}" if desc else ""))
             return True
 
+        if re.match(r"^bl@", text, re.I) and not _is_master_name(sender):
+            denied = "🔒 bl@ مخصص للماستر فقط."
+            self.send_private_text(sender, denied) if is_private else self.send_room_text(room, denied)
+            return True
         if not _is_master_name(sender) and not (_is_mvip_master(sender) and _is_verification_manager_command(text)):
             if _looks_like_admin_command(text):
                 self.send_private_text(sender, "🚫 هذا الأمر مخصص للماستر والإدارة فقط.")
@@ -16964,9 +17333,13 @@ class TalkinBot:
 
         m=re.match(r"^bl@(.+)$", text, re.I)
         if m:
+            if not _is_master_name(sender):
+                denied = "🔒 bl@ مخصص للماستر فقط."
+                self.send_private_text(sender, denied) if is_private else self.send_room_text(room, denied)
+                return True
             target=m.group(1).strip().lstrip("@")
             if not target:
-                self.send_private_text(sender,"❌ الصيغة: bl@اسم المستخدم")
+                self.send_private_text(sender,"❌ الصيغة: bl@اسم المستخدم") if is_private else self.send_room_text(room,"❌ الصيغة: bl@اسم المستخدم")
                 return True
 
             # IMPORTANT: use only rooms that are actually connected in the
@@ -16974,8 +17347,6 @@ class TalkinBot:
             # rooms; sending moderation packets to those rooms can make the
             # server close the socket and trigger the reconnect loop.
             active_rooms={str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()}
-            if self.room:
-                active_rooms.add(str(self.room).strip())
             active_rooms=sorted({r for r in active_rooms if r})
             if not active_rooms:
                 self.send_private_text(sender,"❌ البوت غير موجود في أي غرفة حالياً.")
@@ -16989,17 +17360,29 @@ class TalkinBot:
 
             def _ban_all_rooms():
                 total=len(active_rooms)
+                sent=0
+                failed=0
                 self.log(f"[MOD-ALL] starting global ban target=@{target} rooms={total} delay={delay}s")
                 with self._room_bulk_lock:
                     for index, active_room in enumerate(active_rooms, 1):
                         try:
-                            self.request_admin_action(active_room, target, "ban", sender, announce_room=True)
+                            if self.request_admin_action(active_room, target, "ban", sender, announce_room=True):
+                                sent += 1
+                            else:
+                                failed += 1
                             self.log(f"[MOD-ALL] ban sent {index}/{total}: {active_room} -> @{target}")
                         except Exception as exc:
+                            failed += 1
                             self.log(f"[MOD-ALL] ban failed room={active_room} target=@{target}: {exc!r}")
                         if index < total:
                             time.sleep(delay)
-                    self.log(f"[MOD-ALL] global ban finished target=@{target} rooms={total}")
+                    self.log(f"[MOD-ALL] global ban requests finished target=@{target} sent={sent} failed={failed}")
+                self.send_private_text(
+                    sender,
+                    f"✅ أُرسلت طلبات حظر @{target} إلى {sent} غرفة متصلة.\n"
+                    f"⚠️ تعذّر الإرسال إلى {failed} غرفة.\n"
+                    "🛡️ لا يُستثنى المستهدف بسبب رتبته، والبوت لا يغادر الغرف."
+                )
 
             threading.Thread(
                 target=_ban_all_rooms,
@@ -17896,7 +18279,11 @@ class TalkinBot:
                         except Exception as f_err:
                             self.log("[FLOOD] ban_ip error:", repr(f_err))
                     if banned_names:
-                        self.send_room_text(room, f"🚫 [حماية الفلود] تم حظر IP سريعاً للحسابات التالية: {' '.join(banned_names[:5])}")
+                        if self._configured_room_language(room) == "en":
+                            notice = f"🚫 The flooders have been rounded up! 😋😁 ({len(banned_names)} account(s) IP-banned)"
+                        else:
+                            notice = f"🚫 تم جمع الفلود إلى الزريبة😋😁 (حظر IP لـ {len(banned_names)} حساب)"
+                        self.send_room_text(room, notice)
 
             # --- حماية الدخول والخروج: كشف تكرار الدخول والخروج لنفس النك وحظره ---
             if (pcfg.get("joinleave") and norm_u != _norm_user(BOT_ID)
@@ -18293,7 +18680,7 @@ class TalkinBot:
                   if _norm_filter_text(w) and _norm_filter_text(w) in normalized_body), None)
             if filter_enabled else None
         )
-        if hit and _auto_ban_candidate(self, room, frm, role if role_field_present else None):
+        if hit and _profanity_ban_candidate(self, room, frm, role if role_field_present else None):
             try:
                 exempt = _norm_user(frm) in getattr(self,"filter_exceptions",set())
                 if exempt:
@@ -18301,7 +18688,7 @@ class TalkinBot:
                     mentions=re.findall(r"@([^\s@]+)", body)
                     target=mentions[-1].strip() if mentions else ""
                     if (target and _norm_user(target)!=_norm_user(frm)
-                            and _auto_ban_candidate(self, room, target)):
+                            and _profanity_ban_candidate(self, room, target)):
                         self.send_admin(room,target,"ban")
                         _record_filter_ban(target,room,f"إبلاغ من @{frm}: كلمة الفلتر",hit)
                         self.send_room_text(room,f"🚫 تم حظر @{target}\nالسبب: بلاغ فلتر من @{frm}")

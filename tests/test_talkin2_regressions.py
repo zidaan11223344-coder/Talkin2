@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import tempfile
 import sys
 import threading
@@ -279,7 +281,7 @@ class IncomingEventDedupRegressions(unittest.TestCase):
 
 
 class CommandLanguageAndReconnectRegressions(unittest.TestCase):
-    def test_room_reply_language_follows_each_sender_command_both_directions(self):
+    def test_room_reply_language_follows_saved_room_setting_for_all_commands(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_languages = {
             bot_module._norm_room("ArabicRoom"): "ar",
@@ -298,11 +300,11 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "help", 13: "ArabicRoom"}})
         bot.handle_room_event({"room_event": {1: "text", 2: "Bob", 6: "مساعدة", 13: "EnglishRoom"}})
 
-        self.assertEqual(observed, [("en", "English reply"), ("ar", "رد عربي")])
+        self.assertEqual(observed, [("ar", "رد عربي"), ("en", "English reply")])
         self.assertEqual(bot._effective_room_language("ArabicRoom"), "ar")
         self.assertEqual(bot._effective_room_language("EnglishRoom"), "en")
 
-    def test_numeric_game_choice_inherits_the_players_last_command_language(self):
+    def test_numeric_game_choice_uses_the_saved_room_language(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_languages = {bot_module._norm_room("Hall"): "ar"}
         observed = []
@@ -311,7 +313,7 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         )
         bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "ludo", 13: "Hall"}})
         bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "1", 13: "Hall"}})
-        self.assertEqual(observed, ["en", "en"])
+        self.assertEqual(observed, ["ar", "ar"])
 
     def test_auto_rejoin_stops_after_five_attempts_in_the_window(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -1368,6 +1370,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
     def test_million_bank_result_has_no_artificial_reveal_sleep(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._game_cooldown_notice = lambda *_args: True
+        bot._configured_room_language = lambda _room: "ar"
         sent = []
         bot.send_room_text = lambda room, text: sent.append((room, text))
         with patch.object(bot_module.secrets, "randbelow", return_value=99), patch.object(
@@ -1385,6 +1388,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 cooldowns, sent, awards = [], [], []
                 bot._game_cooldown_notice = lambda _room, _user, seconds, _name: cooldowns.append(seconds) or True
                 bot.send_room_text = lambda room, text: sent.append((room, text))
+                bot._configured_room_language = lambda _room: "ar"
                 bot.user_photos = {}
                 bot._lookup_profile_photo = lambda _user: ""
                 bot.connected_rooms = set()
@@ -1398,9 +1402,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 self.assertEqual(cooldowns, [60.0])
                 self.assertEqual(bool(awards), won)
                 self.assertEqual(awards, ([ ("Player", 1_000_000) ] if won else []))
-                self.assertIn("فاز بنك مليون" if won else "لم يحالفه الحظ", sent[-1][1])
+                self.assertIn("تم الحصول على المليون" if won else "لم يحالفه الحظ", sent[-1][1])
 
-    def test_billion_uses_five_minute_cooldown_and_five_percent_win_chance(self):
+    def test_billion_uses_configured_one_minute_cooldown_and_five_percent_win_chance(self):
         for roll, won in ((4, True), (5, False)):
             with self.subTest(roll=roll):
                 bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -1411,6 +1415,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 bot._handle_pending_bot_choice = lambda *_args: False
                 bot._game_cooldown_notice = lambda _room, _user, seconds, _name: cooldowns.append(seconds) or True
                 bot.send_room_text = lambda room, text: sent.append((room, text))
+                bot._configured_room_language = lambda _room: "ar"
                 bot.send_room_media = lambda *_args: None
                 bot.user_photos = {bot_module._norm_user("Player"): "photo"}
                 bot._active_rooms = lambda: ["North"]
@@ -1422,7 +1427,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                     bot_module, "_record_game", return_value=None
                 ), patch.object(bot_module, "_public_base_url", return_value=""):
                     self.assertTrue(bot.handle_game_command("North", "billion", "Player"))
-                self.assertEqual(cooldowns, [300.0])
+                self.assertEqual(cooldowns, [60.0])
                 self.assertEqual(bool(awards), won)
                 self.assertEqual(awards, ([ ("Player", 1_000_000_000) ] if won else []))
                 self.assertIn("تم الحصول على المليار" if won else "لم يحصل على المليار", sent[-1][1])
@@ -1482,6 +1487,21 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "Admin", ""))
             self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "UnknownUser", ""))
             self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "NewAdmin", "admin"))
+
+    def test_profanity_filter_targets_unranked_and_vip_but_exempts_supervisors(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {"North": {
+            "Owner": "owner", "Admin": "admin", "Moderator": "moderator",
+            "Member": "member", "VIP": "vip",
+        }}
+        with patch.object(bot_module, "_is_master_name", side_effect=lambda name: str(name).casefold() == "master"), patch.object(
+            bot_module, "_is_room_creator", return_value=False
+        ):
+            for protected in ("Owner", "Admin", "Moderator", "Master"):
+                self.assertFalse(bot_module._profanity_ban_candidate(bot, "North", protected), protected)
+            for ordinary in ("Member", "VIP", "NoRank", "UnknownUser"):
+                self.assertTrue(bot_module._profanity_ban_candidate(bot, "North", ordinary), ordinary)
+            self.assertFalse(bot_module._profanity_ban_candidate(bot, "North", "NewAdmin", "room_admin"))
 
     def test_private_protection_menu_has_nine_options_and_applies_only_from_master_dm(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -2731,6 +2751,193 @@ class FollowupFeatureRegressions(unittest.TestCase):
         self.assertIn("Room 31", self.sent[1][1])
         self.assertIn("End of list", self.sent[1][1])
         self.assertFalse(bot._result_pages)
+
+
+class NewMarketAndModerationRegressions(unittest.TestCase):
+    def test_stock_points_delta_is_atomic_idempotent_and_never_overdraws(self):
+        accounts = {"player": {"username": "Player", "points": 500}}
+        history = []
+        with patch.object(bot_module, "_POINTS_CACHE", accounts), patch.object(
+            bot_module, "_POINTS_TRANSFER_CACHE", history
+        ), patch.object(bot_module, "_STATE_DB_ENABLED", False), patch.object(
+            bot_module, "_save_local_json", return_value=None
+        ):
+            first = bot_module._apply_points_delta_once("PLAYER", -100, "market-debit-1", "stock market")
+            retry = bot_module._apply_points_delta_once("Player", -100, "market-debit-1", "stock market")
+            self.assertEqual(first["balance"], 400)
+            self.assertTrue(retry["already_applied"])
+            self.assertEqual(retry["balance"], 400)
+            overdraw = bot_module._apply_points_delta_once("Player", -500, "market-debit-2", "stock market")
+            self.assertEqual(overdraw["error"], "insufficient")
+            credit = bot_module._apply_points_delta_once("Player", 25, "market-credit-1", "stock market")
+            credit_retry = bot_module._apply_points_delta_once("Player", 25, "market-credit-1", "stock market")
+            self.assertEqual(credit["balance"], 425)
+            self.assertTrue(credit_retry["already_applied"])
+            self.assertEqual(credit_retry["balance"], 425)
+            self.assertEqual(len(bot_module._POINTS_TRANSFER_CACHE), 2)
+
+    def test_billion_cooldown_can_be_set_through_environment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env = dict(os.environ)
+            env.update({"BILLION_GAME_COOLDOWN_SECONDS": "137", "BOT_DATA_DIR": temp})
+            result = subprocess.run(
+                [sys.executable, "-c", "import bot; print('COOLDOWN=', bot.BILLION_GAME_COOLDOWN_SECONDS)"],
+                cwd=Path(__file__).resolve().parents[1], env=env,
+                capture_output=True, text=True, timeout=60, check=True,
+            )
+        self.assertIn("COOLDOWN= 137.0", result.stdout)
+
+    def test_stock_order_parser_accepts_arabic_english_and_numeric_assets(self):
+        self.assertEqual(bot_module._parse_stock_market_order("ذهب 100000"), (1, 100000))
+        self.assertEqual(bot_module._parse_stock_market_order("gold@100,000"), (1, 100000))
+        self.assertEqual(bot_module._parse_stock_market_order("بورصة@2@75000"), (2, 75000))
+        self.assertEqual(bot_module._parse_stock_market_order("نفط ١٠٠٠٠٠"), (3, 100000))
+        self.assertEqual(bot_module._parse_stock_market_order("land 50000"), (4, 50000))
+        self.assertIsNone(bot_module._parse_stock_market_order("market tomorrow"))
+
+    def test_manual_stock_command_opens_a_ten_minute_bilingual_menu(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.stock_pending = {}
+        bot.stock_investments = []
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_market_round = None
+        bot._stock_market_round_seq = 0
+        bot._stock_market_seen = set()
+        bot._stock_market_next_announcement = 0
+        bot.connected_rooms = {"ArabicHall"}
+        bot._configured_room_language = lambda _room: "ar"
+        bot._snake_command = lambda *_args: False
+        bot._ludo_command = lambda *_args: False
+        bot._handle_pending_bot_choice = lambda *_args: False
+        bot._game_cooldown_notice = lambda *_args: True
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        bot._save_stock_investments = lambda: None
+        with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_games_enabled_for_room", return_value=True
+        ), patch.object(bot_module, "_looks_like_bot_command", return_value=True), patch.object(
+            bot_module.time, "time", return_value=1_000.0
+        ):
+            self.assertTrue(bot.handle_game_command("ArabicHall", "بورصة", "Player"))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("بدأت البورصة", sent[0][1])
+        self.assertIn("ذهب", sent[0][1])
+        self.assertIn("فضة", sent[0][1])
+        self.assertIn("نفط", sent[0][1])
+        self.assertIn("أرض", sent[0][1])
+        self.assertIn("100000", sent[0][1])
+        self.assertEqual(bot.stock_market_round["ends_at"], 1_600.0)
+        self.assertEqual(bot._stock_market_next_announcement, 1_600.0)
+        self.assertEqual(bot.stock_pending[(bot_module._norm_room("ArabicHall"), bot_module._norm_user("Player"))]["kind"], "market_choice")
+
+    def test_stock_investment_debits_once_and_credits_principal_plus_ten_to_fifty_percent(self):
+        for random_value, expected_percent in ((0, 10), (40, 50)):
+            with self.subTest(expected_percent=expected_percent):
+                bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                bot._stock_market_lock = threading.RLock()
+                bot.stock_market_round = {"id": 7, "started_at": 900.0, "ends_at": 2_000.0}
+                bot._stock_market_seen = set()
+                bot.stock_investments = []
+                bot._configured_room_language = lambda _room: "ar"
+                bot._save_stock_investments = lambda: None
+                messages = []
+                bot.send_room_text = lambda room, text: messages.append((room, text))
+                point_ops = []
+
+                def apply_once(username, delta, transaction_id, reason):
+                    point_ops.append((username, delta, transaction_id, reason))
+                    return {"ok": True, "balance": delta if delta > 0 else 0}
+
+                with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), patch.object(
+                    bot_module.time, "time", return_value=1_000.0
+                ):
+                    bot._stock_market_invest("ArabicHall", "Player", 1, 100_000, expected_round_id=7)
+                    bot._stock_market_invest("ArabicHall", "Player", 1, 100_000, expected_round_id=7)
+                self.assertEqual(len(point_ops), 1)
+                self.assertEqual(point_ops[0][1], -100_000)
+                self.assertTrue(point_ops[0][2].startswith("stock-market-debit:"))
+                self.assertEqual(len(bot.stock_investments), 1)
+
+                with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), patch.object(
+                    bot_module.secrets, "randbelow", return_value=random_value
+                ), patch.object(bot_module, "_record_game", return_value=None):
+                    self.assertEqual(bot._process_stock_market_investments(now=1_300.0), 1)
+                self.assertEqual(len(point_ops), 2)
+                self.assertEqual(point_ops[1][1], 100_000 + 100_000 * expected_percent // 100)
+                self.assertTrue(point_ops[1][2].startswith("stock-market-payout:"))
+                self.assertFalse(bot.stock_investments)
+                result = messages[-1][1]
+                self.assertIn(f"{expected_percent}%", result)
+                self.assertIn("المبلغ المعاد", result)
+
+    def test_bl_is_master_only_and_bans_every_connected_room_without_leaving(self):
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+
+        denied = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        denied._room_list_commands = lambda *_args: False
+        denied_messages = []
+        denied.send_private_text = lambda user, text: denied_messages.append((user, text))
+        with patch.object(bot_module, "_is_master_name", return_value=False):
+            self.assertTrue(denied._handle_management_command_impl("", "bl@Target", "Member", is_private=True))
+        self.assertIn("مخصص للماستر فقط", denied_messages[0][1])
+
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_list_commands = lambda *_args: False
+        bot.connected_rooms = {"RoomB", "RoomA"}
+        bot.room = "StaleRoom"
+        bot._room_bulk_lock = threading.RLock()
+        bot.log = lambda *_args: None
+        calls, messages, leave_calls = [], [], []
+        bot.request_admin_action = lambda room, target, operation, requester, announce_room=False: calls.append(
+            (room, target, operation, requester, announce_room)
+        ) or True
+        bot.send_private_text = lambda user, text: messages.append((user, text))
+        bot.leave_room = lambda *args: leave_calls.append(args)
+        with patch.object(bot_module, "_is_master_name", side_effect=lambda name: name == "Master"), patch.object(
+            bot_module.threading, "Thread", ImmediateThread
+        ), patch.object(bot_module.time, "sleep", return_value=None), patch.dict(
+            bot_module.os.environ, {"GLOBAL_BAN_DELAY_SECONDS": "0.25"}
+        ):
+            self.assertTrue(bot._handle_management_command_impl("", "bl@Target", "Master", is_private=True))
+        self.assertEqual([row[0] for row in calls], ["RoomA", "RoomB"])
+        self.assertTrue(all(row[1:4] == ("Target", "ban", "Master") for row in calls))
+        self.assertFalse(leave_calls)
+        self.assertEqual(bot.connected_rooms, {"RoomA", "RoomB"})
+        self.assertIn("البوت لا يغادر الغرف", messages[-1][1])
+
+    def test_single_room_ban_schedules_guarded_rejoin_without_a_leave_action(self):
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                return None
+
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = {"North"}
+        bot.pending_admin_lock = threading.Lock()
+        bot.pending_admin_actions = {}
+        bot.room_users = {"North": {}}
+        bot.last_admin_actions = {}
+        bot._master_reply_local = threading.local()
+        bot._master_reply_local.tracking = False
+        bot.send_admin = lambda *_args: True
+        bot.log = lambda *_args: None
+        bot.send_private_text = lambda *_args: None
+        bot.send_room_text = lambda *_args: None
+        rejoin_calls, leave_calls = [], []
+        bot._schedule_auto_rejoin = lambda room, delay=2.0: rejoin_calls.append((room, delay))
+        bot.leave_room = lambda *args: leave_calls.append(args)
+        with patch.object(bot_module, "_save_local_json"), patch.object(
+            bot_module.threading, "Thread", ImmediateThread
+        ):
+            self.assertTrue(bot.request_admin_action("North", "Target", "ban", "Master"))
+        self.assertEqual(rejoin_calls, [("North", 2.0)])
+        self.assertEqual(bot.connected_rooms, {"North"})
+        self.assertFalse(leave_calls)
 
 
 if __name__ == "__main__":
