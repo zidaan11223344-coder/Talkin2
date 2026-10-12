@@ -12253,6 +12253,14 @@ class TalkinBot:
                     self.log("[CROP] harvest credited; room result could not be delivered:", room, username)
             else:
                 self.log("[CROP] harvest credited but no room is available for the result:", username)
+            try:
+                private_text = result_text + (
+                    f"\n🏠 غرفة الزراعة: {room}" if self._configured_room_language(room) != "en"
+                    else f"\n🏠 Farm room: {room}"
+                )
+                self.send_private_text(username, private_text)
+            except Exception as exc:
+                self.log("[CROP] harvest credited; private result could not be delivered:", username, repr(exc))
         return len(ready)
 
     def _crop_worker(self):
@@ -12884,6 +12892,14 @@ class TalkinBot:
                     self.send_room_text(room, result_text)
                 except Exception as exc:
                     self.log("[STOCK] result delivery failed:", repr(exc))
+            try:
+                private_text = result_text + (
+                    f"\n🏠 Investment room: {room}" if language == "en"
+                    else f"\n🏠 غرفة الاستثمار: {room}"
+                )
+                self.send_private_text(username, private_text)
+            except Exception as exc:
+                self.log("[STOCK] private result delivery failed:", username, repr(exc))
             with self._stock_market_lock:
                 self.stock_investments = [item for item in self.stock_investments if item.get("id") != investment_id]
             try:

@@ -2783,7 +2783,7 @@ class FollowupFeatureRegressions(unittest.TestCase):
         self.assertIn("Planted 🍎 successfully", self.messages[-1][1])
         self.assertIn("not in a private message", self.messages[-1][1])
 
-    def test_harvest_reward_and_result_are_delivered_to_the_original_room(self):
+    def test_harvest_result_is_delivered_to_room_and_player_private(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.game_lock = threading.Lock()
         bot.crop_plots = {
@@ -2797,14 +2797,18 @@ class FollowupFeatureRegressions(unittest.TestCase):
         bot._save_crop_plots = lambda: None
         bot._configured_room_language = lambda _room: "en"
         bot.send_room_text = lambda room, text: self.sent.append((room, text))
+        bot.send_private_text = lambda user, text: self.private_sent.append((user, text))
         bot.log = lambda *_args: None
-        self.sent = []
+        self.sent, self.private_sent = [], []
         with patch.object(bot_module, "_record_game", lambda *_args: None):
             self.assertEqual(bot._process_due_crop_plots(now=1), 1)
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0][0], "Farm Room")
         self.assertIn("Your harvest is ready", self.sent[0][1])
         self.assertIn("@𓆩DecoratedName𓆪", self.sent[0][1])
+        self.assertEqual(self.private_sent[0][0], "𓆩DecoratedName𓆪")
+        self.assertIn("Your harvest is ready", self.private_sent[0][1])
+        self.assertIn("Farm room: Farm Room", self.private_sent[0][1])
         self.assertFalse(bot.crop_plots)
 
     def test_english_shot_catches_dragon_first_then_regular_animals(self):
@@ -3072,7 +3076,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 bot._configured_room_language = lambda _room: "ar"
                 bot._save_stock_investments = lambda: None
                 messages = []
+                private_messages = []
                 bot.send_room_text = lambda room, text: messages.append((room, text))
+                bot.send_private_text = lambda user, text: private_messages.append((user, text))
                 point_ops = []
 
                 def apply_once(username, delta, transaction_id, reason):
@@ -3104,6 +3110,10 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 self.assertIn(f"{expected_percent}%", result)
                 self.assertIn("الخسارة" if outcome == "loss" else "الربح", result)
                 self.assertIn("-" if outcome == "loss" else "+", result)
+                self.assertEqual(len(private_messages), 1)
+                self.assertEqual(private_messages[0][0], "Player")
+                self.assertIn("غرفة الاستثمار: ArabicHall", private_messages[0][1])
+                self.assertIn("الخسارة" if outcome == "loss" else "الربح", private_messages[0][1])
 
     def test_bl_is_master_only_and_bans_every_connected_room_without_leaving(self):
         class ImmediateThread:
