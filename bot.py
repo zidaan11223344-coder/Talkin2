@@ -286,7 +286,7 @@ GAME_COMMANDS = {
     "billion": "مليار", "farm": "زرع", "crop": "زرع", "plant": "زرع", "face": "فيس", "fruit match": "فيس",
     "snake": "ثعبان", "snakes and ladders": "ثعبان", "ludo": "لودو",
     "fishing": "سنارة", "fishing rod": "سنارة", "fish": "سنارة", "snare": "سنارة", "sannara": "سنارة",
-    "shoot": "شوت",
+    "shoot": "شوت", "shot": "شوت",
     "lightning": "برق", "ruby": "ياقوت", "crash": "صدام", "detector": "كاشف", "guess who": "كاشف",
     "steal": "اسرق", "rob": "اسرق", "lookalike": "شبيه", "twin": "شبيه",
 }
@@ -297,8 +297,14 @@ except (TypeError, ValueError):
     BILLION_GAME_COOLDOWN_SECONDS = 60.0
 MONEY_GAME_WIN_CHANCE_PERCENT = 5
 
-STOCK_MARKET_INTERVAL_SECONDS = 600.0
-STOCK_MARKET_SETTLEMENT_SECONDS = 300.0
+try:
+    STOCK_MARKET_INTERVAL_SECONDS = max(60.0, float(os.getenv("STOCK_MARKET_INTERVAL_SECONDS", "900") or 900))
+except (TypeError, ValueError):
+    STOCK_MARKET_INTERVAL_SECONDS = 900.0
+try:
+    STOCK_MARKET_SETTLEMENT_SECONDS = max(1.0, float(os.getenv("STOCK_MARKET_SETTLEMENT_SECONDS", "60") or 60))
+except (TypeError, ValueError):
+    STOCK_MARKET_SETTLEMENT_SECONDS = 60.0
 STOCK_MARKET_ASSETS = {
     1: {"icon": "🥇", "ar": "الذهب", "en": "Gold"},
     2: {"icon": "🥈", "ar": "الفضة", "en": "Silver"},
@@ -627,6 +633,7 @@ GAME_LEVELS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_levels.duplicates-backup.json"
 GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
 CROP_PLOTS_FILE = DATA_DIR / "crop_plots.json"
 STOCK_MARKET_FILE = DATA_DIR / "stock_market_investments.json"
+DRAGON_HUNTERS_FILE = DATA_DIR / "dragon_hunters.json"
 TRACKED_ROOMS_FILE = DATA_DIR / "tracked_rooms.json"
 BLOCKED_ROOMS_FILE = DATA_DIR / "blocked_rooms.json"
 ROOM_USERS_FILE = DATA_DIR / "room_users.json"
@@ -4176,19 +4183,13 @@ def _auto_ban_candidate(bot, room, sender, event_role=None):
 
 
 def _profanity_ban_candidate(bot, room, sender, event_role=None):
-    """Ban any non-staff user for profanity, even if the roster omits their role."""
-    if not sender or _is_master_name(sender) or _is_room_creator(room, sender):
+    """Ban any account that matches a profanity rule, regardless of room rank."""
+    if not sender:
         return False
-    role, _known = _room_role(bot, room, sender, event_role)
-    role_key = re.sub(r"[\s_-]+", "", role.casefold())
-    protected_roles = {
-        "owner", "creator", "roomowner", "roomcreator", "host", "superadmin",
-        "admin", "roomadmin", "administrator", "moderator", "roommoderator",
-        "supermoderator", "moder", "mod", "supervisor",
-        "مشرف", "مشرفين", "ادمن", "إداري", "اونر", "أونر", "صانع", "صانعي",
-        "صانعالغرفة", "صانعالغرفه", "مالك", "مدير",
-    }
-    return role_key not in protected_roles
+    # The bot cannot be a profanity target; all human roles, including creator,
+    # owner, moderator and the configured master, follow the room's rule.
+    bot_id = str(getattr(bot, "bot_id", "") or BOT_ID or "").strip()
+    return not bot_id or _norm_user(sender) != _norm_user(bot_id)
 
 def _join_flood_candidates(bot, room, username, event_role=None, now=None):
     """Return new accounts to IP-ban for a fast or sustained join burst.
@@ -4301,8 +4302,8 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
-            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — كل 10 دقائق: ذهب/فضة/نفط/أرض؛ مثال: ذهب 100000، النتيجة بعد 5 دقائق وربح 10–50% / stock market\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n39. شوت — تبدأ رحلة صيد كل 10 دقائق؛ محاولة لكل لاعب، وجائزة التنين مليون نقطة.\n📌 اكتب ns لقائمة الكركيت.',
-            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند اكتمال الفريق الأول يعلن البوت تفاصيل المباراة في غرفتي الفريقين فقط، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
+            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — إعلان مختصر كل 15 دقيقة؛ اكتب بورصة واختر الأصل والمبلغ. النتيجة بعد دقيقة: ربح أو خسارة من 10% إلى 50% / stock market\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n39. Shot أو شوت — صيد عادي بأي وقت؛ أول Shot بعد إعلان الرحلة يصيد التنين بجائزة مليون نقطة.\n📌 اكتب ns لقائمة الكركيت.',
+            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -5834,7 +5835,7 @@ class TalkinBot:
             is_verified=_is_cricket_verified_member,
             send_room_text=self.send_room_text,
             send_room_media=self.send_room_media,
-            send_all_rooms_text=self.broadcast_game_rooms,
+            send_all_rooms_text=self.broadcast_game_rooms_async,
             send_private_text=self.send_private_text,
             public_base=_public_base_url,
             reward=lambda username, amount: _add_points(username, amount),
@@ -6023,6 +6024,14 @@ class TalkinBot:
         self._stock_market_round_seq = 0
         self._stock_market_next_announcement = 0.0
         self._stock_market_seen = set()
+        self._dragon_hunters_lock = threading.RLock()
+        saved_dragon_hunters = _load_local_json(DRAGON_HUNTERS_FILE, {})
+        saved_hunters = saved_dragon_hunters.get("hunters", {}) if isinstance(saved_dragon_hunters, dict) else {}
+        self.dragon_hunters = {
+            str(key): dict(value) if isinstance(value, dict) else {"username": str(value)}
+            for key, value in saved_hunters.items()
+            if str(key).strip()
+        } if isinstance(saved_hunters, dict) else {}
         saved_stock = _load_local_json(STOCK_MARKET_FILE, {})
         saved_investments = saved_stock.get("investments", []) if isinstance(saved_stock, dict) else []
         self.stock_investments = [
@@ -7366,6 +7375,17 @@ class TalkinBot:
                     time.sleep(0.05)
         return sent
 
+    def broadcast_game_rooms_async(self, text: str, first_room: str = ""):
+        """Queue a broad game announcement without blocking command delivery."""
+        worker = threading.Thread(
+            target=self.broadcast_game_rooms,
+            args=(text, first_room),
+            daemon=True,
+            name="game-room-announcement",
+        )
+        worker.start()
+        return True
+
     def _localize_room_text(self, room, text):
         """Localize common bot notices for rooms selected as English."""
         if self._effective_room_language(room) != "en":
@@ -7428,6 +7448,26 @@ class TalkinBot:
         exact = cached
         if value in exact:
             return exact[value]
+        cricket_start = re.fullmatch(
+            r"🏏 بدأت مباراة الكريكيت\n(.+)\n(.+)\n🎯 يبدأ الهجوم: (.+)\. لكل لاعب 6 كرات في كل دور\.",
+            value,
+        )
+        if cricket_start:
+            def translate_team(line):
+                for arabic, english in (
+                    ("👥 الهجوم — ", "👥 Attack — "), ("👥 الدفاع — ", "👥 Defense — "),
+                    ("🤖 الهجوم — ", "🤖 Attack — "), ("🤖 الدفاع — ", "🤖 Defense — "),
+                    (" لاعبين): ", " players): "), (" لاعبان): ", " players): "),
+                    ("لاعبون قيد الانضمام", "players joining"), ("الفريق", "team"),
+                ):
+                    line = line.replace(arabic, english)
+                return line.replace("، ", ", ")
+            batting = "Attack" if cricket_start.group(3) == "الهجوم" else "Defense"
+            return (
+                "🏏 Cricket match started\n" + translate_team(cricket_start.group(1)) + "\n"
+                + translate_team(cricket_start.group(2))
+                + f"\n🎯 Batting first: {batting}. Each player has 6 balls per innings."
+            )
         # Ludo has dynamic player names and scores; translate full message
         # templates while preserving those values exactly.
         match = re.fullmatch(r"🎲 تم اختيار لودو لـ (\d+) لاعبين\.\n👥 اكتب join للانضمام — نحتاج (\d+) لاعباً إضافياً\.\n📌 يبدأ اللعب بعد اكتمال العدد، ثم اكتب rool\.", value)
@@ -7998,16 +8038,6 @@ class TalkinBot:
         requester = str(requester or "").strip()
         try:
             self.send_admin(room, target, operation)
-            # A ban must never remove the bot itself. If the room server drops
-            # the bot as a side effect of a moderation packet, schedule a
-            # guarded recovery; the worker skips it when the bot is still in
-            # the room and the normal 5-attempt/15-minute limit still applies.
-            if (operation == "ban" and _norm_user(target) != _norm_user(BOT_ID)
-                    and any(_norm_room(r) == _norm_room(room) for r in getattr(self, "connected_rooms", set()))):
-                try:
-                    self._schedule_auto_rejoin(room, delay=2.0)
-                except Exception as rejoin_exc:
-                    self.log(f"[MOD] fallback rejoin scheduling failed for {room}: {rejoin_exc!r}")
         except Exception as exc:
             self.log(f"[MOD] request failed room={room} target=@{target}: {exc!r}")
             if requester and not _is_master_name(requester):
@@ -12334,6 +12364,73 @@ class TalkinBot:
             except Exception as exc:
                 self.log("[FISHING] event start failed; scheduler will continue:", repr(exc))
 
+    def _is_dragon_hunter(self, username):
+        key = _norm_user(str(username or "").strip().lstrip("@"))
+        if not key:
+            return False
+        lock = getattr(self, "_dragon_hunters_lock", None)
+        if lock is None:
+            self._dragon_hunters_lock = lock = threading.RLock()
+        with lock:
+            hunters = getattr(self, "dragon_hunters", {})
+            return key in hunters if isinstance(hunters, dict) else False
+
+    def _record_dragon_hunter(self, username, room):
+        username = str(username or "").strip().lstrip("@")
+        key = _norm_user(username)
+        if not key:
+            return False
+        lock = getattr(self, "_dragon_hunters_lock", None)
+        if lock is None:
+            self._dragon_hunters_lock = lock = threading.RLock()
+        with lock:
+            hunters = getattr(self, "dragon_hunters", {})
+            hunters = dict(hunters) if isinstance(hunters, dict) else {}
+            hunters[key] = {
+                "username": username,
+                "room": str(room or ""),
+                "awarded_at": int(time.time()),
+            }
+            self.dragon_hunters = hunters
+            try:
+                _save_local_json(DRAGON_HUNTERS_FILE, {"version": 1, "hunters": hunters})
+            except Exception as exc:
+                self.log("[FISHING] dragon hunter badge save failed:", username, repr(exc))
+                return False
+        return True
+
+    def _broadcast_dragon_hunter_result(self, username, room, reward):
+        try:
+            rooms = set(self._active_rooms())
+        except Exception:
+            rooms = {str(item).strip() for item in getattr(self, "connected_rooms", set()) if str(item).strip()}
+        rooms.add(str(room or "").strip())
+        for target_room in sorted({item for item in rooms if item}, key=str.casefold):
+            room_language = self._configured_room_language(target_room)
+            if room_language == "en":
+                result_text = (
+                    f"🐉🏆 @{username} caught the dragon!\n"
+                    f"🏠 Hunting room: {room}\n💰 Reward: +{_fmt_points(reward)} points"
+                )
+            else:
+                result_text = (
+                    f"🐉🏆 @{username} اصطاد التنين!\n"
+                    f"🏠 غرفة الصيد: {room}\n💰 الجائزة: +{_fmt_points(reward)} نقطة"
+                )
+            try:
+                self.send_room_text(target_room, result_text)
+            except Exception as exc:
+                self.log("[FISHING] dragon announcement failed:", target_room, repr(exc))
+
+    def _queue_dragon_hunter_broadcast(self, username, room, reward):
+        worker = threading.Thread(
+            target=self._broadcast_dragon_hunter_result,
+            args=(username, room, reward),
+            daemon=True,
+            name="dragon-hunter-announcement",
+        )
+        worker.start()
+
     def _start_fishing_event(self, now=None):
         now = time.time() if now is None else float(now)
         lock = getattr(self, "_fishing_lock", None)
@@ -12347,17 +12444,20 @@ class TalkinBot:
             self._fishing_pending_shots = set()
             self._fishing_dragon_pending = ""
             self._fishing_dragon_caught = False
-        rooms = sorted({str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}, key=str.casefold)
+        try:
+            rooms = self._active_rooms()
+        except Exception:
+            rooms = sorted({str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}, key=str.casefold)
         for room in rooms:
             if self._configured_room_language(room) == "en":
                 announcement = (
-                    "🏹 The 10-minute hunting trip has started! Type shoot (or شوت) to hunt an animal and win points.\n"
-                    "Each player gets one shot this trip. The rare dragon can be caught only during this trip and awards 1,000,000 points."
+                    "🏹 Hunting trip open! Every 10 minutes.\n"
+                    "🐉 Dragon spotted — first Shot catches it for 1,000,000 points."
                 )
             else:
                 announcement = (
-                    "🏹 بدأت رحلة الصيد لعشر دقائق! أرسل شوت لاصطياد حيوان وربح نقاط.\n"
-                    "لكل لاعب محاولة واحدة في هذه الرحلة. قد يظهر التنين النادر أثناءها وجائزته 1,000,000 نقطة."
+                    "🏹 بدأت رحلة الصيد! كل 10 دقائق.\n"
+                    "🐉 التنين موجود — أول من يرسل شوت أو Shot يصيده ويحصل على مليون نقطة."
                 )
             self.send_room_text(room, announcement)
         self.log("[FISHING] event opened", self._fishing_event_seq, "rooms=", len(rooms))
@@ -12378,34 +12478,36 @@ class TalkinBot:
                 event_id = int(event.get("id", 0))
             shot_key = (event_id, user_key)
             pending = getattr(self, "_fishing_pending_shots", set())
-            shots = getattr(self, "_fishing_shots", set())
-            if event_id is not None and (shot_key in shots or shot_key in pending):
-                already_shot = True
-                dragon = False
-            elif event_id is None:
-                already_shot = False
+            if shot_key in pending:
+                busy = True
                 dragon = False
             else:
-                already_shot = False
+                busy = False
                 pending.add(shot_key)
                 self._fishing_pending_shots = pending
                 dragon_pending = str(getattr(self, "_fishing_dragon_pending", "") or "")
-                dragon = not bool(getattr(self, "_fishing_dragon_caught", False)) and not dragon_pending and secrets.randbelow(100) == 0
+                dragon = event_id is not None and not bool(getattr(self, "_fishing_dragon_caught", False)) and not dragon_pending
                 if dragon:
                     self._fishing_dragon_pending = user_key
 
-        language = self._effective_room_language(room)
-        if event_id is None:
-            text = "⏳ لا توجد رحلة صيد مفتوحة الآن. انتظر إعلان الرحلة التالية كل 10 دقائق." if language == "ar" else "⏳ No hunting trip is open now. Wait for the next announcement, every 10 minutes."
-            self.send_room_text(room, text)
-            return True
-        if already_shot:
-            text = "🎯 لديك محاولة واحدة فقط في رحلة الصيد الحالية. انتظر الرحلة التالية." if language == "ar" else "🎯 You have one shot per hunting trip. Wait for the next trip."
+        language_getter = getattr(self, "_configured_room_language", None) or self._effective_room_language
+        language = language_getter(room)
+        if busy:
+            text = "⏳ جاري احتساب محاولتك، أعد الإرسال بعد لحظة." if language != "en" else "⏳ Your shot is processing; retry in a moment."
             self.send_room_text(room, text)
             return True
 
-        animals = (("🐇 أرنب بري", 5_000), ("🦊 ثعلب", 10_000), ("🦌 غزال", 20_000), ("🐗 خنزير بري", 50_000), ("🐻 دب", 100_000))
-        animal, reward = ("🐉 التنين النادر", 1_000_000) if dragon else secrets.choice(animals)
+        animals = (
+            ("🐇", "أرنب بري", "Wild rabbit", 5_000),
+            ("🦊", "ثعلب", "Fox", 10_000),
+            ("🦌", "غزال", "Deer", 20_000),
+            ("🐗", "خنزير بري", "Wild boar", 50_000),
+            ("🐻", "دب", "Bear", 100_000),
+        )
+        emoji, animal_ar, animal_en, reward = (
+            ("🐉", "التنين النادر", "Rare dragon", 1_000_000)
+            if dragon else secrets.choice(animals)
+        )
         try:
             balance = self._game_award(username, reward)
         except Exception as exc:
@@ -12420,7 +12522,9 @@ class TalkinBot:
 
         with lock:
             self._fishing_pending_shots.discard(shot_key)
-            self._fishing_shots.add(shot_key)
+            self._fishing_shots = getattr(self, "_fishing_shots", set())
+            if event_id is not None:
+                self._fishing_shots.add(shot_key)
             current_event = getattr(self, "_fishing_event", None)
             if dragon and isinstance(current_event, dict) and current_event.get("id") == event_id:
                 self._fishing_dragon_pending = ""
@@ -12430,23 +12534,26 @@ class TalkinBot:
         except Exception as exc:
             self.log("[FISHING] game statistics save failed:", repr(exc))
 
+        if dragon:
+            try:
+                self._record_dragon_hunter(username, room)
+            except Exception as exc:
+                self.log("[FISHING] dragon hunter badge registration failed:", repr(exc))
+            self._queue_dragon_hunter_broadcast(username, room, reward)
+            self._send_game_winner_card("hunt_dragon", username, [room])
+            return True
+
         if language == "en":
             text = (
-                f"🏹 Hunting result for @{username}\n🐾 Animal: {animal}\n"
+                f"🏹 Hunting result for @{username}\n🐾 Animal: {emoji} {animal_en}\n"
                 f"💰 Reward: +{_fmt_points(reward)} points\n💳 Balance: {_fmt_points(balance)}"
             )
-            if dragon:
-                text += f"\n🐉 @{username} caught the dragon!\n📍 Room: {room}"
         else:
             text = (
-                f"🏹 نتيجة رحلة الصيد لـ @{username}\n🐾 الحيوان: {animal}\n"
+                f"🏹 نتيجة رحلة الصيد لـ @{username}\n🐾 الحيوان: {emoji} {animal_ar}\n"
                 f"💰 الجائزة: +{_fmt_points(reward)} نقطة\n💳 الرصيد: {_fmt_points(balance)}"
             )
-            if dragon:
-                text += f"\n🐉 @{username} اصطاد التنين!\n📍 الغرفة: {room}"
         self.send_room_text(room, text)
-        if dragon:
-            self._send_game_winner_card("hunt_dragon", username, [room])
         return True
 
     def _lottery_game(self, room, sender, amount=0):
@@ -12499,19 +12606,39 @@ class TalkinBot:
             snapshot = [dict(row) for row in self.stock_investments if isinstance(row, dict)]
         _save_local_json(STOCK_MARKET_FILE, {"version": 1, "investments": snapshot})
 
+    def _stock_market_announcement(self, language):
+        if language == "en":
+            return "📈 Stock market is open! Type stock, choose an asset and amount. Result in 1 minute: profit or loss."
+        return "📈 بدأت البورصة! أرسل بورصة، واختر الأصل والمبلغ. النتيجة بعد دقيقة: ربح أو خسارة."
+
+    def _broadcast_stock_market_round(self, rooms):
+        for target_room in rooms:
+            language = self._configured_room_language(target_room)
+            try:
+                self.send_room_text(target_room, self._stock_market_announcement(language))
+            except Exception as exc:
+                self.log("[STOCK] round announcement failed:", target_room, repr(exc))
+
+    def _queue_stock_market_round_broadcast(self, rooms):
+        worker = threading.Thread(
+            target=self._broadcast_stock_market_round,
+            args=(list(rooms),),
+            daemon=True,
+            name="stock-market-announcement",
+        )
+        worker.start()
+
     def _stock_market_message(self, language):
         if language == "en":
             return (
-                "📈 The stock market is open! (10-minute round)\n━━━━━━━━━━━━━━\n"
-                "Choose an asset:\n1️⃣ 🥇 Gold\n2️⃣ 🥈 Silver\n3️⃣ 🛢️ Oil\n4️⃣ 🏞️ Land\n\n"
-                "Invest directly, e.g. `gold 100000`, or send 1–4 and then the amount.\n"
-                "⏱️ Result in 5 minutes. Profit is guaranteed between 10% and 50%."
+                "📈 Stock market\n1️⃣ 🥇 Gold  2️⃣ 🥈 Silver  3️⃣ 🛢️ Oil  4️⃣ 🏞️ Land\n"
+                "Send a number then the amount, or type `gold 100000`.\n"
+                "⏱️ Result in 1 minute: 10–50% profit or loss."
             )
         return (
-            "📈 بدأت البورصة! (جولة كل 10 دقائق)\n━━━━━━━━━━━━━━\n"
-            "اختر نوع الاستثمار:\n1️⃣ 🥇 ذهب\n2️⃣ 🥈 فضة\n3️⃣ 🛢️ نفط\n4️⃣ 🏞️ أرض\n\n"
-            "استثمر مباشرةً مثل: ذهب 100000، أو أرسل رقم الخيار 1–4 ثم المبلغ.\n"
-            "⏱️ تظهر النتيجة بعد 5 دقائق. الربح مضمون من 10% إلى 50%."
+            "📈 البورصة\n1️⃣ 🥇 ذهب  2️⃣ 🥈 فضة  3️⃣ 🛢️ نفط  4️⃣ 🏞️ أرض\n"
+            "أرسل رقم الخيار ثم المبلغ، أو اكتب `ذهب 100000`.\n"
+            "⏱️ النتيجة بعد دقيقة: ربح أو خسارة من 10% إلى 50%."
         )
 
     def _stock_market_is_open(self, now=None):
@@ -12537,12 +12664,17 @@ class TalkinBot:
             self.stock_market_round = event
             self._stock_market_seen = set()
             self._stock_market_next_announcement = now + STOCK_MARKET_INTERVAL_SECONDS
-        rooms = {str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}
+        try:
+            rooms = set(self._active_rooms())
+        except Exception:
+            rooms = {str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}
         if first_room:
             rooms.add(str(first_room).strip())
-        for target_room in sorted(rooms, key=str.casefold):
-            language = self._configured_room_language(target_room)
-            self.send_room_text(target_room, self._stock_market_message(language))
+        ordered_rooms = sorted(rooms, key=str.casefold)
+        if first_room and first_room in ordered_rooms:
+            ordered_rooms.remove(first_room)
+            ordered_rooms.insert(0, first_room)
+        self._queue_stock_market_round_broadcast(ordered_rooms)
         return event
 
     def _stock_market_worker(self):
@@ -12550,7 +12682,7 @@ class TalkinBot:
             try:
                 now = time.time()
                 next_announcement = float(getattr(self, "_stock_market_next_announcement", 0) or 0)
-                if now >= next_announcement and getattr(self, "connected_rooms", set()):
+                if now >= next_announcement and self._active_rooms():
                     self._start_stock_market_round(now, force=True)
                 self._process_stock_market_investments(now)
             except Exception as exc:
@@ -12564,8 +12696,8 @@ class TalkinBot:
         except (TypeError, ValueError):
             asset, amount = 0, 0
         language = self._configured_room_language(room)
-        if asset not in STOCK_MARKET_ASSETS or amount <= 0:
-            self.send_room_text(room, "❌ أرسل مبلغاً صحيحاً أكبر من صفر." if language != "en" else "❌ Enter a valid amount greater than zero.")
+        if asset not in STOCK_MARKET_ASSETS or amount < 10:
+            self.send_room_text(room, "❌ الحد الأدنى للاستثمار 10 نقاط." if language != "en" else "❌ The minimum investment is 10 points.")
             return True
         now = time.time()
         with self._stock_market_lock:
@@ -12646,9 +12778,9 @@ class TalkinBot:
             self.log("[STOCK] active state save deferred; recovery will reconcile:", repr(exc))
         data = STOCK_MARKET_ASSETS[asset]
         if language == "en":
-            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ The result will be posted here in 5 minutes."
+            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss."
         else:
-            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ ستظهر النتيجة هنا بعد 5 دقائق."
+            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة."
         self.send_room_text(room, text)
         return True
 
@@ -12697,45 +12829,55 @@ class TalkinBot:
             if now < due_at:
                 continue
             if status != "paying":
-                profit_percent = secrets.randbelow(41) + 10
-                profit = max(1, (amount * profit_percent + 99) // 100)
+                outcome = "loss" if secrets.randbelow(2) else "profit"
+                change_percent = secrets.randbelow(41) + 10
+                change = max(1, amount * change_percent // 100)
                 with self._stock_market_lock:
                     for item in self.stock_investments:
                         if item.get("id") == investment_id:
-                            item.update(status="paying", profit_percent=profit_percent, profit=profit)
+                            item.update(
+                                status="paying", outcome=outcome,
+                                change_percent=change_percent, profit_percent=change_percent,
+                                change=change, profit=change,
+                            )
                             row = dict(item)
                             break
             else:
-                profit_percent = int(row.get("profit_percent", 10) or 10)
-                profit = int(row.get("profit", max(1, (amount * profit_percent + 99) // 100)) or 0)
+                outcome = str(row.get("outcome") or "profit")
+                change_percent = int(row.get("change_percent", row.get("profit_percent", 10)) or 10)
+                change = int(row.get("change", row.get("profit", max(1, (amount * change_percent + 99) // 100))) or 0)
             try:
                 self._save_stock_investments()
             except Exception as exc:
                 self.log("[STOCK] payout state save failed; retrying:", repr(exc))
                 continue
-            payout = amount + profit
+            payout = max(0, amount - change) if outcome == "loss" else amount + change
             credit = _apply_points_delta_once(
                 username, payout, f"stock-market-payout:{investment_id}",
-                f"stock market principal plus {profit_percent}% profit",
+                f"stock market {outcome} {change_percent}% settlement",
             )
             if not credit.get("ok"):
                 self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, credit.get("error"))
                 continue
-            _record_game(username, "stock_market", profit, amount)
+            net_change = payout - amount
+            _record_game(username, "stock_market", net_change, amount)
             room = str(row.get("room") or "")
             language = self._configured_room_language(room)
             data = STOCK_MARKET_ASSETS[asset]
+            result_label = "Loss" if outcome == "loss" else "Profit"
+            result_sign = "-" if outcome == "loss" else "+"
             if language == "en":
                 result_text = (
                     f"📈 Investment result: {data['icon']} {data['en']}\n"
-                    f"💰 Invested: {_fmt_points(amount)} points\n📊 Profit: {profit_percent}% (+{_fmt_points(profit)})\n"
-                    f"✅ Returned to your balance: +{_fmt_points(payout)} points\n💳 Balance: {_fmt_points(credit['balance'])}"
+                    f"💰 Invested: {_fmt_points(amount)} points\n📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
+                    f"💳 Balance: {_fmt_points(credit['balance'])}"
                 )
             else:
+                result_label = "الخسارة" if outcome == "loss" else "الربح"
                 result_text = (
                     f"📈 نتيجة استثمار البورصة: {data['icon']} {data['ar']}\n"
-                    f"💰 مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n📊 نسبة الربح: {profit_percent}% (+{_fmt_points(profit)})\n"
-                    f"✅ المبلغ المعاد إلى رصيدك: +{_fmt_points(payout)} نقطة\n💳 الرصيد: {_fmt_points(credit['balance'])}"
+                    f"💰 مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
+                    f"💳 الرصيد: {_fmt_points(credit['balance'])}"
                 )
             if room:
                 try:
@@ -12761,8 +12903,6 @@ class TalkinBot:
         key = (_norm_room(room), _norm_user(sender))
         now = time.time()
         if choice is None:
-            if not self._game_cooldown_notice(room, sender, 40.0, "بورصة"):
-                return True
             already_open = self._stock_market_is_open(now)
             event = self.stock_market_round if already_open else None
             if not already_open:
@@ -12771,8 +12911,7 @@ class TalkinBot:
                 "kind": "market_choice", "room": room, "user": sender,
                 "created": now, "event_id": event["id"],
             }
-            if already_open:
-                self.send_room_text(room, self._stock_market_message(self._configured_room_language(room)))
+            self.send_room_text(room, self._stock_market_message(self._configured_room_language(room)))
             return True
         try:
             choice = int(choice)
@@ -14766,7 +14905,7 @@ class TalkinBot:
                     "🎮 Games — wagers\n━━━━━━━━━━━━\nbet@amount — wager | duel@amount — duel\nmyluck@amount — luck wager\ninvestment@amount — investment game\nChoose the stake after the game command.",
                     "🎮 Games — bank and rewards\n━━━━━━━━━━━━\nbank million — million bank | billion — billion game\nfarm@item — plant a crop | stock — choose a market\nface@name — face game\nType ns for the next games list.",
                     "🎲 Room games — Ludo and Snake & Ladders\n━━━━━━━━━━━━\nludo — start Ludo; choose 1–4 players\n1 = play against the bot; 2–4 = multiplayer\nOther players type join. When the game starts, the player whose turn it is types rool to roll the die and move. First token to the finish wins.\nsnake — start Snake & Ladders; type join to enter.\nType ns for the next games list.",
-                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nshoot — hunting trip every 10 minutes; one shot per player, dragon reward: 1,000,000 points.\nlightning, ruby, crash, detector\nType ns for the next games list.",
+                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nShot — catch ordinary animals anytime; the first shot after the trip announcement catches the 1,000,000-point dragon.\nlightning, ruby, crash, detector\nType ns for the next games list.",
                     "🏏 Cricket\n━━━━━━━━━━━━\nMaster: start cricket game / stop cricket game.\nVerified players: .cr 1, choose 1–4 players, then each player types join. Choose 1 (bat) or 2 (defend), then send a score from 0 to 6 for each ball.\nType ns to return to the first game list.",
                 ],
                 4: [
@@ -15077,20 +15216,8 @@ class TalkinBot:
         self._master_reply_local.command_room = room
         try:
             handled = self._handle_management_command_impl(room, body, sender, is_private=is_private)
-            # Help/category commands are intentionally silent after displaying
-            # the requested menu; never add a redundant "تم تنفيذ الأمر" line.
-            help_command = bool(re.fullmatch(r"a[1-6]", str(body or '').strip(), re.I)
-                                or str(body or '').strip().casefold() in
-                                {"اوامر", "الاوامر", "help", "مساعدة", "ns", "n", "التالي", "القائمة التالية", "next"})
             if handled and not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, sender, is_private=is_private)
-            if handled and _is_master_name(sender) and not help_command:
-                # Never claim success merely because a handler returned True.
-                # A command-specific handler must provide the actual state/result.
-                if is_private and not self._master_reply_local.private_replied:
-                    self.send_private_text(sender, "ℹ️ تم استقبال الأمر، لكن لا توجد نتيجة حالة إضافية من هذا الأمر.")
-                elif not is_private and not self._master_reply_local.replied:
-                    self.send_room_text(room, "ℹ️ تم استقبال الأمر، لكن لا توجد نتيجة حالة إضافية من هذا الأمر.")
             return handled
         finally:
             self._master_reply_local.tracking = old_tracking
@@ -18216,7 +18343,11 @@ class TalkinBot:
             if len(self.known_rooms) != known_before:
                 _save_persistent_rooms(self.known_rooms)
         event_id = str(event.get(41, ""))
-        username = str(event.get(22, "") or "").strip()
+        username = str(
+            (event.get(17, "") or event.get(22, ""))
+            if event_type in ("user_joined", "user_left")
+            else event.get(22, "")
+        ).strip()
         monitored_username = username or frm or str(event.get(17, "") or "").strip()
         self._report_monitored_event(room, event_type, monitored_username, body)
         # Some server builds return L@a/L@m/L@o as a RoomEvent text `User List:`.
@@ -18337,14 +18468,21 @@ class TalkinBot:
                 self.master_online = True
                 self.master_last_seen = time.time()
             # Welcome the master using the exact configured BOT_MASTER account.
+            welcome = None
             if _norm_user(username) == _norm_user(BOT_MASTER):
-                self.send_room_text(room, f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}")
+                welcome = f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}"
             elif username and _norm_user(username) != _norm_user(BOT_ID):
                 welcomes_enabled = bool(getattr(self, "custom_welcome_enabled", True))
-                cw = self.custom_welcomes.get(_norm_user(username)) if welcomes_enabled else None
+                cw = getattr(self, "custom_welcomes", {}).get(_norm_user(username)) if welcomes_enabled else None
                 welcome = _join_welcome_message(username, room, welcomes_enabled, cw)
-                if welcome:
-                    self.send_room_text(room, welcome)
+            if username and _norm_user(username) != _norm_user(BOT_ID) and self._is_dragon_hunter(username):
+                if self._configured_room_language(room) == "en":
+                    hunter_welcome = f"🐉 Welcome back, Dragon Hunter @{username}!"
+                else:
+                    hunter_welcome = f"🐉 أهلاً بعودة صائد التنين @{username}!"
+                welcome = f"{welcome}\n{hunter_welcome}" if welcome else hunter_welcome
+            if welcome:
+                self.send_room_text(room, welcome)
         if event_type in ("you_joined", "you_rejoined"):
             if room:
                 entry_room = _norm_room(room)

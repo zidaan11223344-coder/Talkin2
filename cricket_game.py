@@ -149,15 +149,30 @@ class CricketGame:
         candidates = self._join_candidates(data, room)
         return candidates[0] if candidates else None
 
-    def _emit(self, data: dict[str, Any], rooms: list[dict[str, Any]], text: str, images: tuple[str, ...] = ()) -> None:
+    def _emit(
+        self,
+        data: dict[str, Any],
+        rooms: list[dict[str, Any]],
+        text: str,
+        images: tuple[str, ...] = (),
+        *,
+        broadcast: bool = False,
+    ) -> None:
         events = data.setdefault("events", [])
-        for participant in rooms:
+        broadcast_id = None
+        if broadcast and rooms:
             data["next_event_id"] = int(data.get("next_event_id", 0)) + 1
+            broadcast_id = data["next_event_id"]
+        for participant in rooms:
+            if not broadcast:
+                data["next_event_id"] = int(data.get("next_event_id", 0)) + 1
+            event_id = broadcast_id if broadcast else data["next_event_id"]
             events.append({
-                "id": data["next_event_id"],
+                "id": event_id,
                 "room": participant["name"],
                 "room_key": participant["key"],
                 "text": str(text),
+                "broadcast": bool(broadcast),
                 "images": [
                     name for name in images
                     if name in ASSET_FILES or str(name).startswith("cricket_result_")
@@ -727,12 +742,12 @@ class CricketGame:
             if str(player).strip()
         }
         start_text = (
-            "🏏 بدأت لعبة الكركيت\n"
+            "🏏 بدأت مباراة الكريكيت\n"
             + self._team_summary(match, "attack") + "\n"
             + self._team_summary(match, "defense") + "\n"
             + f"🎯 يبدأ الهجوم: {self._team_label(match['batting_team'])}. لكل لاعب 6 كرات في كل دور."
         )
-        self._emit(data, participants, start_text)
+        self._emit(data, participants, start_text, broadcast=True)
         self._emit_room_messages(data, self._turn_messages(match))
 
     def _team_player_count(self, match: dict[str, Any], team: str) -> int:
