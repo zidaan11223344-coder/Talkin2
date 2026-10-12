@@ -141,10 +141,10 @@ class CricketIntegration:
                 event_id = int(event.get("id", cursor) or cursor)
                 if event.get("broadcast"):
                     if text and event_id > self._broadcast_cursor:
-                        if self.send_all_rooms_text:
-                            self.send_all_rooms_text(text)
-                        else:
-                            self.send_room_text(room, text)
+                        # Cricket events are room-scoped. A legacy `broadcast`
+                        # marker must not turn a match-start notice into a bot-
+                        # wide message to unrelated rooms.
+                        self.send_room_text(room, text)
                         self._broadcast_cursor = event_id
                 elif text and event_id not in skip_text_event_ids:
                     self.send_room_text(room, text)

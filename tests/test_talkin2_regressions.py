@@ -950,6 +950,10 @@ class CricketIntegrationRegressions(unittest.TestCase):
                 if ball_index == 0:
                     self.assertTrue(room_messages)
                     self.assertTrue(all(room in {"North", "South"} for room, _ in room_messages))
+                    self.assertTrue(any(
+                        "أرسل رقم 1" in text and "أرسل رقم 2" in text
+                        for _, text in room_messages
+                    ))
             match = integration.game.current()
             self.assertEqual((match["innings"], match["balls"]), (1, 6))
 
@@ -2616,6 +2620,117 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertIn("@Newest", replies[0][1])
         self.assertIn("قائمة 2/3", replies[1][1])
         self.assertIn("@Older", replies[1][1])
+
+
+class FollowupFeatureRegressions(unittest.TestCase):
+    def test_crop_menu_and_plant_confirmation_follow_room_language(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.game_lock = threading.Lock()
+        bot.crop_plots = {}
+        bot._effective_room_language = lambda _room: "en"
+        bot._game_cooldown_notice = lambda *_args: True
+        bot._save_crop_plots = lambda: None
+        bot.send_room_text = lambda room, text: self.messages.append((room, text))
+        self.messages = []
+        self.assertTrue(bot._crop_command("Farm", "Tester", "زرع"))
+        self.assertIn("Crop menu", self.messages[-1][1])
+        self.assertIn("farm@🍎", self.messages[-1][1])
+        self.assertTrue(bot._crop_command("Farm", "Tester", "زرع@🍎"))
+        self.assertIn("Planted 🍎 successfully", self.messages[-1][1])
+        self.assertIn("not in a private message", self.messages[-1][1])
+
+    def test_harvest_reward_and_result_are_delivered_to_the_original_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.game_lock = threading.Lock()
+        bot.crop_plots = {
+            "decorated-account|🍎|1": {
+                "username": "𓆩DecoratedName𓆪", "crop": "🍎", "minutes": 5,
+                "reward": 1000, "finish": 0, "room": "Farm Room",
+            }
+        }
+        bot._crop_retry_after = {}
+        bot._game_award = lambda _name, reward: 7000 + reward
+        bot._save_crop_plots = lambda: None
+        bot._configured_room_language = lambda _room: "en"
+        bot.send_room_text = lambda room, text: self.sent.append((room, text))
+        bot.log = lambda *_args: None
+        self.sent = []
+        with patch.object(bot_module, "_record_game", lambda *_args: None):
+            self.assertEqual(bot._process_due_crop_plots(now=1), 1)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][0], "Farm Room")
+        self.assertIn("Your harvest is ready", self.sent[0][1])
+        self.assertIn("@𓆩DecoratedName𓆪", self.sent[0][1])
+        self.assertFalse(bot.crop_plots)
+
+    def test_english_shoot_awards_rare_dragon_once_and_sends_winner_card(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.stock_pending = {}
+        bot._snake_command = lambda *_args: False
+        bot._ludo_command = lambda *_args: False
+        bot._handle_pending_bot_choice = lambda *_args: False
+        bot._fishing_lock = threading.RLock()
+        bot._fishing_event = {"id": 1, "started_at": 100.0, "ends_at": 700.0}
+        bot._fishing_shots = set()
+        bot._fishing_pending_shots = set()
+        bot._fishing_dragon_pending = ""
+        bot._fishing_dragon_caught = False
+        bot._effective_room_language = lambda _room: "en"
+        bot._game_award = lambda _name, reward: reward
+        bot.send_room_text = lambda room, text: self.messages.append((room, text))
+        bot._send_game_winner_card = lambda *args: self.cards.append(args)
+        bot.log = lambda *_args: None
+        self.messages, self.cards = [], []
+        self.assertEqual(bot_module._normalize_game_command_text("shoot"), "شوت")
+        with patch.object(bot_module.time, "time", return_value=200.0), patch.object(
+            bot_module.secrets, "randbelow", return_value=0
+        ), patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_games_enabled_for_room", return_value=True
+        ), patch.object(bot_module, "_record_game", lambda *_args: None):
+            self.assertTrue(bot.handle_game_command("Garden", "shoot", "Hunter"))
+            self.assertTrue(bot.handle_game_command("Garden", "shoot", "Hunter"))
+        self.assertEqual(len(self.cards), 1)
+        self.assertEqual(self.cards[0], ("hunt_dragon", "Hunter", ["Garden"]))
+        self.assertTrue(any("caught the dragon" in text and "Garden" in text for _, text in self.messages))
+        self.assertEqual(sum("Reward: +1m" in text for _, text in self.messages), 1)
+
+    def test_dragon_winner_card_with_avatar_stays_below_50kb(self):
+        if not bot_module.PIL_AVAILABLE:
+            self.skipTest("Pillow is unavailable")
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            avatar = Image.new("RGBA", (116, 116), (70, 130, 190, 255))
+            with patch.object(bot_module, "BASE_DIR", Path(temp)), patch.object(
+                bot_module, "_load_sender_avatar", return_value=avatar
+            ):
+                card = bot_module.render_game_winner_card(
+                    "hunt_dragon", "Hunter", "https://example.invalid/avatar.jpg", language="en"
+                )
+            self.assertTrue(card.is_file())
+            self.assertLessEqual(card.stat().st_size, 50 * 1024)
+
+    def test_myrooms_paginates_thirty_rooms_and_ns_shows_final_page(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = {f"Room {i:02d}" for i in range(1, 32)}
+        bot._result_pages = {}
+        bot._transfer_log_pages = {}
+        bot._transfer_log_languages = {}
+        bot._room_list_commands = lambda *_args: False
+        bot._effective_room_language = lambda _room: "ar"
+        bot._send_text_packets = lambda packet, text, **kwargs: self.sent.append((packet, text, kwargs))
+        bot.send_private_text = lambda *_args: None
+        self.sent = []
+        with patch.object(bot_module, "_is_master_name", return_value=True):
+            self.assertTrue(bot._handle_management_command_impl("", "myrooms", "Master", is_private=True))
+            self.assertTrue(bot._handle_management_command_impl("", "ns", "Master", is_private=True))
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("Currently connected rooms (31)", self.sent[0][1])
+        self.assertIn("Type ns for the next list", self.sent[0][1])
+        self.assertEqual(sum(line[:1].isdigit() for line in self.sent[0][1].splitlines()), 30)
+        self.assertIn("List 2/2", self.sent[1][1])
+        self.assertIn("Room 31", self.sent[1][1])
+        self.assertIn("End of list", self.sent[1][1])
+        self.assertFalse(bot._result_pages)
 
 
 if __name__ == "__main__":

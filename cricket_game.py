@@ -983,8 +983,13 @@ class CricketGame:
         current_wickets = int(wickets.get(batting, 0))
         total = int(scores.get(batting, 0))
 
-        # One compact result message, with the batter's number image delivered first.
-        result_text = f"{outcome}\n📊 {total} نقطة • الكرة {ball_no}/{balls_limit} لهذا الشوط"
+        # Show both submitted values so the attacker can see the defender's
+        # attempted block. The batter's number image is still delivered first.
+        result_text = (
+            f"🏏 المهاجم @{out_name} أرسل رقم {bat_value}\n"
+            f"🛡️ المدافع @{bowler_name} أرسل رقم {bowl_value} لمحاولة الصد\n"
+            f"{outcome}\n📊 {total} نقطة • الكرة {ball_no}/{balls_limit} لهذا الشوط"
+        )
         attack_room = self._room_for_team(match, batting)
         defense_room = self._room_for_team(match, bowling)
         result_rooms = [item for item in (attack_room, defense_room) if item]

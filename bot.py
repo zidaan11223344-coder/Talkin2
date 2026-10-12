@@ -255,6 +255,7 @@ GAME_IMAGE_FILES = {
     "investment": "game_investment.jpg",
     "battle": "game_battle.jpg",
     "hunt_fishing": "game_hunt_fishing.jpg",
+    "hunt_dragon": "game_hunt_dragon.jpg",
     "search": "game_search.jpg",
     "speed": "game_speed.jpg",
     "treasure": "game_treasure.jpg",
@@ -285,6 +286,7 @@ GAME_COMMANDS = {
     "billion": "مليار", "farm": "زرع", "crop": "زرع", "plant": "زرع", "face": "فيس", "fruit match": "فيس",
     "snake": "ثعبان", "snakes and ladders": "ثعبان", "ludo": "لودو",
     "fishing": "سنارة", "fishing rod": "سنارة", "fish": "سنارة", "snare": "سنارة", "sannara": "سنارة",
+    "shoot": "شوت",
     "lightning": "برق", "ruby": "ياقوت", "crash": "صدام", "detector": "كاشف", "guess who": "كاشف",
     "steal": "اسرق", "rob": "اسرق", "lookalike": "شبيه", "twin": "شبيه",
 }
@@ -4178,8 +4180,8 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
-            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — stock/market\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n📌 اكتب ns لقائمة الكركيت.',
-            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند اكتمال الفريق الأول يعلن البوت اسم الغرفة وعدد اللاعبين والأسماء لكل الغرف، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
+            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — stock/market\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n39. شوت — تبدأ رحلة صيد كل 10 دقائق؛ محاولة لكل لاعب، وجائزة التنين مليون نقطة.\n📌 اكتب ns لقائمة الكركيت.',
+            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند اكتمال الفريق الأول يعلن البوت تفاصيل المباراة في غرفتي الفريقين فقط، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -5003,7 +5005,7 @@ def render_billion_card(winner_name, winner_photo_url=""):
     return out
 
 
-def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
+def render_game_winner_card(game_key, winner_name, winner_photo_url="", language="ar"):
     """Elegant winner card in the same style as the gift cards.
 
     - The original game artwork fills the card.
@@ -5021,7 +5023,8 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
 
     image = Image.open(source).convert("RGBA")
     # Enlarge for a crisp final card, preserving aspect ratio.
-    target_w = 1100
+    hunt_card = str(game_key) == "hunt_dragon"
+    target_w = 800 if hunt_card else 1100
     target_h = max(1, round(target_w * image.height / image.width))
     image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
@@ -5033,12 +5036,14 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
     # Title ribbon at the top, same style as the gift header.
     header = (int(w * .22), int(h * .05), int(w * .78), int(h * .16))
     d.rounded_rectangle(header, radius=30, fill=panel, outline=gold, width=4)
-    game_names = {"billion": "المليار", "hangman": "المعلقة", "roulette": "الروليت", "race": "السباق"}
+    game_names = {"billion": "المليار", "hangman": "المعلقة", "roulette": "الروليت", "race": "السباق", "hunt_dragon": "صيد التنين"}
+    if str(language).casefold() == "en" and str(game_key) == "hunt_dragon":
+        game_names[str(game_key)] = "Dragon Hunt"
     game_label = game_names.get(str(game_key), "اللعبة")
     _draw_centered(
         d,
         ((header[0] + header[2]) / 2, header[1] + (header[3] - header[1]) / 2),
-        "🏆 فائز لعبة " + game_label,
+        ("🏆 Dragon Hunt Winner" if str(language).casefold() == "en" and str(game_key) == "hunt_dragon" else "🏆 فائز لعبة " + game_label),
         34,
         (255, 222, 155, 255),
         header[2] - header[0] - 40,
@@ -5072,7 +5077,7 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
     _draw_centered(
         d,
         (text_center_x, box_y + int(box_h * .27)),
-        "الفائز",
+        ("Winner" if str(language).casefold() == "en" and str(game_key) == "hunt_dragon" else "الفائز"),
         24,
         (255, 224, 165, 255),
         text_max_w,
@@ -5101,10 +5106,29 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url=""):
     except Exception:
         pass
     out = out_dir / f"winner_{uuid.uuid4().hex}.jpg"
-    for quality in (94, 92, 90, 88, 86, 84, 82):
-        image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
-        if out.stat().st_size <= 300 * 1024:
-            break
+    if hunt_card:
+        max_bytes = 50 * 1024
+        for quality in (86, 80, 74, 68, 62, 56, 50, 44):
+            image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+            if out.stat().st_size <= max_bytes:
+                break
+        if out.stat().st_size > max_bytes:
+            for width in (720, 640, 560, 480, 400, 320):
+                resized = image.resize((width, max(1, round(width * image.height / image.width))), Image.Resampling.LANCZOS)
+                for quality in (70, 62, 54, 46, 38):
+                    resized.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+                    if out.stat().st_size <= max_bytes:
+                        break
+                if out.stat().st_size <= max_bytes:
+                    break
+        if out.stat().st_size > max_bytes:
+            out.unlink(missing_ok=True)
+            raise RuntimeError("Dragon Hunt winner card could not be compressed below 50KB")
+    else:
+        for quality in (94, 92, 90, 88, 86, 84, 82):
+            image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+            if out.stat().st_size <= 300 * 1024:
+                break
     return out
 
 def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
@@ -5881,6 +5905,14 @@ class TalkinBot:
         self.steal_protection = {}
         raw_crops=_load_local_json(CROP_PLOTS_FILE,{})
         self.crop_plots = raw_crops if isinstance(raw_crops,dict) else {}
+        self._crop_retry_after = {}
+        self._fishing_lock = threading.RLock()
+        self._fishing_event = None
+        self._fishing_event_seq = 0
+        self._fishing_pending_shots = set()
+        self._fishing_shots = set()
+        self._fishing_dragon_pending = ""
+        self._fishing_dragon_caught = False
         self.fruit_games = {}
         # Auto replies and per-user custom welcome messages.
         self.auto_replies_enabled = True
@@ -5890,6 +5922,8 @@ class TalkinBot:
         self._load_social_features()
         self._load_departure_replies()
         threading.Thread(target=self._crop_worker, name="crop-worker", daemon=True).start()
+        if not MASTER_SERVICE_ENABLED:
+            threading.Thread(target=self._fishing_event_worker, name="fishing-event-worker", daemon=True).start()
         self.invite_message_template = _message_template("invite", "default", "يوجد معجب مخفي في {room}")
 
     def _load_social_features(self):
@@ -7436,6 +7470,9 @@ class TalkinBot:
                 "الانتظار:": "Wait:", "دقيقة واحدة": "one minute", "دقائق": "minutes", "دقيقة": "minute",
                 "ثانية": "seconds", "ثواني": "seconds", "قبل بدء لعبة": "before starting the game",
                 "المستثمر:": "Investor:", "الربح:": "Profit:", "الخسارة:": "Loss:", "استثمار مع البوت": "Bot investment",
+                "🏏 المهاجم @": "🏏 Attacker @", "🛡️ المدافع @": "🛡️ Defender @", " أرسل رقم ": " sent: ", " لمحاولة الصد": " (block attempt)",
+                "💡 عند اكتمال الزراعة تظهر المكافأة تلقائياً في الغرفة التي زرعت فيها.": "💡 When ready, the reward is posted in the room where you planted.",
+                "📢 عند اكتمالها ستظهر النتيجة في هذه الغرفة، ولن تصلك رسالة خاصة.": "📢 When it finishes, the result appears in this room—not in a private message.",
                 "حياة سعيدة مليئة بالفرح.": "a happy life full of joy.", "نتمنى لكما": "Wishing you both",
                 "لم أجد عضواً آخر متاحاً للزواج حالياً.": "I couldn't find another available player for a wedding right now.",
                 "لم أجد عضواً آخر حاضراً في هذه الغرفة.": "I couldn't find another player in this room.",
@@ -7469,6 +7506,10 @@ class TalkinBot:
         override = self._active_room_language_override(room)
         if override in ("ar", "en"):
             return override
+        return getattr(self, "room_languages", {}).get(_norm_room(room), "ar")
+
+    def _configured_room_language(self, room):
+        """Return the saved room language, ignoring command-scoped overrides."""
         return getattr(self, "room_languages", {}).get(_norm_room(room), "ar")
 
     def _push_room_language_override(self, room, language):
@@ -11618,7 +11659,8 @@ class TalkinBot:
                 winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
                 if not winner_photo:
                     winner_photo = self._lookup_profile_photo(winner_name)
-                card = render_game_winner_card(game_key, winner_name, winner_photo)
+                language = self._effective_room_language(target_rooms[0]) if game_key == "hunt_dragon" and target_rooms else "ar"
+                card = render_game_winner_card(game_key, winner_name, winner_photo, language=language)
                 url = f"{base}/games/{card.name}"
             self._verify_public_media_url(url, "image")
             rooms = []
@@ -11964,45 +12006,92 @@ class TalkinBot:
 
     def _save_crop_plots(self):
         try:
-            _save_local_json(CROP_PLOTS_FILE, self.crop_plots)
+            with self.game_lock:
+                snapshot = {
+                    key: {name: value for name, value in plot.items() if name != "_claiming"}
+                    if isinstance(plot, dict) else plot
+                    for key, plot in self.crop_plots.items()
+                }
+            _save_local_json(CROP_PLOTS_FILE, snapshot)
+            return True
         except Exception as exc:
             self.log("[CROP] save failed:", repr(exc))
+            return False
+
+    def _process_due_crop_plots(self, now=None):
+        now = time.time() if now is None else float(now)
+        ready = []
+        with self.game_lock:
+            for key, plot in list(getattr(self, "crop_plots", {}).items()):
+                try:
+                    parts = str(key).split("|", 2)
+                    username = str(plot.get("username") or parts[0]).strip().lstrip("@")
+                    crop = str(plot.get("crop") or (parts[1] if len(parts) > 1 else "🌱"))
+                    finish = float(plot.get("finish", 0))
+                    minutes = int(plot.get("minutes", 0))
+                    reward = int(plot.get("reward", minutes * 20))
+                except Exception:
+                    continue
+                retry_after = float(getattr(self, "_crop_retry_after", {}).get(key, 0) or 0)
+                if now < finish or now < retry_after or plot.get("_claiming"):
+                    continue
+                if not username or reward <= 0:
+                    continue
+                plot["_claiming"] = True
+                ready.append((key, username, crop, minutes, reward, str(plot.get("room") or "")))
+
+        for key, username, crop, minutes, reward, planted_room in ready:
+            try:
+                # Use the original saved account name, not the normalized plot
+                # key; decorated Talkin names can differ from their storage key.
+                balance = self._game_award(username, reward)
+            except Exception as exc:
+                self.log("[CROP] reward persistence failed; plot retained for retry:", username, repr(exc))
+                with self.game_lock:
+                    plot = getattr(self, "crop_plots", {}).get(key)
+                    if isinstance(plot, dict):
+                        plot.pop("_claiming", None)
+                    getattr(self, "_crop_retry_after", {})[key] = now + 15.0
+                continue
+
+            try:
+                _record_game(username, "farm", reward, 0)
+            except Exception as exc:
+                self.log("[CROP] game statistics save failed:", repr(exc))
+
+            with self.game_lock:
+                self.crop_plots.pop(key, None)
+                getattr(self, "_crop_retry_after", {}).pop(key, None)
+            self._save_crop_plots()
+
+            room = planted_room or str(getattr(self, "room", "") or "")
+            if self._configured_room_language(room) == "en":
+                result_text = (
+                    f"🌾✨ Your harvest is ready!\n━━━━━━━━━━━━\n"
+                    f"👤 Player: @{username}\n🌱 Crop: {crop}\n⏱️ Growing time: {minutes} minutes\n"
+                    f"💰 Reward: +{_fmt_points(reward)} points\n💸 Loss: 0 points\n"
+                    f"💳 Balance now: {_fmt_points(balance)}\n🌟 Plant again whenever you like!"
+                )
+            else:
+                result_text = (
+                    f"🌾✨ حصادك جاهز!\n━━━━━━━━━━━━\n"
+                    f"👤 اللاعب: @{username}\n🌱 المحصول: {crop}\n⏱️ مدة الزراعة: {minutes} دقيقة\n"
+                    f"💰 المكافأة: +{_fmt_points(reward)} نقطة\n💸 الخسارة: 0 نقطة\n"
+                    f"💳 رصيدك الآن: {_fmt_points(balance)}\n🌟 ازرع من جديد متى شئت!"
+                )
+            if room:
+                if self.send_room_text(room, result_text) is False:
+                    self.log("[CROP] harvest credited; room result could not be delivered:", room, username)
+            else:
+                self.log("[CROP] harvest credited but no room is available for the result:", username)
+        return len(ready)
 
     def _crop_worker(self):
         while not self.stop_event.is_set():
-            now=time.time()
-            ready=[]
-            with self.game_lock:
-                for key, plot in list(self.crop_plots.items()):
-                    try:
-                        parts = key.split("|", 2)
-                        username, crop = parts[0], parts[1]
-                        finish=float(plot.get("finish", 0))
-                        minutes=int(plot.get("minutes", 0))
-                        reward=int(plot.get("reward", minutes*20))
-                    except Exception:
-                        continue
-                    if now >= finish:
-                        ready.append((key, username, crop, minutes, reward))
-                for key, *_ in ready:
-                    self.crop_plots.pop(key, None)
-            if ready:
-                self._save_crop_plots()
-                for key, username, crop, minutes, reward in ready:
-                    balance=self._game_award(username, reward)
-                    _record_game(username, "farm", reward, 0)
-                    result_text = (
-                        f"🌾✨ حصادك جاهز!\n━━━━━━━━━━━━\n"
-                        f"👤 اللاعب: @{username}\n"
-                        f"🌱 المحصول: {crop}\n"
-                        f"⏱️ مدة الزراعة: {minutes} دقيقة\n"
-                        f"💰 مبلغ الفوز: +{_fmt_points(reward)} نقطة\n"
-                        f"💸 مبلغ الخسارة: 0 نقطة\n"
-                        f"💳 رصيدك الآن: {_fmt_points(balance)}\n"
-                        f"🌟 زرع جديد عندما تريد!"
-                    )
-                    # Crop results are private-only; do not announce harvests in rooms.
-                    self.send_private_text(username, result_text)
+            try:
+                self._process_due_crop_plots()
+            except Exception as exc:
+                self.log("[CROP] worker iteration failed; worker will continue:", repr(exc))
             self.stop_event.wait(2.0)
 
     def _crop_command(self, room, sender, raw):
@@ -12011,7 +12100,14 @@ class TalkinBot:
             "🍇":(25,5000), "🍉":(30,6000), "🍓":(35,7000), "🥕":(40,8000),
             "🌽":(45,9000), "🥭":(50,10000)
         }
+        english = self._effective_room_language(room) == "en"
         if raw.casefold()=="زرع":
+            if english:
+                lines = ["🌱 Crop menu", "━━━━━━━━━━━━"]
+                lines.extend(f"{item}: {minutes} minutes → {reward:,} points" for item, (minutes, reward) in crops.items())
+                lines.extend(("📌 Plant: farm@🍎 or farm 🍎", "💡 When ready, the reward is posted in the room where you planted."))
+                self.send_room_text(room, "\n".join(lines))
+                return True
             self.send_room_text(
                     room,
                 "╔════════════════════╗\n"
@@ -12029,16 +12125,24 @@ class TalkinBot:
                 "║ 🥭 50 دقيقة  → 10k  ║\n"
                 "╚════════════════════╝\n"
                 "📌 للزراعة: زرع@🍎 أو زرع 🍎\n"
-                "💡 عند اكتمال الزراعة تصلك المكافأة تلقائياً في الخاص."
+                "💡 عند اكتمال الزراعة تظهر المكافأة تلقائياً في الغرفة التي زرعت فيها."
             )
             return True
         m=re.fullmatch(r"زرع[@ ](.+)", raw, re.I)
         if not m: return False
         crop=m.group(1).strip()
         if crop not in crops:
-            self.send_room_text(room, "❌ اختر محصولاً من قائمة زرع.")
+            self.send_room_text(room, "❌ Choose a crop from the farm list." if english else "❌ اختر محصولاً من قائمة زرع.")
             return True
         user_key=_norm_user(sender)
+        duplicate_crop_text = (
+            "🌱 Choose a different crop; the same crop cannot be planted twice at once."
+            if english else "🌱 ازرع محصولاً آخر؛ لا يمكن زراعة نفس النوع مرتين في الوقت نفسه."
+        )
+        limit_text = (
+            "⏳ You already have 5 crops growing. Harvest one before planting another."
+            if english else "⏳ لديك 5 محاصيل قيد الزراعة حالياً. احصد أحدها أولاً ثم ازرع محصولاً جديداً."
+        )
         with self.game_lock:
             # يسمح لكل مستخدم بحد أقصى 5 محاصيل نشطة في الوقت نفسه،
             # وكل نوع محصول مرة واحدة فقط؛ تكرار نفس النوع يكون صامتاً.
@@ -12050,17 +12154,11 @@ class TalkinBot:
                     active_crops.add(str(plot.get("crop") or ""))
 
             if crop in active_crops:
-                self.send_room_text(
-                    room,
-                    f"🌱 ازرع محصولاً آخر.\n"
-                    f"📖 الطريقة: اكتب زرع ثم @ ثم رمز المحصول.\n"
-                    f"مثال: زرع@🍐\n"
-                    f"💡 لا يمكن زراعة نفس النوع مرتين في نفس الوقت."
-                )
+                self.send_room_text(room, duplicate_crop_text)
                 return True
 
             if len(active_user) >= 5:
-                self.send_room_text(room, "⏳ لديك 5 محاصيل قيد الزراعة حالياً. احصد أحدها أولاً ثم ازرع محصولاً جديداً.")
+                self.send_room_text(room, limit_text)
                 return True
 
         if not self._game_cooldown_notice(room, sender, 40.0, "زرع"):
@@ -12075,16 +12173,10 @@ class TalkinBot:
                     active_user.append((key, plot))
                     active_crops.add(str(plot.get("crop") or ""))
             if crop in active_crops:
-                self.send_room_text(
-                    room,
-                    f"🌱 ازرع محصولاً آخر.\n"
-                    f"📖 الطريقة: زرع@رمز_المحصول\n"
-                    f"مثال: زرع@🍐\n"
-                    f"💡 لا يمكن زراعة نفس النوع مرتين في نفس الوقت."
-                )
+                self.send_room_text(room, duplicate_crop_text)
                 return True
             if len(active_user) >= 5:
-                self.send_room_text(room, "⏳ لديك 5 محاصيل قيد الزراعة حالياً. احصد أحدها أولاً ثم ازرع محصولاً جديداً.")
+                self.send_room_text(room, limit_text)
                 return True
 
             minutes,reward=crops[crop]
@@ -12096,13 +12188,140 @@ class TalkinBot:
                 "finish":time.time()+minutes*60, "room":str(room or "")
             }
         self._save_crop_plots()
-        self.send_room_text(
-                    room,
-            f"🌱 تم زرع {crop} بنجاح!\n"
-            f"⏱️ الانتظار: {minutes} دقيقة\n"
-            f"🎁 المكافأة: {reward} نقطة\n"
-            f"📩 عند اكتمال الزراعة ستصلك النتيجة تلقائياً في الخاص."
-        )
+        if english:
+            message = (
+                f"🌱 Planted {crop} successfully!\n⏱️ Growing time: {minutes} minutes\n"
+                f"🎁 Reward: {reward:,} points\n📢 The result will appear in this room, not in a private message."
+            )
+        else:
+            message = (
+                f"🌱 تم زرع {crop} بنجاح!\n⏱️ الانتظار: {minutes} دقيقة\n"
+                f"🎁 المكافأة: {reward} نقطة\n📢 عند اكتمالها ستظهر النتيجة في هذه الغرفة، ولن تصلك رسالة خاصة."
+            )
+        self.send_room_text(room, message)
+        return True
+
+    def _fishing_event_worker(self):
+        interval = 600.0
+        while not self.stop_event.wait(interval):
+            try:
+                self._start_fishing_event()
+            except Exception as exc:
+                self.log("[FISHING] event start failed; scheduler will continue:", repr(exc))
+
+    def _start_fishing_event(self, now=None):
+        now = time.time() if now is None else float(now)
+        lock = getattr(self, "_fishing_lock", None)
+        if lock is None:
+            self._fishing_lock = lock = threading.RLock()
+        with lock:
+            self._fishing_event_seq = int(getattr(self, "_fishing_event_seq", 0)) + 1
+            event = {"id": self._fishing_event_seq, "started_at": now, "ends_at": now + 600.0}
+            self._fishing_event = event
+            self._fishing_shots = set()
+            self._fishing_pending_shots = set()
+            self._fishing_dragon_pending = ""
+            self._fishing_dragon_caught = False
+        rooms = sorted({str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}, key=str.casefold)
+        for room in rooms:
+            if self._configured_room_language(room) == "en":
+                announcement = (
+                    "🏹 The 10-minute hunting trip has started! Type shoot (or شوت) to hunt an animal and win points.\n"
+                    "Each player gets one shot this trip. The rare dragon can be caught only during this trip and awards 1,000,000 points."
+                )
+            else:
+                announcement = (
+                    "🏹 بدأت رحلة الصيد لعشر دقائق! أرسل شوت لاصطياد حيوان وربح نقاط.\n"
+                    "لكل لاعب محاولة واحدة في هذه الرحلة. قد يظهر التنين النادر أثناءها وجائزته 1,000,000 نقطة."
+                )
+            self.send_room_text(room, announcement)
+        self.log("[FISHING] event opened", self._fishing_event_seq, "rooms=", len(rooms))
+        return event
+
+    def _fishing_shoot(self, room, sender):
+        username = str(sender or "").strip().lstrip("@")
+        user_key = _norm_user(username)
+        now = time.time()
+        lock = getattr(self, "_fishing_lock", None)
+        if lock is None:
+            self._fishing_lock = lock = threading.RLock()
+        with lock:
+            event = getattr(self, "_fishing_event", None)
+            if not isinstance(event, dict) or now < float(event.get("started_at", 0)) or now >= float(event.get("ends_at", 0)):
+                event_id = None
+            else:
+                event_id = int(event.get("id", 0))
+            shot_key = (event_id, user_key)
+            pending = getattr(self, "_fishing_pending_shots", set())
+            shots = getattr(self, "_fishing_shots", set())
+            if event_id is not None and (shot_key in shots or shot_key in pending):
+                already_shot = True
+                dragon = False
+            elif event_id is None:
+                already_shot = False
+                dragon = False
+            else:
+                already_shot = False
+                pending.add(shot_key)
+                self._fishing_pending_shots = pending
+                dragon_pending = str(getattr(self, "_fishing_dragon_pending", "") or "")
+                dragon = not bool(getattr(self, "_fishing_dragon_caught", False)) and not dragon_pending and secrets.randbelow(100) == 0
+                if dragon:
+                    self._fishing_dragon_pending = user_key
+
+        language = self._effective_room_language(room)
+        if event_id is None:
+            text = "⏳ لا توجد رحلة صيد مفتوحة الآن. انتظر إعلان الرحلة التالية كل 10 دقائق." if language == "ar" else "⏳ No hunting trip is open now. Wait for the next announcement, every 10 minutes."
+            self.send_room_text(room, text)
+            return True
+        if already_shot:
+            text = "🎯 لديك محاولة واحدة فقط في رحلة الصيد الحالية. انتظر الرحلة التالية." if language == "ar" else "🎯 You have one shot per hunting trip. Wait for the next trip."
+            self.send_room_text(room, text)
+            return True
+
+        animals = (("🐇 أرنب بري", 5_000), ("🦊 ثعلب", 10_000), ("🦌 غزال", 20_000), ("🐗 خنزير بري", 50_000), ("🐻 دب", 100_000))
+        animal, reward = ("🐉 التنين النادر", 1_000_000) if dragon else secrets.choice(animals)
+        try:
+            balance = self._game_award(username, reward)
+        except Exception as exc:
+            self.log("[FISHING] reward persistence failed:", username, repr(exc))
+            with lock:
+                self._fishing_pending_shots.discard(shot_key)
+                if dragon and getattr(self, "_fishing_dragon_pending", "") == user_key:
+                    self._fishing_dragon_pending = ""
+            text = "❌ تعذر حفظ المكافأة الآن؛ لم تُحتسب المحاولة، أعد شوت بعد قليل." if language == "ar" else "❌ The reward could not be saved; your shot was not counted. Please retry shortly."
+            self.send_room_text(room, text)
+            return True
+
+        with lock:
+            self._fishing_pending_shots.discard(shot_key)
+            self._fishing_shots.add(shot_key)
+            current_event = getattr(self, "_fishing_event", None)
+            if dragon and isinstance(current_event, dict) and current_event.get("id") == event_id:
+                self._fishing_dragon_pending = ""
+                self._fishing_dragon_caught = True
+        try:
+            _record_game(username, "fishing_hunt", reward, 0)
+        except Exception as exc:
+            self.log("[FISHING] game statistics save failed:", repr(exc))
+
+        if language == "en":
+            text = (
+                f"🏹 Hunting result for @{username}\n🐾 Animal: {animal}\n"
+                f"💰 Reward: +{_fmt_points(reward)} points\n💳 Balance: {_fmt_points(balance)}"
+            )
+            if dragon:
+                text += f"\n🐉 @{username} caught the dragon!\n📍 Room: {room}"
+        else:
+            text = (
+                f"🏹 نتيجة رحلة الصيد لـ @{username}\n🐾 الحيوان: {animal}\n"
+                f"💰 الجائزة: +{_fmt_points(reward)} نقطة\n💳 الرصيد: {_fmt_points(balance)}"
+            )
+            if dragon:
+                text += f"\n🐉 @{username} اصطاد التنين!\n📍 الغرفة: {room}"
+        self.send_room_text(room, text)
+        if dragon:
+            self._send_game_winner_card("hunt_dragon", username, [room])
         return True
 
     def _lottery_game(self, room, sender, amount=0):
@@ -13939,6 +14158,8 @@ class TalkinBot:
             return self._horse_game(room, sender_name)
         if low.replace("ة", "ه").startswith("زرع"):
             return self._crop_command(room, sender_name, raw)
+        if game_low == "شوت":
+            return self._fishing_shoot(room, sender_name)
         if low.replace("ة", "ه").startswith("فيس"):
             m=re.fullmatch(r"فيس[@ ](.+)", normalized_raw, re.I)
             return self._fruit_match(room, sender_name, m.group(1).strip() if m else "")
@@ -14159,7 +14380,9 @@ class TalkinBot:
                 text += "\n\n📌 للقائمة التالية اكتب ns"
             elif idx >= len(page_sections) - 1:
                 text += "\n\n✅ انتهت أقسام هذه القائمة."
-        if room and self._effective_room_language(room) == "en":
+        # a1..a6 are language-neutral menu codes: follow the saved room
+        # preference rather than interpreting the Latin code as English.
+        if room and self._configured_room_language(room) == "en":
             english = {
                 1: [
                     "📋 Admin — moderation\n━━━━━━━━━━━━\nkick@name / kick name — kick a member\nban@name / ban name — ban a member\nub@name / unban name — unban a member\n.u — undo the bot’s last action",
@@ -14178,7 +14401,7 @@ class TalkinBot:
                     "🎮 Games — wagers\n━━━━━━━━━━━━\nbet@amount — wager | duel@amount — duel\nmyluck@amount — luck wager\ninvestment@amount — investment game\nChoose the stake after the game command.",
                     "🎮 Games — bank and rewards\n━━━━━━━━━━━━\nbank million — million bank | billion — billion game\nfarm@item — plant a crop | stock — choose a market\nface@name — face game\nType ns for the next games list.",
                     "🎲 Room games — Ludo and Snake & Ladders\n━━━━━━━━━━━━\nludo — start Ludo; choose 1–4 players\n1 = play against the bot; 2–4 = multiplayer\nOther players type join. When the game starts, the player whose turn it is types rool to roll the die and move. First token to the finish wins.\nsnake — start Snake & Ladders; type join to enter.\nType ns for the next games list.",
-                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nfishing, lightning, ruby, crash, detector\nMultiplayer games need other players to join.\nType ns for the next games list.",
+                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nshoot — hunting trip every 10 minutes; one shot per player, dragon reward: 1,000,000 points.\nlightning, ruby, crash, detector\nType ns for the next games list.",
                     "🏏 Cricket\n━━━━━━━━━━━━\nMaster: start cricket game / stop cricket game.\nVerified players: .cr 1, choose 1–4 players, then each player types join. Choose 1 (bat) or 2 (defend), then send a score from 0 to 6 for each ball.\nType ns to return to the first game list.",
                 ],
                 4: [
@@ -15779,6 +16002,32 @@ class TalkinBot:
                     message, _page_count = _format_all_point_transfer_history_page(next_page, english)
                 self.send_private_text(sender, message)
                 return True
+            # Continue paginated non-help results (room lists, saved member
+            # lists, and other result sets) before falling back to help menus.
+            packet_type = "chat_message" if is_private else "room_message"
+            result_key = (packet_type, "" if is_private else str(room or ""), str(sender or ""))
+            result_pages = getattr(self, "_result_pages", {})
+            result_state = result_pages.get(result_key)
+            if isinstance(result_state, dict):
+                pages = result_state.get("pages") or []
+                current = max(1, int(result_state.get("part", 1) or 1))
+                next_part = current + 1
+                language = result_state.get("language", "ar")
+                if next_part <= len(pages):
+                    result_state["part"] = next_part
+                    message = pages[next_part - 1]
+                    if next_part < len(pages):
+                        message += "\n\n📌 اكتب ns للقائمة التالية." if language == "ar" else "\n\n📌 Type ns for the next list."
+                    else:
+                        result_pages.pop(result_key, None)
+                        message += "\n\n✅ انتهت القوائم." if language == "ar" else "\n\n✅ End of list."
+                else:
+                    result_pages.pop(result_key, None)
+                    message = "✅ انتهت القوائم." if language == "ar" else "✅ End of list."
+                self._result_pages = result_pages
+                kwargs = result_state.get("kwargs") or ({"to": str(sender or "")} if is_private else {"room": str(room or "")})
+                self._send_text_packets(packet_type, message, **kwargs)
+                return True
             # Do not assume a1 when ns is sent without opening a category.
             if key not in self.help_pages:
                 target = "a1 إلى a6" if (_is_primary_master(sender) and is_private) else "a2 إلى a6"
@@ -16432,11 +16681,38 @@ class TalkinBot:
         if low in ("غرفي", "غرفيّ", "myrooms", "my rooms"):
             live = sorted({str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()})
             if not live:
-                self.send_private_text(sender, "📭 لا توجد غرف متصلة فعلياً حالياً.")
+                text_out = "📭 لا توجد غرف متصلة فعلياً حالياً." if self._effective_room_language(room) == "ar" else "📭 No rooms are currently connected."
+                if is_private:
+                    self.send_private_text(sender, text_out)
+                elif room:
+                    self.send_room_text(room, text_out)
             else:
-                lines = [f"🏠 الغرف المتصلة فعلياً ({len(live)}):"]
-                lines.extend(f"{i}. {room}" for i, room in enumerate(live, 1))
-                self.send_private_text(sender, "\n".join(lines))
+                total = (len(live) + 29) // 30
+                pages = []
+                language = _detect_text_language(text) or self._effective_room_language(room)
+                for offset in range(0, len(live), 30):
+                    page_no = offset // 30 + 1
+                    if language == "en":
+                        lines = [f"🏠 Currently connected rooms ({len(live)}):", f"📄 List {page_no}/{total}"]
+                    else:
+                        lines = [f"🏠 الغرف المتصلة فعلياً ({len(live)}):", f"📄 القائمة {page_no}/{total}"]
+                    lines.extend(f"{i}. {name}" for i, name in enumerate(live[offset:offset + 30], offset + 1))
+                    pages.append("\n".join(lines))
+                packet_type = "chat_message" if is_private else "room_message"
+                page_key = (packet_type, "" if is_private else str(room or ""), str(sender or ""))
+                kwargs = {"to": str(sender or "")} if is_private else {"room": str(room or "")}
+                result_pages = getattr(self, "_result_pages", {})
+                if total > 1:
+                    result_pages[page_key] = {"pages": pages, "part": 1, "kwargs": kwargs, "language": language}
+                else:
+                    result_pages.pop(page_key, None)
+                self._result_pages = result_pages
+                first = pages[0]
+                if total > 1:
+                    first += "\n\n📌 اكتب ns للقائمة التالية." if language == "ar" else "\n\n📌 Type ns for the next list."
+                else:
+                    first += "\n\n✅ انتهت القوائم." if language == "ar" else "\n\n✅ End of list."
+                self._send_text_packets(packet_type, first, **kwargs)
             return True
 
         m_all = re.fullmatch(r"تحويل للكل@(\d+)", text, re.I)
