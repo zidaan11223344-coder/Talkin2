@@ -533,7 +533,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertTrue(integration.handle("North", "N1", "Join"))
             self.assertIn("تم الانضمام إلى الفريق الأول", room_messages[0][1])
             self.assertIn("N1", integration.game.current()["rooms"][0]["players"])
-            self.assertTrue(any("اكتمل الفريق الأول" in text for _, text in room_messages[1:]))
+            self.assertTrue(any("بدأت لعبة الكريكيت" in text for _, text in room_messages[1:]))
 
     def test_legacy_single_match_state_is_migrated_to_matches_map(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -939,12 +939,13 @@ class CricketIntegrationRegressions(unittest.TestCase):
             for player in ("N1", "N2"):
                 integration.handle("North", player, "Join")
             first_team_announcements = [
-                (room, text) for room, text in room_messages if "اكتمل الفريق الأول" in text
+                (room, text) for room, text in room_messages if text.startswith("🏏 بدأت لعبة الكريكيت")
             ]
-            self.assertEqual({room for room, _ in first_team_announcements}, {"North"})
-            self.assertEqual(len(first_team_announcements), 1)
-            self.assertIn("North (2 لاعبين): @N1، @N2", first_team_announcements[0][1])
-            self.assertIn("أرسلوا Join", first_team_announcements[0][1])
+            self.assertEqual({room for room, _ in first_team_announcements}, {"North", "South", "Lobby"})
+            self.assertEqual(len(first_team_announcements), 3)
+            self.assertIn("غرفة North", first_team_announcements[0][1])
+            self.assertIn("عدد الفريق: 2 لاعبين", first_team_announcements[0][1])
+            self.assertIn("للانضمام أرسل Join", first_team_announcements[0][1])
             self.assertNotIn("Join@", first_team_announcements[0][1])
             self.assertEqual(integration.game.current()["stage"], "lobby")
 
@@ -1410,8 +1411,8 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertIn("جاري البحث", sent[0][1])
         self.assertIn("لم يحالفه الحظ", sent[1][1])
 
-    def test_million_bank_uses_one_minute_cooldown_and_five_percent_win_chance(self):
-        for roll, won in ((4, True), (5, False)):
+    def test_million_bank_uses_one_minute_cooldown_and_three_percent_win_chance(self):
+        for roll, won in ((2, True), (3, False)):
             with self.subTest(roll=roll):
                 bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
                 cooldowns, sent, awards = [], [], []
@@ -1433,8 +1434,8 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 self.assertEqual(awards, ([ ("Player", 1_000_000) ] if won else []))
                 self.assertIn("تم الحصول على المليون" if won else "لم يحالفه الحظ", sent[-1][1])
 
-    def test_billion_uses_configured_one_minute_cooldown_and_five_percent_win_chance(self):
-        for roll, won in ((4, True), (5, False)):
+    def test_billion_uses_configured_one_minute_cooldown_and_three_percent_win_chance(self):
+        for roll, won in ((2, True), (3, False)):
             with self.subTest(roll=roll):
                 bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
                 cooldowns, sent, awards = [], [], []

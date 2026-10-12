@@ -508,14 +508,14 @@ class CricketGame:
                             for player in participant.get("players", [])
                             if str(player).strip()
                         ]
-                        team_names = "، ".join(f"@{player}" for player in team_players)
+                        player_count = len(team_players)
+                        player_label = "لاعب" if player_count == 1 else "لاعبين"
                         self._emit(
                             data, [participant],
-                            f"🏏 اكتمل الفريق الأول — مباراة الكركيت قيد التجهيز\n"
-                            f"👥 {participant['name']} ({len(team_players)} لاعبين): {team_names}\n"
-                            "🔗 بانتظار الفريق الثاني: أرسلوا Join من الغرفة الأخرى؛ "
-                            "وعند وجود عدة قوائم انتظار، يُقرن الطلب بأقدم فريق أول مكتمل. "
-                            "ثم يختار الفريق الأول 1 للهجوم أو 2 للدفاع.",
+                            f"🏏 بدأت لعبة الكريكيت في غرفة {participant['name']}\n"
+                            f"👥 عدد الفريق: {player_count} {player_label}\n"
+                            "🔗 للانضمام أرسل Join.",
+                            broadcast=True,
                         )
             elif len(participants) == self.ROOM_TEAMS:
                 full = all(len(item.get("players", [])) >= target for item in participants)
