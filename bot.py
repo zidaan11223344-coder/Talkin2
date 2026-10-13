@@ -12127,8 +12127,12 @@ class TalkinBot:
                 int(w.get("stake", 0) or 0) for k, w in self.wager_waiting.items()
                 if k != key and _norm_user(w.get("user")) == _norm_user(sender)
             )
+            # The first player sets the stake for the whole round. A later
+            # player's amount in the command does not change that stake: they
+            # must have enough balance for the original challenge amount.
+            round_stake = int(waiting.get("stake", 0) or 0) if waiting else amount
             balance = _get_points(sender)
-            if balance < amount + reserved:
+            if balance < round_stake + reserved:
                     error = _reply_template(
                         "game_insufficient", DEFAULT_REPLY_MESSAGES["game_insufficient"],
                         balance=_fmt_points(balance)
@@ -12156,13 +12160,14 @@ class TalkinBot:
             return True
 
         if waiting:
-            # The second stake is reserved before resolving the match. The
-            # first player's stake was reserved when the challenge opened.
-            _add_points(sender, -amount)
+            # Mirror the first player's wager exactly; do not let a smaller
+            # amount supplied by the challenger understate the loser debit.
+            round_stake = int(waiting.get("stake", 0) or 0)
+            _add_points(sender, -round_stake)
             second = {
                 "user": sender,
                 "room": room,
-                "stake": amount,
+                "stake": round_stake,
                 "reserved": True,
                 "game": game_name,
             }

@@ -1397,6 +1397,50 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(sent[0][0], "North")
         self.assertIn("بدأت لعبة رهان", sent[0][1])
 
+    def test_second_wager_uses_first_players_stake_even_if_command_amount_is_smaller(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.game_lock = threading.RLock()
+        bot.wager_waiting = {
+            "رهان": {"user": "Ahmed", "room": "North", "stake": 1_000_000_000,
+                     "reserved": True, "game": "رهان", "created": bot_module.time.time()}
+        }
+        bot._cleanup_expired_wagers = lambda: None
+        bot._game_cooldown_notice = lambda *_args: True
+        bot.send_room_text = lambda *_args: None
+        resolved = []
+        bot._wager_result = lambda first, second, game: resolved.append((first, second, game))
+        deducted = []
+        with patch.object(bot_module, "_get_points", return_value=2_000_000_000), patch.object(
+            bot_module, "_add_points", side_effect=lambda user, amount: deducted.append((user, amount))
+        ):
+            self.assertTrue(bot._queue_wager("South", "Said", "رهان", 100_000))
+        first, second, game = resolved[0]
+        self.assertEqual(game, "رهان")
+        self.assertEqual(first["stake"], 1_000_000_000)
+        self.assertEqual(second["stake"], 1_000_000_000)
+        self.assertEqual(deducted, [("Said", -1_000_000_000)])
+
+    def test_second_wager_is_rejected_when_balance_cannot_cover_first_players_stake(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.game_lock = threading.RLock()
+        bot.wager_waiting = {
+            "رهان": {"user": "Ahmed", "room": "North", "stake": 1_000_000_000,
+                     "reserved": True, "game": "رهان", "created": bot_module.time.time()}
+        }
+        bot._cleanup_expired_wagers = lambda: None
+        bot._game_cooldown_notice = lambda *_args: True
+        messages, resolved = [], []
+        bot.send_room_text = lambda _room, text: messages.append(text)
+        bot._wager_result = lambda *_args: resolved.append(True)
+        with patch.object(bot_module, "_get_points", return_value=100_000), patch.object(
+            bot_module, "_add_points"
+        ) as add_points:
+            self.assertTrue(bot._queue_wager("South", "Said", "رهان", 100_000))
+        self.assertFalse(resolved)
+        add_points.assert_not_called()
+        self.assertTrue(bot.wager_waiting["رهان"])
+        self.assertTrue(messages)
+
     def test_million_bank_result_has_no_artificial_reveal_sleep(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._game_cooldown_notice = lambda *_args: True
