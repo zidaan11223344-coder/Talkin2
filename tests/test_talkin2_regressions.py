@@ -3635,11 +3635,15 @@ class NewFeatureRegressions(unittest.TestCase):
             bot_module.secrets, "randbelow", return_value=0
         ):
             self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
-            self.assertIn("Victim", messages[-1][1])
-            self.assertIn("Admin", messages[-1][1])
-            self.assertNotIn("@Victim", messages[-1][1])
-            self.assertNotIn("@Admin", messages[-1][1])
-            self.assertIn("30 ثانية", messages[-1][1])
+            challenge = next(text for room, text in messages if room == "Other")
+            confirmation = next(text for room, text in messages if room == "Origin")
+            self.assertIn("Victim", challenge)
+            self.assertIn("Admin", challenge)
+            self.assertNotIn("@Victim", challenge)
+            self.assertNotIn("@Admin", challenge)
+            self.assertIn("30 ثانية", challenge)
+            self.assertIn("تم إرسال القنبلة", confirmation)
+            self.assertIn("Other", confirmation)
             self.assertEqual(private_messages[-1][0], "Victim")
             self.assertIn("Admin", private_messages[-1][1])
             self.assertIn("Other", private_messages[-1][1])
@@ -3655,6 +3659,48 @@ class NewFeatureRegressions(unittest.TestCase):
         self.assertEqual(len(kicks), 1)
         self.assertEqual(kicks[0][0][0:3], ("Other", "Victim", "kick"))
         self.assertTrue(kicks[0][1]["announce_room"])
+        source_result = [text for room, text in messages if room == "Origin"][-1]
+        self.assertIn("انفجرت القنبلة", source_result)
+        self.assertIn("Other", source_result)
+
+    def test_bomb_defusal_result_is_also_reported_in_source_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.bomb_games = {}
+        bot._bomb_games_lock = threading.RLock()
+        bot._active_rooms = lambda: ["Origin", "Other"]
+        messages = []
+        bot.send_room_text = lambda room, text: messages.append((room, text))
+        bot.send_private_text = lambda *_args: None
+        bot._configured_room_language = lambda _room: "ar"
+        with patch.object(bot_module, "_room_manager", return_value=True), patch.object(
+            bot_module.secrets, "randbelow", return_value=0
+        ):
+            self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
+        self.assertTrue(bot._handle_bomb_wire("Other", "Victim", "1"))
+        source_result = [text for room, text in messages if room == "Origin"][-1]
+        destination_result = [text for room, text in messages if room == "Other"][-1]
+        self.assertIn("نجح", source_result)
+        self.assertIn("تفكيك القنبلة", source_result)
+        self.assertIn("تفكيك القنبلة", destination_result)
+
+    def test_bomb_send_failure_is_reported_and_does_not_leave_a_live_challenge(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.bomb_games = {}
+        bot._bomb_games_lock = threading.RLock()
+        bot._active_rooms = lambda: ["Origin", "Other"]
+        messages = []
+        def send_room_text(room, text):
+            messages.append((room, text))
+            return room != "Other"
+        bot.send_room_text = send_room_text
+        bot.send_private_text = lambda *_args: None
+        bot._configured_room_language = lambda _room: "ar"
+        with patch.object(bot_module, "_room_manager", return_value=True), patch.object(
+            bot_module.secrets, "randbelow", return_value=0
+        ):
+            self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
+        self.assertTrue(any(room == "Origin" and "فشل إرسال القنبلة" in text for room, text in messages))
+        self.assertFalse(bot.bomb_games)
 
     def test_active_bomb_wire_is_claimed_before_cricket_or_board_games(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

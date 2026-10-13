@@ -12525,6 +12525,7 @@ class TalkinBot:
                 return True
             games[key] = {
                 "room": destination, "target": target, "started_by": str(sender),
+                "source_room": source_room,
                 "wire": secrets.randbelow(3) + 1, "expires_at": time.time() + 30.0,
             }
             self.bomb_games = games
@@ -12535,7 +12536,33 @@ class TalkinBot:
             if target_english else
             f"💣 وصلت قنبلة إلى {target_plain} من {sender_plain}!\nلتفكيكها اختر رقم السلك:\n1️⃣ أحمر\n2️⃣ أصفر\n3️⃣ أخضر\n⏱️ أمامك 30 ثانية؛ أرسل رقمًا واحدًا."
         )
-        self.send_room_text(destination, challenge)
+        try:
+            send_result = self.send_room_text(destination, challenge)
+        except Exception as exc:
+            self.log("[BOMB] challenge send failed:", destination, repr(exc))
+            send_result = False
+        if send_result is False:
+            with lock:
+                current = getattr(self, "bomb_games", {}).get(key)
+                if (isinstance(current, dict)
+                        and current.get("source_room") == source_room
+                        and current.get("started_by") == str(sender)):
+                    self.bomb_games.pop(key, None)
+            source_english = getattr(self, "_configured_room_language", lambda _room: "ar")(source_room) == "en"
+            failed = (
+                f"❌ Failed to send the bomb challenge to {target_plain} in {destination}."
+                if source_english else
+                f"❌ فشل إرسال القنبلة إلى {target_plain} في غرفة {destination}."
+            )
+            self.send_room_text(source_room, failed)
+            return True
+        if _norm_room(source_room) != _norm_room(destination):
+            sent_notice = (
+                f"✅ Bomb challenge sent to {target_plain} in {destination}."
+                if english else
+                f"✅ تم إرسال القنبلة إلى {target_plain} في غرفة {destination}."
+            )
+            self.send_room_text(source_room, sent_notice)
         private_notice = (
             f"💣 {sender_plain} sent you a bomb in {destination}. Go to that room and defuse it within 30 seconds by sending 1, 2, or 3."
             if target_english else
@@ -12560,22 +12587,60 @@ class TalkinBot:
             if not isinstance(game, dict):
                 return False
             self.bomb_games.pop(key, None)
-        english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
+        destination = str(game.get("room") or room).strip()
+        source_room = str(game.get("source_room") or destination).strip()
+        result_rooms, seen = [], set()
+        for result_room in (destination, source_room):
+            normalized_room = _norm_room(result_room)
+            if result_room and normalized_room not in seen:
+                seen.add(normalized_room)
+                result_rooms.append(result_room)
+
+        def send_result(kind, extra=""):
+            for result_room in result_rooms:
+                english = getattr(self, "_configured_room_language", lambda _room: "ar")(result_room) == "en"
+                prefix = ""
+                if _norm_room(result_room) != _norm_room(destination):
+                    prefix = f"📍 Room: {destination}\n" if english else f"📍 الغرفة: {destination}\n"
+                if kind == "defused":
+                    message = (
+                        f"✅ {username} successfully defused the bomb."
+                        if english else f"✅ نجح {username} في تفكيك القنبلة."
+                    )
+                elif kind == "expired":
+                    message = (
+                        f"💥 {username}'s bomb challenge in {destination} expired before it was defused."
+                        if english else f"💥 انتهى وقت قنبلة {username} في غرفة {destination} دون تفكيكها."
+                    )
+                else:
+                    action_result = (
+                        "The room kick request was sent." if extra == "kick_sent"
+                        else "The room kick request failed."
+                    ) if english else (
+                        "تم إرسال طلب الطرد." if extra == "kick_sent"
+                        else "فشل إرسال طلب الطرد."
+                    )
+                    message = (
+                        f"💥 The bomb exploded on {username} in {destination}; {action_result}"
+                        if english else f"💥 انفجرت القنبلة على {username} في غرفة {destination}؛ {action_result}"
+                    )
+                self.send_room_text(result_room, prefix + message)
+
         if time.time() > float(game.get("expires_at", 0)):
-            self.send_room_text(room, f"⌛ @{username}'s bomb timer expired; no kick was issued." if english else f"⌛ انتهى وقت القنبلة لدى @{username}؛ لم يُنفذ طرد.")
+            send_result("expired")
         elif int(digits) == int(game.get("wire") or 0):
-            self.send_room_text(room, f"✅ @{username} defused the bomb! The correct wire was {digits}." if english else f"✅ فك @{username} القنبلة بنجاح! السلك الصحيح كان {digits}.")
+            send_result("defused")
         else:
             colors = {"1": ("الأحمر", "Red"), "2": ("الأصفر", "Yellow"), "3": ("الأخضر", "Green")}
-            color = colors[digits][1 if english else 0]
-            self.send_room_text(room, f"💥 @{username} chose the {color} wire incorrectly; a room kick will be issued." if english else f"💥 اختار @{username} السلك {color} خطأً! ستُرسل له عملية الطرد من الغرفة.")
+            color = colors[digits][0]
             try:
-                self.request_admin_action(
+                kick_sent = self.request_admin_action(
                     room, username, "kick", str(game.get("started_by") or "bomb game"), announce_room=True
                 )
             except Exception as exc:
                 self.log("[BOMB] kick failed:", room, username, repr(exc))
-                self.send_room_text(room, "⚠️ The server could not issue the kick." if english else "⚠️ تعذر تنفيذ الطرد من الخادم.")
+                kick_sent = False
+            send_result("exploded", "kick_sent" if kick_sent else "kick_failed")
         return True
 
     def _route_room_game_input(self, room, username, text, username_aliases=()):
