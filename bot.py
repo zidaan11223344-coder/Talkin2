@@ -284,6 +284,7 @@ GAME_COMMANDS = {
     "entertainment": "تسليه", "horse": "حصانه", "stock": "بورصة", "market": "بورصة",
     "bank": "بنك", "million": "بنك مليون", "million bank": "بنك مليون", "bank million": "بنك مليون",
     "billion": "مليار", "farm": "زرع", "crop": "زرع", "plant": "زرع", "face": "فيس", "fruit match": "فيس",
+    "work": "عمل", "salary": "راتبي",
     "snake": "ثعبان", "snakes and ladders": "ثعبان", "ludo": "لودو",
     "fishing": "سنارة", "fishing rod": "سنارة", "fish": "سنارة", "snare": "سنارة", "sannara": "سنارة",
     "shoot": "شوت", "shot": "شوت",
@@ -642,6 +643,17 @@ GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
 CROP_PLOTS_FILE = DATA_DIR / "crop_plots.json"
 STOCK_MARKET_FILE = DATA_DIR / "stock_market_investments.json"
 DRAGON_HUNTERS_FILE = DATA_DIR / "dragon_hunters.json"
+PAYROLL_FILE = DATA_DIR / "payroll.json"
+PAYROLL_COOLDOWN_SECONDS = max(60.0, float(os.getenv("PAYROLL_COOLDOWN_SECONDS", "600") or 600))
+PAYROLL_JOBS = (
+    ("عامل نظافة", 5_000), ("ساعي توصيل", 7_000), ("بائع", 8_000),
+    ("طباخ", 10_000), ("مزارع", 12_000), ("مبرمج", 15_000), ("طبيب", 20_000),
+)
+PAYROLL_JOBS_EN = {
+    "عامل نظافة": "Cleaner", "ساعي توصيل": "Courier", "بائع": "Shopkeeper",
+    "طباخ": "Chef", "مزارع": "Farmer", "مبرمج": "Programmer", "طبيب": "Doctor",
+}
+_PAYROLL_LOCK = threading.RLock()
 TRACKED_ROOMS_FILE = DATA_DIR / "tracked_rooms.json"
 BLOCKED_ROOMS_FILE = DATA_DIR / "blocked_rooms.json"
 ROOM_USERS_FILE = DATA_DIR / "room_users.json"
@@ -2596,7 +2608,7 @@ def _looks_like_bot_command(text):
     if not low:
         return False
     prefixes = (
-        "sa@", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
+        "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
@@ -4908,7 +4920,7 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
     try:
         generated_dir.mkdir(parents=True, exist_ok=True)
         for old_card in generated_dir.iterdir():
-            if old_card.is_file():
+            if old_card.is_file() and old_card.name.startswith("gift_"):
                 try:
                     old_card.unlink()
                 except Exception:
@@ -4922,12 +4934,12 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
     else:
         template = Image.new("RGBA", (1239, 1270), (0, 0, 0, 0))
 
-    # Work at a genuinely large final canvas. Keep the template's original
-    # aspect ratio so the frame is enlarged horizontally and vertically
-    # without being stretched. This is large enough for clear sharing on
-    # modern phones while remaining practical for chat media.
-    target_w = 1200
-    target_h = max(1, round(target_w * template.height / template.width))
+    # Work at a genuinely large, portrait-oriented final canvas. The frame is
+    # slightly wider and substantially taller for chat sharing on phones.
+    target_w = 1300
+    # Portrait-oriented delivery card: noticeably taller, with a modest width
+    # increase, while keeping the existing decorative frame recognizable.
+    target_h = max(1, round(target_w * 1.12))
     template = template.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
     # The gift itself remains proportional.  Since the supplied gift artwork
@@ -6027,6 +6039,10 @@ class TalkinBot:
         self.help_page_part = {}
         self.pending_bot_choices = {}
         self.stock_pending = {}
+        self.custom_gift_pending = {}
+        self._custom_gift_pending_lock = threading.RLock()
+        self.bomb_games = {}
+        self._bomb_games_lock = threading.RLock()
         self._stock_market_lock = threading.RLock()
         self.stock_market_round = None
         self._stock_market_round_seq = 0
@@ -12374,6 +12390,148 @@ class TalkinBot:
         self.send_room_text(room, message)
         return True
 
+    def _bomb_command(self, room, sender, target, target_room=None):
+        """Start a room bomb challenge; only a room manager may trigger a kick-based round."""
+        source_room = str(room or "").strip()
+        destination = str(target_room or source_room).strip()
+        target = str(target or "").strip().lstrip("@")
+        english = getattr(self, "_configured_room_language", lambda _room: "ar")(source_room) == "en"
+        if not target or not destination:
+            self.send_room_text(source_room, "❌ Format: bom@username or bom@username@room" if english else "❌ الصيغة: bom@اسم_المستخدم أو bom@اسم_المستخدم@اسم_الغرفة")
+            return True
+        if not _room_manager(self, source_room, sender):
+            self.send_room_text(source_room, "🔒 Only the master or room staff can start a bomb challenge because a wrong wire causes a kick." if english else "🔒 بدء القنبلة التي قد تؤدي إلى طرد لاعب مخصص للماستر أو إدارة الغرفة.")
+            return True
+        if _norm_user(target) == _norm_user(sender):
+            self.send_room_text(source_room, "❌ You cannot target yourself." if english else "❌ لا يمكنك اختيار نفسك هدفًا للقنبلة.")
+            return True
+        active_rooms = {_norm_room(r): str(r).strip() for r in self._active_rooms() if str(r).strip()}
+        if _norm_room(destination) not in active_rooms:
+            self.send_room_text(source_room, f"❌ The bot is not connected to {destination}." if english else f"❌ البوت غير متصل بالغرفة {destination}.")
+            return True
+        destination = active_rooms[_norm_room(destination)]
+        lock = getattr(self, "_bomb_games_lock", None)
+        if lock is None:
+            self._bomb_games_lock = lock = threading.RLock()
+        key = (_norm_room(destination), _norm_user(target))
+        with lock:
+            games = getattr(self, "bomb_games", {})
+            if key in games and float(games[key].get("expires_at", 0)) > time.time():
+                self.send_room_text(source_room, f"⏳ @{target} already has an active bomb challenge in {destination}." if english else f"⏳ لدى @{target} قنبلة نشطة بالفعل في {destination}.")
+                return True
+            games[key] = {
+                "room": destination, "target": target, "started_by": str(sender),
+                "wire": secrets.randbelow(3) + 1, "expires_at": time.time() + 90.0,
+            }
+            self.bomb_games = games
+        target_english = getattr(self, "_configured_room_language", lambda _room: "ar")(destination) == "en"
+        challenge = (
+            f"💣 A bomb was sent to @{target} by @{sender}!\nChoose a wire to defuse it:\n1️⃣ Red\n2️⃣ Yellow\n3️⃣ Green\n⏱️ You have 90 seconds; send one number."
+            if target_english else
+            f"💣 وصلت قنبلة إلى @{target} من @{sender}!\nلتفكيكها اختر رقم السلك:\n1️⃣ أحمر\n2️⃣ أصفر\n3️⃣ أخضر\n⏱️ أمامك 90 ثانية؛ أرسل رقمًا واحدًا."
+        )
+        self.send_room_text(destination, challenge)
+        return True
+
+    def _handle_bomb_wire(self, room, username, text):
+        digits = str(text or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        if digits not in {"1", "2", "3"}:
+            return False
+        key = (_norm_room(room), _norm_user(username))
+        lock = getattr(self, "_bomb_games_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            game = getattr(self, "bomb_games", {}).get(key)
+            if not isinstance(game, dict):
+                return False
+            self.bomb_games.pop(key, None)
+        english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
+        if time.time() > float(game.get("expires_at", 0)):
+            self.send_room_text(room, f"⌛ @{username}'s bomb timer expired; no kick was issued." if english else f"⌛ انتهى وقت القنبلة لدى @{username}؛ لم يُنفذ طرد.")
+        elif int(digits) == int(game.get("wire") or 0):
+            self.send_room_text(room, f"✅ @{username} defused the bomb! The correct wire was {digits}." if english else f"✅ فك @{username} القنبلة بنجاح! السلك الصحيح كان {digits}.")
+        else:
+            colors = {"1": ("الأحمر", "Red"), "2": ("الأصفر", "Yellow"), "3": ("الأخضر", "Green")}
+            color = colors[digits][1 if english else 0]
+            self.send_room_text(room, f"💥 @{username} chose the {color} wire incorrectly; a room kick will be issued." if english else f"💥 اختار @{username} السلك {color} خطأً! ستُرسل له عملية الطرد من الغرفة.")
+            try:
+                self.request_admin_action(
+                    room, username, "kick", str(game.get("started_by") or "bomb game"), announce_room=True
+                )
+            except Exception as exc:
+                self.log("[BOMB] kick failed:", room, username, repr(exc))
+                self.send_room_text(room, "⚠️ The server could not issue the kick." if english else "⚠️ تعذر تنفيذ الطرد من الخادم.")
+        return True
+
+    def _payroll_command(self, room, username, command):
+        """Require a fresh random job before every salary; persist cooldowns and claims."""
+        username = str(username or "").strip().lstrip("@")
+        key = _norm_user(username)
+        if not key:
+            return False
+        english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
+        tr = lambda ar, en: en if english else ar
+        lock = _PAYROLL_LOCK
+        now = time.time()
+        try:
+            with lock:
+                data = _load_local_json(PAYROLL_FILE, {"version": 1, "users": {}})
+                users = data.get("users", {}) if isinstance(data, dict) else {}
+                users = dict(users) if isinstance(users, dict) else {}
+                state = dict(users.get(key, {})) if isinstance(users.get(key), dict) else {}
+                pending = state.get("pending") if isinstance(state.get("pending"), dict) else None
+
+                if command == "work":
+                    if pending:
+                        job_name = PAYROLL_JOBS_EN.get(str(pending.get("job") or ""), pending.get("job")) if english else pending.get("job")
+                        self.send_room_text(room, tr(
+                            f"👷 وظيفتك الحالية: {job_name} — راتبك {_fmt_points(pending.get('amount', 0))} نقطة. اكتب راتبي لاستلامه.",
+                            f"👷 Your current job is {job_name}; salary: {_fmt_points(pending.get('amount', 0))} points. Type salary to collect it.",
+                        ))
+                        return True
+                    last_work = float(state.get("last_work_at") or 0)
+                    remaining = PAYROLL_COOLDOWN_SECONDS - (now - last_work)
+                    if last_work and remaining > 0:
+                        seconds = max(1, int(remaining + 0.999))
+                        self.send_room_text(room, tr(f"⏳ استرح قبل العمل التالي. يمكنك العمل بعد {seconds} ثانية.", f"⏳ Please wait {seconds} seconds before your next job."))
+                        return True
+                    job, amount = secrets.choice(PAYROLL_JOBS)
+                    shown_job = PAYROLL_JOBS_EN.get(job, job) if english else job
+                    pending = {"id": uuid.uuid4().hex, "job": job, "amount": int(amount), "created_at": int(now)}
+                    state.update(username=username, last_work_at=now, pending=pending)
+                    users[key] = state
+                    _save_local_json(PAYROLL_FILE, {"version": 1, "users": users})
+                    self.send_room_text(room, tr(
+                        f"👷 حصلت على وظيفة: {shown_job}\n💰 راتبك: {_fmt_points(amount)} نقطة\n📩 اكتب راتبي لاستلامه. يتجدد العمل كل 10 دقائق.",
+                        f"👷 Random job assigned: {shown_job}\n💰 Salary: {_fmt_points(amount)} points\n📩 Type salary to collect it. Work refreshes every 10 minutes.",
+                    ))
+                    return True
+
+                if not pending:
+                    self.send_room_text(room, tr("❌ لا يوجد راتب جاهز. أرسل عمل أولاً لتحصل على وظيفة عشوائية.", "❌ No salary is ready. Type work first to get a random job."))
+                    return True
+                amount = int(pending.get("amount") or 0)
+                job = str(pending.get("job") or "وظيفة")
+                shown_job = PAYROLL_JOBS_EN.get(job, job) if english else job
+                txid = "payroll:" + str(pending.get("id") or "")
+                result = _apply_points_delta_once(username, amount, txid, "work salary")
+                if not result.get("ok"):
+                    self.send_room_text(room, tr("⚠️ تعذر حفظ الراتب الآن؛ بقي راتبك محفوظًا. أعد كتابة راتبي بعد قليل.", "⚠️ Salary could not be saved. Your claim remains pending; type salary again shortly."))
+                    return True
+                state.pop("pending", None)
+                users[key] = state
+                _save_local_json(PAYROLL_FILE, {"version": 1, "users": users})
+            self.send_room_text(room, tr(
+                f"💵 تم صرف راتبك يا @{username}\n👷 الوظيفة: {shown_job}\n💰 الراتب: +{_fmt_points(amount)} نقطة\n💳 رصيدك: {_fmt_points(result.get('balance', 0))} نقطة",
+                f"💵 Salary paid to @{username}\n👷 Job: {shown_job}\n💰 Pay: +{_fmt_points(amount)} points\n💳 Balance: {_fmt_points(result.get('balance', 0))} points",
+            ))
+            return True
+        except Exception as exc:
+            self.log("[PAYROLL] operation failed:", username, repr(exc))
+            self.send_room_text(room, tr("⚠️ تعذر إكمال عملية الراتب؛ لم أؤكد الصرف. حاول مرة أخرى بعد قليل.", "⚠️ Salary processing failed; payment was not confirmed. Please retry shortly."))
+            return True
+
     def _fishing_event_worker(self):
         interval = 600.0
         while not self.stop_event.wait(interval):
@@ -12391,7 +12549,11 @@ class TalkinBot:
             self._dragon_hunters_lock = lock = threading.RLock()
         with lock:
             hunters = getattr(self, "dragon_hunters", {})
-            return key in hunters if isinstance(hunters, dict) else False
+            entry = hunters.get(key) if isinstance(hunters, dict) else None
+            if not isinstance(entry, dict):
+                return False
+            expiry = float(entry.get("expires_at") or (float(entry.get("awarded_at") or 0) + 600.0))
+            return time.time() < expiry
 
     def _record_dragon_hunter(self, username, room):
         username = str(username or "").strip().lstrip("@")
@@ -12408,6 +12570,7 @@ class TalkinBot:
                 "username": username,
                 "room": str(room or ""),
                 "awarded_at": int(time.time()),
+                "expires_at": int(time.time()) + 600,
             }
             self.dragon_hunters = hunters
             try:
@@ -14761,6 +14924,15 @@ class TalkinBot:
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
+        if self._handle_bomb_wire(room, sender_name, raw):
+            return True
+        bomb = re.fullmatch(r"bom@([^@]+)(?:@(.+))?", raw.strip(), re.I)
+        if bomb:
+            return self._bomb_command(room, sender_name, bomb.group(1), bomb.group(2))
+        if game_low in ("عمل", "راتبي"):
+            return self._payroll_command(
+                room, sender_name, "work" if game_low == "عمل" else "salary"
+            )
         if stock_order:
             self.stock_pending.pop(stock_key, None)
             return self._stock_market_invest(room, sender_name, stock_order[0], stock_order[1])
@@ -18257,6 +18429,132 @@ class TalkinBot:
                 self.send_private_text(sender, "❌ أخطاء النشر: " + " | ".join(f"{r}: {e[:60]}" for r,e in errors))
         return True
 
+    def _request_custom_gift_image(self, room, sender, target, *, private_to=""):
+        sender = str(sender or "").strip().lstrip("@")
+        target = str(target or "").strip().lstrip("@")
+        if not sender or not target:
+            return False
+        if not _is_verified_user(sender):
+            english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
+            notice = (f"🔒 @{sender} must be verified to send a gift image.\n{_verification_notice()}" if english else f"🔒 @{sender} يحتاج توثيقًا لإرسال هدية صورة.\n{_verification_notice()}")
+            self.send_private_text(private_to, notice) if private_to else self.send_room_text(room, notice)
+            return True
+        lock = getattr(self, "_custom_gift_pending_lock", None)
+        if lock is None:
+            self._custom_gift_pending_lock = lock = threading.RLock()
+        with lock:
+            pending = getattr(self, "custom_gift_pending", {})
+            pending[_norm_user(sender)] = {
+                "sender": sender, "receiver": target, "room": str(room or ""),
+                "created_at": time.time(), "private_to": str(private_to or ""),
+            }
+            self.custom_gift_pending = pending
+        english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
+        prompt = (f"🎁 Send the gift image now within 2 minutes. I will add sender @{sender} and recipient @{target} to the card and share it in the bot's rooms." if english else f"🎁 أرسل الآن صورة الهدية خلال دقيقتين؛ سأكتب عليها اسم المرسل @{sender} والمستلم @{target} وأنشرها في غرف البوت.")
+        self.send_private_text(private_to, prompt) if private_to else self.send_room_text(room, prompt)
+        return True
+
+    def _try_custom_gift_media(self, room, media_url, candidates=()):
+        media_url = str(media_url or "").strip()
+        sender = next((str(value or "").strip() for value in candidates if str(value or "").strip()), "")
+        if not media_url or not sender:
+            return False
+        lock = getattr(self, "_custom_gift_pending_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            pending = getattr(self, "custom_gift_pending", {})
+            key = _norm_user(sender)
+            request = pending.get(key)
+            if not isinstance(request, dict):
+                return False
+            if time.time() - float(request.get("created_at") or 0) > 120:
+                pending.pop(key, None)
+                return False
+            pending.pop(key, None)
+        threading.Thread(
+            target=self._custom_gift_image_worker,
+            args=(str(request.get("room") or room), str(request.get("sender") or sender),
+                  str(request.get("receiver") or ""), media_url, str(request.get("private_to") or "")),
+            name="custom-gift-image", daemon=True,
+        ).start()
+        return True
+
+    def _custom_gift_image_worker(self, room, sender, receiver, media_url, private_to=""):
+        """Make a tall exact-text gift card from the submitted artwork, then fan it out safely."""
+        try:
+            if not PIL_AVAILABLE:
+                raise RuntimeError("Pillow غير مثبت")
+            base = _public_base_url()
+            if not base:
+                raise RuntimeError("لا يوجد رابط عام لإرسال صورة الهدية")
+            response = requests.get(media_url, timeout=(5, 15), stream=True)
+            response.raise_for_status()
+            chunks, size = [], 0
+            for chunk in response.iter_content(64 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > 12 * 1024 * 1024:
+                    raise ValueError("حجم الصورة أكبر من 12 ميغابايت")
+                chunks.append(chunk)
+            source = Image.open(io.BytesIO(b"".join(chunks))).convert("RGB")
+            max_w, max_h = 1100, 1000
+            scale = min(max_w / source.width, max_h / source.height, 1.0)
+            source = source.resize((max(1, round(source.width * scale)), max(1, round(source.height * scale))), Image.Resampling.LANCZOS)
+            width, photo_h = source.size
+            panel_h = 390
+            card = Image.new("RGB", (width, photo_h + panel_h), (13, 16, 28))
+            card.paste(source, (0, 0))
+            draw = ImageDraw.Draw(card)
+            draw.rounded_rectangle((24, photo_h + 18, width - 24, photo_h + panel_h - 18), radius=28,
+                                   fill=(16, 21, 37), outline=(244, 196, 92), width=4)
+            _draw_centered(draw, (width / 2, photo_h + 65), "🎁 Gift / هدية", 40, (255, 222, 155), width - 80)
+            _draw_centered(draw, (width / 2, photo_h + 145), f"Sender / المرسل: {sender}", 32, (126, 226, 255), width - 80)
+            _draw_centered(draw, (width / 2, photo_h + 225), f"Recipient / المستلم: {receiver}", 32, (255, 166, 218), width - 80)
+            _draw_centered(draw, (width / 2, photo_h + 310), f"Room / الغرفة: {room}", 29, (230, 230, 238), width - 80)
+            generated = BASE_DIR / "generated_gifts" / f"usergift_{uuid.uuid4().hex}.jpg"
+            generated.parent.mkdir(parents=True, exist_ok=True)
+            card.save(generated, "JPEG", quality=90, optimize=True, progressive=True)
+            media = f"{base.rstrip('/')}/gifts/{generated.name}"
+            self._verify_public_media_url(media, "image")
+            rooms = list(self._active_rooms())
+            if room and all(_norm_room(r) != _norm_room(room) for r in rooms):
+                rooms.append(room)
+            sent, failed = 0, 0
+            delay = max(0.02, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "0.08") or 0.08))
+            bulk_lock = getattr(self, "_room_bulk_lock", None)
+            if bulk_lock is None:
+                bulk_lock = threading.RLock()
+            with bulk_lock:
+                for index, target_room in enumerate(rooms):
+                    try:
+                        english = getattr(self, "_configured_room_language", lambda _room: "ar")(target_room) == "en"
+                        caption = (f"🎁 Gift image\n📤 Sender: @{sender}\n📥 Recipient: @{receiver}\n🏠 Room: {room}" if english else f"🎁 هدية مصوّرة\n📤 المرسل: @{sender}\n📥 المستلم: @{receiver}\n🏠 الغرفة: {room}")
+                        if self.send_room_media(target_room, media, "image") is False:
+                            failed += 1
+                        else:
+                            self.send_room_text(target_room, caption)
+                            sent += 1
+                    except Exception as exc:
+                        failed += 1
+                        self.log("[CUSTOM-GIFT] room delivery failed:", str(target_room), repr(exc))
+                    if index + 1 < len(rooms):
+                        time.sleep(delay)
+            english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
+            result = (f"✅ Gift image shared in {sent} room(s)." + (f" Failed: {failed}." if failed else "")) if english else (f"✅ نُشرت صورة الهدية في {sent} غرفة." + (f" تعذر النشر في {failed} غرفة." if failed else ""))
+            if private_to:
+                self.send_private_text(private_to, result)
+            else:
+                self.send_room_text(room, result)
+        except Exception as exc:
+            self.log("[CUSTOM-GIFT] image processing failed:", repr(exc))
+            english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
+            if private_to:
+                self.send_private_text(private_to, "❌ Could not prepare or share the gift image; send the command and image again." if english else "❌ تعذر تجهيز صورة الهدية أو نشرها؛ أعد إرسال الأمر والصورة.")
+            else:
+                self.send_room_text(room, "❌ Could not prepare or share the gift image; send the command and image again." if english else "❌ تعذر تجهيز صورة الهدية أو نشرها؛ أعد إرسال الأمر والصورة.")
+
     def _handle_publish_media(self, room, sender, media_url, description=""):
         """Claim an incoming image and schedule publishing without blocking commands."""
         if not media_url:
@@ -18794,6 +19092,12 @@ class TalkinBot:
             if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
                 media_senders.append(candidate)
 
+        # sav@ owns the next image from the same sender and has priority over
+        # the generic public-image publisher.
+        if media_url and getattr(self, "custom_gift_pending", {}):
+            if self._try_custom_gift_media(room, media_url, media_senders):
+                return
+
         # استخدم المسار المباشر نفسه الموجود في Talkin1 حتى لا تضيع أخطاء
         # معالجة الصورة داخل خيط خلفي.
         if getattr(self, "publish_pending", {}):
@@ -18944,6 +19248,11 @@ class TalkinBot:
                 self.log("[WORD-FILTER] native room ban", frm, "word=", hit, "room=", room)
             except Exception as exc:
                 self.log("[WORD-FILTER] failed:", repr(exc))
+            return
+
+        gift_request = re.fullmatch(r"sav@([^@\s]+)", body.strip(), re.I)
+        if gift_request:
+            self._request_custom_gift_image(room, frm, gift_request.group(1))
             return
 
         # صورتي/صورتك: صورة عشوائية من الويب داخل الغرفة.
@@ -19329,6 +19638,9 @@ class TalkinBot:
                     message_room = str(cm.get(4, "") or cm.get(13, "") or "").strip()
                     tracked_rooms = {_norm_room(r) for r in self._active_rooms()}
                     media_room = message_room if _norm_room(message_room) in tracked_rooms else self.room
+                    if media_url and getattr(self, "custom_gift_pending", {}):
+                        if self._try_custom_gift_media(media_room, media_url, [frm, cm.get(22, ""), cm.get("sender", "")]):
+                            return
                     if media_url and getattr(self, "publish_pending", {}):
                         media_candidates = [frm, cm.get(22, ""), cm.get("sender", ""), cm.get("username", "")]
                         if self._try_publish_pending_media(media_room, media_url, media_candidates):
@@ -19463,6 +19775,13 @@ class TalkinBot:
                     if body.strip().lower().startswith(".sa "):
                         if self.handle_music_command(self.room, body, frm):
                             return
+                    m_custom_gift = re.fullmatch(r"sav@([^@\s]+)", body.strip(), re.I)
+                    if m_custom_gift:
+                        if private_is_verified:
+                            self._request_custom_gift_image(self.room, private_command_sender, m_custom_gift.group(1), private_to=frm)
+                        else:
+                            self.send_private_text(frm, f"🔒 @{frm} يحتاج توثيقًا لإرسال هدية صورة.\n{_verification_notice()}")
+                        return
                     if re.match(r"^sa@[^@]+@.+$", body.strip(), re.I):
                         if private_is_verified:
                             if self.handle_gift_command(self.room, body, private_command_sender, private_to=frm):

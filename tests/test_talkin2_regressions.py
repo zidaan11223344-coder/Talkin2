@@ -3260,5 +3260,95 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertFalse(leave_calls)
 
 
+class NewFeatureRegressions(unittest.TestCase):
+    def test_payroll_requires_work_and_pays_once_then_enforces_cooldown(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        state = {"version": 1, "users": {}}
+        messages, awards = [], []
+        bot.send_room_text = lambda room, text: messages.append((room, text))
+        bot.log = lambda *_args: None
+
+        def load(_path, default):
+            return state
+
+        def save(_path, value, **_kwargs):
+            nonlocal state
+            state = value
+
+        with patch.object(bot_module, "PAYROLL_FILE", Path("payroll-test.json")), patch.object(
+            bot_module, "_load_local_json", side_effect=load
+        ), patch.object(bot_module, "_save_local_json", side_effect=save), patch.object(
+            bot_module, "_apply_points_delta_once",
+            side_effect=lambda user, amount, txid, reason: awards.append((user, amount, txid, reason)) or {"ok": True, "balance": amount},
+        ), patch.object(bot_module.secrets, "choice", return_value=("مزارع", 12_000)), patch.object(
+            bot_module, "PAYROLL_COOLDOWN_SECONDS", 600
+        ):
+            with patch.object(bot_module.time, "time", return_value=1_000.0):
+                bot._payroll_command("Hall", "Worker", "salary")
+                bot._payroll_command("Hall", "Worker", "work")
+                bot._payroll_command("Hall", "Worker", "salary")
+                bot._payroll_command("Hall", "Worker", "salary")
+            with patch.object(bot_module.time, "time", return_value=1_599.0):
+                bot._payroll_command("Hall", "Worker", "work")
+
+        self.assertEqual(len(awards), 1)
+        self.assertEqual(awards[0][1], 12_000)
+        self.assertTrue(awards[0][2].startswith("payroll:"))
+        self.assertIn("أرسل عمل أولاً", messages[0][1])
+        self.assertIn("وظيفة: مزارع", messages[1][1])
+        self.assertIn("تم صرف راتبك", messages[2][1])
+        self.assertIn("بعد", messages[-1][1])
+        self.assertNotIn("pending", state["users"][bot_module._norm_user("Worker")])
+
+    def test_bomb_game_is_manager_only_targets_the_named_user_and_kicks_on_wrong_wire(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {"Origin": {"Admin": "admin"}}
+        bot.bomb_games = {}
+        bot._bomb_games_lock = threading.RLock()
+        bot._active_rooms = lambda: ["Origin", "Other"]
+        messages, kicks = [], []
+        bot.send_room_text = lambda room, text: messages.append((room, text))
+        bot.request_admin_action = lambda *args, **kwargs: kicks.append((args, kwargs)) or True
+        with patch.object(bot_module, "_room_manager", side_effect=lambda _bot, _room, user: user == "Admin"), patch.object(
+            bot_module.secrets, "randbelow", return_value=0
+        ):
+            self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
+            self.assertIn("Victim", messages[-1][1])
+            self.assertIn("Other", bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["room"])
+            self.assertFalse(bot._handle_bomb_wire("Other", "SomeoneElse", "2"))
+            self.assertTrue(bot._handle_bomb_wire("Other", "Victim", "2"))
+        self.assertEqual(len(kicks), 1)
+        self.assertEqual(kicks[0][0][0:3], ("Other", "Victim", "kick"))
+        self.assertTrue(kicks[0][1]["announce_room"])
+
+    def test_custom_gift_image_claim_is_owned_by_requesting_sender(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.custom_gift_pending = {
+            bot_module._norm_user("Sender"): {
+                "sender": "Sender", "receiver": "Receiver", "room": "Hall",
+                "created_at": 10_000.0, "private_to": "",
+            }
+        }
+        bot._custom_gift_pending_lock = threading.RLock()
+        delivered = []
+        bot._custom_gift_image_worker = lambda *args: delivered.append(args)
+        with patch.object(bot_module.time, "time", return_value=10_030.0), patch.object(
+            bot_module.threading, "Thread", lambda target, args, **_kwargs: type("T", (), {"start": lambda self: target(*args)})()
+        ):
+            self.assertFalse(bot._try_custom_gift_media("Hall", "https://img.test/a.jpg", ["Intruder"]))
+            self.assertTrue(bot._try_custom_gift_media("Hall", "https://img.test/a.jpg", ["Sender"]))
+        self.assertEqual(delivered[0][0:3], ("Hall", "Sender", "Receiver"))
+        self.assertFalse(bot.custom_gift_pending)
+
+    def test_dragon_hunter_welcome_expiration_is_ten_minutes(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._dragon_hunters_lock = threading.RLock()
+        bot.dragon_hunters = {bot_module._norm_user("Hunter"): {"username": "Hunter", "expires_at": 1_600}}
+        with patch.object(bot_module.time, "time", return_value=1_599.0):
+            self.assertTrue(bot._is_dragon_hunter("Hunter"))
+        with patch.object(bot_module.time, "time", return_value=1_600.0):
+            self.assertFalse(bot._is_dragon_hunter("Hunter"))
+
+
 if __name__ == "__main__":
     unittest.main()
