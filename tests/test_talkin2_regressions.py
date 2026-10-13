@@ -3627,6 +3627,8 @@ class NewFeatureRegressions(unittest.TestCase):
         bot._bomb_games_lock = threading.RLock()
         bot._active_rooms = lambda: ["Origin", "Other"]
         messages, private_messages, kicks = [], [], []
+        scheduled = []
+        bot._schedule_bomb_expiry = lambda key, expires_at: scheduled.append((key, expires_at))
         bot.send_room_text = lambda room, text: messages.append((room, text))
         bot.send_private_text = lambda who, text: private_messages.append((who, text))
         bot.request_admin_action = lambda *args, **kwargs: kicks.append((args, kwargs)) or True
@@ -3649,7 +3651,9 @@ class NewFeatureRegressions(unittest.TestCase):
             self.assertIn("Other", private_messages[-1][1])
             self.assertIn("30 ثانية", private_messages[-1][1])
             self.assertIn("Other", bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["room"])
-            self.assertAlmostEqual(bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["expires_at"] - bot_module.time.time(), 30.0, delta=0.1)
+            bomb_key = (bot_module._norm_room("Other"), bot_module._norm_user("Victim"))
+            self.assertAlmostEqual(bot.bomb_games[bomb_key]["expires_at"] - bot_module.time.time(), 30.0, delta=0.1)
+            self.assertEqual(scheduled, [(bomb_key, bot.bomb_games[bomb_key]["expires_at"])])
             self.assertFalse(bot._handle_bomb_wire("Other", "SomeoneElse", "2"))
             # Talkin can report a display/ID in the primary sender field while
             # the stored bomb target is the canonical username in another field.
@@ -3669,19 +3673,68 @@ class NewFeatureRegressions(unittest.TestCase):
         bot._bomb_games_lock = threading.RLock()
         bot._active_rooms = lambda: ["Origin", "Other"]
         messages = []
+        bot._schedule_bomb_expiry = lambda *_args: None
         bot.send_room_text = lambda room, text: messages.append((room, text))
         bot.send_private_text = lambda *_args: None
+        bot.request_admin_action = lambda *_args, **_kwargs: self.fail("defused bomb must not kick")
         bot._configured_room_language = lambda _room: "ar"
         with patch.object(bot_module, "_room_manager", return_value=True), patch.object(
             bot_module.secrets, "randbelow", return_value=0
         ):
             self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
+        key = (bot_module._norm_room("Other"), bot_module._norm_user("Victim"))
+        expiry = bot.bomb_games[key]["expires_at"]
         self.assertTrue(bot._handle_bomb_wire("Other", "Victim", "1"))
+        self.assertFalse(bot._expire_bomb_challenge(key, expiry))
         source_result = [text for room, text in messages if room == "Origin"][-1]
         destination_result = [text for room, text in messages if room == "Other"][-1]
         self.assertIn("نجح", source_result)
         self.assertIn("تفكيك القنبلة", source_result)
         self.assertIn("تفكيك القنبلة", destination_result)
+
+    def test_bomb_timeout_without_wire_sends_kick_and_notifies_both_rooms_once(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.bomb_games = {}
+        bot._bomb_games_lock = threading.RLock()
+        key = (bot_module._norm_room("Other"), bot_module._norm_user("Victim"))
+        expires_at = 2_000.0
+        bot.bomb_games[key] = {
+            "room": "Other", "source_room": "Origin", "target": "Victim",
+            "started_by": "Admin", "wire": 2, "expires_at": expires_at,
+        }
+        kicks, messages = [], []
+        bot.request_admin_action = lambda *args, **kwargs: kicks.append((args, kwargs)) or True
+        bot.send_room_text = lambda room, text: messages.append((room, text))
+        bot._configured_room_language = lambda _room: "ar"
+        with patch.object(bot_module.time, "time", return_value=expires_at):
+            self.assertTrue(bot._expire_bomb_challenge(key, expires_at))
+            self.assertFalse(bot._expire_bomb_challenge(key, expires_at))
+        self.assertEqual(len(kicks), 1)
+        self.assertEqual(kicks[0][0][0:3], ("Other", "Victim", "kick"))
+        self.assertTrue(kicks[0][1]["announce_room"])
+        self.assertFalse(bot.bomb_games)
+        self.assertEqual({room for room, _ in messages}, {"Origin", "Other"})
+        self.assertTrue(all("لم يرسل Victim رقم السلك خلال 30 ثانية" in text for _, text in messages))
+        self.assertTrue(all("تم إرسال طلب الطرد" in text for _, text in messages))
+
+    def test_late_wire_after_deadline_is_not_treated_as_success_and_requests_kick(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.bomb_games = {}
+        bot._bomb_games_lock = threading.RLock()
+        key = (bot_module._norm_room("Hall"), bot_module._norm_user("Victim"))
+        bot.bomb_games[key] = {
+            "room": "Hall", "source_room": "Hall", "target": "Victim",
+            "started_by": "Admin", "wire": 1, "expires_at": 2_000.0,
+        }
+        kicks, messages = [], []
+        bot.request_admin_action = lambda *args, **kwargs: kicks.append((args, kwargs)) or True
+        bot.send_room_text = lambda room, text: messages.append((room, text))
+        bot._configured_room_language = lambda _room: "ar"
+        with patch.object(bot_module.time, "time", return_value=2_001.0):
+            self.assertTrue(bot._handle_bomb_wire("Hall", "Victim", "1"))
+        self.assertEqual(len(kicks), 1)
+        self.assertTrue(any("لم يرسل Victim رقم السلك خلال 30 ثانية" in text for _, text in messages))
+        self.assertFalse(any("نجح Victim في تفكيك" in text for _, text in messages))
 
     def test_bomb_send_failure_is_reported_and_does_not_leave_a_live_challenge(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -3689,6 +3742,7 @@ class NewFeatureRegressions(unittest.TestCase):
         bot._bomb_games_lock = threading.RLock()
         bot._active_rooms = lambda: ["Origin", "Other"]
         messages = []
+        bot._schedule_bomb_expiry = lambda *_args: None
         def send_room_text(room, text):
             messages.append((room, text))
             return room != "Other"

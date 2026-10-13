@@ -12528,6 +12528,7 @@ class TalkinBot:
                 "source_room": source_room,
                 "wire": secrets.randbelow(3) + 1, "expires_at": time.time() + 30.0,
             }
+            expires_at = float(games[key]["expires_at"])
             self.bomb_games = games
         target_english = getattr(self, "_configured_room_language", lambda _room: "ar")(destination) == "en"
         target_plain, sender_plain = target.lstrip("@"), str(sender).lstrip("@")
@@ -12556,6 +12557,7 @@ class TalkinBot:
             )
             self.send_room_text(source_room, failed)
             return True
+        self._schedule_bomb_expiry(key, expires_at)
         if _norm_room(source_room) != _norm_room(destination):
             sent_notice = (
                 f"✅ Bomb challenge sent to {target_plain} in {destination}."
@@ -12573,6 +12575,65 @@ class TalkinBot:
         except Exception as exc:
             self.log("[BOMB] private notice failed:", target_plain, destination, repr(exc))
         return True
+
+    def _schedule_bomb_expiry(self, key, expires_at):
+        """Schedule a non-blocking timeout; wrong/no answer triggers a kick request."""
+        delay = max(0.0, float(expires_at) - time.time())
+        timer = threading.Timer(delay, self._expire_bomb_challenge, args=(key, float(expires_at)))
+        timer.daemon = True
+        timer.start()
+
+    def _expire_bomb_challenge(self, key, expected_expires_at):
+        lock = getattr(self, "_bomb_games_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            game = getattr(self, "bomb_games", {}).get(key)
+            if not isinstance(game, dict):
+                return False
+            if abs(float(game.get("expires_at", 0) or 0) - float(expected_expires_at)) > 0.001:
+                return False
+            remaining = float(expected_expires_at) - time.time()
+            if remaining > 0:
+                self._schedule_bomb_expiry(key, expected_expires_at)
+                return False
+            self.bomb_games.pop(key, None)
+        self._finish_expired_bomb(game)
+        return True
+
+    def _finish_expired_bomb(self, game):
+        """Kick a target who did not answer within 30 seconds and notify both rooms."""
+        destination = str(game.get("room") or "").strip()
+        source_room = str(game.get("source_room") or destination).strip()
+        target = str(game.get("target") or "").strip().lstrip("@")
+        try:
+            kick_sent = self.request_admin_action(
+                destination, target, "kick", str(game.get("started_by") or "bomb timeout"), announce_room=True
+            )
+        except Exception as exc:
+            self.log("[BOMB] timeout kick failed:", destination, target, repr(exc))
+            kick_sent = False
+        rooms, seen = [], set()
+        for room in (destination, source_room):
+            norm = _norm_room(room)
+            if room and norm not in seen:
+                seen.add(norm)
+                rooms.append(room)
+        for room in rooms:
+            english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
+            prefix = ""
+            if _norm_room(room) != _norm_room(destination):
+                prefix = f"📍 Room: {destination}\n" if english else f"📍 الغرفة: {destination}\n"
+            if english:
+                action = "The kick request was sent." if kick_sent else "The kick request failed."
+                message = f"💥 {target} did not send a wire number within 30 seconds; the bomb exploded. {action}"
+            else:
+                action = "تم إرسال طلب الطرد." if kick_sent else "تعذر إرسال طلب الطرد."
+                message = f"💥 لم يرسل {target} رقم السلك خلال 30 ثانية؛ انفجرت القنبلة. {action}"
+            try:
+                self.send_room_text(room, prefix + message)
+            except Exception as exc:
+                self.log("[BOMB] timeout result notice failed:", room, repr(exc))
 
     def _handle_bomb_wire(self, room, username, text):
         digits = str(text or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
@@ -12607,11 +12668,6 @@ class TalkinBot:
                         f"✅ {username} successfully defused the bomb."
                         if english else f"✅ نجح {username} في تفكيك القنبلة."
                     )
-                elif kind == "expired":
-                    message = (
-                        f"💥 {username}'s bomb challenge in {destination} expired before it was defused."
-                        if english else f"💥 انتهى وقت قنبلة {username} في غرفة {destination} دون تفكيكها."
-                    )
                 else:
                     action_result = (
                         "The room kick request was sent." if extra == "kick_sent"
@@ -12626,8 +12682,8 @@ class TalkinBot:
                     )
                 self.send_room_text(result_room, prefix + message)
 
-        if time.time() > float(game.get("expires_at", 0)):
-            send_result("expired")
+        if time.time() >= float(game.get("expires_at", 0)):
+            self._finish_expired_bomb(game)
         elif int(digits) == int(game.get("wire") or 0):
             send_result("defused")
         else:
