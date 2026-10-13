@@ -687,6 +687,7 @@ MF_FILE = DATA_DIR / "mf.json"
 FILTER_EXCEPTIONS_FILE = DATA_DIR / "filter_exceptions.json"
 FILTER_BANS_FILE = DATA_DIR / "filter_bans.json"
 BOT_BANS_FILE = DATA_DIR / "bot_bans.json"
+LAST_BOT_BANS_FILE = DATA_DIR / "last_bot_bans.json"
 PUBLISH_BANS_FILE = DATA_DIR / "publish_bans.json"
 PROTECTION_FILE = DATA_DIR / "room_protection.json"
 SNAKE_FILE = DATA_DIR / "snake_games.json"
@@ -700,7 +701,7 @@ _STATE_FILE_NAMES = (
     "masters.json", "vip_users.json", "verified_users.json", "points.json",
     "messages.json", "published_posts.json", "media_stats.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
-    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
+    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
     "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "backup_manifest.json",
 )
 
@@ -5929,6 +5930,8 @@ class TalkinBot:
         self.pending_admin_actions = {}
         self.pending_admin_lock = threading.Lock()
         self.last_admin_actions = {}
+        last_bot_bans = _load_local_json(LAST_BOT_BANS_FILE, {})
+        self.last_bot_bans = last_bot_bans if isinstance(last_bot_bans, dict) else {}
         # Last successfully dispatched bot command. Used by `.u` to repeat
         # the exact command (room, sender, privacy and arguments).
         self.last_bot_action = _load_local_json(DATA_DIR / "last_action.json", {})
@@ -7974,26 +7977,49 @@ class TalkinBot:
         finally:
             self._replaying_bot_action = old_flag
 
-    def _undo_last_bot_action(self, requester):
-        """Undo the last confirmed moderation action, restoring the old role."""
-        action = getattr(self, "last_admin_action", None)
-        if not isinstance(action, dict) or not action.get("room"):
-            action = _load_local_json(DATA_DIR / "last_admin_action.json", {})
-        if not isinstance(action, dict) or action.get("undone"):
-            self.send_private_text(requester, "📭 لا توجد عملية إدارية قابلة للتراجع.")
+    def _undo_last_bot_action(self, requester, room=""):
+        """Unban the latest confirmed bot-banned user in this exact room."""
+        room = str(room or "").strip()
+        room_key = _norm_room(room)
+        if not room_key:
+            self.send_private_text(requester, "❌ نفّذ .u من الغرفة نفسها التي حظر فيها البوت المستخدم.")
             return True
-        room = str(action.get("room") or "").strip()
+        bans = getattr(self, "last_bot_bans", None)
+        if not isinstance(bans, dict):
+            bans = _load_local_json(LAST_BOT_BANS_FILE, {})
+        action = bans.get(room_key) if isinstance(bans, dict) else None
+        if not isinstance(action, dict) or not action.get("active") or action.get("undo_requested"):
+            self.send_private_text(requester, f"📭 لا يوجد حظر حديث قابل للتراجع في الغرفة {room}.")
+            return True
         target = str(action.get("target") or "").strip().lstrip("@")
-        inverse = str(action.get("inverse") or "member").strip() or "member"
+        if not target:
+            self.send_private_text(requester, "📭 لا يوجد حظر حديث قابل للتراجع في هذه الغرفة.")
+            return True
         try:
-            self.send_admin(room, target, inverse)
-            action["undone"] = True
-            self.last_admin_action = action
-            _save_local_json(DATA_DIR / "last_admin_action.json", action)
-            self.send_private_text(requester, f"✅ تم التراجع عن آخر عملية: @{target} في {room}\n↩️ تمت استعادة الرتبة: {inverse}")
+            # Set the idempotency marker before the packet; the server may
+            # confirm the role change before request_admin_action returns.
+            action["undo_requested"] = True
+            action["undo_requested_at"] = int(time.time())
+            bans[room_key] = action
+            self.last_bot_bans = bans
+            _save_local_json(LAST_BOT_BANS_FILE, bans)
+            # Keep the unban in the normal moderation confirmation flow; never
+            # silently assign member or undo an action from another room.
+            sent = self.request_admin_action(room, target, "member", requester, announce_room=True)
+            if not sent:
+                action["undo_requested"] = False
+                action.pop("undo_requested_at", None)
+                _save_local_json(LAST_BOT_BANS_FILE, bans)
+                self.send_private_text(requester, f"❌ تعذر إرسال طلب فك حظر @{target} في {room}.")
+                return True
+            self.send_private_text(requester, f"⏳ أُرسل طلب التراجع عن حظر @{target} في الغرفة {room}؛ بانتظار تأكيد الخادم.")
         except Exception as exc:
-            self.log("[UNDO] admin undo failed:", repr(exc))
-            self.send_private_text(requester, f"❌ تعذر التراجع عن العملية: {exc}")
+            action["undo_requested"] = False
+            action.pop("undo_requested_at", None)
+            self.last_bot_bans = bans
+            _save_local_json(LAST_BOT_BANS_FILE, bans)
+            self.log("[UNDO] room ban undo failed:", repr(exc))
+            self.send_private_text(requester, f"❌ تعذر التراجع عن حظر الغرفة: {exc}")
         return True
 
     def send_admin(self, room: str, target: str, operation: str):
@@ -12474,6 +12500,15 @@ class TalkinBot:
             f"💣 وصلت قنبلة إلى {target_plain} من {sender_plain}!\nلتفكيكها اختر رقم السلك:\n1️⃣ أحمر\n2️⃣ أصفر\n3️⃣ أخضر\n⏱️ أمامك 30 ثانية؛ أرسل رقمًا واحدًا."
         )
         self.send_room_text(destination, challenge)
+        private_notice = (
+            f"💣 {sender_plain} sent you a bomb in {destination}. Go to that room and defuse it within 30 seconds by sending 1, 2, or 3."
+            if target_english else
+            f"💣 أرسل لك {sender_plain} قنبلة في غرفة {destination}. اذهب إلى الغرفة وفككها خلال 30 ثانية بإرسال رقم السلك 1 أو 2 أو 3."
+        )
+        try:
+            self.send_private_text(target_plain, private_notice)
+        except Exception as exc:
+            self.log("[BOMB] private notice failed:", target_plain, destination, repr(exc))
         return True
 
     def _handle_bomb_wire(self, room, username, text):
@@ -17847,7 +17882,7 @@ class TalkinBot:
         if low == ".u":
             if not _is_master_name(sender):
                 return True
-            return self._undo_last_bot_action(sender)
+            return self._undo_last_bot_action(sender, room)
 
         m=re.match(r"^(u@|ub@|unban\s+)(@?[^\s]+)$", text, re.I)
         if m:
@@ -18733,11 +18768,10 @@ class TalkinBot:
         return bool(previous and now - previous < ttl)
 
     def _auto_unban(self, room, username):
-        try:
-            self.send_admin(room, username, "member")
-            self.log("[JOINLEAVE] auto-unban", room, username)
-        except Exception as exc:
-            self.log("[JOINLEAVE] auto-unban failed", repr(exc))
+        # A ban must persist until an explicit master action (.u in the same
+        # room, or an explicit unban command) confirms the role change.
+        self.log("[JOINLEAVE] ignored automatic member restore after ban:", room, username)
+        return False
 
     def handle_room_event(self, result):
         event = (result.get("room_event") or {}) if isinstance(result, dict) else {}
@@ -19028,6 +19062,31 @@ class TalkinBot:
                             requester,
                             "حظر إداري",
                         )
+                        last_bans = getattr(self, "last_bot_bans", None)
+                        if not isinstance(last_bans, dict):
+                            last_bans = {}
+                        last_bans[_norm_room(room)] = {
+                            "room": str(pending.get("room") or room),
+                            "target": str(pending.get("target") or changed_user).lstrip("@"),
+                            "banned_by": requester,
+                            "created_at": int(time.time()),
+                            "active": True,
+                            "undo_requested": False,
+                            "undone": False,
+                        }
+                        self.last_bot_bans = last_bans
+                        _save_local_json(LAST_BOT_BANS_FILE, last_bans)
+                    elif changed_role == "member":
+                        last_bans = getattr(self, "last_bot_bans", None)
+                        if isinstance(last_bans, dict):
+                            latest_ban = last_bans.get(_norm_room(room))
+                            if (isinstance(latest_ban, dict)
+                                    and _norm_user(latest_ban.get("target")) == _norm_user(changed_user)):
+                                latest_ban["active"] = False
+                                latest_ban["undo_requested"] = False
+                                latest_ban["undone"] = True
+                                latest_ban["unbanned_at"] = int(time.time())
+                                _save_local_json(LAST_BOT_BANS_FILE, last_bans)
                     inverse = {
                         "kicked": "member",
                         "outcast": "member",

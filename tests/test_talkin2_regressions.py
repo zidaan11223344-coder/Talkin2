@@ -3349,10 +3349,11 @@ class NewFeatureRegressions(unittest.TestCase):
         bot.pending_admin_actions = {
             ("north", "target", "outcast"): {
                 "room": "North", "target": "Target", "role": "outcast",
-                "requester": "", "announce_room": False, "previous_role": "member",
+                "requester": "Master", "announce_room": False, "previous_role": "member",
             }
         }
         bot.last_admin_actions = {}
+        bot.last_bot_bans = {}
         bot._remember_inflight_command = lambda *_args, **_kwargs: None
         bot._report_monitored_event = lambda *_args, **_kwargs: None
         bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
@@ -3362,13 +3363,18 @@ class NewFeatureRegressions(unittest.TestCase):
         bot.log = lambda *_args: None
         with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
             bot_module, "_save_persistent_rooms"
-        ), patch.object(bot_module, "_record_bot_ban"):
+        ), patch.object(bot_module, "_record_bot_ban"), patch.object(
+            bot_module, "_save_local_json"
+        ), patch.object(bot_module, "_is_master_name", return_value=True):
             bot._handle_room_event_impl({"room_event": {
                 1: "role_changed", 13: "North", 17: "test-bot", 22: "Target", 31: "outcast",
             }})
         self.assertIn("North", bot.connected_rooms)
         self.assertNotIn("Target", bot.room_users["North"])
         self.assertFalse(bot.pending_admin_actions)
+        ban = bot.last_bot_bans[bot_module._norm_room("North")]
+        self.assertEqual(ban["target"], "Target")
+        self.assertTrue(ban["active"])
 
     def test_user_left_with_actor_only_after_ban_does_not_trigger_rejoin(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -3398,6 +3404,70 @@ class NewFeatureRegressions(unittest.TestCase):
             }})
         self.assertIn("North", bot.connected_rooms)
         self.assertIn("Target", bot.room_users["North"])
+
+    def test_auto_unban_is_disabled_and_never_grants_member(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        calls = []
+        bot.send_admin = lambda *args: calls.append(args)
+        bot.log = lambda *_args: None
+        self.assertFalse(bot._auto_unban("North", "RecentlyBanned"))
+        self.assertFalse(calls)
+
+    def test_dot_u_only_requests_unban_for_latest_confirmed_ban_in_same_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        room_key = bot_module._norm_room("Garden")
+        bot.last_bot_bans = {room_key: {
+            "room": "Garden", "target": "RecentlyBanned", "active": True,
+            "undo_requested": False,
+        }}
+        calls, messages = [], []
+        bot.request_admin_action = lambda *args, **kwargs: calls.append((args, kwargs)) or True
+        bot.send_private_text = lambda who, text: messages.append((who, text))
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "_save_local_json"):
+            self.assertTrue(bot._undo_last_bot_action("Master", "OtherRoom"))
+            self.assertFalse(calls)
+            self.assertTrue(bot._undo_last_bot_action("Master", "Garden"))
+        self.assertEqual(calls[0][0], ("Garden", "RecentlyBanned", "member", "Master"))
+        self.assertTrue(calls[0][1]["announce_room"])
+        self.assertTrue(bot.last_bot_bans[room_key]["undo_requested"])
+        self.assertIn("بانتظار تأكيد الخادم", messages[-1][1])
+
+    def test_confirmed_unban_deactivates_room_ban_record(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.room_users = {"Garden": {}}
+        bot.known_rooms = {"Garden"}
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot.connected_rooms = {"Garden"}
+        bot.pending_admin_lock = threading.Lock()
+        bot.pending_admin_actions = {
+            ("garden", "target", "member"): {
+                "room": "Garden", "target": "Target", "role": "member",
+                "requester": "Master", "announce_room": False, "previous_role": "outcast",
+            }
+        }
+        room_key = bot_module._norm_room("Garden")
+        bot.last_bot_bans = {room_key: {
+            "room": "Garden", "target": "Target", "active": True,
+            "undo_requested": True,
+        }}
+        bot.last_admin_actions = {}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        bot.send_room_text = lambda *_args: None
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "_save_persistent_rooms"), patch.object(
+            bot_module, "_save_local_json"
+        ), patch.object(bot_module, "_is_master_name", return_value=True):
+            bot._handle_room_event_impl({"room_event": {
+                1: "role_changed", 13: "Garden", 17: "Target", 31: "member",
+            }})
+        self.assertFalse(bot.last_bot_bans[room_key]["active"])
+        self.assertTrue(bot.last_bot_bans[room_key]["undone"])
 
     def test_payroll_requires_work_and_pays_once_then_enforces_cooldown(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -3444,8 +3514,9 @@ class NewFeatureRegressions(unittest.TestCase):
         bot.bomb_games = {}
         bot._bomb_games_lock = threading.RLock()
         bot._active_rooms = lambda: ["Origin", "Other"]
-        messages, kicks = [], []
+        messages, private_messages, kicks = [], [], []
         bot.send_room_text = lambda room, text: messages.append((room, text))
+        bot.send_private_text = lambda who, text: private_messages.append((who, text))
         bot.request_admin_action = lambda *args, **kwargs: kicks.append((args, kwargs)) or True
         bot._configured_room_language = lambda _room: "ar"
         with patch.object(bot_module, "_room_manager", side_effect=lambda _bot, _room, user: user == "Admin"), patch.object(
@@ -3457,6 +3528,10 @@ class NewFeatureRegressions(unittest.TestCase):
             self.assertNotIn("@Victim", messages[-1][1])
             self.assertNotIn("@Admin", messages[-1][1])
             self.assertIn("30 ثانية", messages[-1][1])
+            self.assertEqual(private_messages[-1][0], "Victim")
+            self.assertIn("Admin", private_messages[-1][1])
+            self.assertIn("Other", private_messages[-1][1])
+            self.assertIn("30 ثانية", private_messages[-1][1])
             self.assertIn("Other", bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["room"])
             self.assertAlmostEqual(bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["expires_at"] - bot_module.time.time(), 30.0, delta=0.1)
             self.assertFalse(bot._handle_bomb_wire("Other", "SomeoneElse", "2"))
