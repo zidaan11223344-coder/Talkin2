@@ -298,6 +298,8 @@ try:
 except (TypeError, ValueError):
     BILLION_GAME_COOLDOWN_SECONDS = 60.0
 MONEY_GAME_WIN_CHANCE_PERCENT = 3
+MONEY_GAME_WIN_GAP_LOSSES = 1
+_MONEY_GAME_WIN_LOCK = threading.RLock()
 
 try:
     STOCK_MARKET_INTERVAL_SECONDS = max(60.0, float(os.getenv("STOCK_MARKET_INTERVAL_SECONDS", "900") or 900))
@@ -688,6 +690,7 @@ FILTER_EXCEPTIONS_FILE = DATA_DIR / "filter_exceptions.json"
 FILTER_BANS_FILE = DATA_DIR / "filter_bans.json"
 BOT_BANS_FILE = DATA_DIR / "bot_bans.json"
 LAST_BOT_BANS_FILE = DATA_DIR / "last_bot_bans.json"
+MONEY_GAME_WIN_STATE_FILE = DATA_DIR / "money_game_win_state.json"
 PUBLISH_BANS_FILE = DATA_DIR / "publish_bans.json"
 PROTECTION_FILE = DATA_DIR / "room_protection.json"
 SNAKE_FILE = DATA_DIR / "snake_games.json"
@@ -701,7 +704,7 @@ _STATE_FILE_NAMES = (
     "masters.json", "vip_users.json", "verified_users.json", "points.json",
     "messages.json", "published_posts.json", "media_stats.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
-    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
+    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "money_game_win_state.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
     "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "backup_manifest.json",
 )
 
@@ -1816,6 +1819,35 @@ def _save_local_json(path, data, *, persist_state_db=True):
     github_save = globals().get("_github_sync_after_local_save")
     if github_save:
         github_save(path, data)
+
+def _money_game_roll(game_name):
+    """Roll a 3% money-game win with a persisted gap after each jackpot."""
+    game_name = str(game_name or "").strip().lower()
+    if game_name not in {"million", "billion"}:
+        raise ValueError("game_name must be million or billion")
+    with _MONEY_GAME_WIN_LOCK:
+        state = _load_local_json(MONEY_GAME_WIN_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        game_state = state.get(game_name, {})
+        if not isinstance(game_state, dict):
+            game_state = {}
+        forced_losses = max(0, int(game_state.get("forced_losses_remaining", 0) or 0))
+        if forced_losses:
+            won = False
+            forced_losses -= 1
+        else:
+            won = secrets.randbelow(100) < MONEY_GAME_WIN_CHANCE_PERCENT
+            if won:
+                forced_losses = max(1, int(MONEY_GAME_WIN_GAP_LOSSES))
+        state[game_name] = {
+            "forced_losses_remaining": forced_losses,
+            "last_result": "win" if won else "loss",
+            "rounds": max(0, int(game_state.get("rounds", 0) or 0)) + 1,
+            "updated_at": int(time.time()),
+        }
+        _save_local_json(MONEY_GAME_WIN_STATE_FILE, state)
+        return won
 
 # GitHub-backed persistent state. Runtime stays in Talkin1; durable state is
 # backed up to Talkin4 asynchronously so message handling is not blocked by
@@ -13949,7 +13981,7 @@ class TalkinBot:
             self.send_room_text(room, f"🏦✨ Million Bank ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the prize...\n━━━━━━━━━━━━━━")
         else:
             self.send_room_text(room, f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن الجائزة...\n━━━━━━━━━━━━━━")
-        won = secrets.randbelow(100) < MONEY_GAME_WIN_CHANCE_PERCENT
+        won = _money_game_roll("million")
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
         if not won:
@@ -15127,7 +15159,7 @@ class TalkinBot:
                 self.send_room_text(room, f"🎰✨ Billion game ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the billion...\n━━━━━━━━━━━━━━")
             else:
                 self.send_room_text(room, f"🎰✨ لعبة المليار ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن مليار...\n━━━━━━━━━━━━━━")
-            won = secrets.randbelow(100) < MONEY_GAME_WIN_CHANCE_PERCENT
+            won = _money_game_roll("billion")
             reward = 1000000000 if won else 0
             _record_game(sender_name, "billion", reward, 0)
 

@@ -1403,7 +1403,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         bot._configured_room_language = lambda _room: "ar"
         sent = []
         bot.send_room_text = lambda room, text: sent.append((room, text))
-        with patch.object(bot_module.secrets, "randbelow", return_value=99), patch.object(
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
+        ), patch.object(bot_module.secrets, "randbelow", return_value=99), patch.object(
             bot_module, "_record_game", lambda *_args: None
         ), patch.object(bot_module.time, "sleep", side_effect=AssertionError("unexpected delay")):
             self.assertTrue(bot._million_bank_game("North", "Player"))
@@ -1425,7 +1427,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 bot.log = lambda *_args: None
                 bot._game_award = lambda user, amount: awards.append((user, amount))
                 bot._send_game_winner_card = lambda *_args, **_kwargs: None
-                with patch.object(bot_module.secrets, "randbelow", return_value=roll), patch.object(
+                with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+                    bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
+                ), patch.object(bot_module.secrets, "randbelow", return_value=roll), patch.object(
                     bot_module, "_record_game", return_value=None
                 ):
                     self.assertTrue(bot._million_bank_game("North", "Player"))
@@ -1451,7 +1455,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 bot._active_rooms = lambda: ["North"]
                 bot.log = lambda *_args: None
                 bot._game_award = lambda user, amount: awards.append((user, amount))
-                with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+                with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+                    bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
+                ), patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
                     bot_module, "_games_enabled_for_room", return_value=True
                 ), patch.object(bot_module.secrets, "randbelow", return_value=roll), patch.object(
                     bot_module, "_record_game", return_value=None
@@ -1461,6 +1467,22 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 self.assertEqual(bool(awards), won)
                 self.assertEqual(awards, ([ ("Player", 1_000_000_000) ] if won else []))
                 self.assertIn("تم الحصول على المليار" if won else "لم يحصل على المليار", sent[-1][1])
+
+    def test_money_game_wins_are_separated_and_each_game_has_independent_persistent_gap(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
+        ), patch.object(bot_module.secrets, "randbelow", return_value=0):
+            # Even an RNG that returns a win every time cannot produce
+            # consecutive jackpots; the gap is separate for each game type.
+            results = (
+                bot_module._money_game_roll("billion"),
+                bot_module._money_game_roll("million"),
+                bot_module._money_game_roll("billion"),
+                bot_module._money_game_roll("million"),
+                bot_module._money_game_roll("billion"),
+                bot_module._money_game_roll("million"),
+            )
+        self.assertEqual(results, (True, True, False, False, True, True))
 
     def test_enter_my_rooms_joins_every_saved_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
