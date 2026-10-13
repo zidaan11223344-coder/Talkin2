@@ -18834,15 +18834,18 @@ class TalkinBot:
         event_user_22 = str(event.get(22, "") or "").strip()
         if event_type in ("user_joined", "user_left"):
             username = event_user_17 or event_user_22
-            if event_type == "user_left" and not event_user_17 and _norm_user(event_user_22) == _norm_user(BOT_ID):
-                # Some Talkin servers put the command actor in field 22 on the
-                # target's leave event and omit field 17. During a recent ban,
-                # field 22 is not sufficient evidence that the bot itself left.
+            if event_type == "user_left" and _norm_user(username) == _norm_user(BOT_ID):
+                # A leave packet immediately following a ban can identify the
+                # bot as actor/initiator (in either native field), not as the
+                # account removed. Do not let that ambiguous echo schedule a
+                # leave/rejoin cycle when this room's pending moderation named
+                # a different target. A moderation request targeting the bot
+                # itself is never suppressed.
                 marker = getattr(self, "_recent_room_moderation", {}).get(_norm_room(room))
                 if (isinstance(marker, dict)
                         and float(marker.get("created_at", 0) or 0) >= time.time() - 20
                         and _norm_user(marker.get("target")) != _norm_user(BOT_ID)):
-                    self.log(f"[MOD_EVENT] ignored actor-only user_left after moderation in {room}")
+                    self.log(f"[MOD_EVENT] ignored ambiguous bot user_left after moderation of another account in {room}")
                     username = ""
         else:
             username = event_user_22
@@ -19038,6 +19041,19 @@ class TalkinBot:
                             if match:
                                 changed_user = match
                                 break
+            if _norm_user(changed_user) == _norm_user(BOT_ID):
+                recent = getattr(self, "_recent_room_moderation", {}).get(_norm_room(room))
+                if (isinstance(recent, dict)
+                        and float(recent.get("created_at", 0) or 0) >= time.time() - 20
+                        and _norm_user(recent.get("target")) != _norm_user(BOT_ID)):
+                    target_key = _norm_user(recent.get("target"))
+                    actual_target = next((candidate for candidate in candidates
+                                          if _norm_user(candidate) == target_key), None)
+                    if actual_target:
+                        changed_user = actual_target
+                    else:
+                        self.log(f"[MOD_EVENT] ignored ambiguous bot role_changed after moderation of another account in {room}")
+                        changed_user = ""
             if changed_user and changed_role:
                 if changed_role in ("kicked", "outcast"):
                     self.room_users.get(room, {}).pop(changed_user, None)

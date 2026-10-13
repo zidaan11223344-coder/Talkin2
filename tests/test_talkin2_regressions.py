@@ -3399,9 +3399,12 @@ class NewFeatureRegressions(unittest.TestCase):
         with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
             bot_module, "_room_protection_cfg", return_value={}
         ), patch.object(bot_module, "_save_persistent_rooms"), patch.object(bot_module, "_remember_roster"):
-            bot._handle_room_event_impl({"room_event": {
-                1: "user_left", 13: "North", 22: "test-bot",
-            }})
+            # Cover actor-only field 22 and the ambiguous field-17/field-22 order.
+            for packet in (
+                {1: "user_left", 13: "North", 22: "test-bot"},
+                {1: "user_left", 13: "North", 17: "test-bot", 22: "Target"},
+            ):
+                bot._handle_room_event_impl({"room_event": packet})
         self.assertIn("North", bot.connected_rooms)
         self.assertIn("Target", bot.room_users["North"])
 
