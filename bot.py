@@ -12048,10 +12048,9 @@ class TalkinBot:
         winner_stake = int(winner.get("stake", 0) or 0)
         loser_stake = int(loser.get("stake", 0) or 0)
 
-        # Each player risks the amount they entered. The winner receives the
-        # opponent's stake; the winner's own stake is returned implicitly.
-        # Both stakes were reserved atomically when players joined. Do not
-        # debit again here; return the winner's stake and add the loser's stake.
+        # Both players enter at the first player's shared stake. Both stakes
+        # were reserved atomically when they joined. Do not debit again here:
+        # return the winner's stake and add the loser's stake to the winner.
         _add_points(winner.get("user"), winner_stake + loser_stake)
 
         game_key = {

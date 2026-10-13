@@ -1441,6 +1441,49 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertTrue(bot.wager_waiting["رهان"])
         self.assertTrue(messages)
 
+    def test_matched_billion_wager_deducts_full_stake_from_loser_for_either_winner(self):
+        stake = 1_000_000_000
+        for game_name in ("رهان", "مراهنة", "مضاربة", "استثمار", "حظي"):
+            for roll, expected_winner, expected_loser in (
+                (0, "Ahmed", "Said"), (1, "Said", "Ahmed")
+            ):
+              with self.subTest(game=game_name, winner=expected_winner):
+                bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                bot.game_lock = threading.RLock()
+                # Ahmed's stake was already reserved while the challenge waited.
+                balances = {"Ahmed": stake, "Said": 2 * stake}
+                bot.wager_waiting = {
+                    game_name.casefold(): {"user": "Ahmed", "room": "North", "stake": stake,
+                                           "reserved": True, "game": game_name, "created": bot_module.time.time()}
+                }
+                bot._cleanup_expired_wagers = lambda: None
+                bot._game_cooldown_notice = lambda *_args: True
+                sent, records = [], []
+                bot.send_room_text = lambda room, text: sent.append((room, text))
+                bot._send_game_winner_card = lambda *_args: None
+
+                def add_points(user, delta):
+                    balances[user] += delta
+                    return balances[user]
+
+                with patch.object(bot_module, "_get_points", side_effect=lambda user: balances[user]), \
+                     patch.object(bot_module, "_add_points", side_effect=add_points), \
+                     patch.object(bot_module, "_record_game", side_effect=lambda *args: records.append(args)), \
+                     patch.object(bot_module.secrets, "randbelow", return_value=roll):
+                    self.assertTrue(bot._queue_wager("South", "Said", game_name, 100_000))
+
+                winner_balance = balances[expected_winner]
+                loser_balance = balances[expected_loser]
+                self.assertEqual(winner_balance, 3 * stake)  # Own stake returned + opponent's stake.
+                self.assertEqual(loser_balance, stake)  # One billion was debited; no extra debit.
+                self.assertEqual(len(records), 2)
+                loser_record = next(item for item in records if item[0] == expected_loser)
+                winner_record = next(item for item in records if item[0] == expected_winner)
+                self.assertEqual(loser_record[2], -stake)
+                self.assertEqual(loser_record[3], stake)
+                self.assertEqual(winner_record[2], stake)
+                self.assertTrue(any("-1b" in text for _, text in sent))
+
     def test_million_bank_result_has_no_artificial_reveal_sleep(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._game_cooldown_notice = lambda *_args: True
