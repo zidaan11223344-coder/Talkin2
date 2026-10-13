@@ -12542,6 +12542,22 @@ class TalkinBot:
                 self.send_room_text(room, "⚠️ The server could not issue the kick." if english else "⚠️ تعذر تنفيذ الطرد من الخادم.")
         return True
 
+    def _route_room_game_input(self, room, username, text, username_aliases=()):
+        """Route active bomb wires before board-game and Cricket commands."""
+        candidates, seen = [], set()
+        for candidate in (username, *(username_aliases or ())):
+            candidate = str(candidate or "").strip().lstrip("@")
+            key = _norm_user(candidate)
+            if candidate and key and key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+        for candidate in candidates:
+            if self._handle_bomb_wire(room, candidate, text):
+                return True
+        if self._route_active_board_game_join(room, username, text):
+            return True
+        return self._cricket.handle(room, username, text, is_private=False)
+
     def _payroll_command(self, room, username, command):
         """Require a fresh random job before every salary; persist cooldowns and claims."""
         username = str(username or "").strip().lstrip("@")
@@ -19457,12 +19473,11 @@ class TalkinBot:
         is_verified = bool(verified_sender)
         command_sender = verified_sender or username or frm or str(event.get(17, "") or "").strip()
         cricket_sender = command_sender
-        # Cricket also uses the plain `Join` command and claims it even when no
-        # cricket match is running. If Ludo or Snake is active in this room,
-        # route the same command to that board game first.
-        if self._route_active_board_game_join(room, cricket_sender, body):
-            return
-        if self._cricket.handle(room, cricket_sender, body, is_private=False):
+        # Bomb replies use digits that Cricket also accepts, so the shared
+        # router claims active bomb wires before routing any board-game input.
+        if self._route_room_game_input(
+                room, cricket_sender, body,
+                username_aliases=(username, frm, event.get(17, ""), event.get(22, ""))):
             return
 
         # Verified users may use normal bot commands; administration remains

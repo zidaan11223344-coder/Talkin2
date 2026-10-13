@@ -3538,10 +3538,32 @@ class NewFeatureRegressions(unittest.TestCase):
             self.assertIn("Other", bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["room"])
             self.assertAlmostEqual(bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["expires_at"] - bot_module.time.time(), 30.0, delta=0.1)
             self.assertFalse(bot._handle_bomb_wire("Other", "SomeoneElse", "2"))
-            self.assertTrue(bot._handle_bomb_wire("Other", "Victim", "2"))
+            # Talkin can report a display/ID in the primary sender field while
+            # the stored bomb target is the canonical username in another field.
+            self.assertTrue(bot._route_room_game_input(
+                "Other", "VictimDisplayId", "2", username_aliases=("Victim",)
+            ))
         self.assertEqual(len(kicks), 1)
         self.assertEqual(kicks[0][0][0:3], ("Other", "Victim", "kick"))
         self.assertTrue(kicks[0][1]["announce_room"])
+
+    def test_active_bomb_wire_is_claimed_before_cricket_or_board_games(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        calls = []
+        bot._handle_bomb_wire = lambda room, username, text: calls.append(("bomb", room, username, text)) or True
+        bot._route_active_board_game_join = lambda *_args: self.fail("bomb wire must not reach board-game join routing")
+        bot._cricket = type("CricketStub", (), {
+            "handle": lambda *_args, **_kwargs: self.fail("bomb wire must not reach Cricket")
+        })()
+        self.assertTrue(bot._route_room_game_input("Hall", "Victim", "2"))
+        self.assertEqual(calls, [("bomb", "Hall", "Victim", "2")])
+
+        bot._handle_bomb_wire = lambda *_args: False
+        bot._route_active_board_game_join = lambda *_args: False
+        bot._cricket = type("CricketStub", (), {
+            "handle": lambda *_args, **_kwargs: True
+        })()
+        self.assertTrue(bot._route_room_game_input("Hall", "Player", "2"))
 
     def test_custom_gift_image_claim_is_owned_by_requesting_sender(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
