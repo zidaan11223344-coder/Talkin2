@@ -2841,7 +2841,7 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
             bot_module, "_all_point_transfer_history", return_value=([history_entry], 1, 1)
         ) as get_log:
             self.assertTrue(master._handle_management_command_impl("Room", "transfer history", "Master", is_private=False))
-        get_log.assert_called_once_with(page=1, page_size=8)
+        get_log.assert_called_once_with(page=1, page_size=bot_module._POINT_TRANSFER_HISTORY_PAGE_SIZE)
         self.assertEqual(master_replies[0][0], "Master")
         self.assertIn("@Sender → @Recipient", master_replies[0][1])
         self.assertIn("1k", master_replies[0][1])
@@ -2874,6 +2874,27 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertIn("@Newest", replies[0][1])
         self.assertIn("قائمة 2/3", replies[1][1])
         self.assertIn("@Older", replies[1][1])
+
+    def test_global_transfer_log_page_fits_ws_limit_with_extremely_long_fields(self):
+        huge_entry = {
+            "sender": "مرسل" * 2_000,
+            "recipient": "مستلم" * 2_000,
+            "amount": 1_000_000_000,
+            "timestamp": 1_700_000_000,
+            "sender_balance_after": 9_000_000_000,
+            "recipient_balance_after": 9_000_000_000,
+            "reason": "سبب تحويل طويل جدًا " * 2_000,
+        }
+        with patch.object(
+            bot_module, "_all_point_transfer_history",
+            return_value=([dict(huge_entry) for _ in range(bot_module._POINT_TRANSFER_HISTORY_PAGE_SIZE)], 100, 34),
+        ) as get_history:
+            message, pages = bot_module._format_all_point_transfer_history_page(1, english=False)
+        get_history.assert_called_once_with(page=1, page_size=bot_module._POINT_TRANSFER_HISTORY_PAGE_SIZE)
+        self.assertEqual(pages, 34)
+        packet = bot_module.encode_query("chat_message", type_="text", to="Master", body=message)
+        self.assertLessEqual(len(packet), bot_module._ws_payload_limit())
+        self.assertLessEqual(len(message.encode("utf-8")), 800)
 
 
 class FollowupFeatureRegressions(unittest.TestCase):

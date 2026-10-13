@@ -3795,7 +3795,16 @@ def _all_point_transfer_history(page=1, page_size=8):
     return rows[start:start + page_size], total, pages
 
 
-_POINT_TRANSFER_HISTORY_PAGE_SIZE = 8
+_POINT_TRANSFER_HISTORY_PAGE_SIZE = 3
+
+
+def _transfer_log_safe_field(value, max_bytes=48):
+    """Sanitize and UTF-8-bound untrusted transfer-log fields."""
+    text = str(value or "?").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore") + "…"
 
 
 def _format_all_point_transfer_history_page(page=1, english=False):
@@ -3814,17 +3823,23 @@ def _format_all_point_transfer_history_page(page=1, english=False):
                      else "No transfers are recorded on this bot yet.")
     else:
         for index, entry in enumerate(rows, start=(page - 1) * _POINT_TRANSFER_HISTORY_PAGE_SIZE + 1):
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(entry.get("timestamp", 0) or 0)))
-            source = str(entry.get("sender") or "?").replace("\n", " ").replace("\r", " ")
-            target = str(entry.get("recipient") or "?").replace("\n", " ").replace("\r", " ")
+            try:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(entry.get("timestamp", 0) or 0)))
+            except (TypeError, ValueError, OverflowError, OSError):
+                when = "unknown time" if english else "وقت غير معروف"
+            source = _transfer_log_safe_field(entry.get("sender"))
+            target = _transfer_log_safe_field(entry.get("recipient"))
             detail = f"{when} | @{source} → @{target} | {_fmt_points(entry.get('amount'))}"
             source_after = entry.get("sender_balance_after")
             target_after = entry.get("recipient_balance_after")
             if source_after is not None and target_after is not None:
                 detail += f" | {_fmt_points(source_after)} → {_fmt_points(target_after)}"
-            reason = str(entry.get("reason") or "").replace("\n", " ").replace("\r", " ")
+            reason = _transfer_log_safe_field(entry.get("reason"), max_bytes=32) if entry.get("reason") else ""
             if reason:
                 detail += f" | {reason}"
+            # Keep even malformed/oversized stored records from exceeding the
+            # packet budget. Three bounded rows fit comfortably under 1008 B.
+            detail = _transfer_log_safe_field(detail, max_bytes=180)
             lines.append(f"{index}. {detail}")
     lines.append("━━━━━━━━━━━━")
     if page < pages:
