@@ -32,6 +32,7 @@ from urllib.parse import urlparse, unquote, urlencode, quote
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from collections import defaultdict
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 
 import requests
 try:
@@ -321,6 +322,23 @@ STOCK_MARKET_ASSETS = {
     4: {"icon": "🏞️", "ar": "الأرض", "en": "Land"},
 }
 
+def _parse_compact_amount(value):
+    """Convert plain or compact stakes (1k/1m/1b) to whole points."""
+    token = str(value or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    token = token.replace(",", "")
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([kmb]?)", token, re.I)
+    if not match:
+        return None
+    multiplier = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000}[match.group(2).casefold()]
+    try:
+        amount = Decimal(match.group(1)) * multiplier
+    except InvalidOperation:
+        return None
+    if amount != amount.to_integral_value() or amount <= 0:
+        return None
+    return int(amount)
+
+
 def _parse_stock_market_order(text):
     """Parse direct orders such as ذهب 100000, gold@100000, or 1@100000."""
     value = str(text or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
@@ -331,16 +349,20 @@ def _parse_stock_market_order(text):
         "أرض": 4, "ارض": 4, "الأرض": 4, "الارض": 4, "land": 4,
     }
     asset_pattern = "|".join(sorted((re.escape(word) for word in asset_words), key=len, reverse=True))
-    match = re.fullmatch(rf"(?:(?:بورصة|بورصه|stock|market)\s*[@ ]*)?({asset_pattern})\s*[@ ]+([0-9][0-9,]*)", value, re.I)
+    amount_pattern = r"([0-9][0-9,]*(?:\.[0-9]+)?[kmb]?)"
+    match = re.fullmatch(rf"(?:(?:بورصة|بورصه|stock|market)\s*[@ ]*)?({asset_pattern})\s*[@ ]+{amount_pattern}", value, re.I)
     if match:
         asset_name = match.group(1).casefold()
-        return asset_words.get(asset_name), int(match.group(2).replace(",", ""))
-    match = re.fullmatch(r"(?:بورصة|بورصه|stock|market)\s*[@ ]*([1-4])\s*[@ ]+([0-9][0-9,]*)", value, re.I)
+        amount = _parse_compact_amount(match.group(2))
+        return (asset_words.get(asset_name), amount) if amount is not None else None
+    match = re.fullmatch(rf"(?:بورصة|بورصه|stock|market)\s*[@ ]*([1-4])\s*[@ ]+{amount_pattern}", value, re.I)
     if match:
-        return int(match.group(1)), int(match.group(2).replace(",", ""))
-    match = re.fullmatch(r"([1-4])\s*[@ ]+([0-9][0-9,]*)", value, re.I)
+        amount = _parse_compact_amount(match.group(2))
+        return (int(match.group(1)), amount) if amount is not None else None
+    match = re.fullmatch(rf"([1-4])\s*[@ ]+{amount_pattern}", value, re.I)
     if match:
-        return int(match.group(1)), int(match.group(2).replace(",", ""))
+        amount = _parse_compact_amount(match.group(2))
+        return (int(match.group(1)), amount) if amount is not None else None
     return None
 
 
@@ -2610,7 +2632,7 @@ def _looks_like_bot_command(text):
     prefixes = (
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
-        "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
+        "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
@@ -2618,6 +2640,9 @@ def _looks_like_bot_command(text):
     )
     prefixes = prefixes + (
         "bl@", "+ds@", "رهان ", "مضاربه ", "استثمار ", "حظي ",
+        "ذهب ", "الذهب ", "فضة ", "الفضة ", "فضه ", "الفضه ",
+        "نفط ", "النفط ", "أرض ", "ارض ", "الأرض ", "الارض ",
+        "gold ", "silver ", "oil ", "land ",
         "سجل التحويل", "سجل تحويلاتي", "سجل المليار", "سجل مليار", "سجل المليون", "سجل مليون",
         "transfer history", "transfer log", "billion record", "billion history", "million record", "million history",
         "top b", "topb", "top m", "topm",
@@ -2699,7 +2724,7 @@ def _looks_like_admin_command(text):
     prefixes = (
         ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "msb@", "-sb@",
-        "i@", "inv", "دعوات", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
+        "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
     return low.startswith(prefixes)
@@ -8062,21 +8087,35 @@ class TalkinBot:
         room = str(room or "").strip()
         target = str(target or "").strip().lstrip("@")
         requester = str(requester or "").strip()
+        key = (room.casefold(), target.casefold(), expected_role)
+        marker = {
+            "room": room, "target": target, "role": expected_role,
+            "created_at": time.time(), "requester": requester,
+        }
+        # Publish intent before the packet: Talkin may deliver role_changed
+        # immediately, and the event fields can contain both actor and target.
+        with self.pending_admin_lock:
+            self.pending_admin_actions[key] = {
+                **marker, "announced": False, "announce_room": bool(announce_room),
+                "previous_role": self.room_users.get(room, {}).get(target),
+            }
+        if operation in ("ban", "kick"):
+            recent = getattr(self, "_recent_room_moderation", None)
+            if recent is None:
+                recent = self._recent_room_moderation = {}
+            recent[_norm_room(room)] = marker
         try:
             self.send_admin(room, target, operation)
         except Exception as exc:
+            with self.pending_admin_lock:
+                self.pending_admin_actions.pop(key, None)
+            recent = getattr(self, "_recent_room_moderation", {})
+            if recent.get(_norm_room(room)) == marker:
+                recent.pop(_norm_room(room), None)
             self.log(f"[MOD] request failed room={room} target=@{target}: {exc!r}")
             if requester and not _is_master_name(requester):
                 self.send_private_text(requester, f"❌ تعذر إرسال أمر الإدارة إلى الخادم: {exc}")
             return False
-        key = (room.casefold(), target.casefold(), expected_role)
-        with self.pending_admin_lock:
-            self.pending_admin_actions[key] = {
-                "room": room, "target": target, "role": expected_role,
-                "requester": requester, "created_at": time.time(), "announced": False,
-                "announce_room": bool(announce_room),
-                "previous_role": self.room_users.get(room, {}).get(target),
-            }
         previous_role = self.room_users.get(room, {}).get(target)
         inverse = previous_role if previous_role in {"none", "member", "admin", "owner"} else "member"
         self.last_admin_action = {
@@ -10208,7 +10247,7 @@ class TalkinBot:
             self.log("[STREAM] invitation exception:", username, detail)
             return False, detail
 
-    def send_private_invite(self, username: str, room: str, inviter: str = ""):
+    def send_private_invite(self, username: str, room: str, inviter: str = "", allow_repeat: bool = False):
         if not getattr(self, "invites_enabled", True):
             return False
         """Send a NORMAL private chat invitation, not a system/RPC invitation.
@@ -10222,7 +10261,7 @@ class TalkinBot:
         if not username or username == BOT_ID or not room:
             return False
         with self.invite_lock:
-            if username in self.invite_sent:
+            if not allow_repeat and username in self.invite_sent:
                 return False
 
         # IMPORTANT: normal TalkinChat private message, deliberately NOT
@@ -10234,7 +10273,10 @@ class TalkinBot:
             text = text.format(sender=(inviter or INVITE_SENDER_NAME), room=room, username=username)
         except Exception:
             text = f"يوجد معجب مخفي في {room}"
-        self.send_query(encode_query("chat_message", type_="text", to=username, body=text))
+        result = self.send_query(encode_query("chat_message", type_="text", to=username, body=text))
+        if result is False:
+            self.log("[INV] private invitation packet was not sent:", username, "room=", room)
+            return False
 
         with self.invite_lock:
             self.invite_sent.add(username)
@@ -12421,14 +12463,15 @@ class TalkinBot:
                 return True
             games[key] = {
                 "room": destination, "target": target, "started_by": str(sender),
-                "wire": secrets.randbelow(3) + 1, "expires_at": time.time() + 90.0,
+                "wire": secrets.randbelow(3) + 1, "expires_at": time.time() + 30.0,
             }
             self.bomb_games = games
         target_english = getattr(self, "_configured_room_language", lambda _room: "ar")(destination) == "en"
+        target_plain, sender_plain = target.lstrip("@"), str(sender).lstrip("@")
         challenge = (
-            f"💣 A bomb was sent to @{target} by @{sender}!\nChoose a wire to defuse it:\n1️⃣ Red\n2️⃣ Yellow\n3️⃣ Green\n⏱️ You have 90 seconds; send one number."
+            f"💣 A bomb was sent to {target_plain} by {sender_plain}!\nChoose a wire to defuse it:\n1️⃣ Red\n2️⃣ Yellow\n3️⃣ Green\n⏱️ You have 30 seconds; send one number."
             if target_english else
-            f"💣 وصلت قنبلة إلى @{target} من @{sender}!\nلتفكيكها اختر رقم السلك:\n1️⃣ أحمر\n2️⃣ أصفر\n3️⃣ أخضر\n⏱️ أمامك 90 ثانية؛ أرسل رقمًا واحدًا."
+            f"💣 وصلت قنبلة إلى {target_plain} من {sender_plain}!\nلتفكيكها اختر رقم السلك:\n1️⃣ أحمر\n2️⃣ أصفر\n3️⃣ أخضر\n⏱️ أمامك 30 ثانية؛ أرسل رقمًا واحدًا."
         )
         self.send_room_text(destination, challenge)
         return True
@@ -14856,10 +14899,14 @@ class TalkinBot:
                 self.stock_pending.pop(stock_key,None)
                 self.send_room_text(room,"⌛ انتهت مهلة البورصة. اكتب بورصة من جديد.")
                 return True
-            if pending_stock.get("kind") == "market_amount" and re.fullmatch(r"[0-9][0-9,]*", raw_digits):
+            if pending_stock.get("kind") == "market_amount" and re.fullmatch(r"[0-9][0-9,]*(?:\.[0-9]+)?[kmb]?", raw_digits, re.I):
+                amount = _parse_compact_amount(raw_digits)
+                if amount is None:
+                    self.send_room_text(room, "❌ مبلغ غير صالح. استخدم رقمًا مثل 100000 أو 1m أو 1b.")
+                    return True
                 self.stock_pending.pop(stock_key, None)
                 return self._stock_market_invest(
-                    room, sender_name, pending_stock.get("asset"), int(raw_digits.replace(",", "")),
+                    room, sender_name, pending_stock.get("asset"), amount,
                     expected_round_id=pending_stock.get("event_id"),
                 )
             if pending_stock.get("kind") == "market_choice" and re.fullmatch(r"[1-4]",raw_digits):
@@ -14972,22 +15019,30 @@ class TalkinBot:
             return self._stock_exchange_game(room, sender_name)
         # PvP games: outcome is decided by strong random selection, never by
         # who entered first or second.
-        m=re.fullmatch(r"(مراهنه|رهان|مضاربه|حظي)[@\s]+([0-9]+)", normalized_raw, re.I)
+        m=re.fullmatch(r"(مراهنه|رهان|مضاربه|حظي)[@\s]+([0-9][0-9,]*(?:\.[0-9]+)?[kmb]?)", normalized_raw, re.I)
         if m:
-            return self._queue_wager(room, sender_name, m.group(1), int(m.group(2)))
+            amount = _parse_compact_amount(m.group(2))
+            if amount is not None:
+                return self._queue_wager(room, sender_name, m.group(1), amount)
         # حظ يا نصيب is the new name for the old stake-based investment game.
-        m=re.fullmatch(r"حظ[ _\s]+يا[ _\s]+نصيب[@\s]+([0-9]+)", normalized_raw, re.I)
+        m=re.fullmatch(r"حظ[ _\s]+يا[ _\s]+نصيب[@\s]+([0-9][0-9,]*(?:\.[0-9]+)?[kmb]?)", normalized_raw, re.I)
         if m:
-            return self._queue_wager(room, sender_name, "حظ يا نصيب", int(m.group(1)))
+            amount = _parse_compact_amount(m.group(1))
+            if amount is not None:
+                return self._queue_wager(room, sender_name, "حظ يا نصيب", amount)
         # استثمار@المبلغ هو أمر الاستثمار بالمبلغ، ويحتفظ بنفس نظام الرهان السابق.
-        m=re.fullmatch(r"استثمار[@\s]+([0-9]+)", normalized_raw, re.I)
+        m=re.fullmatch(r"استثمار[@\s]+([0-9][0-9,]*(?:\.[0-9]+)?[kmb]?)", normalized_raw, re.I)
         if m:
-            return self._queue_wager(room, sender_name, "استثمار", int(m.group(1)))
+            amount = _parse_compact_amount(m.group(1))
+            if amount is not None:
+                return self._queue_wager(room, sender_name, "استثمار", amount)
         # بورصة@المبلغ ليست لعبة؛ البورصة الآن هي اختيار ذهب/نفط/معادن فقط.
         # كلمة استثمار وحدها ليست لعبة ولا تدخل في فاصل الألعاب.
-        m=re.fullmatch(r"حظ[@\s]+([0-9]+)", normalized_raw, re.I)
+        m=re.fullmatch(r"حظ[@\s]+([0-9][0-9,]*(?:\.[0-9]+)?[kmb]?)", normalized_raw, re.I)
         if m:
-            return self._lottery_game(room, sender_name, int(m.group(1)))
+            amount = _parse_compact_amount(m.group(1))
+            if amount is not None:
+                return self._lottery_game(room, sender_name, amount)
         if game_low == "طاوله":
             return self._table_bot_game(room, sender_name)
         if game_low == "اونو":
@@ -17977,7 +18032,7 @@ class TalkinBot:
                 response_to="",
             )
             return True
-        m_single_invite = re.fullmatch(r"i@(.+)", text.strip(), re.I)
+        m_single_invite = re.fullmatch(r"(?:i@|دعوه?\s+|دعوة\s+)(.+)", text.strip(), re.I)
         if m_single_invite:
             target = m_single_invite.group(1).strip().lstrip("@").strip()
             target_room = str(room or self.room or "").strip()
@@ -18002,10 +18057,10 @@ class TalkinBot:
                 self.send_private_text(sender, "⏳ جاري التحقق من رتبة البوت. أعد i@اسم_المستخدم بعد لحظات إذا لزم الأمر.")
                 return True
             try:
-                sent = self.send_private_invite(target, target_room, inviter=sender)
+                sent = self.send_private_invite(target, target_room, inviter=sender, allow_repeat=True)
                 msg = (f"✅ تم إرسال الدعوة الخاصة إلى @{target} للغرفة {target_room}."
                        if sent else
-                       f"⚠️ الدعوة إلى @{target} أُرسلت سابقاً أو تعذر إرسالها.")
+                       f"❌ تعذر إرسال الدعوة الخاصة إلى @{target} للغرفة {target_room}؛ تحقق من الاتصال واسم المستخدم.")
                 if is_private:
                     self.send_private_text(sender, msg)
                 else:
@@ -18450,7 +18505,7 @@ class TalkinBot:
             }
             self.custom_gift_pending = pending
         english = getattr(self, "_configured_room_language", lambda _room: "ar")(room) == "en"
-        prompt = (f"🎁 Send the gift image now within 2 minutes. I will add sender @{sender} and recipient @{target} to the card and share it in the bot's rooms." if english else f"🎁 أرسل الآن صورة الهدية خلال دقيقتين؛ سأكتب عليها اسم المرسل @{sender} والمستلم @{target} وأنشرها في غرف البوت.")
+        prompt = "🎁 Send the gift image now." if english else "🎁 أرسل صورة الهدية الآن"
         self.send_private_text(private_to, prompt) if private_to else self.send_room_text(room, prompt)
         return True
 
@@ -18741,11 +18796,22 @@ class TalkinBot:
             if len(self.known_rooms) != known_before:
                 _save_persistent_rooms(self.known_rooms)
         event_id = str(event.get(41, ""))
-        username = str(
-            (event.get(17, "") or event.get(22, ""))
-            if event_type in ("user_joined", "user_left")
-            else event.get(22, "")
-        ).strip()
+        event_user_17 = str(event.get(17, "") or "").strip()
+        event_user_22 = str(event.get(22, "") or "").strip()
+        if event_type in ("user_joined", "user_left"):
+            username = event_user_17 or event_user_22
+            if event_type == "user_left" and not event_user_17 and _norm_user(event_user_22) == _norm_user(BOT_ID):
+                # Some Talkin servers put the command actor in field 22 on the
+                # target's leave event and omit field 17. During a recent ban,
+                # field 22 is not sufficient evidence that the bot itself left.
+                marker = getattr(self, "_recent_room_moderation", {}).get(_norm_room(room))
+                if (isinstance(marker, dict)
+                        and float(marker.get("created_at", 0) or 0) >= time.time() - 20
+                        and _norm_user(marker.get("target")) != _norm_user(BOT_ID)):
+                    self.log(f"[MOD_EVENT] ignored actor-only user_left after moderation in {room}")
+                    username = ""
+        else:
+            username = event_user_22
         monitored_username = username or frm or str(event.get(17, "") or "").strip()
         self._report_monitored_event(room, event_type, monitored_username, body)
         # Some server builds return L@a/L@m/L@o as a RoomEvent text `User List:`.
@@ -18914,13 +18980,30 @@ class TalkinBot:
             # field 31 is its resulting role. Field 22 can identify the actor
             # who issued the moderation command, so never use it as a fallback:
             # doing so can falsely mark the bot as outcast when it bans a member.
-            changed_user = str(
-                event.get(17, "") or event.get("target", "") or event.get("to", "")
-                or event.get("username", "") or event.get("user", "")
-            ).strip()
             changed_role = str(
                 event.get(31, "") or event.get("role", "") or event.get("value", "")
             ).strip().lower()
+            explicit_candidates = [
+                str(event.get(name, "") or "").strip()
+                for name in ("target", "to", "username", "user")
+                if str(event.get(name, "") or "").strip()
+            ]
+            field_candidates = [value for value in (event_user_17, event_user_22) if value]
+            candidates = list(dict.fromkeys(explicit_candidates + field_candidates))
+            changed_user = explicit_candidates[0] if explicit_candidates else event_user_17
+            # A pending action is authoritative when the native packet carries
+            # both actor and target but their field positions vary by server.
+            if changed_role:
+                with self.pending_admin_lock:
+                    for pending_action in self.pending_admin_actions.values():
+                        if (_norm_room(pending_action.get("room")) == _norm_room(room)
+                                and str(pending_action.get("role", "")).lower() == changed_role):
+                            target_key = _norm_user(pending_action.get("target"))
+                            match = next((candidate for candidate in candidates
+                                          if _norm_user(candidate) == target_key), None)
+                            if match:
+                                changed_user = match
+                                break
             if changed_user and changed_role:
                 if changed_role in ("kicked", "outcast"):
                     self.room_users.get(room, {}).pop(changed_user, None)

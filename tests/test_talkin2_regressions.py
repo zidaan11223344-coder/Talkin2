@@ -3261,6 +3261,144 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
 
 
 class NewFeatureRegressions(unittest.TestCase):
+    def test_compact_money_amounts_for_stock_and_wagers(self):
+        self.assertEqual(bot_module._parse_stock_market_order("ذهب 1m"), (1, 1_000_000))
+        self.assertEqual(bot_module._parse_stock_market_order("gold 1b"), (1, 1_000_000_000))
+        self.assertEqual(bot_module._parse_stock_market_order("فضة 2.5m"), (2, 2_500_000))
+        self.assertEqual(bot_module._parse_compact_amount("١m"), 1_000_000)
+        self.assertEqual(bot_module._parse_compact_amount("1b"), 1_000_000_000)
+        self.assertTrue(bot_module._looks_like_bot_command("ذهب 1m"))
+        self.assertTrue(bot_module._looks_like_bot_command("gold 1m"))
+        self.assertTrue(bot_module._looks_like_bot_command("حظي 1b"))
+
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.stock_pending = {}
+        bot._snake_command = lambda *_args: False
+        bot._ludo_command = lambda *_args: False
+        bot._handle_pending_bot_choice = lambda *_args: False
+        investments, wagers = [], []
+        bot._stock_market_invest = lambda room, user, asset, amount, **kwargs: investments.append((asset, amount)) or True
+        bot._queue_wager = lambda room, user, kind, amount: wagers.append((kind, amount)) or True
+        with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_games_enabled_for_room", return_value=True
+        ):
+            self.assertTrue(bot.handle_game_command("Hall", "ذهب 1m", "Player"))
+            self.assertTrue(bot.handle_game_command("Hall", "حظي 1b", "Player"))
+        self.assertEqual(investments, [(1, 1_000_000)])
+        self.assertEqual(wagers, [("حظي", 1_000_000_000)])
+
+    def test_single_invite_sends_a_fresh_private_invitation_on_each_command(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.invites_enabled = True
+        bot.invite_lock = threading.Lock()
+        bot.invite_sent = {"Ahmed"}
+        bot.invite_message_template = "Join us in {room}"
+        bot.log = lambda *_args: None
+        sent = []
+        bot.send_query = lambda payload: sent.append(bot_module.decode_message(payload)) or True
+        self.assertTrue(bot.send_private_invite("Ahmed", "Garden", inviter="Master", allow_repeat=True))
+        self.assertTrue(bot.send_private_invite("Ahmed", "Garden", inviter="Master", allow_repeat=True))
+        self.assertEqual(len(sent), 2)
+        for packet in sent:
+            fields = {key: values[0] for key, values in packet.items()}
+            self.assertEqual(fields[4], b"Ahmed")
+            self.assertEqual(fields[5], b"Join us in Garden")
+
+    def test_single_invite_reports_unsent_packet_as_failure(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.invites_enabled = True
+        bot.invite_lock = threading.Lock()
+        bot.invite_sent = set()
+        bot.invite_message_template = "Join {room}"
+        bot.log = lambda *_args: None
+        bot.send_query = lambda _payload: False
+        self.assertFalse(bot.send_private_invite("Ahmed", "Garden", allow_repeat=True))
+        self.assertNotIn("Ahmed", bot.invite_sent)
+
+    def test_i_at_and_arabic_daawa_name_route_to_single_user_invite_only(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.invites_enabled = True
+        bot._room_list_commands = lambda *_args: False
+        bot._inv_bot_owner_allowed = lambda _room: True
+        bot._active_rooms = lambda: self.fail("individual invite must not start the group invitation flow")
+        sent, replies = [], []
+        bot.send_private_invite = lambda target, room, inviter="", allow_repeat=False: sent.append(
+            (target, room, inviter, allow_repeat)
+        ) or True
+        bot.send_room_text = lambda room, text: replies.append((room, text))
+        bot.send_private_text = lambda *_args: None
+        for command in ("i@Ahmed", "دعوه Said", "دعوة Layla"):
+            with patch.object(bot_module, "_is_master_name", return_value=True):
+                self.assertTrue(bot._handle_management_command_impl("Garden", command, "Master", is_private=False))
+        self.assertEqual([item[0] for item in sent], ["Ahmed", "Said", "Layla"])
+        self.assertTrue(all(item[1:] == ("Garden", "Master", True) for item in sent))
+        self.assertEqual(len(replies), 3)
+        self.assertTrue(all("تم إرسال الدعوة" in reply for _, reply in replies))
+        self.assertTrue(bot_module._looks_like_bot_command("دعوه Ahmed"))
+        self.assertTrue(bot_module._looks_like_admin_command("دعوه Ahmed"))
+
+    def test_ambiguous_role_changed_uses_pending_moderation_target_not_bot_actor(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.room_users = {"North": {"Target": "member"}}
+        bot.known_rooms = {"North"}
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot.connected_rooms = {"North"}
+        bot.pending_admin_lock = threading.Lock()
+        bot.pending_admin_actions = {
+            ("north", "target", "outcast"): {
+                "room": "North", "target": "Target", "role": "outcast",
+                "requester": "", "announce_room": False, "previous_role": "member",
+            }
+        }
+        bot.last_admin_actions = {}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        bot._schedule_auto_rejoin = lambda *_args, **_kwargs: self.fail("the bot actor must not be treated as the banned target")
+        bot.send_room_text = lambda *_args: None
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
+            bot_module, "_save_persistent_rooms"
+        ), patch.object(bot_module, "_record_bot_ban"):
+            bot._handle_room_event_impl({"room_event": {
+                1: "role_changed", 13: "North", 17: "test-bot", 22: "Target", 31: "outcast",
+            }})
+        self.assertIn("North", bot.connected_rooms)
+        self.assertNotIn("Target", bot.room_users["North"])
+        self.assertFalse(bot.pending_admin_actions)
+
+    def test_user_left_with_actor_only_after_ban_does_not_trigger_rejoin(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.room_users = {"North": {"Target": "member"}}
+        bot.known_rooms = {"North"}
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot.connected_rooms = {"North"}
+        bot._master_online_rooms = set()
+        bot._room_entry_times = {}
+        bot._room_entry_users = {}
+        bot._recent_room_moderation = {bot_module._norm_room("North"): {
+            "target": "Target", "created_at": bot_module.time.time(), "role": "outcast",
+        }}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        bot._schedule_auto_rejoin = lambda *_args, **_kwargs: self.fail("actor-only field 22 is not proof the bot left")
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
+            bot_module, "_room_protection_cfg", return_value={}
+        ), patch.object(bot_module, "_save_persistent_rooms"), patch.object(bot_module, "_remember_roster"):
+            bot._handle_room_event_impl({"room_event": {
+                1: "user_left", 13: "North", 22: "test-bot",
+            }})
+        self.assertIn("North", bot.connected_rooms)
+        self.assertIn("Target", bot.room_users["North"])
+
     def test_payroll_requires_work_and_pays_once_then_enforces_cooldown(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         state = {"version": 1, "users": {}}
@@ -3309,12 +3447,18 @@ class NewFeatureRegressions(unittest.TestCase):
         messages, kicks = [], []
         bot.send_room_text = lambda room, text: messages.append((room, text))
         bot.request_admin_action = lambda *args, **kwargs: kicks.append((args, kwargs)) or True
+        bot._configured_room_language = lambda _room: "ar"
         with patch.object(bot_module, "_room_manager", side_effect=lambda _bot, _room, user: user == "Admin"), patch.object(
             bot_module.secrets, "randbelow", return_value=0
         ):
             self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
             self.assertIn("Victim", messages[-1][1])
+            self.assertIn("Admin", messages[-1][1])
+            self.assertNotIn("@Victim", messages[-1][1])
+            self.assertNotIn("@Admin", messages[-1][1])
+            self.assertIn("30 ثانية", messages[-1][1])
             self.assertIn("Other", bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["room"])
+            self.assertAlmostEqual(bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["expires_at"] - bot_module.time.time(), 30.0, delta=0.1)
             self.assertFalse(bot._handle_bomb_wire("Other", "SomeoneElse", "2"))
             self.assertTrue(bot._handle_bomb_wire("Other", "Victim", "2"))
         self.assertEqual(len(kicks), 1)
