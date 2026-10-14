@@ -2850,6 +2850,10 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
     def test_global_transfer_log_uses_list_one_then_ns_for_next_list(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._room_list_commands = lambda *_args: False
+        bot._master_reply_local = threading.local()
+        bot._result_pages = {}
+        bot._filter_list_state = {}
+        bot._remember_bot_action = lambda *_args, **_kwargs: None
         replies = []
         bot.send_private_text = lambda who, text: replies.append((who, text))
 
@@ -2865,15 +2869,81 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
 
         with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
             bot_module, "_all_point_transfer_history", side_effect=page_data
+        ), patch.object(
+            bot_module, "_format_all_point_transfer_history_page",
+            side_effect=[
+                ("قائمة 1/3\n@Newest\nاكتب ns", 3),
+                ("قائمة 2/3\n@Older\nاكتب ns", 3),
+                ("قائمة 3/3\n@Oldest", 3),
+            ],
         ):
-            self.assertTrue(bot._handle_management_command_impl("Room", "سجل التحويل", "Master", is_private=False))
-            self.assertTrue(bot._handle_management_command_impl("Room", "ns", "Master", is_private=False))
-        self.assertEqual(len(replies), 2)
+            self.assertTrue(bot._handle_management_command("Room", "سجل التحويل", "Master", is_private=True))
+            self.assertTrue(bot._handle_management_command("Room", "ns", "Master", is_private=True))
+            self.assertTrue(bot._handle_management_command("Room", "ns", "Master", is_private=True))
+            self.assertTrue(bot._handle_management_command("Room", "ns", "Master", is_private=True))
+        self.assertEqual(len(replies), 4)
         self.assertIn("قائمة 1/3", replies[0][1])
         self.assertIn("اكتب ns", replies[0][1])
         self.assertIn("@Newest", replies[0][1])
         self.assertIn("قائمة 2/3", replies[1][1])
         self.assertIn("@Older", replies[1][1])
+        self.assertIn("قائمة 3/3", replies[2][1])
+        self.assertIn("@Oldest", replies[2][1])
+        self.assertIn("آخر قائمة", replies[3][1])
+        self.assertNotIn(bot_module._norm_user("Master"), bot._transfer_log_pages)
+
+    def test_recipient_transfer_history_filters_and_paginates_all_matching_rows(self):
+        rows = [
+            {"recipient_key": "target-key", "recipient": "Target", "sender": f"Sender{i}", "amount": i}
+            for i in range(5)
+        ] + [
+            {"recipient_key": "other-key", "recipient": "Other", "sender": "OtherSender", "amount": 99}
+        ]
+        with patch.object(bot_module, "_points_data", return_value={}), patch.object(
+            bot_module, "_resolve_points_account", return_value=("target-key", {"username": "Target"})
+        ), patch.object(bot_module, "_POINTS_TRANSFER_CACHE", rows):
+            page, total, pages = bot_module._all_point_transfer_history(
+                page=2, page_size=bot_module._POINT_TRANSFER_HISTORY_PAGE_SIZE, recipient="Target"
+            )
+        self.assertEqual(total, 5)
+        self.assertEqual(pages, 2)
+        self.assertEqual([row["sender"] for row in page], ["Sender1", "Sender0"])
+
+    def test_recipient_transfer_log_command_is_master_only_and_starts_private_pages(self):
+        master = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        master._room_list_commands = lambda *_args: False
+        master._master_reply_local = threading.local()
+        master._result_pages = {}
+        master._filter_list_state = {}
+        master._remember_bot_action = lambda *_args, **_kwargs: None
+        replies = []
+        master.send_private_text = lambda who, text: replies.append((who, text))
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_points_data", return_value={}
+        ), patch.object(
+            bot_module, "_resolve_points_account", return_value=("target-key", {"username": "Target"})
+        ), patch.object(
+            bot_module, "_format_all_point_transfer_history_page", return_value=("قائمة 1/2", 2)
+        ) as format_page:
+            self.assertTrue(master._handle_management_command("Room", "سجل تحويل@Target", "Master", is_private=True))
+        format_page.assert_called_once_with(1, False, recipient="Target")
+        self.assertEqual(master._transfer_log_pages[bot_module._norm_user("Master")], 1)
+        self.assertEqual(master._transfer_log_targets[bot_module._norm_user("Master")], "Target")
+        self.assertEqual(replies, [("Master", "قائمة 1/2")])
+
+        master._master_reply_local = threading.local()
+        master._filter_list_state = {}
+        master._result_pages = {}
+        master._remember_bot_action = lambda *_args, **_kwargs: None
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_all_point_transfer_history", return_value=([], 4, 2)
+        ) as get_log, patch.object(
+            bot_module, "_format_all_point_transfer_history_page", return_value=("قائمة 2/2", 2)
+        ) as format_page:
+            self.assertTrue(master._handle_management_command("Room", "ns", "Master", is_private=True))
+        get_log.assert_called_once_with(page=1, page_size=bot_module._POINT_TRANSFER_HISTORY_PAGE_SIZE, recipient="Target")
+        format_page.assert_called_once_with(2, False, recipient="Target")
+        self.assertEqual(replies[-1], ("Master", "قائمة 2/2"))
 
     def test_global_transfer_log_page_fits_ws_limit_with_extremely_long_fields(self):
         huge_entry = {

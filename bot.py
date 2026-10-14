@@ -3775,8 +3775,8 @@ def _point_transfer_history(username, limit=10):
     return list(reversed(rows[-max(1, int(limit)):]))
 
 
-def _all_point_transfer_history(page=1, page_size=8):
-    """Return one newest-first page from the bot-wide transfer audit log."""
+def _all_point_transfer_history(page=1, page_size=8, recipient=None):
+    """Return one newest-first page from the bot-wide or recipient audit log."""
     _points_data()  # Ensure the v2 snapshot/history cache is initialized.
     try:
         page = max(1, int(page))
@@ -3788,6 +3788,17 @@ def _all_point_transfer_history(page=1, page_size=8):
         page_size = 8
     with _GAME_STATE_LOCK:
         rows = [dict(entry) for entry in (_POINTS_TRANSFER_CACHE or []) if isinstance(entry, dict)]
+    if recipient is not None:
+        resolved = _resolve_points_account(_points_data(), recipient)
+        if not resolved:
+            rows = []
+        else:
+            recipient_key = resolved[0]
+            recipient_norm = _norm_user(recipient)
+            rows = [entry for entry in rows if (
+                str(entry.get("recipient_key") or "") == recipient_key
+                or _norm_user(entry.get("recipient")) == recipient_norm
+            )]
     rows.reverse()
     total = len(rows)
     pages = max(1, (total + page_size - 1) // page_size)
@@ -3807,20 +3818,34 @@ def _transfer_log_safe_field(value, max_bytes=48):
     return encoded[:max_bytes].decode("utf-8", errors="ignore") + "…"
 
 
-def _format_all_point_transfer_history_page(page=1, english=False):
-    rows, total, pages = _all_point_transfer_history(
-        page=page, page_size=_POINT_TRANSFER_HISTORY_PAGE_SIZE
-    )
+def _format_all_point_transfer_history_page(page=1, english=False, recipient=None):
+    if recipient is None:
+        rows, total, pages = _all_point_transfer_history(
+            page=page, page_size=_POINT_TRANSFER_HISTORY_PAGE_SIZE
+        )
+    else:
+        rows, total, pages = _all_point_transfer_history(
+            page=page, page_size=_POINT_TRANSFER_HISTORY_PAGE_SIZE, recipient=recipient
+        )
     if page > pages:
         message = (f"⚠️ لا توجد قائمة بهذا الرقم. الصفحات من 1 إلى {pages}." if not english
                    else f"⚠️ No list with that number. Pages range from 1 to {pages}.")
         return message, pages
-    title = (f"📒 سجل تحويلات البوت — قائمة {page}/{pages} — الإجمالي {total}" if not english
-             else f"📒 Bot-wide transfer log — List {page}/{pages} — {total} total")
+    if recipient is None:
+        title = (f"📒 سجل تحويلات البوت — قائمة {page}/{pages} — الإجمالي {total}" if not english
+                 else f"📒 Bot-wide transfer log — List {page}/{pages} — {total} total")
+    else:
+        safe_recipient = _transfer_log_safe_field(recipient)
+        title = (f"📒 سجل التحويلات إلى @{safe_recipient} — قائمة {page}/{pages} — الإجمالي {total}" if not english
+                 else f"📒 Transfers to @{safe_recipient} — List {page}/{pages} — {total} total")
     lines = [title, "━━━━━━━━━━━━"]
     if not rows:
-        lines.append("لا توجد تحويلات مسجلة على البوت حتى الآن." if not english
-                     else "No transfers are recorded on this bot yet.")
+        if recipient is not None:
+            lines.append((f"لا توجد تحويلات مسجلة إلى @{_transfer_log_safe_field(recipient)}." if not english
+                          else f"No transfers are recorded to @{_transfer_log_safe_field(recipient)}."))
+        else:
+            lines.append("لا توجد تحويلات مسجلة على البوت حتى الآن." if not english
+                         else "No transfers are recorded on this bot yet.")
     else:
         for index, entry in enumerate(rows, start=(page - 1) * _POINT_TRANSFER_HISTORY_PAGE_SIZE + 1):
             try:
@@ -3846,8 +3871,10 @@ def _format_all_point_transfer_history_page(page=1, english=False):
         lines.append((f"📌 اكتب ns لعرض قائمة {page + 1}." if not english
                       else f"📌 Type ns to view List {page + 1}."))
     else:
-        lines.append("هذه آخر قائمة. اكتب سجل التحويل لبدء العرض من جديد." if not english
-                     else "This is the last list. Type transfer history to start again.")
+        restart = (f"سجل تحويل@{_transfer_log_safe_field(recipient)}" if recipient is not None else "سجل التحويل")
+        lines.append((f"هذه آخر قائمة. اكتب {restart} لبدء العرض من جديد." if not english
+                      else (f"This is the last list. Type transfer history@{_transfer_log_safe_field(recipient)} to restart."
+                            if recipient is not None else "This is the last list. Type transfer history to start again.")))
     return "\n".join(lines), pages
 
 
@@ -15587,6 +15614,41 @@ class TalkinBot:
                         self.send_room_text(room, "✅ انتهت قوائم كلمات الفلتر.\n📌 أرسل l@mf لعرضها من البداية.")
                 return True
 
+            # Transfer logs are emitted privately and keep their own page
+            # cursor. Handle this here (the real dispatcher) before generic
+            # result/help pagination can consume the same `ns` command.
+            transfer_key = _norm_user(sender)
+            transfer_pages = getattr(self, "_transfer_log_pages", {})
+            if _is_master_name(sender) and transfer_key in transfer_pages:
+                current = max(1, int(transfer_pages.get(transfer_key, 1) or 1))
+                next_page = current + 1
+                target = getattr(self, "_transfer_log_targets", {}).get(transfer_key)
+                language = getattr(self, "_transfer_log_languages", {}).get(transfer_key, False)
+                if target is None:
+                    _rows, _total, page_count = _all_point_transfer_history(
+                        page=1, page_size=_POINT_TRANSFER_HISTORY_PAGE_SIZE
+                    )
+                else:
+                    _rows, _total, page_count = _all_point_transfer_history(
+                        page=1, page_size=_POINT_TRANSFER_HISTORY_PAGE_SIZE, recipient=target
+                    )
+                if next_page > page_count:
+                    transfer_pages.pop(transfer_key, None)
+                    getattr(self, "_transfer_log_languages", {}).pop(transfer_key, None)
+                    getattr(self, "_transfer_log_targets", {}).pop(transfer_key, None)
+                    if target is None:
+                        message = "📒 هذه آخر قائمة في سجل التحويل." if not language else "📒 This is the last transfer-log list."
+                    else:
+                        message = (f"📒 هذه آخر قائمة لتحويلات @{_transfer_log_safe_field(target)}."
+                                   if not language else f"📒 This is the last list of transfers to @{_transfer_log_safe_field(target)}.")
+                else:
+                    transfer_pages[transfer_key] = next_page
+                    message, _page_count = _format_all_point_transfer_history_page(
+                        next_page, language, recipient=target
+                    )
+                self.send_private_text(sender, message)
+                return True
+
             # Generic long-result navigation. Any command that produced more
             # than one safe text page is continued with Ns.
             result_pages = getattr(self, "_result_pages", {})
@@ -17112,6 +17174,37 @@ class TalkinBot:
         if low in ("نقاطي","points"):
             self.send_private_text(sender, _points_summary_text(sender))
             return True
+        recipient_log = re.fullmatch(
+            r"(?:سجل\s+(?:التحويل|تحويل)|transfer\s+(?:history|log))\s*@\s*(.+)",
+            text, re.I,
+        )
+        if recipient_log:
+            english = _detect_text_language(text) == "en"
+            if not _is_master_name(sender):
+                message = "🔒 سجل تحويلات المستخدمين مخصص للماستر فقط." if not english else "🔒 User transfer logs are for the master only."
+                self.send_private_text(sender, message)
+                return True
+            requested = recipient_log.group(1).strip().lstrip("@").strip()
+            resolved = _resolve_points_account(_points_data(), requested)
+            if not resolved:
+                message = (f"❌ لم أجد @{_transfer_log_safe_field(requested)} في ملف النقاط؛ لم يُعرض أي سجل."
+                           if not english else f"❌ @{_transfer_log_safe_field(requested)} was not found in the points file; no log was shown.")
+                self.send_private_text(sender, message)
+                return True
+            target = str(resolved[1].get("username") or requested).strip()
+            message, pages = _format_all_point_transfer_history_page(1, english, recipient=target)
+            transfer_key = _norm_user(sender)
+            if not isinstance(getattr(self, "_transfer_log_pages", None), dict):
+                self._transfer_log_pages = {}
+            if not isinstance(getattr(self, "_transfer_log_languages", None), dict):
+                self._transfer_log_languages = {}
+            if not isinstance(getattr(self, "_transfer_log_targets", None), dict):
+                self._transfer_log_targets = {}
+            self._transfer_log_pages[transfer_key] = 1
+            self._transfer_log_languages[transfer_key] = english
+            self._transfer_log_targets[transfer_key] = target
+            self.send_private_text(sender, message)
+            return True
         transfer_log = re.fullmatch(r"(?:سجل التحويل|transfer history|transfer log)(?:\s+(\d+))?", text, re.I)
         if transfer_log:
             english = _detect_text_language(text) == "en"
@@ -17127,8 +17220,11 @@ class TalkinBot:
                     self._transfer_log_pages = {}
                 if not hasattr(self, "_transfer_log_languages") or not isinstance(self._transfer_log_languages, dict):
                     self._transfer_log_languages = {}
+                if not isinstance(getattr(self, "_transfer_log_targets", None), dict):
+                    self._transfer_log_targets = {}
                 self._transfer_log_pages[transfer_key] = page
                 self._transfer_log_languages[transfer_key] = english
+                self._transfer_log_targets.pop(transfer_key, None)
             # The complete cross-user audit log is always private, even when
             # the master invokes it from a room.
             self.send_private_text(sender, message)
