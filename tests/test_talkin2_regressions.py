@@ -1627,7 +1627,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "UnknownUser", ""))
             self.assertFalse(bot_module._auto_ban_candidate(bot, "North", "NewAdmin", "admin"))
 
-    def test_profanity_filter_bans_every_room_rank_including_owner_and_master(self):
+    def test_profanity_filter_bans_every_room_rank_but_never_the_master(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {"North": {
             "Owner": "owner", "Admin": "admin", "Moderator": "moderator",
@@ -1636,8 +1636,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.object(bot_module, "_is_master_name", side_effect=lambda name: str(name).casefold() == "master"), patch.object(
             bot_module, "_is_room_creator", return_value=False
         ):
-            for ordinary in ("Owner", "Admin", "Moderator", "Master", "Member", "VIP", "NoRank", "UnknownUser"):
+            for ordinary in ("Owner", "Admin", "Moderator", "Member", "VIP", "NoRank", "UnknownUser"):
                 self.assertTrue(bot_module._profanity_ban_candidate(bot, "North", ordinary), ordinary)
+            self.assertFalse(bot_module._profanity_ban_candidate(bot, "North", "Master"))
             self.assertTrue(bot_module._profanity_ban_candidate(bot, "North", "NewAdmin", "room_admin"))
         with patch.object(bot_module, "BOT_ID", "test-bot"):
             self.assertFalse(bot_module._profanity_ban_candidate(bot, "North", "test-bot"))
@@ -3338,8 +3339,8 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
 
     def test_stock_investment_settles_profit_or_loss_after_one_minute(self):
         cases = (
-            (0, 0, "profit", 10), (0, 40, "profit", 50),
-            (1, 0, "loss", 10), (1, 40, "loss", 50),
+            (0, 0, "profit", 1), (0, 19, "profit", 20),
+            (1, 0, "loss", 1), (1, 19, "loss", 20),
         )
         for outcome_draw, percent_draw, outcome, expected_percent in cases:
             with self.subTest(outcome=outcome, expected_percent=expected_percent):
@@ -3348,7 +3349,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 bot.stock_market_round = {"id": 7, "started_at": 900.0, "ends_at": 2_000.0}
                 bot._stock_market_seen = set()
                 bot.stock_investments = []
-                bot._configured_room_language = lambda _room: "ar"
+                bot.stock_market_history = []
+                bot._active_rooms = lambda: ["ArabicHall", "EnglishHall"]
+                bot._configured_room_language = lambda active_room: "en" if active_room == "EnglishHall" else "ar"
                 bot._save_stock_investments = lambda: None
                 messages = []
                 private_messages = []
@@ -3373,7 +3376,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
 
                 with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), patch.object(
                     bot_module.secrets, "randbelow", side_effect=[outcome_draw, percent_draw]
-                ), patch.object(bot_module, "_record_game", return_value=None):
+                ), patch.object(bot_module, "_record_game", return_value=None), patch.object(
+                    bot_module, "_save_local_json", return_value=None
+                ):
                     self.assertEqual(bot._process_stock_market_investments(now=1_300.0), 1)
                 self.assertEqual(len(point_ops), 2)
                 change = 100_000 * expected_percent // 100
@@ -3381,14 +3386,117 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 self.assertEqual(point_ops[1][1], expected_payout)
                 self.assertTrue(point_ops[1][2].startswith("stock-market-payout:"))
                 self.assertFalse(bot.stock_investments)
-                result = messages[-1][1]
+                result_by_room = dict(messages)
+                self.assertEqual(set(result_by_room), {"ArabicHall", "EnglishHall"})
+                result = result_by_room["ArabicHall"]
                 self.assertIn(f"{expected_percent}%", result)
-                self.assertIn("الخسارة" if outcome == "loss" else "الربح", result)
+                self.assertIn("خسارة" if outcome == "loss" else "ربح", result)
                 self.assertIn("-" if outcome == "loss" else "+", result)
+                self.assertIn("المستثمر: @Player", result)
+                self.assertIn("Investor: @Player", result_by_room["EnglishHall"])
                 self.assertEqual(len(private_messages), 1)
                 self.assertEqual(private_messages[0][0], "Player")
                 self.assertIn("غرفة الاستثمار: ArabicHall", private_messages[0][1])
                 self.assertIn("الخسارة" if outcome == "loss" else "الربح", private_messages[0][1])
+
+    def test_stock_history_is_private_paginated_and_ns_from_room_continues_it(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_market_history = [
+            {"id": str(i), "username": "Player", "asset": 1 + (i % 4), "amount": 100_000,
+             "outcome": "profit" if i % 2 else "loss", "change_percent": 5,
+             "change": 5_000, "status": "settled", "started_at": 1_700_000_000 + i,
+             "settled_at": 1_700_000_060 + i, "room": f"Hall{i}"}
+            for i in range(7)
+        ]
+        bot.stock_investments = []
+        bot._configured_room_language = lambda _room: "ar"
+        bot._result_pages = {}
+        private, packets = [], []
+        bot.send_private_text = lambda user, text: private.append((user, text))
+        bot._send_text_packets = lambda packet_type, text, **kwargs: packets.append((packet_type, text, kwargs))
+        bot._room_list_commands = lambda *_args, **_kwargs: False
+        self.assertTrue(bot._stock_history_command("Hall", "Player"))
+        self.assertEqual(private[0][0], "Player")
+        self.assertIn("سجل بورصتي", private[0][1])
+        self.assertEqual(len(bot._result_pages[("chat_message", "", "Player")]["pages"]), 3)
+        self.assertTrue(bot._handle_management_command_impl("Hall", "ns", "Player", is_private=False))
+        self.assertEqual(packets[-1][0], "chat_message")
+        self.assertEqual(packets[-1][2], {"to": "Player"})
+        self.assertIn("القائمة 2/3", packets[-1][1])
+
+    def test_stock_history_persists_each_settlement_once(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_market_history = []
+        writes = []
+        with patch.object(bot_module, "_save_local_json", side_effect=lambda path, data: writes.append((path, data))):
+            row = {"id": "market-1", "username": "Player", "amount": 100, "asset": 1, "status": "settled"}
+            self.assertTrue(bot._record_stock_market_history(row))
+            self.assertTrue(bot._record_stock_market_history(row))
+        self.assertEqual(len(bot.stock_market_history), 1)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][0], bot_module.STOCK_MARKET_HISTORY_FILE)
+
+    def test_recovered_old_stock_settlement_is_clamped_to_twenty_percent(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_market_history = []
+        bot.stock_investments = [{
+            "id": "old-market", "username": "Player", "asset": 1, "amount": 100_000,
+            "due_at": 0, "room": "Hall", "status": "paying", "outcome": "profit",
+            "change_percent": 50, "change": 50_000,
+        }]
+        bot._save_stock_investments = lambda: None
+        bot._active_rooms = lambda: ["Hall"]
+        bot._configured_room_language = lambda _room: "ar"
+        bot.send_room_text = lambda *_args: None
+        bot.send_private_text = lambda *_args: None
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "_apply_points_delta_once", return_value={"ok": True, "balance": 120_000}) as apply, patch.object(
+            bot_module, "_save_local_json", return_value=None
+        ), patch.object(bot_module, "_record_game", return_value=None):
+            self.assertEqual(bot._process_stock_market_investments(now=100), 1)
+        self.assertEqual(apply.call_args.args[1], 120_000)
+        self.assertEqual(bot.stock_market_history[0]["change_percent"], 20)
+        self.assertEqual(bot.stock_market_history[0]["change"], 20_000)
+
+    def test_plus_mf_accepts_unicode_word_persists_and_confirms_privately(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_list_commands = lambda *_args, **_kwargs: False
+        bot.moderation_enabled = False
+        bot.banned_words = set()
+        bot.log = lambda *_args: None
+        private = []
+        bot.send_private_text = lambda user, text: private.append((user, text))
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_save_moderation_config", return_value=[]
+        ) as save_moderation, patch.object(bot_module, "_save_mf_config", return_value=[]):
+            self.assertTrue(bot._handle_management_command_impl("", "+mf@الكلمه", "Master", is_private=True))
+        self.assertIn("الكلمه", bot.banned_words)
+        self.assertEqual(save_moderation.call_count, 1)
+        self.assertIn("تمت إضافة الكلمة", private[-1][1])
+
+    def test_new_gifts_and_highest_crop_are_wired_to_assets_and_rewards(self):
+        for gift_id, expected_file in (("18", "gift_18_farm.jpg"), ("19", "gift_19_tractor.jpg"), ("20", "gift_20_barn.jpg")):
+            self.assertIn(gift_id, bot_module.GIFT_CATALOG)
+            self.assertEqual([path.name for path in bot_module.GIFT_IMAGE_FILES[gift_id]], [expected_file])
+            self.assertTrue((bot_module.ASSETS_DIR / expected_file).is_file())
+            self.assertLess((bot_module.ASSETS_DIR / expected_file).stat().st_size, 50_000)
+
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.crop_plots = {}
+        bot.game_lock = threading.RLock()
+        bot._game_cooldown_notice = lambda *_args: True
+        bot._save_crop_plots = lambda: None
+        bot._configured_room_language = lambda _room: "ar"
+        messages = []
+        bot.send_room_text = lambda room, text: messages.append(text)
+        with patch.object(bot_module.time, "time", return_value=1_000.0):
+            self.assertTrue(bot._crop_command("Hall", "Player", "زرع@🌳"))
+        plot = next(iter(bot.crop_plots.values()))
+        self.assertEqual(plot["reward"], 500_000_000)
+        self.assertEqual(plot["minutes"], 960)
 
     def test_bl_is_master_only_and_bans_every_connected_room_without_leaving(self):
         class ImmediateThread:
@@ -3774,13 +3882,19 @@ class NewFeatureRegressions(unittest.TestCase):
         ):
             self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
         key = (bot_module._norm_room("Other"), bot_module._norm_user("Victim"))
+        bot.bomb_games[key]["defuse_reward"] = 500_000
         expiry = bot.bomb_games[key]["expires_at"]
-        self.assertTrue(bot._handle_bomb_wire("Other", "Victim", "1"))
+        with patch.object(bot_module, "_apply_points_delta_once", return_value={"ok": True, "balance": 500_000}) as award, patch.object(
+            bot_module, "_record_game", return_value=None
+        ):
+            self.assertTrue(bot._handle_bomb_wire("Other", "Victim", "1"))
+        self.assertEqual(award.call_args.args[0:2], ("Victim", 500_000))
         self.assertFalse(bot._expire_bomb_challenge(key, expiry))
         source_result = [text for room, text in messages if room == "Origin"][-1]
         destination_result = [text for room, text in messages if room == "Other"][-1]
         self.assertIn("نجح", source_result)
         self.assertIn("تفكيك القنبلة", source_result)
+        self.assertIn("500k", source_result)
         self.assertIn("تفكيك القنبلة", destination_result)
 
     def test_bomb_timeout_without_wire_sends_kick_and_notifies_both_rooms_once(self):

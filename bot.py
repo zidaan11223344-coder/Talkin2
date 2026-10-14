@@ -246,6 +246,11 @@ GIFT_IMAGE_FILES = {
     ]
     for i in range(1, 18)
 }
+GIFT_IMAGE_FILES.update({
+    "18": [ASSETS_DIR / "gift_18_farm.jpg"],
+    "19": [ASSETS_DIR / "gift_19_tractor.jpg"],
+    "20": [ASSETS_DIR / "gift_20_barn.jpg"],
+})
 # الألعاب وصورها معطلة بناءً على إعداد البوت المطلوب؛ لا تُرسل صور ألعاب.
 GAME_IMAGE_FILES = {
     "bet": "game_bet.jpg",
@@ -415,6 +420,7 @@ GIFT_CATALOG = {
     "10": ("🏎️", "سيارة"), "11": ("✈️", "طائرة"), "12": ("🐉", "تنين"),
     "13": ("🚀", "سفينة فضاء"), "14": ("🏰", "قصر"),
     "15": ("☕", "قهوة"), "16": ("🫖", "دلة"), "17": ("🐓", "ديك"),
+    "18": ("🏡", "مزرعة"), "19": ("🚜", "جرار"), "20": ("🐑", "حظيرة"),
 }
 
 # ============================================================
@@ -666,6 +672,7 @@ GAME_LEVELS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_levels.duplicates-backup.json"
 GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
 CROP_PLOTS_FILE = DATA_DIR / "crop_plots.json"
 STOCK_MARKET_FILE = DATA_DIR / "stock_market_investments.json"
+STOCK_MARKET_HISTORY_FILE = DATA_DIR / "stock_market_history.json"
 DRAGON_HUNTERS_FILE = DATA_DIR / "dragon_hunters.json"
 PAYROLL_FILE = DATA_DIR / "payroll.json"
 PAYROLL_COOLDOWN_SECONDS = max(60.0, float(os.getenv("PAYROLL_COOLDOWN_SECONDS", "600") or 600))
@@ -745,7 +752,7 @@ _migrate_legacy_state_files()
 # Restore state from GitHub after the data directory and legacy migration are ready.
 
 # Giant Chat gift costs/labels; images remain the local Giant assets.
-GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500,"15":525,"16":550,"17":575}
+GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500,"15":525,"16":550,"17":575,"18":600,"19":625,"20":650}
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://chatp.net/api?").rstrip("?") + "?"
@@ -888,7 +895,10 @@ _ENV_BANNED_WORDS = {w.strip() for w in os.getenv("BANNED_WORDS", "").split(",")
 def _arabic_filter_word(word):
     text = str(word or "").strip()
     return bool(text) and bool(re.search(r"[\u0600-\u06ff]", text)) and not bool(re.search(r"[A-Za-z]", text))
-BANNED_WORDS = {w for w in (_ENV_BANNED_WORDS | _BUILTIN_OFFENSIVE_WORDS) if _arabic_filter_word(w)}
+def _valid_filter_word(word):
+    text = str(word or "").strip()
+    return bool(text) and len(text) <= 80 and any(char.isalnum() for char in text) and not any(ord(char) < 32 for char in text)
+BANNED_WORDS = {w for w in (_ENV_BANNED_WORDS | _BUILTIN_OFFENSIVE_WORDS) if _valid_filter_word(w)}
 # Never enable word filtering implicitly on a new deployment. A room manager
 # must explicitly turn on room protection option 1 (or use mf@on as intended).
 AUTO_BAN_WORDS = os.getenv("AUTO_BAN_WORDS", "0") == "1"
@@ -2667,7 +2677,7 @@ def _looks_like_bot_command(text):
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
-        "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
+        "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
     )
@@ -4040,7 +4050,7 @@ def _load_moderation_config():
         if not isinstance(words, list):
             words = sorted(BANNED_WORDS)
 
-    words = [str(w).strip() for w in words if str(w).strip() and _arabic_filter_word(w)]
+    words = [str(w).strip() for w in words if _valid_filter_word(w)]
     raw_enabled = mf_data.get("enabled", moderation_data.get("enabled", AUTO_BAN_WORDS))
     enabled = bool(raw_enabled) if isinstance(raw_enabled, (bool, int)) else AUTO_BAN_WORDS
 
@@ -4303,11 +4313,13 @@ def _auto_ban_candidate(bot, room, sender, event_role=None):
 
 
 def _profanity_ban_candidate(bot, room, sender, event_role=None):
-    """Ban any account that matches a profanity rule, regardless of room rank."""
+    """Ban profanity offenders of any room rank, but never the configured master."""
     if not sender:
         return False
-    # The bot cannot be a profanity target; all human roles, including creator,
-    # owner, moderator and the configured master, follow the room's rule.
+    # The configured master is protected from false positives regardless of
+    # cached room-role data. Other user roles continue following room policy.
+    if _is_master_name(sender):
+        return False
     bot_id = str(getattr(bot, "bot_id", "") or BOT_ID or "").strip()
     return not bot_id or _norm_user(sender) != _norm_user(bot_id)
 
@@ -4422,7 +4434,7 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
-            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — إعلان مختصر كل 15 دقيقة؛ اكتب بورصة واختر الأصل والمبلغ. النتيجة بعد دقيقة: ربح أو خسارة من 10% إلى 50% / stock market\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n39. Shot أو شوت — صيد عادي بأي وقت؛ أول Shot بعد إعلان الرحلة يصيد التنين بجائزة مليون نقطة.\n📌 اكتب ns لقائمة الكركيت.',
+            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — إعلان مختصر كل 15 دقيقة؛ اكتب بورصة واختر الأصل والمبلغ. النتيجة بعد دقيقة: ربح أو خسارة من 1% إلى 20% / stock market؛ بورصتي لعرض سجلك الخاص\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n39. Shot أو شوت — صيد عادي بأي وقت؛ أول Shot بعد إعلان الرحلة يصيد التنين بجائزة مليون نقطة.\n📌 اكتب ns لقائمة الكركيت.',
             '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
@@ -5036,7 +5048,7 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
 
     # Work at a genuinely large, portrait-oriented final canvas. The frame is
     # slightly wider and substantially taller for chat sharing on phones.
-    target_w = 1300
+    target_w = 1500
     # Portrait-oriented delivery card: noticeably taller, with a modest width
     # increase, while keeping the existing decorative frame recognizable.
     target_h = max(1, round(target_w * 1.12))
@@ -6165,6 +6177,12 @@ class TalkinBot:
             row for row in saved_investments
             if isinstance(row, dict) and row.get("id") and row.get("username")
         ] if isinstance(saved_investments, list) else []
+        saved_stock_history = _load_local_json(STOCK_MARKET_HISTORY_FILE, {})
+        saved_stock_rows = saved_stock_history.get("history", []) if isinstance(saved_stock_history, dict) else []
+        self.stock_market_history = [
+            row for row in saved_stock_rows
+            if isinstance(row, dict) and row.get("id") and row.get("username")
+        ] if isinstance(saved_stock_rows, list) else []
         # Global wager queues, crop timers, and fruit-match state.
         self.wager_waiting = {}
         # Global fixed-prize PvP queues: one open challenge per game name.
@@ -10588,6 +10606,8 @@ class TalkinBot:
     def _cache_user_photos_from_result(self, result):
         """Cache Talkin profile photo URLs from any occupants/users response."""
         try:
+            if not isinstance(getattr(self, "user_photos", None), dict):
+                self.user_photos = {}
             for user in (result.get("users") or []):
                 if not isinstance(user, dict):
                     continue
@@ -10603,6 +10623,7 @@ class TalkinBot:
                             self._profile_base_status = status
                 if username and photo and username != BOT_ID and photo.startswith(("http://", "https://")):
                     self.user_photos[username.casefold()] = photo
+                    self.user_photos[_norm_user(username)] = photo
             for user in self._users_from_room_admin(result.get("room_admin") or {}):
                 username = str(user.get("username") or "").strip()
                 photo = str(user.get("photo") or "").strip()
@@ -10616,16 +10637,26 @@ class TalkinBot:
                             self._profile_base_status = status
                 if username and photo and photo.startswith(("http://", "https://")):
                     self.user_photos[username.casefold()] = photo
+                    self.user_photos[_norm_user(username)] = photo
         except Exception as exc:
             self.log("[GIFT] photo cache failed:", repr(exc))
 
     def _lookup_profile_photo(self, username):
         """Best-effort profile-photo lookup for a gift receiver not in cache."""
-        username = str(username or "").strip().lstrip("@").casefold()
-        if not username or not getattr(self.db, "client", None):
+        raw_username = str(username or "").strip().lstrip("@")
+        username = raw_username.casefold()
+        if not username:
+            return ""
+        photos = getattr(self, "user_photos", {})
+        for cache_key in (username, _norm_user(raw_username)):
+            photo = str(photos.get(cache_key, "") or "").strip() if isinstance(photos, dict) else ""
+            if photo.startswith(("http://", "https://")):
+                return photo
+        client = getattr(getattr(self, "db", None), "client", None)
+        if not client:
             return ""
         try:
-            response = (self.db.client.table("profiles").select("*")
+            response = (client.table("profiles").select("*")
                         .eq("username", username).limit(1).execute())
             rows = getattr(response, "data", None) or []
             if rows:
@@ -10634,7 +10665,10 @@ class TalkinBot:
                               ("photo_url", "photo", "avatar_url", "avatar", "image_url")
                               if str(row.get(key) or "").strip().startswith(("http://", "https://"))), "")
                 if photo:
+                    if not isinstance(getattr(self, "user_photos", None), dict):
+                        self.user_photos = {}
                     self.user_photos[username] = photo
+                    self.user_photos[_norm_user(raw_username)] = photo
                     return photo
         except Exception as exc:
             self.log("[GIFT] receiver photo lookup failed:", repr(exc))
@@ -12448,7 +12482,10 @@ class TalkinBot:
             "🍎":(5,50_000), "🍐":(10,75_000), "🍊":(15,100_000), "🍋":(20,150_000),
             "🍇":(25,200_000), "🍉":(30,250_000), "🍓":(35,300_000), "🥕":(40,350_000),
             "🌽":(45,400_000), "🥭":(50,450_000), "🍍":(55,500_000), "🍌":(60,600_000),
-            "🥥":(65,700_000), "🥑":(70,850_000), "🥔":(75,1_000_000)
+            "🥥":(65,700_000), "🥑":(70,850_000), "🥔":(75,1_000_000),
+            "🍒":(90,2_000_000), "🍈":(120,5_000_000), "🫐":(180,10_000_000),
+            "🍅":(240,25_000_000), "🥒":(360,50_000_000), "🧄":(480,100_000_000),
+            "🌻":(600,200_000_000), "🌾":(720,300_000_000), "🌳":(960,500_000_000),
         }
         english = self._effective_room_language(room) == "en"
         if raw.casefold()=="زرع":
@@ -12569,6 +12606,7 @@ class TalkinBot:
                 "room": destination, "target": target, "started_by": str(sender),
                 "source_room": source_room,
                 "wire": secrets.randbelow(3) + 1, "expires_at": time.time() + 30.0,
+                "id": uuid.uuid4().hex, "defuse_reward": secrets.choice((500_000, 1_000_000)),
             }
             expires_at = float(games[key]["expires_at"])
             self.bomb_games = games
@@ -12706,10 +12744,17 @@ class TalkinBot:
                 if _norm_room(result_room) != _norm_room(destination):
                     prefix = f"📍 Room: {destination}\n" if english else f"📍 الغرفة: {destination}\n"
                 if kind == "defused":
-                    message = (
-                        f"✅ {username} successfully defused the bomb."
-                        if english else f"✅ نجح {username} في تفكيك القنبلة."
-                    )
+                    if str(extra).startswith("reward:"):
+                        reward = int(str(extra).split(":", 1)[1])
+                        message = (
+                            f"✅ {username} successfully defused the bomb and received +{_fmt_points(reward)} points!"
+                            if english else f"✅ نجح {username} في تفكيك القنبلة وحصل على +{_fmt_points(reward)} نقطة!"
+                        )
+                    else:
+                        message = (
+                            f"✅ {username} defused the bomb, but the reward could not be saved; contact the master."
+                            if english else f"✅ نجح {username} في تفكيك القنبلة، لكن تعذر حفظ الجائزة؛ أبلغ الماستر."
+                        )
                 else:
                     action_result = (
                         "The room kick request was sent." if extra == "kick_sent"
@@ -12727,7 +12772,19 @@ class TalkinBot:
         if time.time() >= float(game.get("expires_at", 0)):
             self._finish_expired_bomb(game)
         elif int(digits) == int(game.get("wire") or 0):
-            send_result("defused")
+            target = str(game.get("target") or username).strip().lstrip("@")
+            reward = int(game.get("defuse_reward") or secrets.choice((500_000, 1_000_000)))
+            transaction_id = f"bomb-defuse-reward:{game.get('id') or _norm_room(destination) + ':' + _norm_user(target) + ':' + str(int(game.get('expires_at', 0)))}"
+            award = _apply_points_delta_once(target, reward, transaction_id, "bomb defusal reward")
+            if award.get("ok"):
+                try:
+                    _record_game(target, "bomb_defuse", reward, 0)
+                except Exception as exc:
+                    self.log("[BOMB] defusal statistics save failed:", repr(exc))
+                send_result("defused", f"reward:{reward}")
+            else:
+                self.log("[BOMB] defusal reward persistence failed:", target, award.get("error"))
+                send_result("defused", "reward_failed")
         else:
             colors = {"1": ("الأحمر", "Red"), "2": ("الأصفر", "Yellow"), "3": ("الأخضر", "Green")}
             color = colors[digits][0]
@@ -13114,6 +13171,100 @@ class TalkinBot:
             snapshot = [dict(row) for row in self.stock_investments if isinstance(row, dict)]
         _save_local_json(STOCK_MARKET_FILE, {"version": 1, "investments": snapshot})
 
+    def _record_stock_market_history(self, result):
+        """Persist one completed investment exactly once for the user's بورصتي log."""
+        if not isinstance(result, dict) or not result.get("id") or not result.get("username"):
+            return False
+        with self._stock_market_lock:
+            history = [dict(row) for row in getattr(self, "stock_market_history", []) if isinstance(row, dict)]
+            if any(str(row.get("id")) == str(result.get("id")) for row in history):
+                self.stock_market_history = history
+                return True
+            history.append(dict(result))
+            try:
+                _save_local_json(STOCK_MARKET_HISTORY_FILE, {"version": 1, "history": history})
+            except Exception as exc:
+                self.log("[STOCK] history save failed; settlement will retry:", repr(exc))
+                return False
+            self.stock_market_history = history
+            return True
+
+    def _stock_history_command(self, room, sender):
+        """Send a user's full retained stock-market history in private, Ns pages."""
+        user_key = _norm_user(sender)
+        with self._stock_market_lock:
+            rows = [dict(row) for row in getattr(self, "stock_market_history", [])
+                    if isinstance(row, dict) and _norm_user(row.get("username")) == user_key]
+            seen_ids = {str(row.get("id")) for row in rows}
+            rows.extend(dict(row) for row in getattr(self, "stock_investments", [])
+                         if isinstance(row, dict) and _norm_user(row.get("username")) == user_key
+                         and str(row.get("id")) not in seen_ids)
+        rows.sort(key=lambda row: float(row.get("settled_at", row.get("started_at", 0)) or 0), reverse=True)
+        english = self._configured_room_language(room) == "en"
+        if english:
+            title = f"📈 My stock-market history — {len(rows)} investments"
+        else:
+            title = f"📈 سجل بورصتي — {len(rows)} عملية"
+        if not rows:
+            self.send_private_text(sender, "📭 لا توجد استثمارات بورصة مسجلة لحسابك بعد." if not english else "📭 You have no recorded stock-market investments yet.")
+            return True
+
+        details = []
+        for row in rows:
+            try:
+                asset_id = int(row.get("asset", 0) or 0)
+            except (TypeError, ValueError):
+                asset_id = 0
+            asset = STOCK_MARKET_ASSETS.get(asset_id, {})
+            asset_name = asset.get("en" if english else "ar", "Unknown" if english else "غير معروف")
+            when_ts = row.get("settled_at", row.get("started_at", row.get("timestamp", 0)))
+            try:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(when_ts or 0)))
+            except (TypeError, ValueError, OverflowError, OSError):
+                when = "unknown time" if english else "وقت غير معروف"
+            amount = int(row.get("amount", 0) or 0)
+            status = str(row.get("status") or "settled")
+            room_name = _transfer_log_safe_field(row.get("room"), 36)
+            if status in {"pending_debit", "active", "paying"}:
+                line = (f"{when} | {asset.get('icon', '📈')} {asset_name} | {_fmt_points(amount)} | "
+                        f"{'Pending settlement' if english else 'قيد التسوية'} | {room_name}")
+            else:
+                outcome = str(row.get("outcome") or "profit")
+                change = int(row.get("change", row.get("profit", 0)) or 0)
+                percent = int(row.get("change_percent", row.get("profit_percent", 0)) or 0)
+                is_profit = outcome == "profit"
+                label = (("Profit" if is_profit else "Loss") if english
+                         else ("ربح" if is_profit else "خسارة"))
+                sign = "+" if is_profit else "-"
+                line = (f"{when} | {asset.get('icon', '📈')} {asset_name} | {_fmt_points(amount)} | "
+                        f"{label} {percent}% ({sign}{_fmt_points(change)}) | {room_name}")
+            details.append(_transfer_log_safe_field(line, max_bytes=170))
+
+        pages = []
+        for start in range(0, len(details), 3):
+            page_no = start // 3 + 1
+            page_total = (len(details) + 2) // 3
+            header = (f"📈 My stock-market history — List {page_no}/{page_total}"
+                      if english else f"📈 سجل بورصتي — القائمة {page_no}/{page_total}")
+            pages.append("\n".join((header, "━━━━━━━━━━━━", *details[start:start + 3])))
+        page_key = ("chat_message", "", str(sender or ""))
+        result_pages = getattr(self, "_result_pages", {})
+        if not isinstance(result_pages, dict):
+            result_pages = {}
+        result_pages[page_key] = {
+            "pages": pages, "part": 1, "kwargs": {"to": str(sender or "")},
+            "language": "en" if english else "ar",
+        }
+        self._result_pages = result_pages
+        first = pages[0]
+        if len(pages) > 1:
+            first += "\n\n📌 Type ns for the next list." if english else "\n\n📌 اكتب ns للقائمة التالية."
+        else:
+            result_pages.pop(page_key, None)
+            first += "\n\n✅ End of list." if english else "\n\n✅ انتهت القوائم."
+        self.send_private_text(sender, first)
+        return True
+
     def _stock_market_announcement(self, language):
         if language == "en":
             return "📈 Stock market is open! Type stock, choose an asset and amount. Result in 1 minute: profit or loss."
@@ -13141,12 +13292,12 @@ class TalkinBot:
             return (
                 "📈 Stock market\n1️⃣ 🥇 Gold  2️⃣ 🥈 Silver  3️⃣ 🛢️ Oil  4️⃣ 🏞️ Land\n"
                 "Send a number then the amount, or type `gold 100000`.\n"
-                "⏱️ Result in 1 minute: 10–50% profit or loss.\n⏳ 2-minute cooldown between investments."
+                "⏱️ Result in 1 minute: 1–20% profit or loss.\n⏳ 2-minute cooldown between investments."
             )
         return (
             "📈 البورصة\n1️⃣ 🥇 ذهب  2️⃣ 🥈 فضة  3️⃣ 🛢️ نفط  4️⃣ 🏞️ أرض\n"
             "أرسل رقم الخيار ثم المبلغ، أو اكتب `ذهب 100000`.\n"
-            "⏱️ النتيجة بعد دقيقة: ربح أو خسارة من 10% إلى 50%.\n⏳ فاصل دقيقتين بين كل استثمار."
+            "⏱️ النتيجة بعد دقيقة: ربح أو خسارة من 1% إلى 20%.\n⏳ فاصل دقيقتين بين كل استثمار."
         )
 
     def _stock_market_is_open(self, now=None):
@@ -13332,6 +13483,47 @@ class TalkinBot:
         self.send_room_text(room, text)
         return True
 
+    def _broadcast_stock_market_result(self, username, source_room, asset, amount, outcome, change_percent, change):
+        """Announce one settled investment in every room the bot is currently in."""
+        rooms = set()
+        try:
+            rooms.update(str(value).strip() for value in self._active_rooms() if str(value).strip())
+        except Exception as exc:
+            self.log("[STOCK] active-room lookup failed during result broadcast:", repr(exc))
+        for field in ("connected_rooms",):
+            try:
+                rooms.update(str(value).strip() for value in getattr(self, field, set()) if str(value).strip())
+            except Exception:
+                pass
+        if source_room:
+            rooms.add(str(source_room).strip())
+        data = STOCK_MARKET_ASSETS.get(int(asset), {})
+        is_profit = str(outcome) == "profit"
+        sign = "+" if is_profit else "-"
+        display_user = _transfer_log_safe_field(username, max_bytes=80)
+        for target_room in sorted(rooms, key=str.casefold):
+            english = self._configured_room_language(target_room) == "en"
+            if english:
+                label = "PROFIT" if is_profit else "LOSS"
+                text = (
+                    f"📈 Stock-market result — {label}\n"
+                    f"👤 Investor: @{display_user}\n"
+                    f"{data.get('icon', '📈')} {data.get('en', 'Market')} | Invested: {_fmt_points(amount)} points\n"
+                    f"📊 {label}: {int(change_percent)}% ({sign}{_fmt_points(change)})"
+                )
+            else:
+                label = "ربح" if is_profit else "خسارة"
+                text = (
+                    f"📈 نتيجة البورصة — {label}\n"
+                    f"👤 المستثمر: @{display_user}\n"
+                    f"{data.get('icon', '📈')} {data.get('ar', 'البورصة')} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
+                    f"📊 {label}: {int(change_percent)}% ({sign}{_fmt_points(change)})"
+                )
+            try:
+                self.send_room_text(target_room, text)
+            except Exception as exc:
+                self.log("[STOCK] result broadcast failed:", target_room, repr(exc))
+
     def _process_stock_market_investments(self, now=None):
         now = time.time() if now is None else float(now)
         with self._stock_market_lock:
@@ -13378,7 +13570,7 @@ class TalkinBot:
                 continue
             if status != "paying":
                 outcome = "loss" if secrets.randbelow(2) else "profit"
-                change_percent = secrets.randbelow(41) + 10
+                change_percent = secrets.randbelow(20) + 1
                 change = max(1, amount * change_percent // 100)
                 with self._stock_market_lock:
                     for item in self.stock_investments:
@@ -13392,8 +13584,21 @@ class TalkinBot:
                             break
             else:
                 outcome = str(row.get("outcome") or "profit")
-                change_percent = int(row.get("change_percent", row.get("profit_percent", 10)) or 10)
-                change = int(row.get("change", row.get("profit", max(1, (amount * change_percent + 99) // 100))) or 0)
+                stored_percent = int(row.get("change_percent", row.get("profit_percent", 10)) or 10)
+                change_percent = max(1, min(20, stored_percent))
+                if change_percent != stored_percent:
+                    change = max(1, amount * change_percent // 100)
+                    with self._stock_market_lock:
+                        for item in self.stock_investments:
+                            if item.get("id") == investment_id:
+                                item.update(
+                                    change_percent=change_percent, profit_percent=change_percent,
+                                    change=change, profit=change,
+                                )
+                                row = dict(item)
+                                break
+                else:
+                    change = int(row.get("change", row.get("profit", max(1, amount * change_percent // 100))) or 0)
             try:
                 self._save_stock_investments()
             except Exception as exc:
@@ -13408,30 +13613,43 @@ class TalkinBot:
                 self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, credit.get("error"))
                 continue
             net_change = payout - amount
+            history_row = dict(row)
+            history_row.update({
+                "status": "settled", "payout": payout, "net_change": net_change,
+                "balance_after": int(credit.get("balance", 0) or 0), "settled_at": now,
+            })
+            if not self._record_stock_market_history(history_row):
+                # Keep the paying row so the idempotent credit and history write
+                # can be retried after a transient storage error.
+                continue
             _record_game(username, "stock_market", net_change, amount)
             room = str(row.get("room") or "")
             language = self._configured_room_language(room)
             data = STOCK_MARKET_ASSETS[asset]
+            display_user = _transfer_log_safe_field(username, max_bytes=80)
             result_label = "Loss" if outcome == "loss" else "Profit"
             result_sign = "-" if outcome == "loss" else "+"
             if language == "en":
                 result_text = (
-                    f"📈 Investment result: {data['icon']} {data['en']}\n"
-                    f"💰 Invested: {_fmt_points(amount)} points\n📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
+                    f"📈 Your stock-market result — {result_label}\n👤 Investor: @{display_user}\n"
+                    f"{data['icon']} {data['en']} | Invested: {_fmt_points(amount)} points\n"
+                    f"📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
                     f"💳 Balance: {_fmt_points(credit['balance'])}"
                 )
             else:
                 result_label = "الخسارة" if outcome == "loss" else "الربح"
                 result_text = (
-                    f"📈 نتيجة استثمار البورصة: {data['icon']} {data['ar']}\n"
-                    f"💰 مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
+                    f"📈 نتيجتك في البورصة — {result_label}\n👤 المستثمر: @{display_user}\n"
+                    f"{data['icon']} {data['ar']} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
+                    f"📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
                     f"💳 الرصيد: {_fmt_points(credit['balance'])}"
                 )
-            if room:
-                try:
-                    self.send_room_text(room, result_text)
-                except Exception as exc:
-                    self.log("[STOCK] result delivery failed:", repr(exc))
+            try:
+                self._broadcast_stock_market_result(
+                    username, room, asset, amount, outcome, change_percent, change
+                )
+            except Exception as exc:
+                self.log("[STOCK] result broadcast failed:", repr(exc))
             try:
                 private_text = result_text + (
                     f"\n🏠 Investment room: {room}" if language == "en"
@@ -15142,6 +15360,8 @@ class TalkinBot:
         low=raw.casefold()
         if self._snake_command(room,sender_name,raw): return True
         if self._ludo_command(room,sender_name,raw): return True
+        if low in ("بورصتي", "سجل بورصتي", "my stock history", "my stock market"):
+            return self._stock_history_command(room, sender_name)
         stock_key=(_norm_room(room), _norm_user(sender_name))
         pending_stock=self.stock_pending.get(stock_key)
         if pending_stock:
@@ -17112,6 +17332,14 @@ class TalkinBot:
             result_key = (packet_type, "" if is_private else str(room or ""), str(sender or ""))
             result_pages = getattr(self, "_result_pages", {})
             result_state = result_pages.get(result_key)
+            if not isinstance(result_state, dict) and not is_private:
+                # Some commands (including personal logs) deliberately answer
+                # in DM even when issued in a room. Let `ns` sent from that room
+                # advance the user's private result list instead of losing it.
+                private_key = ("chat_message", "", str(sender or ""))
+                private_state = result_pages.get(private_key)
+                if isinstance(private_state, dict):
+                    result_key, result_state, packet_type = private_key, private_state, "chat_message"
             if isinstance(result_state, dict):
                 pages = result_state.get("pages") or []
                 current = max(1, int(result_state.get("part", 1) or 1))
@@ -17432,11 +17660,16 @@ class TalkinBot:
                 return True
             if low.startswith("+mf@"):
                 word = text[4:].strip()
-                if word and _arabic_filter_word(word):
+                if _valid_filter_word(word):
+                    duplicate = any(_norm_filter_text(saved) == _norm_filter_text(word) for saved in self.banned_words)
                     self.banned_words.add(word)
                     _save_moderation_config(self.moderation_enabled, sorted(self.banned_words))
                     _save_mf_config(self.moderation_enabled, sorted(self.banned_words))
                     self.log("[FILTER] saved to mf.json:", word)
+                    notice = "ℹ️ الكلمة موجودة مسبقًا في قائمة المنع." if duplicate else "✅ تمت إضافة الكلمة إلى قائمة المنع وحفظها."
+                else:
+                    notice = "❌ كلمة غير صالحة. أرسل نصًا من 1 إلى 80 حرفًا بعد +mf@."
+                self.send_private_text(sender, notice)
                 return True
             if low.startswith("-mf@"):
                 word = text[4:].strip()
@@ -19664,7 +19897,12 @@ class TalkinBot:
         # never activate filtering by itself. This keeps the filter completely
         # inactive until the master explicitly enables protection option 1.
         filter_enabled = bool(protection_cfg.get("swear", False))
-        filter_words = room_cfg["words"] or sorted(self.banned_words)
+        room_words = room_cfg.get("words") or []
+        if isinstance(room_words, dict):
+            room_words = list(room_words.keys())
+        elif not isinstance(room_words, (list, tuple, set)):
+            room_words = [room_words] if isinstance(room_words, str) else []
+        filter_words = sorted({str(word).strip() for word in room_words if str(word).strip()} | set(self.banned_words))
         normalized_body = _norm_filter_text(body)
         hit = (
             next((w for w in filter_words
