@@ -1393,9 +1393,74 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.object(bot_module, "_get_points", return_value=100), patch.object(
             bot_module, "_add_points", return_value=80
         ):
-            self.assertTrue(bot._queue_wager("North", "Player", "رهان", 20))
+                self.assertTrue(bot._queue_wager("North", "Player", "رهان", 20))
         self.assertEqual(sent[0][0], "North")
         self.assertIn("بدأت لعبة رهان", sent[0][1])
+
+    def test_expired_wager_refunds_reserved_stake_without_competitor(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.game_lock = threading.RLock()
+        bot.wager_waiting = {
+            "رهان": {"id": "wager-123", "user": "Player", "room": "North", "stake": 5_000_000_000,
+                     "reserved": True, "game": "رهان", "created": 100.0}
+        }
+        bot._effective_room_language = lambda _room: "ar"
+        bot.log = lambda *_args: None
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        with patch.object(bot_module.time, "time", return_value=221.0), patch.object(
+            bot_module, "_apply_points_delta_once", return_value={"ok": True, "balance": 5_000_000_000}
+        ) as apply:
+            bot._cleanup_expired_wagers()
+        self.assertFalse(bot.wager_waiting)
+        self.assertEqual(apply.call_args.args[:3], ("Player", 5_000_000_000, "wager-timeout-refund:wager-123"))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("أُعيد مبلغ", sent[0][1])
+        self.assertIn("Player", sent[0][1])
+
+    def test_expired_wager_refund_retries_after_points_persistence_failure(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.game_lock = threading.RLock()
+        bot.wager_waiting = {
+            "رهان": {"id": "wager-retry", "user": "Player", "room": "North", "stake": 5_000,
+                     "reserved": True, "game": "رهان", "created": 100.0}
+        }
+        bot._effective_room_language = lambda _room: "ar"
+        bot.log = lambda *_args: None
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        with patch.object(bot_module.time, "time", return_value=221.0), patch.object(
+            bot_module, "_apply_points_delta_once",
+            side_effect=[{"ok": False, "error": "persistence_failed"}, {"ok": True, "balance": 5_000}],
+        ) as apply:
+            bot._cleanup_expired_wagers()
+            self.assertIn("رهان", bot.wager_waiting)
+            self.assertNotIn("_refund_pending", bot.wager_waiting["رهان"])
+            self.assertFalse(sent)
+            bot._cleanup_expired_wagers()
+        self.assertEqual(apply.call_count, 2)
+        self.assertEqual(apply.call_args_list[0].args[2], apply.call_args_list[1].args[2])
+        self.assertFalse(bot.wager_waiting)
+        self.assertEqual(len(sent), 1)
+
+    def test_stock_market_worker_checks_expired_wagers_periodically(self):
+        class StopAfterOneIteration:
+            def __init__(self):
+                self.iterations = 0
+            def is_set(self):
+                return self.iterations >= 1
+            def wait(self, _seconds):
+                self.iterations += 1
+
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.stop_event = StopAfterOneIteration()
+        bot._stock_market_next_announcement = bot_module.time.time() + 3600
+        bot._active_rooms = lambda: []
+        bot._cleanup_expired_wagers = lambda: cleanups.append(True)
+        bot._process_stock_market_investments = lambda _now: None
+        cleanups = []
+        bot._stock_market_worker()
+        self.assertEqual(cleanups, [True])
 
     def test_second_wager_uses_first_players_stake_even_if_command_amount_is_smaller(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -3478,11 +3543,20 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertIn("تمت إضافة الكلمة", private[-1][1])
 
     def test_new_gifts_and_highest_crop_are_wired_to_assets_and_rewards(self):
-        for gift_id, expected_file in (("18", "gift_18_farm.jpg"), ("19", "gift_19_tractor.jpg"), ("20", "gift_20_barn.jpg")):
+        expected_gifts = {
+            "18": "gift_18_farm.jpg", "19": "gift_19_tractor.jpg", "20": "gift_20_barn.jpg",
+            "21": "gift_21_diamond.jpg", "22": "gift_22_cat.jpg", "23": "gift_23_dog.jpg",
+            "24": "gift_24_console.jpg", "25": "gift_25_trophy.jpg", "26": "gift_26_helicopter.jpg",
+            "27": "gift_27_watch.jpg", "28": "gift_28_cupcake.jpg", "29": "gift_29_dolphin.jpg",
+            "30": "gift_30_island.jpg",
+        }
+        self.assertEqual(len(bot_module.GIFT_CATALOG), 30)
+        for gift_id, expected_file in expected_gifts.items():
             self.assertIn(gift_id, bot_module.GIFT_CATALOG)
             self.assertEqual([path.name for path in bot_module.GIFT_IMAGE_FILES[gift_id]], [expected_file])
             self.assertTrue((bot_module.ASSETS_DIR / expected_file).is_file())
             self.assertLess((bot_module.ASSETS_DIR / expected_file).stat().st_size, 50_000)
+            self.assertGreater(bot_module.GIFT_COSTS[gift_id], 0)
 
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.crop_plots = {}
@@ -3497,6 +3571,19 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         plot = next(iter(bot.crop_plots.values()))
         self.assertEqual(plot["reward"], 500_000_000)
         self.assertEqual(plot["minutes"], 960)
+
+    def test_gift_help_splits_thirty_items_into_short_english_pages(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._effective_room_language = lambda _room: "en"
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        bot.gift_help("Hall")
+        self.assertEqual(len(sent), 4)
+        self.assertIn("List 1/4", sent[0][1])
+        self.assertIn("List 4/4", sent[-1][1])
+        self.assertIn("Island", sent[-1][1])
+        self.assertIn("sa@gift_id@username", sent[-1][1])
+        self.assertTrue(all(len(text.encode("utf-8")) < 800 for _, text in sent))
 
     def test_bl_is_master_only_and_bans_every_connected_room_without_leaving(self):
         class ImmediateThread:

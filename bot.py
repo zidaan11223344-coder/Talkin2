@@ -250,6 +250,16 @@ GIFT_IMAGE_FILES.update({
     "18": [ASSETS_DIR / "gift_18_farm.jpg"],
     "19": [ASSETS_DIR / "gift_19_tractor.jpg"],
     "20": [ASSETS_DIR / "gift_20_barn.jpg"],
+    "21": [ASSETS_DIR / "gift_21_diamond.jpg"],
+    "22": [ASSETS_DIR / "gift_22_cat.jpg"],
+    "23": [ASSETS_DIR / "gift_23_dog.jpg"],
+    "24": [ASSETS_DIR / "gift_24_console.jpg"],
+    "25": [ASSETS_DIR / "gift_25_trophy.jpg"],
+    "26": [ASSETS_DIR / "gift_26_helicopter.jpg"],
+    "27": [ASSETS_DIR / "gift_27_watch.jpg"],
+    "28": [ASSETS_DIR / "gift_28_cupcake.jpg"],
+    "29": [ASSETS_DIR / "gift_29_dolphin.jpg"],
+    "30": [ASSETS_DIR / "gift_30_island.jpg"],
 })
 # الألعاب وصورها معطلة بناءً على إعداد البوت المطلوب؛ لا تُرسل صور ألعاب.
 GAME_IMAGE_FILES = {
@@ -421,6 +431,20 @@ GIFT_CATALOG = {
     "13": ("🚀", "سفينة فضاء"), "14": ("🏰", "قصر"),
     "15": ("☕", "قهوة"), "16": ("🫖", "دلة"), "17": ("🐓", "ديك"),
     "18": ("🏡", "مزرعة"), "19": ("🚜", "جرار"), "20": ("🐑", "حظيرة"),
+    "21": ("💎", "ماسة"), "22": ("🐈", "قطة"), "23": ("🐕", "كلب"),
+    "24": ("🎮", "جهاز ألعاب"), "25": ("🏆", "كأس ذهبي"),
+    "26": ("🚁", "مروحية"), "27": ("⌚", "ساعة فاخرة"),
+    "28": ("🧁", "كب كيك"), "29": ("🐬", "دلفين"), "30": ("🏝️", "جزيرة"),
+}
+GIFT_CATALOG_EN = {
+    "1": "Rose", "2": "Heart", "3": "Kiss", "4": "Teddy bear", "5": "Cake",
+    "6": "Fireworks", "7": "Lightning", "8": "Crown", "9": "Princess",
+    "10": "Sports car", "11": "Airplane", "12": "Dragon", "13": "Spaceship",
+    "14": "Castle", "15": "Coffee", "16": "Coffee pot", "17": "Rooster",
+    "18": "Farm", "19": "Tractor", "20": "Barn", "21": "Diamond",
+    "22": "Cat", "23": "Dog", "24": "Game console", "25": "Gold trophy",
+    "26": "Helicopter", "27": "Luxury watch", "28": "Cupcake", "29": "Dolphin",
+    "30": "Island",
 }
 
 # ============================================================
@@ -752,7 +776,7 @@ _migrate_legacy_state_files()
 # Restore state from GitHub after the data directory and legacy migration are ready.
 
 # Giant Chat gift costs/labels; images remain the local Giant assets.
-GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500,"15":525,"16":550,"17":575,"18":600,"19":625,"20":650}
+GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500,"15":525,"16":550,"17":575,"18":600,"19":625,"20":650,"21":700,"22":725,"23":750,"24":775,"25":800,"26":825,"27":850,"28":875,"29":900,"30":950}
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://chatp.net/api?").rstrip("?") + "?"
@@ -3635,7 +3659,10 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
         positive = delta > 0
         history.append({
             "id": txid, "timestamp": int(time.time()),
-            "sender": "stock_market" if positive else item["username"],
+            "sender": (
+                "wager_refund" if positive and str(reason or "").casefold().startswith("refund expired")
+                else "stock_market" if positive else item["username"]
+            ),
             "sender_key": "" if positive else key,
             "recipient": item["username"] if positive else "stock_market",
             "recipient_key": key if positive else "",
@@ -11679,12 +11706,26 @@ class TalkinBot:
         return self.send_query(encode_query("gifts", type_=GIFT_PROTOCOL, **kwargs))
 
     def gift_help(self, room):
-        lines = ["🎁 الهدايا | الأسعار"]
-        for k, (emoji, name) in GIFT_CATALOG.items():
-            cost = GIFT_COSTS.get(str(k), 0)
-            lines.append(f"{k} {emoji} {name} — 💰 {cost}")
-        lines.append("📌 للإرسال: sa@رقم_الهدية@اسم_المستخدم")
-        self.send_room_text(room, "\n".join(lines))
+        english = self._effective_room_language(room) == "en"
+        gift_lines = []
+        for key, (emoji, arabic_name) in GIFT_CATALOG.items():
+            name = GIFT_CATALOG_EN.get(str(key), arabic_name) if english else arabic_name
+            cost = GIFT_COSTS.get(str(key), 0)
+            unit = "points" if english else "نقطة"
+            gift_lines.append(f"{key}. {emoji} {name} — {cost} {unit}")
+        page_size = 8
+        pages = [gift_lines[index:index + page_size] for index in range(0, len(gift_lines), page_size)]
+        for index, page in enumerate(pages, 1):
+            heading = (
+                f"🎁 Gifts and prices — List {index}/{len(pages)}"
+                if english else f"🎁 الهدايا والأسعار — القائمة {index}/{len(pages)}"
+            )
+            if index == len(pages):
+                command = "📌 Send: sa@gift_id@username" if english else "📌 للإرسال: sa@رقم_الهدية@اسم_المستخدم"
+                page.append(command)
+            self.send_room_text(room, heading + "\n" + "\n".join(page))
+            if index < len(pages):
+                time.sleep(0.05)
 
     def _verify_public_media_url(self, url: str, media_kind: str = "image"):
         try:
@@ -12087,18 +12128,65 @@ class TalkinBot:
         expired = []
         with self.game_lock:
             for key, waiting in list(self.wager_waiting.items()):
-                if now - float(waiting.get("created", 0) or 0) >= timeout:
-                    expired.append((key, waiting))
-                    self.wager_waiting.pop(key, None)
-        for _, waiting in expired:
+                try:
+                    is_expired = now - float(waiting.get("created", 0) or 0) >= timeout
+                except (TypeError, ValueError):
+                    is_expired = True
+                if is_expired and not waiting.get("_refund_pending"):
+                    user = str(waiting.get("user") or "")
+                    created = str(waiting.get("created", 0) or 0)
+                    challenge_id = str(waiting.get("id") or "")
+                    if not challenge_id:
+                        challenge_id = uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"wager-timeout:{key}:{_norm_user(user)}:{created}",
+                        ).hex
+                        waiting["id"] = challenge_id
+                    waiting["_refund_pending"] = True
+                    expired.append((key, dict(waiting), challenge_id))
+        for key, waiting, challenge_id in expired:
             room = str(waiting.get("room") or "").strip()
             game = str(waiting.get("game") or "اللعبة").strip()
             user = str(waiting.get("user") or "").strip()
-            if waiting.get("reserved"):
-                _add_points(user, int(waiting.get("stake", 0) or 0))
+            stake = max(0, int(waiting.get("stake", 0) or 0))
+            reserved = bool(waiting.get("reserved"))
+            if reserved:
+                refund = _apply_points_delta_once(
+                    user, stake, f"wager-timeout-refund:{challenge_id}",
+                    f"refund expired {game} wager",
+                ) if user and stake > 0 else {"ok": False, "error": "invalid_wager"}
+                if not refund.get("ok"):
+                    with self.game_lock:
+                        current = self.wager_waiting.get(key)
+                        if current and str(current.get("id") or "") == challenge_id:
+                            current.pop("_refund_pending", None)
+                    self.log("[GAME] expired wager refund failed; will retry", game, user, refund.get("error"))
+                    continue
+            removed = False
+            with self.game_lock:
+                current = self.wager_waiting.get(key)
+                if current and str(current.get("id") or "") == challenge_id:
+                    self.wager_waiting.pop(key, None)
+                    removed = True
+            if not removed:
+                continue
             if room:
-                self.send_room_text(room, f"✅ انتهت لعبة {game}")
-            self.log("[GAME] expired wager", game, user)
+                english = self._effective_room_language(room) == "en"
+                if reserved:
+                    text = (
+                        f"⌛ The {game} wager expired without an opponent; "
+                        f"{_fmt_points(stake)} points were refunded to @{user}."
+                        if english else
+                        f"⌛ انتهى وقت انتظار منافس للعبة {game}؛ أُعيد مبلغ "
+                        f"{_fmt_points(stake)} نقطة إلى @{user}."
+                    )
+                else:
+                    text = f"⌛ The {game} wager expired without an opponent." if english else f"⌛ انتهى وقت انتظار منافس للعبة {game}."
+                try:
+                    self.send_room_text(room, text)
+                except Exception as exc:
+                    self.log("[GAME] expired wager notice failed:", room, repr(exc))
+            self.log("[GAME] expired wager refunded", game, user, stake if reserved else 0)
 
     def _cleanup_expired_fixed_games(self):
         # ألعاب سنارة/برق/ياقوت/صدام/كاشف تنتظر منافساً لمدة دقيقتين فقط.
@@ -12178,6 +12266,14 @@ class TalkinBot:
         self._cleanup_expired_wagers()
         with self.game_lock:
             existing = self.wager_waiting.get(game_name.casefold())
+            if existing and existing.get("_refund_pending"):
+                self.send_room_text(
+                    room,
+                    "⌛ انتهت مهلة هذا الرهان ويجري إعادة مبلغه؛ جرّب بعد لحظات."
+                    if self._effective_room_language(room) != "en"
+                    else "⌛ This wager expired and its refund is processing; try again shortly.",
+                )
+                return True
             if existing and _norm_user(existing.get("user")) == _norm_user(sender):
                 self.send_room_text(room, f"⏳ @{sender} لديك لعبة {game_name} شغالة حالياً.\n🎯 ما زالت تبحث عن منافس.\n⌛ مدة البحث دقيقتان فقط، وبعدها تُلغى تلقائياً إذا لم يدخل منافس.")
                 return True
@@ -12193,7 +12289,13 @@ class TalkinBot:
         error = None
         with self.game_lock:
             waiting = self.wager_waiting.get(key)
-            if waiting and _norm_user(waiting["user"]) == _norm_user(sender):
+            if waiting and waiting.get("_refund_pending"):
+                error = (
+                    "⌛ انتهت مهلة هذا الرهان ويجري إعادة مبلغه؛ جرّب بعد لحظات."
+                    if self._effective_room_language(room) != "en"
+                    else "⌛ This wager expired and its refund is processing; try again shortly."
+                )
+            elif waiting and _norm_user(waiting["user"]) == _norm_user(sender):
                 return True
 
             # A player cannot spend points that are already committed to another
@@ -12207,7 +12309,7 @@ class TalkinBot:
             # must have enough balance for the original challenge amount.
             round_stake = int(waiting.get("stake", 0) or 0) if waiting else amount
             balance = _get_points(sender)
-            if balance < round_stake + reserved:
+            if error is None and balance < round_stake + reserved:
                     error = _reply_template(
                         "game_insufficient", DEFAULT_REPLY_MESSAGES["game_insufficient"],
                         balance=_fmt_points(balance)
@@ -12222,6 +12324,7 @@ class TalkinBot:
                 # balance in another game while the challenge is open.
                 _add_points(sender, -amount)
                 self.wager_waiting[key] = {
+                    "id": uuid.uuid4().hex,
                     "user": sender,
                     "room": room,
                     "stake": amount,
@@ -13343,6 +13446,7 @@ class TalkinBot:
                 next_announcement = float(getattr(self, "_stock_market_next_announcement", 0) or 0)
                 if now >= next_announcement and self._active_rooms():
                     self._start_stock_market_round(now, force=True)
+                self._cleanup_expired_wagers()
                 self._process_stock_market_investments(now)
             except Exception as exc:
                 self.log("[STOCK] worker iteration failed; will retry:", repr(exc))
