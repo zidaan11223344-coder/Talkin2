@@ -928,7 +928,9 @@ CLEANUP_MEMORY_MAX_AGE_SECONDS = max(300, int(os.getenv("CLEANUP_MEMORY_MAX_AGE_
 # Cooperative CPU guard: it throttles diagnostics only; it never closes the
 # WebSocket, leaves rooms, or restarts the server.
 CPU_GUARD_ENABLED = os.getenv("CPU_GUARD_ENABLED", "1").strip() == "1"
-CPU_GUARD_INTERVAL_SECONDS = max(5.0, float(os.getenv("CPU_GUARD_INTERVAL_SECONDS", "10") or 10))
+# Check at most once per hour by default so CPU diagnostics never compete with
+# startup room restoration or normal event processing.
+CPU_GUARD_INTERVAL_SECONDS = max(60.0, float(os.getenv("CPU_GUARD_INTERVAL_SECONDS", "3600") or 3600))
 CPU_GUARD_HIGH_PERCENT = max(50.0, float(os.getenv("CPU_GUARD_HIGH_PERCENT", "50") or 50))
 CPU_GUARD_RECOVER_PERCENT = min(CPU_GUARD_HIGH_PERCENT - 1.0, max(20.0, float(os.getenv("CPU_GUARD_RECOVER_PERCENT", "35") or 35)))
 CPU_GUARD_LOG_COOLDOWN_SECONDS = max(5.0, float(os.getenv("CPU_GUARD_LOG_COOLDOWN_SECONDS", "15") or 15))
