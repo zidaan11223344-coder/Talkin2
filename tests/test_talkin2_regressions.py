@@ -3641,6 +3641,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         crop_rows = [line for line in packets[0][1].splitlines() if "=" in line]
         self.assertEqual(len(crop_rows), 24)
         self.assertLessEqual(len(crop_rows), 30)
+        self.assertIn("🍎 5د=", packets[0][1])
+        self.assertIn("🌳 90د=", packets[0][1])
+        self.assertNotRegex(packets[0][1], r"(?:120|180|240|360|480|600|720)د=")
         self.assertIn("500m", packets[0][1])
         self.assertIn("اكتب ns", packets[0][1])
 
