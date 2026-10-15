@@ -16694,21 +16694,19 @@ class TalkinBot:
             for target in cleaned:
                 key=_norm_room(target)
                 if any(_norm_room(r)==key for r in getattr(self, "connected_rooms", set())):
-                    if not sender:
-                        skipped += 1
-                        continue
-                    # A manual join also recovers stale local membership after
-                    # a missed departure event; cycle only this requested room.
-                    try:
-                        self.log("[ROOM] manual join requested for a listed room; refreshing membership:", target)
-                        self.leave_room(target)
-                        time.sleep(max(0.5, float(os.getenv("ROOM_CYCLE_DELAY_SECONDS", "1.0") or 1.0)))
-                    except Exception as exc:
-                        skipped += 1
-                        self.log("[ROOM] manual membership refresh failed:", target, repr(exc))
-                        continue
+                    # The server already confirmed this room in the current
+                    # session. Never leave/rejoin it just because the master
+                    # requested the saved-room list; that race used to produce
+                    # a false "unable to enter" timeout after a real success.
+                    if sender:
+                        try:
+                            self.send_private_text(sender, f"✅ البوت موجود داخل الغرفة: {target}")
+                        except Exception as exc:
+                            self.log("[ROOM] connected-room notice failed:", target, repr(exc))
+                    skipped += 1
+                    continue
                 try:
-                    if self.join_room(target, force=False, requested_by=sender):
+                    if self.join_room(target, force=bool(fast_restore), requested_by=sender):
                         sent += 1
                         if not fast_restore:
                             # Manual joins wait for you_joined/you_rejoined so
@@ -20294,6 +20292,21 @@ class TalkinBot:
             }
             if event_type in failure_events:
                 blocked_room = _norm_room(room)
+                if any(_norm_room(item) == blocked_room for item in getattr(self, "connected_rooms", set())):
+                    # A delayed/replayed rejection can arrive after the
+                    # server has already emitted you_joined. The live ACK is
+                    # authoritative; do not remove the room or tell the user
+                    # that entry failed.
+                    self.log("[ROOM] ignored stale join failure after confirmed entry:", room, event_type)
+                    pending_join = self._pending_room_joins.pop(blocked_room, None)
+                    if pending_join and pending_join.get("timer"):
+                        pending_join["timer"].cancel()
+                    if ACK_ROOM_EVENTS and result.get("uid"):
+                        try:
+                            self.ack(result["uid"])
+                        except Exception as exc:
+                            self.log("[ACK] stale join-failure ack failed:", exc)
+                    return
                 reason_text = self._room_failure_message(room, event_type)
                 pending_join = self._pending_room_joins.pop(blocked_room, None)
                 if pending_join and pending_join.get("timer"):
@@ -21370,9 +21383,12 @@ class TalkinBot:
         if MASTER_SERVICE_ENABLED:
             rooms_to_restore = set()
         else:
+            # tracked_rooms.json is the authoritative startup source. The
+            # in-memory known_rooms set may be a truncated/stale view after a
+            # reconnect and was the reason only a subset was restored.
             rooms_to_restore = {
-                str(r).strip() for r in self.known_rooms
-                if str(r).strip()
+                str(r).strip() for r in _persistent_rooms()
+                if str(r).strip() and _norm_room(r) not in getattr(self, "blocked_rooms", set())
             }
             if self.room:
                 rooms_to_restore.add(str(self.room).strip())

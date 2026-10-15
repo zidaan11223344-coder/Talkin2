@@ -433,7 +433,7 @@ class RoomExclusionRegressions(unittest.TestCase):
             bot._process_room_list([{"name": "Forbidden"}, {"name": "Other"}])
         self.assertEqual(bot.known_rooms, {"Other"})
 
-    def test_manual_join_refreshes_a_room_already_listed_as_connected(self):
+    def test_manual_join_reports_a_room_already_listed_as_connected(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.connected_rooms = {"RoomA"}
         bot._pending_room_joins = {}
@@ -441,21 +441,16 @@ class RoomExclusionRegressions(unittest.TestCase):
         bot.log = lambda *_args: None
         calls = []
 
-        def leave(room):
-            calls.append(("leave", room))
-            bot.connected_rooms.clear()
-            return True
-
         def join(room, force=False, requested_by=""):
             calls.append(("join", room, force, requested_by))
             return True
 
-        bot.leave_room = leave
         bot.join_room = join
+        bot.send_private_text = lambda *_args: None
         with patch.object(bot_module.time, "sleep"):
             result = bot._join_rooms_serially(["RoomA"], sender="Master")
-        self.assertEqual(result, {"sent": 1, "skipped": 0})
-        self.assertEqual(calls, [("leave", "RoomA"), ("join", "RoomA", False, "Master")])
+        self.assertEqual(result, {"sent": 0, "skipped": 1})
+        self.assertEqual(calls, [])
 
     def test_occupants_response_alone_does_not_mark_room_connected(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
