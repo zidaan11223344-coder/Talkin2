@@ -925,6 +925,13 @@ CLEANUP_LOG_ENABLED = os.getenv("CLEANUP_LOG_ENABLED", "1").strip() == "1"
 CLEANUP_TMP_ENABLED = os.getenv("CLEANUP_TMP_ENABLED", "1").strip() == "1"
 CLEANUP_MEMORY_ENABLED = os.getenv("CLEANUP_MEMORY_ENABLED", "1").strip() == "1"
 CLEANUP_MEMORY_MAX_AGE_SECONDS = max(300, int(os.getenv("CLEANUP_MEMORY_MAX_AGE_SECONDS", "1800")))
+# Cooperative CPU guard: it throttles diagnostics only; it never closes the
+# WebSocket, leaves rooms, or restarts the server.
+CPU_GUARD_ENABLED = os.getenv("CPU_GUARD_ENABLED", "1").strip() == "1"
+CPU_GUARD_INTERVAL_SECONDS = max(5.0, float(os.getenv("CPU_GUARD_INTERVAL_SECONDS", "10") or 10))
+CPU_GUARD_HIGH_PERCENT = max(50.0, float(os.getenv("CPU_GUARD_HIGH_PERCENT", "50") or 50))
+CPU_GUARD_RECOVER_PERCENT = min(CPU_GUARD_HIGH_PERCENT - 1.0, max(20.0, float(os.getenv("CPU_GUARD_RECOVER_PERCENT", "35") or 35)))
+CPU_GUARD_LOG_COOLDOWN_SECONDS = max(5.0, float(os.getenv("CPU_GUARD_LOG_COOLDOWN_SECONDS", "15") or 15))
 
 RAW_DIAGNOSTIC = os.getenv("RAW_DIAGNOSTIC", "0") == "1"
 ACK_ROOM_EVENTS = os.getenv("ACK_ROOM_EVENTS", "1") == "1"
@@ -6149,6 +6156,14 @@ class TalkinBot:
             os.getenv("STREAM_ERROR_LOG_FILE", str(DATA_DIR / "stream_accept_errors.log"))
         ).expanduser()
         self._runtime_log_lock = threading.Lock()
+        self._cpu_guard_stop = threading.Event()
+        self._cpu_guard_thread = None
+        self._cpu_cooling = False
+        self._cpu_cooling_since = 0.0
+        self._cpu_last_percent = 0.0
+        self._cpu_last_log_line = ""
+        self._cpu_last_log_at = 0.0
+        self._cpu_log_suppressed = 0
         self._telegram_chat_id = ""
         self._telegram_update_offset = 0
         self._telegram_stop = threading.Event()
@@ -6486,6 +6501,79 @@ class TalkinBot:
             self.send_room_text(room, reply)
         return True
 
+    def _cpu_guard_snapshot(self, cpu_percent):
+        """Collect cheap clues about CPU pressure without inspecting or stopping the WS."""
+        queue_size = -1
+        try:
+            queue_size = self._event_queue.qsize()
+        except Exception:
+            pass
+        active_threads = [thread.name for thread in threading.enumerate() if thread.is_alive()]
+        return (
+            f"cpu={cpu_percent:.1f}% threads={len(active_threads)} "
+            f"event_queue={queue_size} log_room_messages={'on' if LOG_ROOM_MESSAGES else 'off'} "
+            f"log_suppressed={getattr(self, '_cpu_log_suppressed', 0)} "
+            f"rooms={len(getattr(self, 'connected_rooms', set()))} "
+            f"music={len(getattr(self, 'music_current', {}))} "
+            f"crops={len(getattr(self, 'crop_plots', {}))} "
+            f"workers={','.join(active_threads[:18])}"
+        )
+
+    def _cpu_guard_loop(self):
+        """Reduce diagnostic/logging pressure when this process uses over 50% CPU.
+
+        This is deliberately cooperative: no socket close, room leave, process
+        restart, or server stop is performed by the guard.
+        """
+        last_wall = time.monotonic()
+        last_cpu = time.process_time()
+        was_cooling = False
+        while not self._cpu_guard_stop.wait(CPU_GUARD_INTERVAL_SECONDS):
+            now_wall = time.monotonic()
+            now_cpu = time.process_time()
+            wall_delta = max(0.001, now_wall - last_wall)
+            cpu_percent = max(0.0, (now_cpu - last_cpu) * 100.0 / wall_delta)
+            last_wall, last_cpu = now_wall, now_cpu
+            self._cpu_last_percent = cpu_percent
+            if cpu_percent >= CPU_GUARD_HIGH_PERCENT and not was_cooling:
+                was_cooling = True
+                self._cpu_cooling = True
+                self._cpu_cooling_since = time.time()
+                snapshot = self._cpu_guard_snapshot(cpu_percent)
+                # This diagnosis distinguishes log pressure from event/music
+                # pressure; room messages are not logged by default.
+                self.log("[CPU-GUARD] cooling enabled;", snapshot)
+                if BOT_MASTER:
+                    try:
+                        self.send_private_text(
+                            BOT_MASTER,
+                            "⚠️ تبريد CPU تلقائي فعّال بدون فصل البوت أو السيرفر.\n"
+                            f"{snapshot}\n"
+                            "تم تخفيف السجل التشخيصي فقط؛ الاتصال والغرف لم يتم لمسها.",
+                        )
+                    except Exception:
+                        pass
+            elif was_cooling and cpu_percent <= CPU_GUARD_RECOVER_PERCENT:
+                was_cooling = False
+                self._cpu_cooling = False
+                self.log(f"[CPU-GUARD] cooling disabled; cpu={cpu_percent:.1f}%")
+
+    def _start_cpu_guard(self):
+        if not CPU_GUARD_ENABLED or self._cpu_guard_thread is not None:
+            return
+        self._cpu_guard_stop.clear()
+        self._cpu_guard_thread = threading.Thread(
+            target=self._cpu_guard_loop, name="cpu-guard", daemon=True
+        )
+        self._cpu_guard_thread.start()
+
+    def _stop_cpu_guard(self):
+        self._cpu_guard_stop.set()
+        thread = self._cpu_guard_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._cpu_guard_thread = None
+
     def log(self, *args):
         """Optional diagnostics. Quiet mode avoids stdout and persistent log growth."""
         if QUIET_MODE and not DEBUG:
@@ -6500,6 +6588,18 @@ class TalkinBot:
             ):
                 return
             line = " ".join(str(x) for x in args)
+            self._cpu_log_suppressed = int(getattr(self, "_cpu_log_suppressed", 0) or 0)
+            if getattr(self, "_cpu_cooling", False):
+                now = time.monotonic()
+                critical = any(
+                    marker in line.upper()
+                    for marker in ("ERROR", "FAILED", "EXCEPTION", "RECONNECT", "AUTH")
+                )
+                if not critical and line == getattr(self, "_cpu_last_log_line", "") and now - getattr(self, "_cpu_last_log_at", 0.0) < CPU_GUARD_LOG_COOLDOWN_SECONDS:
+                    self._cpu_log_suppressed += 1
+                    return
+                self._cpu_last_log_line = line
+                self._cpu_last_log_at = now
             stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             record = f"[{stamp}] {line}"
             try:
@@ -17420,7 +17520,10 @@ class TalkinBot:
                 f"• RAM المتاحة: {metrics['ram_available_mb']:.0f} MB\n"
                 f"• CPU: {metrics['cpu_count']} نواة\n"
                 f"• الحمل الحالي: {metrics['load_1']:.2f} / {metrics['load_5']:.2f} / {metrics['load_15']:.2f}\n"
-                f"• الحمل لكل نواة: {metrics['load_pct_per_core']:.1f}%"
+                f"• الحمل لكل نواة: {metrics['load_pct_per_core']:.1f}%\n"
+                f"• CPU داخل البوت: {getattr(self, '_cpu_last_percent', 0.0):.1f}%\n"
+                f"• التبريد التلقائي: {'🟡 فعّال' if getattr(self, '_cpu_cooling', False) else '🟢 جاهز'}\n"
+                f"• رسائل السجل المخفّضة: {getattr(self, '_cpu_log_suppressed', 0)}"
             )
             return True
 
@@ -21279,6 +21382,7 @@ class TalkinBot:
             self.log("[TELEGRAM] polling disabled for this process; another instance owns getUpdates")
         else:
             self.log("[TELEGRAM] TELEGRAM_BOT_TOKEN is not configured; Telegram log upload disabled")
+        self._start_cpu_guard()
         self._cleanup_thread = start_runtime_cleanup(self.stop_event, self)
         self.asset_server = start_asset_server()
         while not self.stop_event.is_set():
