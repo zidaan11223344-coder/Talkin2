@@ -4387,6 +4387,18 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
             self.assertTrue(bot._handle_management_command_impl("", "جلب غرف السيرفر", "Master", is_private=True))
         self.assertEqual(bot.sync_request[0:2], ("Master", ""))
 
+    def test_server_fetch_without_socket_does_not_show_saved_rooms(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.ws = None
+        bot._server_room_catalog = ["OldRoom"]
+        sent = []
+        bot.send_private_text = lambda user, text: sent.append(text)
+        with patch.object(bot_module, "_persistent_rooms", return_value=["SavedRoom"]):
+            self.assertFalse(bot._request_full_room_sync("Master"))
+        self.assertEqual(bot._server_room_catalog, [])
+        self.assertTrue(any("لا يوجد اتصال" in text for text in sent))
+        self.assertFalse(any("SavedRoom" in text for text in sent))
+
     def test_stock_room_wide_announcements_are_disabled_by_default(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.log = lambda *_args: None

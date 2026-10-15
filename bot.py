@@ -20901,10 +20901,9 @@ class TalkinBot:
         """Request the server room catalog; joining is optional and explicit."""
         self.send_private_text(sender, "⏳ جاري جلب قوائم الغرف من السيرفر...")
         if not getattr(self, "ws", None):
-            fallback = _persistent_rooms()
-            if not fallback:
-                fallback = sorted({str(item).strip() for item in getattr(self, "connected_rooms", set()) if str(item).strip()}, key=str.casefold)
-            return self._finish_full_room_sync(fallback, from_server=False)
+            self._server_room_catalog = []
+            self.send_private_text(sender, "❌ تعذر جلب غرف السيرفر: لا يوجد اتصال WebSocket بالسيرفر.")
+            return False
         token = uuid.uuid4().hex
         self._pending_full_room_sync = {
             "token": token, "sender": str(sender or ""), "room": str(room or ""),
@@ -20914,14 +20913,19 @@ class TalkinBot:
             self.send_query(encode_query("load_list_new"))
             self.log("[ROOM-SYNC] requested complete room list from server")
         except Exception as exc:
-            self.log("[ROOM-SYNC] server request failed; using rooms file:", repr(exc))
-            return self._finish_full_room_sync(_persistent_rooms(), from_server=False, join_after=join_after)
+            self.log("[ROOM-SYNC] server request failed:", repr(exc))
+            self._pending_full_room_sync = None
+            self._server_room_catalog = []
+            self.send_private_text(sender, "❌ تعذر إرسال طلب قائمة غرف السيرفر.")
+            return False
 
         def fallback():
             state = getattr(self, "_pending_full_room_sync", None)
             if isinstance(state, dict) and state.get("token") == token:
-                self.log("[ROOM-SYNC] server response timeout; using rooms file")
-                self._finish_full_room_sync(_persistent_rooms(), from_server=False, join_after=join_after)
+                self.log("[ROOM-SYNC] server response timeout; no local fallback for explicit server fetch")
+                self._pending_full_room_sync = None
+                self._server_room_catalog = []
+                self.send_private_text(sender, "❌ لم يرد السيرفر بقائمة الغرف ضمن المهلة. لم يتم استخدام ملف الغرف.")
         threading.Timer(max(2.0, float(os.getenv("ROOM_LIST_SYNC_TIMEOUT_SECONDS", "4") or 4)), fallback).start()
         return True
 
