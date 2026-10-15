@@ -2696,6 +2696,23 @@ def _is_master_name(name):
     }
     configured.discard("")
     return bool(n and (n in configured or n in {_norm_user(x) for x in _master_list()}))
+
+def _is_configured_master_account(name):
+    """Return only whether *name* is the master configured by deployment vars.
+
+    Leaderboards use this narrower check intentionally: adding another account
+    to the persisted masters list must not hide it from rankings unless it is
+    the actual configured BOT_MASTER/MASTER_USERNAME/MASTER_ID account.
+    """
+    candidate = _norm_user(name)
+    configured = {
+        _norm_user(BOT_MASTER),
+        _norm_user(os.getenv("BOT_MASTER", "").strip()),
+        _norm_user(os.getenv("MASTER_USERNAME", "").strip()),
+        _norm_user(os.getenv("MASTER_ID", "").strip()),
+    }
+    configured.discard("")
+    return bool(candidate and candidate in configured)
 def _mvip_master_list():
     data = _load_local_json(MVIP_MASTERS_FILE, [])
     return data if isinstance(data, list) else []
@@ -2729,7 +2746,7 @@ def _looks_like_bot_command(text):
         return False
     prefixes = (
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
-        ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ",
+        ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
         "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
@@ -2751,7 +2768,7 @@ def _looks_like_bot_command(text):
     return (
         low.startswith(prefixes)
         or normalized_low.startswith(normalized_prefixes)
-        or low in ("help", "مساعدة", "games", "game")
+        or low in ("help", "مساعدة", "games", "game", "bom", "vi", "vip")
         or normalized_low in ("مساعده", "games", "game")
         or low in {x.casefold() for x in GAME_COMMANDS}
         or normalized_low in normalized_games
@@ -2820,8 +2837,8 @@ def _looks_like_admin_command(text):
     if re.match(r"^(?:إضافة|اضافة|استرجاع|استعادة|زيادة|زود)\s+(?:العاب|ألعاب)@", str(text or "").strip(), re.I):
         return True
     prefixes = (
-        ".u", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
-        "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "msb@", "-sb@",
+        ".u", "vi", "vi@", "vip", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
+        "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق", "msb@", "-sb@",
         "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
@@ -3286,9 +3303,12 @@ def _game_top10():
         level, label, plays = _game_level_from_item(merged)
         if not plays:
             continue
+        username = str(merged.get("username") or canonical).strip().lstrip("@")
+        if _is_configured_master_account(username):
+            continue
         rows_by_name[canonical] = (
             level, label, plays,
-            str(merged.get("username") or canonical).strip().lstrip("@"),
+            username,
         )
     rows = list(rows_by_name.values())
     rows.sort(key=lambda row: (-row[0], -row[2], _norm_user(row[3])))
@@ -3481,6 +3501,8 @@ def _game_top(game_key, limit=10):
         staked = int(g.get("staked", 0) or 0)
         if plays:
             username = str(item.get("username") or key)
+            if _is_configured_master_account(username):
+                continue
             canonical = _game_name_key(username) or _norm_user(username)
             row = (points, staked, plays, username)
             previous = unique.get(canonical)
@@ -6050,6 +6072,10 @@ class TalkinBot:
         self._incoming_seen = {}
         self._incoming_seen_lock = threading.Lock()
         self._management_command_seen = {}
+        # Commands without an inline username ask for the target in the next
+        # message. State is keyed by sender to keep rooms and users isolated.
+        self._pending_named_commands = {}
+        self._pending_bomb_targets = {}
         # Live room membership cache: username -> role.  This is updated by
         # occupants_list and by user_joined/user_left room events.
         self.room_users = defaultdict(dict)
@@ -12792,9 +12818,9 @@ class TalkinBot:
         target_english = getattr(self, "_configured_room_language", lambda _room: "ar")(destination) == "en"
         target_plain, sender_plain = target.lstrip("@"), str(sender).lstrip("@")
         challenge = (
-            f"💣 A bomb was sent to {target_plain} by {sender_plain}!\nChoose a wire to defuse it:\n1️⃣ Red\n2️⃣ Yellow\n3️⃣ Green\n⏱️ You have 30 seconds; send one number.\n🏆 Successfully defuse it to win 500,000 or 1,000,000 points."
+            f"💣 A bomb was sent to {target_plain} by {sender_plain}!\nChoose a wire to defuse it:\n1️⃣ 🔴 Red\n2️⃣ 🟡 Yellow\n3️⃣ 🟢 Green\n⏱️ You have 30 seconds; send one number.\n🏆 Successfully defuse it to win 500,000 or 1,000,000 points."
             if target_english else
-            f"💣 وصلت قنبلة إلى {target_plain} من {sender_plain}!\nلتفكيكها اختر رقم السلك:\n1️⃣ أحمر\n2️⃣ أصفر\n3️⃣ أخضر\n⏱️ أمامك 30 ثانية؛ أرسل رقمًا واحدًا.\n🏆 إذا نجحت في التفكيك ستحصل على جائزة 500 ألف أو مليون نقطة."
+            f"💣 وصلت قنبلة إلى {target_plain} من {sender_plain}!\nلتفكيكها اختر رقم السلك:\n1️⃣ 🔴 أحمر\n2️⃣ 🟡 أصفر\n3️⃣ 🟢 أخضر\n⏱️ أمامك 30 ثانية؛ أرسل رقمًا واحدًا.\n🏆 إذا نجحت في التفكيك ستحصل على جائزة 500 ألف أو مليون نقطة."
         )
         try:
             send_result = self.send_room_text(destination, challenge)
@@ -14652,11 +14678,12 @@ class TalkinBot:
         if not _looks_like_bot_command(text):
             raw = str(text or "").strip()
             pending_key = _game_choice_key(room, sender_name)
+            has_pending_bomb = pending_key in getattr(self, "_pending_bomb_targets", {})
             ludo_game = getattr(self, "ludo_games", {}).get(f"ludo:{_norm_room(room)}")
             has_pending_choice = pending_key in getattr(self, "pending_bot_choices", {})
             has_pending_stock = pending_key in getattr(self, "stock_pending", {})
             is_ludo_choice = raw in {"1", "2", "3", "4", "١", "٢", "٣", "٤"} and bool(ludo_game)
-            if not (has_pending_choice or has_pending_stock or is_ludo_choice):
+            if not (has_pending_bomb or has_pending_choice or has_pending_stock or is_ludo_choice):
                 return False
         response_language = self._capture_room_response_language(room, text)
         def worker():
@@ -15628,6 +15655,24 @@ class TalkinBot:
         if stock_order:
             raw = "بورصة"
         if not raw or not sender_name: return False
+        bomb_key = _game_choice_key(room, sender_name)
+        pending_bomb = getattr(self, "_pending_bomb_targets", {}).get(bomb_key)
+        if pending_bomb:
+            target = str(raw).strip().lstrip("@").split()[0] if raw else ""
+            if target and not _looks_like_bot_command(raw):
+                getattr(self, "_pending_bomb_targets", {}).pop(bomb_key, None)
+                return self._bomb_command(room, sender_name, target, pending_bomb.get("target_room") or room)
+        if raw.casefold() == "bom":
+            if not _room_manager(self, room, sender_name):
+                self.send_room_text(room, "🔒 بدء القنبلة مخصص للماستر أو إدارة الغرفة.")
+                return True
+            pending = getattr(self, "_pending_bomb_targets", None)
+            if not isinstance(pending, dict):
+                pending = {}
+                self._pending_bomb_targets = pending
+            pending[bomb_key] = {"target_room": room, "created": time.time()}
+            self.send_room_text(room, "👤 أرسل اسم المستخدم المستهدف بالقنبلة الآن، وسيتم تنفيذ الأمر في هذه الغرفة.")
+            return True
         # Active board-game state always gets first priority.  This prevents
         # numeric Ludo choices (1-4), join and rool from being swallowed by
         # unrelated pending game prompts such as the stock exchange.
@@ -16261,7 +16306,9 @@ class TalkinBot:
 
         join_command = bool(re.match(r"^(?:دخول|join)\s*@\s*.+$", str(body or "").strip(), re.I))
         join_all_command = str(body or "").strip().casefold() in {"دخول الكل", "دخولكل", "join all"}
-        verification_manager_command = _is_verification_manager_command(body)
+        verification_manager_command = _is_verification_manager_command(body) or str(body or "").strip().casefold() in {
+            "vi", "vip", "ماستر توثيق"
+        }
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
         master_points_transfer_command = bool(re.fullmatch(r"msb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
         master_points_deduction_command = str(body or "").strip().casefold().startswith("-sb@")
@@ -16291,6 +16338,52 @@ class TalkinBot:
             room and _room_manager(self, room, sender)
             and isinstance(getattr(self, "_pending_protection_number", {}).get(_norm_user(sender)), dict)
         )
+        pending_named_target = isinstance(
+            getattr(self, "_pending_named_commands", {}).get(_norm_user(sender)), dict
+        )
+        # Interactive management flow: `حظر`/`طرد`/`ادمن`/... first asks for
+        # the username, then executes in the original room/context.
+        pending_key = _norm_user(sender)
+        pending_named = getattr(self, "_pending_named_commands", {}).get(pending_key)
+        if isinstance(pending_named, dict) and time.time() - float(pending_named.get("created", 0) or 0) <= 180:
+            candidate = str(body or "").strip().lstrip("@").split()[0] if str(body or "").strip() else ""
+            if candidate and not _looks_like_bot_command(body) and not _looks_like_admin_command(body):
+                self._pending_named_commands.pop(pending_key, None)
+                action = pending_named.get("action")
+                context_room = str(pending_named.get("room") or room or "").strip()
+                if action in {"kick", "ban", "member", "admin", "owner"}:
+                    if not context_room:
+                        self.send_private_text(sender, "❌ لا توجد غرفة لتنفيذ العملية فيها.")
+                    else:
+                        self.request_admin_action(context_room, candidate, action, sender, announce_room=True)
+                    return True
+                # Reuse the tested canonical handlers for account-list actions.
+                canonical = {"master": f"mas@{candidate}", "mvip": f"mvip@{candidate}",
+                              "vip": f"vip@{candidate}", "verify": f"vi@{candidate}"}.get(action)
+                if canonical:
+                    return self._handle_management_command_impl(context_room, canonical, sender, is_private=bool(pending_named.get("is_private", is_private)))
+        elif isinstance(pending_named, dict):
+            self._pending_named_commands.pop(pending_key, None)
+
+        named_commands = {
+            "ادمن": "admin", "طرد": "kick", "حظر": "ban", "اونر": "owner", "أونر": "owner",
+            "عضو": "member", "ماستر": "master", "ماستر توثيق": "mvip", "vip": "vip", "vi": "verify",
+        }
+        named_action = named_commands.get(str(body or "").strip().casefold())
+        if named_action:
+            if named_action in {"admin", "kick", "ban", "member", "owner"} and not room:
+                self.send_private_text(sender, "❌ أرسل هذا الأمر من الغرفة التي تريد تنفيذ العملية فيها.")
+                return True
+            self._pending_named_commands[pending_key] = {
+                "action": named_action, "room": str(room or ""),
+                "is_private": bool(is_private), "created": time.time(),
+            }
+            prompt = "👤 أرسل اسم المستخدم الآن لتنفيذ العملية." if named_action not in {"master", "mvip", "vip", "verify"} else "👤 أرسل اسم المستخدم الآن، وبعدها سينفذ البوت العملية."
+            if is_private:
+                self.send_private_text(sender, prompt)
+            else:
+                self.send_room_text(room, prompt)
+            return True
         if (not _is_master_name(sender)
                 and not public_top_command
                 and not (verification_manager_command and _is_mvip_master(sender))
@@ -16299,6 +16392,7 @@ class TalkinBot:
                 and not join_command
                 and not join_all_command
                 and not repeat_last_command
+                and not pending_named_target
                 and not ((security_command or is_game_cmd or is_creator_cmd or pending_protection_choice) and room and _room_manager(self, room, sender))):
             return False
         # A private command can be replayed by the Talkin transport with a new
@@ -17824,6 +17918,8 @@ class TalkinBot:
                     if not isinstance(value, dict):
                         continue
                     username = str(value.get("username") or key or "").strip().lstrip("@")
+                    if _is_configured_master_account(username):
+                        continue
                     canonical = _game_name_key(username)
                     if not canonical:
                         continue
