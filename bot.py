@@ -15483,18 +15483,27 @@ class TalkinBot:
     def _random_social_hunt_game(self, room, sender, command):
         """Pick a live room member and attach a generic, credited stock portrait."""
         english = self._effective_room_language(room) == "en"
-        candidates = self._fun_room_members(room, sender)
+        female_photo = str(command or "").strip() == "صيد مزه"
+        requested_gender = "female" if female_photo else "male"
+        room_members = self._fun_room_members(room, sender)
+        # Both hunt variants must select from the live roster of this room and
+        # must not fall back to a mixed/unknown candidate.
+        candidates = [
+            member for member in room_members
+            if self._picture_gender_hint(member) == requested_gender
+        ]
         if not candidates:
             self.send_room_text(
                 room,
-                "No other room member is available for this game." if english
-                else "لم أجد عضواً آخر متاحاً في الغرفة لهذه اللعبة.",
+                ("No other male room member is available for this game." if requested_gender == "male"
+                 else "No other female room member is available for this game.") if english else
+                ("لم أجد عضواً ذكراً آخر متاحاً في الغرفة لهذه اللعبة." if requested_gender == "male"
+                 else "لم أجد عضوةً أنثى أخرى متاحةً في الغرفة لهذه اللعبة."),
             )
             return True
         if not self._game_cooldown_notice(room, sender, 30.0, str(command)):
             return True
         target = secrets.choice(candidates)
-        female_photo = str(command or "").strip() == "صيد مزه"
         photo_group = "woman" if female_photo else "man"
         photo_key = (_norm_room(room), photo_group)
         photo_pool = [path for path in SOCIAL_HUNT_IMAGE_FILES[photo_group] if path.is_file()]

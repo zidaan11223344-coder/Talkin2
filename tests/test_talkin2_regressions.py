@@ -3647,7 +3647,8 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
     def test_social_hunt_uses_generic_stock_photos_and_excludes_sender(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._effective_room_language = lambda _room: "ar"
-        bot._fun_room_members = lambda room, sender: ["Target"]
+        bot._fun_room_members = lambda room, sender: ["MaleTarget", "FemaleTarget"]
+        bot._picture_gender_hint = lambda name: "female" if name == "FemaleTarget" else "male"
         bot._game_cooldown_notice = lambda *_args: True
         bot._game_public_image = lambda path, route="games": f"https://media.example/{route}/{path.name}"
         bot.log = lambda *_args: None
@@ -3667,9 +3668,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             second_man_photo = media[-1][1]
         self.assertNotEqual(first_woman_photo, second_woman_photo)
         self.assertNotEqual(first_man_photo, second_man_photo)
-        self.assertTrue(all("@Target" in text and "لا تمثل صورة العضو" in text for text in texts))
-        self.assertIn("@Player اصطاد مزه: @Target", texts[0])
-        self.assertIn("@Player اصطادت مز: @Target", texts[2])
+        self.assertTrue(all("لا تمثل صورة العضو" in text for text in texts))
+        self.assertIn("@Player اصطاد مزه: @FemaleTarget", texts[0])
+        self.assertIn("@Player اصطادت مز: @MaleTarget", texts[2])
         self.assertTrue(all(path.is_file() for paths in bot_module.SOCIAL_HUNT_IMAGE_FILES.values() for path in paths))
         self.assertEqual(set(bot_module.SOCIAL_HUNT_IMAGE_FILES), {"woman", "man"})
         bot._effective_room_language = lambda _room: "en"
@@ -3677,7 +3678,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مزه"))
         self.assertIn("Beauty Hunt", texts[-1])
         self.assertIn("not a picture of the selected member", texts[-1])
-        self.assertIn("@Player caught a beauty: @Target", texts[-1])
+        self.assertIn("@Player caught a beauty: @FemaleTarget", texts[-1])
         self.assertEqual(bot_module._normalize_game_command_text("hunt a beauty"), "صيد مزه")
         self.assertEqual(bot_module._normalize_game_command_text("my ex"), "طليقي")
         for command in ("صيد مزه", "صيد مز", "طليقي", "خلع", "طلاق"):
