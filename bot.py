@@ -296,6 +296,11 @@ GAME_COMMANDS = {
     "marriage": "زواج", "wedding": "زواج", "wife": "زوجتي", "husband": "زوجي",
     "engagement": "خطبة", "fiance": "خطيب", "love": "حبك", "enemy": "عدو",
     "friend": "صديق", "creep": "زاحف", "sheep": "خروف",
+    "hunt a beauty": "صيد مزه", "catch a beauty": "صيد مزه",
+    "hunt a man": "صيد مز", "catch a man": "صيد مز",
+    "my ex": "طليقي", "khul": "خلع", "divorce": "طلاق",
+    "صيد مزه": "صيد مزه", "صيد مز": "صيد مز",
+    "طليقي": "طليقي", "خلع": "خلع", "طلاق": "طلاق",
     "challenge": "تحدي", "riddle": "لغز", "puzzle": "لغز", "mood": "مزاج",
     "entertainment": "تسليه", "horse": "حصانه", "stock": "بورصة", "market": "بورصة",
     "bank": "بنك", "million": "بنك مليون", "million bank": "بنك مليون", "bank million": "بنك مليون",
@@ -4459,13 +4464,13 @@ def _default_help_sections():
         3: [
             '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📌 اكتب ns للقائمة التالية',
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
-            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 الأسماء العربية والإنجليزية مقبولة.',
+            '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
-            '🎮 A3 — الألعاب — 5: ألعاب إضافية وتفاعل\n━━━━━━━━━━━━\n30. زواج — marriage/wedding\n31. تحدي — challenge\n32. لغز — riddle/puzzle\n33. مزاج — mood\n34. حصانه — horse\n35. تسليه — entertainment\n36. بورصة — إعلان مختصر كل 15 دقيقة؛ اكتب بورصة واختر الأصل والمبلغ. النتيجة بعد دقيقة: ربح أو خسارة من 1% إلى 20% / stock market؛ بورصتي لعرض سجلك الخاص\n37. اسرق@اسم — steal@name\n38. شبيه@اسم — lookalike@name\n39. Shot أو شوت — صيد عادي بأي وقت؛ أول Shot بعد إعلان الرحلة يصيد التنين بجائزة مليون نقطة.\n📌 اكتب ns لقائمة الكركيت.',
+            '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — بعد دقيقة؛ ربح أو خسارة 1–20%. بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
             '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
-            '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا\ngifts — الهدايا\ngv — الهدايا\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
+            '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا (حتى 30 هدية في القائمة)\ngifts / gv — قائمة الهدايا؛ اكتب ns للتالي\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
             '📢 النشر — 2\n━━━━━━━━━━━━\nبوست أو انشر — تجهيز ونشر صورة\nبوست@وصف أو انشر@وصف — نشر صورة مع وصف\n📌 الوصف يمر عبر فلتر الكلمات المسيئة، ومن يخالفه يُمنع من النشر حتى mbp@اسم\n\n📌 أرسل الصورة بعد أمر بوست أو انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
         ],
         5: [
@@ -8075,7 +8080,7 @@ class TalkinBot:
             if re.match(r"^sa@[^@]+@.+$", command, re.I):
                 return bool(self.handle_gift_command(target_room, command, original_sender))
             if low in ("هدايا", "gifts", "gv"):
-                self.gift_help(target_room)
+                self.gift_help(target_room, original_sender)
                 return True
             if re.fullmatch(r"sher@(.+)", command, re.I):
                 self.share_last_music(original_sender, command.split("@",1)[1], target_room)
@@ -11705,27 +11710,63 @@ class TalkinBot:
         kwargs[GIFT_ID_FIELD] = gift_id
         return self.send_query(encode_query("gifts", type_=GIFT_PROTOCOL, **kwargs))
 
-    def gift_help(self, room):
+    def _send_room_result_pages(self, room, sender, pages, language="ar"):
+        """Store a room result list so `ns` can continue it, 30 items at a time."""
+        room_text = str(room or "")
+        sender_text = str(sender or "")
+        page_list = [str(page or "") for page in (pages or []) if str(page or "").strip()]
+        if not page_list:
+            return False
+        key = ("room_message", room_text, sender_text)
+        result_pages = getattr(self, "_result_pages", {})
+        if not isinstance(result_pages, dict):
+            result_pages = {}
+        result_pages[key] = {
+            "pages": page_list, "part": 1,
+            "kwargs": {"room": room_text}, "language": "en" if language == "en" else "ar",
+        }
+        self._result_pages = result_pages
+        # A newly opened room list takes precedence over an older master-only
+        # transfer log when the same user next types `ns`.
+        transfer_key = _norm_user(sender_text)
+        transfer_pages = getattr(self, "_transfer_log_pages", None)
+        if isinstance(transfer_pages, dict):
+            transfer_pages.pop(transfer_key, None)
+        transfer_languages = getattr(self, "_transfer_log_languages", None)
+        if isinstance(transfer_languages, dict):
+            transfer_languages.pop(transfer_key, None)
+        first = page_list[0]
+        first += (
+            "\n\n📌 Type ns for the next list." if language == "en"
+            else "\n\n📌 اكتب ns للانتقال إلى القائمة التالية."
+        )
+        return self._send_text_packets("room_message", first, room=room_text)
+
+    def gift_help(self, room, sender=""):
         english = self._effective_room_language(room) == "en"
         gift_lines = []
         for key, (emoji, arabic_name) in GIFT_CATALOG.items():
             name = GIFT_CATALOG_EN.get(str(key), arabic_name) if english else arabic_name
             cost = GIFT_COSTS.get(str(key), 0)
-            unit = "points" if english else "نقطة"
-            gift_lines.append(f"{key}. {emoji} {name} — {cost} {unit}")
-        page_size = 8
+            gift_lines.append(f"{key} {emoji} {name}={cost}")
+        page_size = 30
         pages = [gift_lines[index:index + page_size] for index in range(0, len(gift_lines), page_size)]
+        if not pages:
+            pages = [[]]
+        page_texts = []
         for index, page in enumerate(pages, 1):
             heading = (
-                f"🎁 Gifts and prices — List {index}/{len(pages)}"
-                if english else f"🎁 الهدايا والأسعار — القائمة {index}/{len(pages)}"
+                f"🎁 Gifts and prices in points — List {index}/{len(pages)}"
+                if english else f"🎁 قائمة الهدايا — الأسعار بالنقاط — القائمة {index}/{len(pages)}"
             )
             if index == len(pages):
-                command = "📌 Send: sa@gift_id@username" if english else "📌 للإرسال: sa@رقم_الهدية@اسم_المستخدم"
-                page.append(command)
-            self.send_room_text(room, heading + "\n" + "\n".join(page))
-            if index < len(pages):
-                time.sleep(0.05)
+                command = "📌 Send: sa@id@username" if english else "📌 للإرسال: sa@رقم@اسم_المستخدم"
+                page_texts.append(heading + "\n" + "\n".join(page) + "\n" + command)
+            else:
+                page_texts.append(heading + "\n" + "\n".join(page))
+        return self._send_room_result_pages(
+            room, sender, page_texts, "en" if english else "ar"
+        )
 
     def _verify_public_media_url(self, url: str, media_kind: str = "image"):
         try:
@@ -12592,16 +12633,25 @@ class TalkinBot:
         }
         english = self._effective_room_language(room) == "en"
         if raw.casefold()=="زرع":
-            if english:
-                lines = ["🌱 Crop menu", "━━━━━━━━━━━━"]
-                lines.extend(f"{item}: {minutes} minutes → {reward:,} points" for item, (minutes, reward) in crops.items())
-                lines.extend(("📌 Plant: farm@🍎 or farm 🍎", "💡 When ready, the reward is posted in the room where you planted."))
-                self.send_room_text(room, "\n".join(lines))
-                return True
-            lines = ["🌱 قائمة المحاصيل", "━━━━━━━━━━━━"]
-            lines.extend(f"{item}: {minutes} دقيقة → {_fmt_points(reward)} نقطة" for item, (minutes, reward) in crops.items())
-            lines.extend(("📌 للزراعة: زرع@🍎 أو زرع 🍎", "💡 عند اكتمال الزراعة تظهر المكافأة في الغرفة التي زرعت فيها."))
-            self.send_room_text(room, "\n".join(lines))
+            crop_lines = [
+                (f"{item} {minutes}m={reward:,}" if english
+                 else f"{item} {minutes}د={_fmt_points(reward)}")
+                for item, (minutes, reward) in crops.items()
+            ]
+            page_size = 30
+            pages = [crop_lines[index:index + page_size] for index in range(0, len(crop_lines), page_size)] or [[]]
+            page_texts = []
+            for index, page in enumerate(pages, 1):
+                heading = (
+                    f"🌱 Crop menu — minutes/reward points — List {index}/{len(pages)}"
+                    if english else f"🌱 قائمة المحاصيل — الوقت بالدقائق/المكافأة بالنقاط — القائمة {index}/{len(pages)}"
+                )
+                footer = (
+                    "📌 Plant: farm@🍎 or farm 🍎"
+                    if english else "📌 للزراعة: زرع@🍎 أو زرع 🍎"
+                )
+                page_texts.append(heading + "\n" + "\n".join(page) + "\n" + footer)
+            self._send_room_result_pages(room, sender, page_texts, "en" if english else "ar")
             return True
         m=re.fullmatch(r"زرع[@ ](.+)", raw, re.I)
         if not m: return False
@@ -15358,6 +15408,93 @@ class TalkinBot:
         self.send_room_text(room, result)
         return True
 
+    def _random_social_hunt_game(self, room, sender, command):
+        """Pick a live room member and attach a generic, credited stock portrait."""
+        english = self._effective_room_language(room) == "en"
+        candidates = self._fun_room_members(room, sender)
+        if not candidates:
+            self.send_room_text(
+                room,
+                "No other room member is available for this game." if english
+                else "لم أجد عضواً آخر متاحاً في الغرفة لهذه اللعبة.",
+            )
+            return True
+        if not self._game_cooldown_notice(room, sender, 30.0, str(command)):
+            return True
+        target = secrets.choice(candidates)
+        female_photo = str(command or "").strip() == "صيد مزه"
+        filename = "game_hunt_woman.jpg" if female_photo else "game_hunt_man.jpg"
+        label = "beauty hunt" if female_photo else "handsome man hunt"
+        photo_url = ""
+        if (ASSETS_DIR / filename).is_file():
+            photo_url = self._game_public_image(ASSETS_DIR / filename, route="assets")
+        image_sent = False
+        if photo_url:
+            try:
+                image_sent = self.send_room_media(room, photo_url, "image") is not False
+            except Exception as exc:
+                self.log("[SOCIAL-HUNT] image delivery failed:", room, repr(exc))
+        if english:
+            result = (
+                f"🎯 {label.title()}! Random room pick: @{target}.\n"
+                "🖼️ This is a generic game photo, not a picture of the selected member."
+            )
+            if not image_sent:
+                result += "\n⚠️ The photo could not be sent; check the public media URL."
+        else:
+            label_ar = "صيد المزة" if female_photo else "صيد المز"
+            result = (
+                f"🎯 {label_ar}! اختار البوت من أعضاء الغرفة: @{target}.\n"
+                "🖼️ الصورة عامة للعبة ولا تمثل صورة العضو المختار."
+            )
+            if not image_sent:
+                result += "\n⚠️ تعذر إرسال الصورة؛ تحقق من رابط الوسائط العام."
+        self.send_room_text(room, result)
+        return True
+
+    def _court_social_game(self, room, sender, command):
+        """Lighthearted room-only ex/khul/divorce game; not a real legal result."""
+        english = self._effective_room_language(room) == "en"
+        candidates = self._fun_room_members(room, sender)
+        if not candidates:
+            self.send_room_text(
+                room,
+                "No other room member is available for this game." if english
+                else "لم أجد عضواً آخر متاحاً في الغرفة لهذه اللعبة.",
+            )
+            return True
+        partner = secrets.choice(candidates)
+        kind = str(command or "").strip()
+        if kind == "طليقي":
+            text = (
+                f"💔 @{sender}, your ex is @{partner}. (For fun only.)"
+                if english else f"💔 @{sender}، طليقك هو @{partner}. (لعبة مزاح فقط)"
+            )
+            self.send_room_text(room, text)
+            return True
+        self.send_room_text(
+            room,
+            "⌛ Awaiting the court's ruling..." if english else "⌛ بانتظار حكم المحكمة...",
+        )
+        if kind == "خلع":
+            result = (
+                f"⚖️ The game court grants khulʿ for @{sender} from @{partner}.\n"
+                f"💰 All expenses are returned to @{sender}. (For fun only.)"
+                if english else
+                f"⚖️ حكم القاضي بخلع @{sender} من @{partner}.\n"
+                f"💰 رُدّت كامل النفقات للمخلوع @{sender}. (لعبة مزاح فقط)"
+            )
+        else:
+            result = (
+                f"⚖️ The game court grants triple divorce to @{partner}.\n"
+                f"✍️ Initiator: @{sender}. (For fun only.)"
+                if english else
+                f"⚖️ حكم القاضي بطلاق @{partner} طلاقاً بالثلاث.\n"
+                f"✍️ المطلق: @{sender}. (لعبة مزاح فقط)"
+            )
+        self.send_room_text(room, result)
+        return True
+
     def _celebrity_partner_game(self, room, sender, gender):
         female = ["نانسي عجرم", "إليسا", "أصالة نصري", "أحلام الشامسي", "نجوى كرم", "شيرين عبد الوهاب", "بيونسيه", "تايلور سويفت"]
         male = ["ماجد المهندس", "كاظم الساهر", "عمرو دياب", "محمد عبده", "تامر حسني", "عادل إمام", "توم كروز", "ليوناردو دي كابريو"]
@@ -15559,6 +15696,10 @@ class TalkinBot:
             return self._stock_market_invest(room, sender_name, stock_order[0], stock_order[1])
         if game_low in ("زواج", "زوجه"):
             return self._marriage_game(room, sender_name)
+        if game_low in ("صيد مزه", "صيد مز"):
+            return self._random_social_hunt_game(room, sender_name, game_low)
+        if game_low in ("طليقي", "خلع", "طلاق"):
+            return self._court_social_game(room, sender_name, game_low)
         if game_low == "زوجتي":
             return self._celebrity_partner_game(room, sender_name, "female")
         if game_low == "زوجي":
@@ -15806,11 +15947,11 @@ class TalkinBot:
                     "🎮 Games — wagers\n━━━━━━━━━━━━\nbet@amount — wager | duel@amount — duel\nmyluck@amount — luck wager\ninvestment@amount — investment game\nChoose the stake after the game command.",
                     "🎮 Games — bank and rewards\n━━━━━━━━━━━━\nbank million — million bank | billion — billion game\nfarm@item — plant a crop | stock — choose a market\nface@name — face game\nType ns for the next games list.",
                     "🎲 Room games — Ludo and Snake & Ladders\n━━━━━━━━━━━━\nludo — start Ludo; choose 1–4 players\n1 = play against the bot; 2–4 = multiplayer\nOther players type join. When the game starts, the player whose turn it is types rool to roll the die and move. First token to the finish wins.\nsnake — start Snake & Ladders; type join to enter.\nType ns for the next games list.",
-                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nShot — one shot every 2 minutes; each ordinary animal pays 5,000 points. The first shot after a trip announcement catches the 1,000,000-point dragon.\nlightning, ruby, crash, detector\nType ns for the next games list.",
+                    "🎮 More games\n━━━━━━━━━━━━\nmarriage, challenge, riddle, mood, horse, entertainment\nstock/market, steal@name, lookalike@name\nhunt a beauty / hunt a man — random member with a generic stock photo\nmy ex / khul / divorce — playful room-court games\nShot — one shot every 2 minutes; each ordinary animal pays 5,000 points. The first shot after a trip announcement catches the 1,000,000-point dragon.\nlightning, ruby, crash, detector\nType ns for the next games list.",
                     "🏏 Cricket\n━━━━━━━━━━━━\nMaster: start cricket game / stop cricket game.\nVerified players: .cr 1, choose 1–4 players, then each player types join. Choose 1 (bat) or 2 (defend), then send a score from 0 to 6 for each ball.\nType ns to return to the first game list.",
                 ],
                 4: [
-                    "🎁 Gifts\n━━━━━━━━━━━━\nsa@number@name — send a gift\ngifts / gv — open the gift menu\nThe sender and recipient must be eligible; gift cost is deducted from points.",
+                    "🎁 Gifts\n━━━━━━━━━━━━\nsa@number@name — send a gift\ngifts / gv — open the gift menu (up to 30 items per list; type ns for next)\nThe sender and recipient must be eligible; gift cost is deducted from points.",
                     "📢 Publishing\n━━━━━━━━━━━━\npost or publish — prepare an image post\npost@description / publish@description — add a caption\nSend the image when prompted. Publishing follows the room’s permissions and content filter.",
                 ],
                 5: [
@@ -20109,7 +20250,7 @@ class TalkinBot:
                     self._remember_bot_action(room, body, frm, is_private=False)
                 return
         if body.strip().casefold() in ("هدايا", "gifts", "gv"):
-            self.gift_help(room)
+            self.gift_help(room, frm)
             if not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, frm, is_private=False)
             return

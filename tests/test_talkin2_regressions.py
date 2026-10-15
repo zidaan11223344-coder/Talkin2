@@ -3041,6 +3041,8 @@ class FollowupFeatureRegressions(unittest.TestCase):
         bot._effective_room_language = lambda _room: "en"
         bot._game_cooldown_notice = lambda *_args: True
         bot._save_crop_plots = lambda: None
+        bot._result_pages = {}
+        bot._send_text_packets = lambda _packet_type, text, **kwargs: self.messages.append((kwargs.get("room"), text))
         bot.send_room_text = lambda room, text: self.messages.append((room, text))
         self.messages = []
         self.assertTrue(bot._crop_command("Farm", "Tester", "زرع"))
@@ -3572,18 +3574,108 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertEqual(plot["reward"], 500_000_000)
         self.assertEqual(plot["minutes"], 960)
 
-    def test_gift_help_splits_thirty_items_into_short_english_pages(self):
+    def test_gift_help_shows_thirty_items_in_one_compact_list_and_ns_reports_end(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._effective_room_language = lambda _room: "en"
-        sent = []
-        bot.send_room_text = lambda room, text: sent.append((room, text))
-        bot.gift_help("Hall")
-        self.assertEqual(len(sent), 4)
-        self.assertIn("List 1/4", sent[0][1])
-        self.assertIn("List 4/4", sent[-1][1])
-        self.assertIn("Island", sent[-1][1])
-        self.assertIn("sa@gift_id@username", sent[-1][1])
-        self.assertTrue(all(len(text.encode("utf-8")) < 800 for _, text in sent))
+        bot._result_pages = {}
+        packets = []
+        bot._send_text_packets = lambda packet_type, text, **kwargs: packets.append((packet_type, text, kwargs))
+        bot._room_list_commands = lambda *_args, **_kwargs: False
+        bot.gift_help("Hall", "Player")
+        self.assertEqual(len(packets), 1)
+        self.assertEqual(packets[0][0], "room_message")
+        self.assertIn("List 1/1", packets[0][1])
+        self.assertIn("30 🏝️ Island=", packets[0][1])
+        self.assertIn("sa@id@username", packets[0][1])
+        self.assertIn("ns for the next list", packets[0][1])
+        self.assertLess(len(packets[0][1].encode("utf-8")), 1008)
+        state = bot._result_pages[("room_message", "Hall", "Player")]
+        self.assertEqual(len(state["pages"]), 1)
+        self.assertTrue(bot._handle_management_command_impl("Hall", "ns", "Player", is_private=False))
+        self.assertIn("End of list", packets[-1][1])
+
+    def test_gift_help_uses_ns_for_each_thirty_item_page(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._effective_room_language = lambda _room: "en"
+        bot._result_pages = {}
+        bot._room_list_commands = lambda *_args, **_kwargs: False
+        packets = []
+        bot._send_text_packets = lambda packet_type, text, **kwargs: packets.append((packet_type, text, kwargs))
+        catalog = {str(i): ("🎁", f"Gift{i}") for i in range(1, 62)}
+        english_names = {str(i): f"Gift{i}" for i in range(1, 62)}
+        costs = {str(i): i for i in range(1, 62)}
+        with patch.object(bot_module, "GIFT_CATALOG", catalog), patch.object(
+            bot_module, "GIFT_CATALOG_EN", english_names
+        ), patch.object(bot_module, "GIFT_COSTS", costs):
+            bot.gift_help("Hall", "Player")
+            state = bot._result_pages[("room_message", "Hall", "Player")]
+            self.assertEqual(len(state["pages"]), 3)
+            self.assertIn("Gift30=30", state["pages"][0])
+            self.assertNotIn("Gift31=31", state["pages"][0])
+            self.assertIn("Gift60=60", state["pages"][1])
+            self.assertIn("Gift61=61", state["pages"][2])
+            self.assertTrue(bot._handle_management_command_impl("Hall", "ns", "Player", is_private=False))
+            self.assertIn("List 2/3", packets[-1][1])
+            self.assertTrue(bot._handle_management_command_impl("Hall", "ns", "Player", is_private=False))
+            self.assertIn("List 3/3", packets[-1][1])
+
+    def test_crop_menu_is_paginated_in_thirty_item_lists_with_ns(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._effective_room_language = lambda _room: "ar"
+        bot._result_pages = {}
+        packets = []
+        bot._send_text_packets = lambda packet_type, text, **kwargs: packets.append((packet_type, text, kwargs))
+        self.assertTrue(bot._crop_command("Hall", "Player", "زرع"))
+        self.assertEqual(len(packets), 1)
+        self.assertIn("القائمة 1/1", packets[0][1])
+        crop_rows = [line for line in packets[0][1].splitlines() if "=" in line]
+        self.assertEqual(len(crop_rows), 24)
+        self.assertLessEqual(len(crop_rows), 30)
+        self.assertIn("500m", packets[0][1])
+        self.assertIn("اكتب ns", packets[0][1])
+
+    def test_social_hunt_uses_generic_stock_photos_and_excludes_sender(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._effective_room_language = lambda _room: "ar"
+        bot._fun_room_members = lambda room, sender: ["Target"]
+        bot._game_cooldown_notice = lambda *_args: True
+        bot._game_public_image = lambda path, route="games": f"https://media.example/{route}/{path.name}"
+        bot.log = lambda *_args: None
+        media, texts = [], []
+        bot.send_room_media = lambda room, url, kind: media.append((room, url, kind)) or True
+        bot.send_room_text = lambda room, text: texts.append(text)
+        with patch.object(bot_module.secrets, "choice", return_value="Target"):
+            self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مزه"))
+            self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مز"))
+        self.assertEqual(media[0][1], "https://media.example/assets/game_hunt_woman.jpg")
+        self.assertEqual(media[1][1], "https://media.example/assets/game_hunt_man.jpg")
+        self.assertTrue(all("@Target" in text and "لا تمثل صورة العضو" in text for text in texts))
+        bot._effective_room_language = lambda _room: "en"
+        with patch.object(bot_module.secrets, "choice", return_value="Target"):
+            self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مزه"))
+        self.assertIn("Beauty Hunt", texts[-1])
+        self.assertIn("not a picture of the selected member", texts[-1])
+        self.assertEqual(bot_module._normalize_game_command_text("hunt a beauty"), "صيد مزه")
+        self.assertEqual(bot_module._normalize_game_command_text("my ex"), "طليقي")
+        for command in ("صيد مزه", "صيد مز", "طليقي", "خلع", "طلاق"):
+            self.assertTrue(bot_module._looks_like_bot_command(command))
+
+    def test_court_games_pick_a_random_member_and_return_the_requested_judgments(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._effective_room_language = lambda _room: "ar"
+        bot._fun_room_members = lambda room, sender: ["Target"]
+        texts = []
+        bot.send_room_text = lambda room, text: texts.append(text)
+        with patch.object(bot_module.secrets, "choice", return_value="Target"):
+            for command in ("طليقي", "خلع", "طلاق"):
+                self.assertTrue(bot._court_social_game("Hall", "Player", command))
+        all_text = "\n".join(texts)
+        self.assertIn("طليقك هو @Target", all_text)
+        self.assertIn("بانتظار حكم المحكمة", all_text)
+        self.assertIn("حكم القاضي بخلع @Player من @Target", all_text)
+        self.assertIn("كامل النفقات للمخلوع @Player", all_text)
+        self.assertIn("طلاق @Target طلاقاً بالثلاث", all_text)
+        self.assertIn("المطلق: @Player", all_text)
 
     def test_bl_is_master_only_and_bans_every_connected_room_without_leaving(self):
         class ImmediateThread:
