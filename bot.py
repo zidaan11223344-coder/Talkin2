@@ -7233,6 +7233,19 @@ class TalkinBot:
             return
         room = str(pending.get("room") or room_norm).strip()
         requester = str(pending.get("requested_by") or "").strip()
+        catalog = {
+            _norm_room(item) for item in getattr(self, "_server_room_catalog", [])
+            if str(item).strip()
+        }
+        if requester and _norm_room(room) in catalog:
+            # A complete server-room list is an authoritative membership
+            # snapshot. Some gateways deliver the you_joined event late, so a
+            # timer must not turn a successful room entry into a false error.
+            self.connected_rooms.add(room)
+            self.known_rooms.add(room)
+            _save_persistent_rooms(self.known_rooms)
+            self.send_private_text(requester, f"✅ تم تأكيد وجود البوت في الغرفة: {room}")
+            return
         self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
         _save_persistent_rooms(self.known_rooms)
@@ -7484,6 +7497,10 @@ class TalkinBot:
             saved for saved in self.connected_rooms
             if _norm_room(saved) != room_norm
         }
+        self._server_room_catalog = [
+            saved for saved in getattr(self, "_server_room_catalog", [])
+            if _norm_room(saved) != room_norm
+        ]
         self.log("[ROOM] left", room)
         return True
 
@@ -7717,6 +7734,14 @@ class TalkinBot:
         )
         rooms.update(
             str(r).strip() for r in getattr(self, "connected_rooms", set())
+            if str(r).strip() and _norm_room(r) not in blocked
+        )
+        rooms.update(
+            str(r).strip() for r in getattr(self, "_server_room_catalog", [])
+            if str(r).strip() and _norm_room(r) not in blocked
+        )
+        rooms.update(
+            str(r).strip() for r in _persistent_rooms()
             if str(r).strip() and _norm_room(r) not in blocked
         )
         return sorted(rooms)
@@ -12967,6 +12992,20 @@ class TalkinBot:
             _norm_user(username) == _norm_user(target)
             for username in destination_roster
         )
+        # The in-memory roster can lag after reconnect. Ask the configured
+        # database roster before declaring a user absent; the old check caused
+        # false "not present" replies when the bot was already in the room.
+        if not present and getattr(self, "db", None):
+            try:
+                db_rows = self.db.room_users(destination) or []
+                for row in db_rows:
+                    username = str(row.get("username") or "").strip() if isinstance(row, dict) else ""
+                    if username:
+                        self.room_users.setdefault(destination, {})[username] = str(row.get("role") or "none")
+                    if username and _norm_user(username) == _norm_user(target):
+                        present = True
+            except Exception as exc:
+                self.log("[BOMB] database presence lookup failed:", destination, repr(exc))
         if not present:
             self.send_room_text(
                 source_room,

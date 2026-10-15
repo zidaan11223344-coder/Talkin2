@@ -4168,6 +4168,21 @@ class NewFeatureRegressions(unittest.TestCase):
         self.assertEqual(messages[-1][0], "Origin")
         self.assertIn("المستخدم @Victim غير موجود في الغرفة Other", messages[-1][1])
 
+    def test_bomb_uses_database_roster_when_live_memory_is_stale(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {"Origin": {"Admin": "admin"}, "Other": {}}
+        bot.db = type("DB", (), {"room_users": lambda _self, _room: [{"username": "Victim", "role": "member"}]})()
+        bot.bomb_games = {}
+        bot._bomb_games_lock = threading.RLock()
+        bot._active_rooms = lambda: ["Origin", "Other"]
+        bot._configured_room_language = lambda _room: "ar"
+        bot.send_room_text = lambda *_args: True
+        bot.send_private_text = lambda *_args: None
+        bot._schedule_bomb_expiry = lambda *_args: None
+        with patch.object(bot_module, "_room_manager", return_value=True):
+            self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
+        self.assertIn((bot_module._norm_room("Other"), bot_module._norm_user("Victim")), bot.bomb_games)
+
     def test_bomb_defusal_result_is_also_reported_in_source_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {"Origin": {"Admin": "admin"}, "Other": {"Victim": "member"}}
