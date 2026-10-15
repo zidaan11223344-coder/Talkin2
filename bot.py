@@ -13299,7 +13299,9 @@ class TalkinBot:
         except Exception:
             rooms = {str(item).strip() for item in getattr(self, "connected_rooms", set()) if str(item).strip()}
         rooms.add(str(room or "").strip())
-        for target_room in sorted({item for item in rooms if item}, key=str.casefold):
+        target_rooms = sorted({item for item in rooms if item}, key=str.casefold)
+
+        def announce(target_room):
             room_language = self._configured_room_language(target_room)
             if room_language == "en":
                 result_text = (
@@ -13315,6 +13317,13 @@ class TalkinBot:
                 self.send_room_text(target_room, result_text)
             except Exception as exc:
                 self.log("[FISHING] dragon announcement failed:", target_room, repr(exc))
+
+        # Deliver to all active rooms concurrently. send_query's socket send
+        # lock still serializes individual frames safely, but no room waits on
+        # a previous room's network/encoding work.
+        if target_rooms:
+            with ThreadPoolExecutor(max_workers=min(8, len(target_rooms)), thread_name_prefix="dragon-result") as pool:
+                list(pool.map(announce, target_rooms))
 
     def _queue_dragon_hunter_broadcast(self, username, room, reward):
         worker = threading.Thread(
@@ -13342,8 +13351,8 @@ class TalkinBot:
             rooms = self._active_rooms()
         except Exception:
             rooms = sorted({str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}, key=str.casefold)
-        for room in rooms:
-            if self._configured_room_language(room) == "en":
+        def announce_open(target_room):
+            if self._configured_room_language(target_room) == "en":
                 announcement = (
                     "🏹 Hunting trip open! Every 10 minutes.\n"
                     "🐉 Dragon spotted — first Shot catches it for 1,000,000 points."
@@ -13353,7 +13362,14 @@ class TalkinBot:
                     "🏹 بدأت رحلة الصيد! كل 10 دقائق.\n"
                     "🐉 التنين موجود — أول من يرسل شوت أو Shot يصيده ويحصل على مليون نقطة."
                 )
-            self.send_room_text(room, announcement)
+            try:
+                self.send_room_text(target_room, announcement)
+            except Exception as exc:
+                self.log("[FISHING] dragon event announcement failed:", target_room, repr(exc))
+
+        if rooms:
+            with ThreadPoolExecutor(max_workers=min(8, len(rooms)), thread_name_prefix="dragon-open") as pool:
+                list(pool.map(announce_open, rooms))
         self.log("[FISHING] event opened", self._fishing_event_seq, "rooms=", len(rooms))
         return event
 
