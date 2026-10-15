@@ -4023,7 +4023,7 @@ class NewFeatureRegressions(unittest.TestCase):
 
     def test_bomb_game_is_manager_only_targets_the_named_user_and_kicks_on_wrong_wire(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
-        bot.room_users = {"Origin": {"Admin": "admin"}}
+        bot.room_users = {"Origin": {"Admin": "admin"}, "Other": {"Victim": "member"}}
         bot.bomb_games = {}
         bot._bomb_games_lock = threading.RLock()
         bot._active_rooms = lambda: ["Origin", "Other"]
@@ -4070,8 +4070,21 @@ class NewFeatureRegressions(unittest.TestCase):
         self.assertIn("انفجرت القنبلة", source_result)
         self.assertIn("Other", source_result)
 
+    def test_bomb_rejects_target_missing_from_destination_room(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {"Origin": {"Admin": "admin"}, "Other": {"SomeoneElse": "member"}}
+        bot._active_rooms = lambda: ["Origin", "Other"]
+        messages = []
+        bot.send_room_text = lambda room, text: messages.append((room, text))
+        bot._configured_room_language = lambda _room: "ar"
+        with patch.object(bot_module, "_room_manager", return_value=True):
+            self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
+        self.assertEqual(messages[-1][0], "Origin")
+        self.assertIn("المستخدم @Victim غير موجود في الغرفة Other", messages[-1][1])
+
     def test_bomb_defusal_result_is_also_reported_in_source_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {"Origin": {"Admin": "admin"}, "Other": {"Victim": "member"}}
         bot.bomb_games = {}
         bot._bomb_games_lock = threading.RLock()
         bot._active_rooms = lambda: ["Origin", "Other"]
@@ -4147,6 +4160,7 @@ class NewFeatureRegressions(unittest.TestCase):
 
     def test_bomb_send_failure_is_reported_and_does_not_leave_a_live_challenge(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room_users = {"Origin": {"Admin": "admin"}, "Other": {"Victim": "member"}}
         bot.bomb_games = {}
         bot._bomb_games_lock = threading.RLock()
         bot._active_rooms = lambda: ["Origin", "Other"]

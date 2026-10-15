@@ -12798,6 +12798,25 @@ class TalkinBot:
             self.send_room_text(source_room, f"❌ The bot is not connected to {destination}." if english else f"❌ البوت غير متصل بالغرفة {destination}.")
             return True
         destination = active_rooms[_norm_room(destination)]
+        # Only start a challenge for a user that is present in the target
+        # room's live roster. This prevents sending a bomb to stale/saved
+        # usernames that are no longer in the room.
+        destination_roster = None
+        for known_room, roster in (getattr(self, "room_users", {}) or {}).items():
+            if _norm_room(known_room) == _norm_room(destination):
+                destination_roster = roster if isinstance(roster, dict) else {}
+                break
+        present = bool(destination_roster) and any(
+            _norm_user(username) == _norm_user(target)
+            for username in destination_roster
+        )
+        if not present:
+            self.send_room_text(
+                source_room,
+                f"❌ User {target} is not present in room {destination}."
+                if english else f"❌ المستخدم @{target} غير موجود في الغرفة {destination}."
+            )
+            return True
         lock = getattr(self, "_bomb_games_lock", None)
         if lock is None:
             self._bomb_games_lock = lock = threading.RLock()
