@@ -15698,7 +15698,7 @@ class TalkinBot:
         return True
 
     def _random_social_hunt_game(self, room, sender, command):
-        """Pick a live room member and send that member's profile photo."""
+        """Pick a live room member and send a profile/fallback portrait."""
         english = self._effective_room_language(room) == "en"
         female_photo = str(command or "").strip() == "صيد مزه"
         requested_gender = "female" if female_photo else "male"
@@ -15729,6 +15729,22 @@ class TalkinBot:
         photo_url = str(getattr(self, "user_photos", {}).get(target_key, "") or "").strip()
         if not photo_url:
             photo_url = self._lookup_profile_photo(target)
+        fallback_used = False
+        if not photo_url:
+            # A missing Talkin profile photo must not stop the game. Search a
+            # gender-specific, SFW portrait on the public image sources; the
+            # final LoremFlickr URL keeps the game usable if search providers
+            # temporarily block the hosting IP.
+            query = "beautiful woman portrait safe for work" if female_photo else "handsome man portrait safe for work"
+            try:
+                photo_url = _search_lookalike_image(query)
+            except Exception as exc:
+                self.log("[SOCIAL-HUNT] fallback image search failed:", repr(exc))
+            if not photo_url:
+                lock = secrets.randbelow(1_000_000) + 1
+                tags = "woman,portrait" if female_photo else "man,portrait"
+                photo_url = f"https://loremflickr.com/640/480/{tags}?lock={lock}"
+            fallback_used = bool(photo_url)
         image_sent = False
         if photo_url:
             try:
@@ -15741,7 +15757,9 @@ class TalkinBot:
             action = f"@{hunter_plain} caught a beauty: @{target_plain}" if female_photo else f"@{hunter_plain} caught a handsome man: @{target_plain}"
             result = f"🎯 {label}!\n👤 {action}.\n🖼️ This is the selected member's profile photo."
             if not image_sent:
-                result += "\n⚠️ No profile photo is available for this member."
+                result += "\n⚠️ The portrait could not be downloaded."
+            elif fallback_used:
+                result += "\n🖼️ A random gender-matched internet portrait was used because no profile photo was available."
         else:
             label_ar = "صيد المزة" if female_photo else "صيد المز"
             action = f"@{hunter_plain} اصطاد مزه: @{target_plain}" if female_photo else f"@{hunter_plain} اصطادت مز: @{target_plain}"
@@ -15750,7 +15768,9 @@ class TalkinBot:
                 "🖼️ هذه صورة بروفايل العضو المختار."
             )
             if not image_sent:
-                result += "\n⚠️ لا توجد صورة بروفايل متاحة لهذا العضو."
+                result += "\n⚠️ تعذر تحميل الصورة البديلة حالياً."
+            elif fallback_used:
+                result += "\n🖼️ لم توجد صورة بروفايل؛ تم استخدام صورة عشوائية من الإنترنت مناسبة للنوع."
         self.send_room_text(room, result)
         return True
 

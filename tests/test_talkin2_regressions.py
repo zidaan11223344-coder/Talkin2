@@ -4183,6 +4183,30 @@ class NewFeatureRegressions(unittest.TestCase):
             self.assertTrue(bot._bomb_command("Origin", "Admin", "Victim", "Other"))
         self.assertIn((bot_module._norm_room("Other"), bot_module._norm_user("Victim")), bot.bomb_games)
 
+    def test_social_hunts_use_gender_matched_internet_fallback_without_profile_photo(self):
+        for command, gender, expected_query in (
+            ("صيد مزه", "female", "beautiful woman portrait"),
+            ("صيد مز", "male", "handsome man portrait"),
+        ):
+            with self.subTest(command=command):
+                bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                bot.room_users = {"Room": {"Hunter": "admin", "Target": "member"}}
+                bot.user_photos = {}
+                bot._configured_room_language = lambda _room: "ar"
+                bot._effective_room_language = lambda _room: "ar"
+                bot._fun_room_members = lambda _room, _sender: ["Target"]
+                bot._picture_gender_hint = lambda _name: gender
+                bot._game_cooldown_notice = lambda *_args: True
+                bot._lookup_profile_photo = lambda _name: ""
+                bot.send_room_media = lambda _room, url, _kind: media.append(url) or True
+                bot.send_room_text = lambda _room, text: messages.append(text)
+                media, messages = [], []
+                with patch.object(bot_module, "_search_lookalike_image", return_value=f"https://img.test/{gender}.jpg") as search:
+                    self.assertTrue(bot._random_social_hunt_game("Room", "Hunter", command))
+                self.assertIn(expected_query, search.call_args.args[0])
+                self.assertEqual(media, [f"https://img.test/{gender}.jpg"])
+                self.assertIn("صورة عشوائية من الإنترنت", messages[-1])
+
     def test_bomb_defusal_result_is_also_reported_in_source_room(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room_users = {"Origin": {"Admin": "admin"}, "Other": {"Victim": "member"}}
