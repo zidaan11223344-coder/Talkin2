@@ -1523,9 +1523,15 @@ class RawWebSocket:
         if rsv1 and self.permessage_deflate and opcode in (0x1, 0x2, 0x0):
             import zlib
             try:
-                data = zlib.decompress(data + b"\\x00\\x00\\xff\\xff", -zlib.MAX_WBITS)
+                data = zlib.decompress(data + b"\x00\x00\xff\xff", -zlib.MAX_WBITS)
             except zlib.error:
                 pass
+        # Consume the complete frame to keep the stream synchronized, then
+        # drop it locally. Never send a close frame or tear down the socket for
+        # an oversized inbound packet.
+        max_bytes = _ws_payload_limit()
+        if opcode in (0x1, 0x2, 0x0) and len(data) > max_bytes:
+            return ("oversize", {"size": len(data), "limit": max_bytes})
         if opcode == 0x8:
             code = None; reason = ''
             if len(data) >= 2:
@@ -21176,6 +21182,9 @@ class TalkinBot:
                 continue
             if kind == "pong":
                 continue
+            if kind == "oversize":
+                self.log("[WS_DROP_OVERSIZE_INBOUND] تم تجاهل حزمة واردة كبيرة:", message)
+                continue
             if kind == "close":
                 raise ConnectionError(f"WebSocket closed during server bootstrap: {message}")
             if kind != "binary":
@@ -21220,6 +21229,8 @@ class TalkinBot:
                     pass
             if kind == "binary":
                 self.on_message(self.ws, message)
+            elif kind == "oversize":
+                self.log("[WS_DROP_OVERSIZE_INBOUND] تم تجاهل حزمة واردة كبيرة:", message)
             elif kind == "ping":
                 continue
             elif kind == "close":
@@ -21337,6 +21348,8 @@ class TalkinBot:
                                 continue
                             if kind == "binary":
                                 self.on_message(self.ws, message)
+                            elif kind == "oversize":
+                                self.log("[WS_DROP_OVERSIZE_INBOUND] تم تجاهل حزمة واردة كبيرة:", message)
                             elif kind == "ping":
                                 continue
                             elif kind == "pong":

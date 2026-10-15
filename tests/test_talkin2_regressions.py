@@ -472,6 +472,30 @@ class RoomExclusionRegressions(unittest.TestCase):
 
 
 class RawWebSocketTransportRegressions(unittest.TestCase):
+    def test_recv_drops_inbound_payload_over_1008_without_closing_socket(self):
+        class FakeSocket:
+            def __init__(self, payload):
+                self.payload = payload
+                self.sent = []
+            def recv(self, _size):
+                chunk, self.payload = self.payload, b""
+                return chunk
+            def sendall(self, payload):
+                self.sent.append(payload)
+
+        oversized = b"x" * 1009
+        frame = b"\x82\x7e" + len(oversized).to_bytes(2, "big") + oversized
+        ws = bot_module.RawWebSocket.__new__(bot_module.RawWebSocket)
+        ws.sock = FakeSocket(frame)
+        ws._recvbuf = bytearray()
+        ws.timeout = 1
+        ws.permessage_deflate = False
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
+            kind, details = ws.recv()
+        self.assertEqual(kind, "oversize")
+        self.assertEqual(details["size"], 1009)
+        self.assertEqual(ws.sock.sent, [])
+
     def test_send_binary_enforces_absolute_1008_byte_cap(self):
         class FakeSocket:
             def __init__(self):
