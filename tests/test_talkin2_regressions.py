@@ -3684,6 +3684,22 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         for command in ("صيد مزه", "صيد مز", "طليقي", "خلع", "طلاق"):
             self.assertTrue(bot_module._looks_like_bot_command(command))
 
+    def test_social_hunt_falls_back_to_any_live_member_when_gender_is_unknown(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._effective_room_language = lambda _room: "ar"
+        bot._fun_room_members = lambda _room, _sender: ["MysteryMember"]
+        bot._picture_gender_hint = lambda _name: "unknown"
+        bot._game_cooldown_notice = lambda *_args: True
+        bot._game_public_image = lambda path, route="games": f"https://media.example/{route}/{path.name}"
+        bot.send_room_media = lambda *_args: True
+        messages = []
+        bot.send_room_text = lambda _room, text: messages.append(text)
+        with patch.object(bot_module.secrets, "choice", side_effect=lambda seq: seq[0]), patch.object(
+            bot_module.random, "choice", side_effect=lambda seq: seq[0]
+        ):
+            self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مز"))
+        self.assertIn("@MysteryMember", messages[-1])
+
     def test_court_games_pick_a_random_member_and_return_the_requested_judgments(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._effective_room_language = lambda _room: "ar"

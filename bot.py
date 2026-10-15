@@ -15492,6 +15492,10 @@ class TalkinBot:
             member for member in room_members
             if self._picture_gender_hint(member) == requested_gender
         ]
+        # If no member matches the requested gender, keep the game usable by
+        # choosing randomly from the same room roster as a fallback.
+        if not candidates:
+            candidates = list(room_members)
         if not candidates:
             self.send_room_text(
                 room,
