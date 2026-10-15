@@ -353,6 +353,9 @@ try:
     STOCK_MARKET_PLAYER_COOLDOWN_SECONDS = max(0.0, float(os.getenv("STOCK_MARKET_PLAYER_COOLDOWN_SECONDS", "120") or 120))
 except (TypeError, ValueError):
     STOCK_MARKET_PLAYER_COOLDOWN_SECONDS = 120.0
+# Market investments remain available on request, but periodic/cross-room
+# announcements are disabled by default so they cannot flood every room.
+STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED = os.getenv("STOCK_MARKET_ROOM_ANNOUNCEMENTS", "0").strip().casefold() in {"1", "true", "yes", "on"}
 try:
     FISHING_SHOT_COOLDOWN_SECONDS = max(0.0, float(os.getenv("FISHING_SHOT_COOLDOWN_SECONDS", "120") or 120))
 except (TypeError, ValueError):
@@ -6231,6 +6234,7 @@ class TalkinBot:
         # a manual join request clears the exclusion if permissions changed.
         self._blocked_room_notices = set()
         self._pending_room_joins = {}
+        self._pending_full_room_sync = None
         if self.room and _norm_room(self.room) not in self.blocked_rooms:
             self.known_rooms.add(_norm_room(self.room))
         _save_persistent_rooms(self.known_rooms)
@@ -6880,6 +6884,15 @@ class TalkinBot:
     def _send_reconnect_notice(self, reason, command=None):
         """Deliver a sanitized connection-recovery diagnostic to both channels."""
         safe_reason = self._redact_connection_secrets(reason)
+        if str(safe_reason or "").strip().casefold() in {
+            "socket closed",
+            "websocket closed by server",
+            "websocket closed during server bootstrap",
+            "code': 1000",
+            '"code": 1000',
+        }:
+            self.log("[CONNECTION_NOTICE] suppressed normal socket close")
+            return False
         message = (
             "⚠️ عاد اتصال بوت Talkin بعد انقطاع/تعذر اتصال."
             f"\n📍 الغرفة: {self.room or 'غير محددة'}"
@@ -13660,6 +13673,9 @@ class TalkinBot:
                 self.log("[STOCK] round announcement failed:", target_room, repr(exc))
 
     def _queue_stock_market_round_broadcast(self, rooms):
+        if not STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED:
+            self.log("[STOCK] room-wide announcements disabled")
+            return
         worker = threading.Thread(
             target=self._broadcast_stock_market_round,
             args=(list(rooms),),
@@ -13722,7 +13738,7 @@ class TalkinBot:
             try:
                 now = time.time()
                 next_announcement = float(getattr(self, "_stock_market_next_announcement", 0) or 0)
-                if now >= next_announcement and self._active_rooms():
+                if STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED and now >= next_announcement and self._active_rooms():
                     self._start_stock_market_round(now, force=True)
                 self._cleanup_expired_wagers()
                 self._process_stock_market_investments(now)
@@ -13867,6 +13883,8 @@ class TalkinBot:
 
     def _broadcast_stock_market_result(self, username, source_room, asset, amount, outcome, change_percent, change):
         """Announce one settled investment in every room the bot is currently in."""
+        if not STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED:
+            return
         rooms = set()
         try:
             rooms.update(str(value).strip() for value in self._active_rooms() if str(value).strip())
@@ -18642,41 +18660,22 @@ class TalkinBot:
         # "غرفي" must show only rooms that are actually connected in the
         # current WebSocket session. known_rooms is historical and may contain
         # rooms saved from an earlier run, so it must NOT be used here.
+        if low in ("دخول الغرف", "دخول غرف السيرفر", "دخول كل غرف السيرفر", "join server rooms"):
+            if not is_private:
+                self.send_room_text(room, "⏳ جاري طلب كل غرف السيرفر ثم دخولها... سأرسل القائمة الكاملة في الخاص.")
+            self._request_full_room_sync(
+                sender, room,
+                language=_detect_text_language(text) or self._effective_room_language(room),
+            )
+            return True
         if low in ("غرفي", "غرفيّ", "myrooms", "my rooms"):
-            live = sorted({str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()})
-            if not live:
-                text_out = "📭 لا توجد غرف متصلة فعلياً حالياً." if self._effective_room_language(room) == "ar" else "📭 No rooms are currently connected."
-                if is_private:
-                    self.send_private_text(sender, text_out)
-                elif room:
-                    self.send_room_text(room, text_out)
-            else:
-                total = (len(live) + 29) // 30
-                pages = []
-                language = _detect_text_language(text) or self._effective_room_language(room)
-                for offset in range(0, len(live), 30):
-                    page_no = offset // 30 + 1
-                    if language == "en":
-                        lines = [f"🏠 Currently connected rooms ({len(live)}):", f"📄 List {page_no}/{total}"]
-                    else:
-                        lines = [f"🏠 الغرف المتصلة فعلياً ({len(live)}):", f"📄 القائمة {page_no}/{total}"]
-                    lines.extend(f"{i}. {name}" for i, name in enumerate(live[offset:offset + 30], offset + 1))
-                    pages.append("\n".join(lines))
-                packet_type = "chat_message" if is_private else "room_message"
-                page_key = (packet_type, "" if is_private else str(room or ""), str(sender or ""))
-                kwargs = {"to": str(sender or "")} if is_private else {"room": str(room or "")}
-                result_pages = getattr(self, "_result_pages", {})
-                if total > 1:
-                    result_pages[page_key] = {"pages": pages, "part": 1, "kwargs": kwargs, "language": language}
-                else:
-                    result_pages.pop(page_key, None)
-                self._result_pages = result_pages
-                first = pages[0]
-                if total > 1:
-                    first += "\n\n📌 اكتب ns للقائمة التالية." if language == "ar" else "\n\n📌 Type ns for the next list."
-                else:
-                    first += "\n\n✅ انتهت القوائم." if language == "ar" else "\n\n✅ End of list."
-                self._send_text_packets(packet_type, first, **kwargs)
+            live = sorted({str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()}, key=str.casefold)
+            if not is_private:
+                self.send_room_text(room, "📡 أعرض الآن الغرف التي أكد السيرفر اتصال البوت بها.")
+            self._send_room_names_pages(
+                sender, room, live, from_server=True,
+                language=_detect_text_language(text) or self._effective_room_language(room),
+            )
             return True
 
         m_all = re.fullmatch(r"تحويل للكل@(\d+)", text, re.I)
@@ -20713,7 +20712,7 @@ class TalkinBot:
             self.send_room_text(room, "أوامر البوت: k@ اسم، b@ اسم، a@ اسم، o@ اسم، دخول@اسم_الغرفة، خروج [اسم_الغرفة]، inv، invmsg نص الدعوة لدعوة مستخدمي الغرفة")
 
     def _process_room_list(self, rooms):
-        """Import the server room list after login/reconnect without joining it blindly."""
+        """Import the complete server room list and finish an explicit sync."""
         found = set()
         def walk(obj):
             if isinstance(obj, dict):
@@ -20730,9 +20729,97 @@ class TalkinBot:
         if not found:
             return
         self.log("[ROOM-LIST] loaded", len(found), "rooms")
-        # Keep the historical list so reconnect can restore rooms previously selected by the master.
+        # Keep every server-returned room so reconnect and `غرفي` use the
+        # authoritative list instead of the truncated local view.
         self.known_rooms.update(found)
         _save_persistent_rooms(self.known_rooms)
+        if isinstance(getattr(self, "_pending_full_room_sync", None), dict):
+            self._finish_full_room_sync(sorted(found, key=str.casefold), from_server=True)
+
+    def _send_room_names_pages(self, sender, room, rooms, from_server=False, language=None):
+        """Display all room names with safe pagination."""
+        names = sorted({str(item).strip() for item in rooms or [] if str(item).strip()}, key=str.casefold)
+        language = language or self._effective_room_language(room)
+        if not names:
+            text = "📭 لم تصل قائمة غرف من السيرفر ولا توجد غرف في الملف." if language == "ar" else "📭 The server returned no rooms and the rooms file is empty."
+            if getattr(self, "ws", None):
+                self._send_text_packets("chat_message", text, to=str(sender or ""))
+            else:
+                self.send_private_text(sender, text)
+            return
+        total = (len(names) + 29) // 30
+        pages = []
+        for offset in range(0, len(names), 30):
+            page_no = offset // 30 + 1
+            title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else f"🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else f"🏠 Bot rooms — rooms file")
+            lines = [title, f"📄 القائمة {page_no}/{total}"]
+            lines.extend(f"{i}. {name}" for i, name in enumerate(names[offset:offset + 30], offset + 1))
+            pages.append("\n".join(lines))
+        key = ("chat_message", "", str(sender or ""))
+        result_pages = getattr(self, "_result_pages", {})
+        if not isinstance(result_pages, dict):
+            result_pages = {}
+        result_pages[key] = {"pages": pages, "part": 1, "kwargs": {"to": str(sender or "")}, "language": language}
+        self._result_pages = result_pages
+        first = pages[0]
+        first += "\n\n📌 اكتب ns للقائمة التالية." if total > 1 and language == "ar" else ("\n\n📌 Type ns for the next list." if total > 1 else "\n\n✅ انتهت القوائم.")
+        if total == 1:
+            result_pages.pop(key, None)
+            self._result_pages = result_pages
+        if getattr(self, "ws", None):
+            self._send_text_packets("chat_message", first, to=str(sender or ""))
+        else:
+            self.send_private_text(sender, first)
+
+    def _finish_full_room_sync(self, rooms, from_server=False):
+        state = getattr(self, "_pending_full_room_sync", None)
+        if not isinstance(state, dict):
+            return False
+        self._pending_full_room_sync = None
+        blocked = getattr(self, "blocked_rooms", set())
+        rooms = sorted({str(item).strip() for item in rooms or [] if str(item).strip() and _norm_room(item) not in blocked}, key=str.casefold)
+        if not from_server and not rooms:
+            rooms = sorted({str(item).strip() for item in getattr(self, "known_rooms", set()) if str(item).strip() and _norm_room(item) not in blocked}, key=str.casefold)
+        if rooms:
+            self.known_rooms.update(rooms)
+            _save_persistent_rooms(self.known_rooms)
+        self._send_room_names_pages(
+            state["sender"], state.get("room", ""), rooms,
+            from_server=from_server, language=state.get("language"),
+        )
+        if rooms:
+            threading.Thread(
+                target=self._join_rooms_serially, args=(rooms, "", True),
+                daemon=True, name="full-server-room-restore",
+            ).start()
+        return True
+
+    def _request_full_room_sync(self, sender, room="", language=None):
+        """Request all rooms, then join them; fallback to tracked_rooms.json."""
+        if not getattr(self, "ws", None):
+            fallback = _persistent_rooms()
+            if not fallback:
+                fallback = sorted({str(item).strip() for item in getattr(self, "connected_rooms", set()) if str(item).strip()}, key=str.casefold)
+            return self._finish_full_room_sync(fallback, from_server=False)
+        token = uuid.uuid4().hex
+        self._pending_full_room_sync = {
+            "token": token, "sender": str(sender or ""), "room": str(room or ""),
+            "language": language or self._effective_room_language(room),
+        }
+        try:
+            self.send_query(encode_query("load_list_new"))
+            self.log("[ROOM-SYNC] requested complete room list from server")
+        except Exception as exc:
+            self.log("[ROOM-SYNC] server request failed; using rooms file:", repr(exc))
+            return self._finish_full_room_sync(_persistent_rooms(), from_server=False)
+
+        def fallback():
+            state = getattr(self, "_pending_full_room_sync", None)
+            if isinstance(state, dict) and state.get("token") == token:
+                self.log("[ROOM-SYNC] server response timeout; using rooms file")
+                self._finish_full_room_sync(_persistent_rooms(), from_server=False)
+        threading.Timer(max(2.0, float(os.getenv("ROOM_LIST_SYNC_TIMEOUT_SECONDS", "4") or 4)), fallback).start()
+        return True
 
     def _event_worker_loop(self):
         while not self.stop_event.is_set():

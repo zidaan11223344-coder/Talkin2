@@ -478,6 +478,11 @@ class RawWebSocketTransportRegressions(unittest.TestCase):
         self.assertTrue(bot_module._is_normal_ws_close_reason("close code': 1000"))
         self.assertFalse(bot_module._is_normal_ws_close_reason("TLS handshake failed"))
 
+    def test_reconnect_notice_suppresses_socket_closed(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.log = lambda *_args: None
+        self.assertFalse(bot._send_reconnect_notice("socket closed"))
+
     def test_recv_drops_inbound_payload_over_1008_without_closing_socket(self):
         class FakeSocket:
             def __init__(self, payload):
@@ -3326,19 +3331,23 @@ class FollowupFeatureRegressions(unittest.TestCase):
         bot._transfer_log_languages = {}
         bot._room_list_commands = lambda *_args: False
         bot._effective_room_language = lambda _room: "ar"
+        bot.help_pages = {}
+        bot.help_page_part = {}
+        bot.help_game_part = {}
         bot._send_text_packets = lambda packet, text, **kwargs: self.sent.append((packet, text, kwargs))
-        bot.send_private_text = lambda *_args: None
+        private_sent = []
+        bot.send_private_text = lambda _user, text: private_sent.append(text)
         self.sent = []
         with patch.object(bot_module, "_is_master_name", return_value=True):
             self.assertTrue(bot._handle_management_command_impl("", "myrooms", "Master", is_private=True))
             self.assertTrue(bot._handle_management_command_impl("", "ns", "Master", is_private=True))
-        self.assertEqual(len(self.sent), 2)
-        self.assertIn("Currently connected rooms (31)", self.sent[0][1])
-        self.assertIn("Type ns for the next list", self.sent[0][1])
-        self.assertEqual(sum(line[:1].isdigit() for line in self.sent[0][1].splitlines()), 30)
-        self.assertIn("List 2/2", self.sent[1][1])
-        self.assertIn("Room 31", self.sent[1][1])
-        self.assertIn("End of list", self.sent[1][1])
+        self.assertEqual(len(private_sent), 1)
+        self.assertIn("Complete bot rooms (31) — server", private_sent[0])
+        self.assertIn("Type ns for the next list", private_sent[0])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("📄 القائمة 2/2", self.sent[0][1])
+        self.assertIn("Room 31", self.sent[0][1])
+        self.assertIn("✅ End of list", self.sent[0][1])
         self.assertFalse(bot._result_pages)
 
 
@@ -3409,7 +3418,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         bot.connected_rooms = {"ArabicHall", "EnglishHall"}
         bot._active_rooms = lambda: ["ArabicHall", "EnglishHall"]
         bot._configured_room_language = lambda room: "en" if room == "EnglishHall" else "ar"
-        bot._queue_stock_market_round_broadcast = lambda rooms: bot._broadcast_stock_market_round(rooms)
+        bot._queue_stock_market_round_broadcast = lambda _rooms: None
         bot._snake_command = lambda *_args: False
         bot._ludo_command = lambda *_args: False
         bot._handle_pending_bot_choice = lambda *_args: False
@@ -3423,13 +3432,10 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             bot_module.time, "time", return_value=1_000.0
         ):
             self.assertTrue(bot.handle_game_command("ArabicHall", "بورصة", "Player"))
-        self.assertEqual(len(sent), 3)
-        self.assertIn("بدأت البورصة", sent[0][1])
-        self.assertIn("بعد دقيقة", sent[0][1])
-        self.assertIn("Stock market is open", sent[1][1])
+        self.assertEqual(len(sent), 1)
         for asset in ("ذهب", "فضة", "نفط", "أرض"):
-            self.assertIn(asset, sent[2][1])
-        self.assertIn("100000", sent[2][1])
+            self.assertIn(asset, sent[0][1])
+        self.assertIn("100000", sent[0][1])
         self.assertEqual(bot.stock_market_round["ends_at"], 1_900.0)
         self.assertEqual(bot._stock_market_next_announcement, 1_900.0)
         self.assertEqual(bot.stock_pending[(bot_module._norm_room("ArabicHall"), bot_module._norm_user("Player"))]["kind"], "market_choice")
@@ -3513,13 +3519,13 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 self.assertTrue(point_ops[1][2].startswith("stock-market-payout:"))
                 self.assertFalse(bot.stock_investments)
                 result_by_room = dict(messages)
-                self.assertEqual(set(result_by_room), {"ArabicHall", "EnglishHall"})
-                result = result_by_room["ArabicHall"]
+                self.assertEqual(set(result_by_room), {"ArabicHall"})
+                self.assertNotIn("نتيجة البورصة", result_by_room["ArabicHall"])
+                result = private_messages[0][1]
                 self.assertIn(f"{expected_percent}%", result)
-                self.assertIn("خسارة" if outcome == "loss" else "ربح", result)
+                self.assertIn("الخسارة" if outcome == "loss" else "الربح", result)
                 self.assertIn("-" if outcome == "loss" else "+", result)
                 self.assertIn("المستثمر: @Player", result)
-                self.assertIn("Investor: @Player", result_by_room["EnglishHall"])
                 self.assertEqual(len(private_messages), 1)
                 self.assertEqual(private_messages[0][0], "Player")
                 self.assertIn("غرفة الاستثمار: ArabicHall", private_messages[0][1])
@@ -4309,6 +4315,66 @@ class NewFeatureRegressions(unittest.TestCase):
             self.assertTrue(bot._is_dragon_hunter("Hunter"))
         with patch.object(bot_module.time, "time", return_value=1_600.0):
             self.assertFalse(bot._is_dragon_hunter("Hunter"))
+
+
+class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
+    def test_server_room_list_finishes_full_sync_and_starts_all_rooms(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.blocked_rooms = set()
+        bot.known_rooms = set()
+        bot._pending_full_room_sync = {"token": "x", "sender": "Master", "room": ""}
+        bot._result_pages = {}
+        bot._effective_room_language = lambda _room: "ar"
+        bot.send_private_text = lambda *_args: None
+        bot.log = lambda *_args: None
+        joined = []
+        bot._join_rooms_serially = lambda rooms, sender, fast: joined.append((rooms, sender, fast))
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target, self.args = target, args
+            def start(self):
+                self.target(*self.args)
+        with patch.object(bot_module.threading, "Thread", ImmediateThread), patch.object(
+            bot_module, "_save_persistent_rooms"
+        ):
+            bot._process_room_list({"rooms": [{"name": "Room A"}, {"room": "Room B"}, {"title": "Room A"}]})
+        self.assertIsNone(bot._pending_full_room_sync)
+        self.assertEqual(joined, [(["Room A", "Room B"], "", True)])
+        self.assertEqual(bot.known_rooms, {"Room A", "Room B"})
+
+    def test_full_sync_falls_back_to_rooms_file_when_server_does_not_reply(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.blocked_rooms = set()
+        bot.known_rooms = set()
+        bot._pending_full_room_sync = {"token": "x", "sender": "Master", "room": ""}
+        bot._result_pages = {}
+        bot._effective_room_language = lambda _room: "ar"
+        bot.send_private_text = lambda *_args: None
+        bot._join_rooms_serially = lambda *_args: None
+        with patch.object(bot_module, "_persistent_rooms", return_value=["Fallback A", "Fallback B"]), patch.object(
+            bot_module, "_save_persistent_rooms"
+        ):
+            self.assertTrue(bot._finish_full_room_sync(["Fallback A", "Fallback B"], from_server=False))
+        self.assertIsNone(bot._pending_full_room_sync)
+
+    def test_enter_server_rooms_requests_server_list_before_joining(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_list_commands = lambda *_args: False
+        bot._request_full_room_sync = lambda sender, room, language=None: setattr(bot, "sync_request", (sender, room, language)) or True
+        bot.send_private_text = lambda *_args: None
+        with patch.object(bot_module, "_is_master_name", return_value=True):
+            self.assertTrue(bot._handle_management_command_impl("", "دخول الغرف", "Master", is_private=True))
+        self.assertEqual(bot.sync_request[0:2], ("Master", ""))
+
+    def test_stock_room_wide_announcements_are_disabled_by_default(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.log = lambda *_args: None
+        sent = []
+        bot.send_room_text = lambda room, text: sent.append((room, text))
+        with patch.object(bot_module, "STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED", False):
+            bot._queue_stock_market_round_broadcast(["Room A", "Room B"])
+            bot._broadcast_stock_market_result("Player", "Room A", 1, 100, "profit", 10, 10)
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":
