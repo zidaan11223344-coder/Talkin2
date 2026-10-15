@@ -4323,7 +4323,7 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         bot.send_private_text = lambda *_args: None
         bot.log = lambda *_args: None
         joined = []
-        bot._join_rooms_serially = lambda rooms, sender, fast: joined.append((rooms, sender, fast))
+        bot._join_rooms_serially = lambda rooms, sender, fast, sync_id: joined.append((rooms, sender, fast, sync_id))
         class ImmediateThread:
             def __init__(self, target=None, args=(), **_kwargs):
                 self.target, self.args = target, args
@@ -4334,8 +4334,18 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         ):
             bot._process_room_list({"rooms": [{"name": "Room A"}, {"room": "Room B"}, {"title": "Room A"}]})
         self.assertIsNone(bot._pending_full_room_sync)
-        self.assertEqual(joined, [(["Room A", "Room B"], "", True)])
+        self.assertEqual(joined, [(["Room A", "Room B"], "Master", False, joined[0][3])])
         self.assertEqual(bot.known_rooms, {"Room A", "Room B"})
+
+    def test_server_room_list_extracts_numeric_protobuf_room_fields(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.blocked_rooms = set()
+        bot.known_rooms = set()
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "_save_persistent_rooms"):
+            bot._process_room_list([{1: "2024", 2: "ignored description"}, {1: "Room Numeric"}])
+        self.assertIn("2024", bot.known_rooms)
+        self.assertIn("Room Numeric", bot.known_rooms)
 
     def test_full_sync_falls_back_to_rooms_file_when_server_does_not_reply(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -4351,6 +4361,21 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         ):
             self.assertTrue(bot._finish_full_room_sync(["Fallback A", "Fallback B"], from_server=False))
         self.assertIsNone(bot._pending_full_room_sync)
+
+    def test_room_sync_reports_successes_and_failures_to_requester(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_sync_jobs = {
+            "sync": {"sender": "Master", "total": 2, "results": {}}
+        }
+        sent = []
+        bot.send_private_text = lambda user, text: sent.append((user, text))
+        bot._record_room_sync_result("sync", "Good", True, "تم تأكيد الدخول")
+        self.assertEqual(len(sent), 0)
+        bot._record_room_sync_result("sync", "Bad", False, "الغرفة محظورة")
+        self.assertEqual(sent[0][0], "Master")
+        self.assertIn("دخل 1 من أصل 2", sent[0][1])
+        self.assertIn("Good", sent[0][1])
+        self.assertIn("Bad: الغرفة محظورة", sent[0][1])
 
     def test_enter_server_rooms_requests_server_list_before_joining(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

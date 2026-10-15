@@ -6234,6 +6234,7 @@ class TalkinBot:
         # a manual join request clears the exclusion if permissions changed.
         self._blocked_room_notices = set()
         self._pending_room_joins = {}
+        self._room_sync_jobs = {}
         self._pending_full_room_sync = None
         if self.room and _norm_room(self.room) not in self.blocked_rooms:
             self.known_rooms.add(_norm_room(self.room))
@@ -16666,7 +16667,32 @@ class TalkinBot:
                 return pkey, value
         return None, None
 
-    def _join_rooms_serially(self, rooms, sender="", fast_restore=False):
+    def _record_room_sync_result(self, sync_id, room, ok, detail=""):
+        jobs = getattr(self, "_room_sync_jobs", {})
+        state = jobs.get(sync_id) if isinstance(jobs, dict) else None
+        if not isinstance(state, dict):
+            return
+        key = _norm_room(room)
+        if key in state.get("results", {}):
+            return
+        state.setdefault("results", {})[key] = {"room": str(room), "ok": bool(ok), "detail": str(detail or "")}
+        if len(state["results"]) < int(state.get("total", 0) or 0):
+            return
+        jobs.pop(sync_id, None)
+        success = [row["room"] for row in state["results"].values() if row.get("ok")]
+        failed = [row for row in state["results"].values() if not row.get("ok")]
+        lines = [
+            "✅ انتهى دخول غرف السيرفر",
+            f"📊 النتيجة: دخل {len(success)} من أصل {state.get('total', 0)} غرفة.",
+        ]
+        if success:
+            lines.append("🟢 تم الدخول: " + ", ".join(sorted(success, key=str.casefold)))
+        if failed:
+            lines.append("🔴 تعذر الدخول:")
+            lines.extend(f"• {row['room']}: {row.get('detail') or 'لم يصل تأكيد من السيرفر'}" for row in failed)
+        self.send_private_text(state.get("sender", ""), "\n".join(lines))
+
+    def _join_rooms_serially(self, rooms, sender="", fast_restore=False, sync_id=None):
         """Join rooms one at a time and wait for each server acknowledgement.
 
         Talkin's gateway is sensitive to a burst of room_join packets.  More
@@ -16704,6 +16730,8 @@ class TalkinBot:
                         except Exception as exc:
                             self.log("[ROOM] connected-room notice failed:", target, repr(exc))
                     skipped += 1
+                    if sync_id:
+                        self._record_room_sync_result(sync_id, target, True, "موجودة ومتصل بها البوت")
                     continue
                 try:
                     if self.join_room(target, force=bool(fast_restore), requested_by=sender):
@@ -16714,11 +16742,20 @@ class TalkinBot:
                             deadline=time.time()+timeout+1.0
                             while time.time() < deadline and key in getattr(self, "_pending_room_joins", {}):
                                 time.sleep(0.25)
+                        if sync_id:
+                            connected = any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set()))
+                            detail = "تم تأكيد الدخول" if connected else getattr(self, "_blocked_room_reasons", {}).get(key, "لم يصل تأكيد من السيرفر")
+                            self._record_room_sync_result(sync_id, target, connected, detail)
                     else:
                         skipped += 1
+                        if sync_id:
+                            connected = any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set()))
+                            self._record_room_sync_result(sync_id, target, connected, "الغرفة متصلة مسبقاً" if connected else getattr(self, "_blocked_room_reasons", {}).get(key, "تعذر إرسال طلب الدخول"))
                 except Exception as exc:
                     skipped += 1
                     self.log("[ROOM] serial join failed:", target, repr(exc))
+                    if sync_id:
+                        self._record_room_sync_result(sync_id, target, False, str(exc)[:180])
                 if target != cleaned[-1]:
                     time.sleep(gap)
         return {"sent": sent, "skipped": skipped}
@@ -20729,6 +20766,20 @@ class TalkinBot:
         found = set()
         def walk(obj):
             if isinstance(obj, dict):
+                # decode_generic exposes protobuf RoomItem fields as numeric
+                # keys. The Android app reads the name field from these items,
+                # while the old extractor only understood JSON-style keys and
+                # consequently missed most rooms returned by load_list_new.
+                numeric = {int(k): v for k, v in obj.items() if str(k).isdigit()}
+                if numeric:
+                    v1 = numeric.get(1)
+                    v2 = numeric.get(2)
+                    t1 = str(v1 or "").strip() if isinstance(v1, str) else ""
+                    t2 = str(v2 or "").strip() if isinstance(v2, str) else ""
+                    if t1 and not t1.startswith(("http://", "https://")):
+                        found.add(t1)
+                    elif t2 and not t2.startswith(("http://", "https://")):
+                        found.add(t2)
                 for k, v in obj.items():
                     kl = str(k).casefold()
                     if kl in ("name", "room", "room_name", "title") and isinstance(v, str) and v.strip():
@@ -20794,21 +20845,41 @@ class TalkinBot:
         if not from_server and not rooms:
             rooms = sorted({str(item).strip() for item in getattr(self, "known_rooms", set()) if str(item).strip() and _norm_room(item) not in blocked}, key=str.casefold)
         if rooms:
-            self.known_rooms.update(rooms)
+            if from_server:
+                # For an explicit server sync, replace the stale/truncated
+                # local view with the authoritative list returned by the app
+                # endpoint. Reconnect then restores the same complete set.
+                self.known_rooms = set(rooms)
+            else:
+                self.known_rooms.update(rooms)
             _save_persistent_rooms(self.known_rooms)
+        sender = state.get("sender", "")
+        if from_server:
+            self.send_private_text(sender, f"✅ تم جلب عدد الغرف: {len(rooms)} غرفة\n🚪 بدأ الدخول بالتتالي...")
         self._send_room_names_pages(
-            state["sender"], state.get("room", ""), rooms,
+            sender, state.get("room", ""), rooms,
             from_server=from_server, language=state.get("language"),
         )
         if rooms:
+            sync_id = uuid.uuid4().hex
+            jobs = getattr(self, "_room_sync_jobs", None)
+            if not isinstance(jobs, dict):
+                jobs = self._room_sync_jobs = {}
+            jobs[sync_id] = {
+                "sender": sender, "total": len(rooms), "results": {},
+            }
             threading.Thread(
-                target=self._join_rooms_serially, args=(rooms, "", True),
+                target=self._join_rooms_serially,
+                args=(rooms, sender, False, sync_id),
                 daemon=True, name="full-server-room-restore",
             ).start()
+        elif from_server:
+            self.send_private_text(sender, "❌ السيرفر لم يُرجع أي غرفة للدخول.")
         return True
 
     def _request_full_room_sync(self, sender, room="", language=None):
         """Request all rooms, then join them; fallback to tracked_rooms.json."""
+        self.send_private_text(sender, "⏳ جاري جلب قوائم الغرف من السيرفر...")
         if not getattr(self, "ws", None):
             fallback = _persistent_rooms()
             if not fallback:
