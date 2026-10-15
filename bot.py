@@ -1068,6 +1068,21 @@ def _ws_payload_limit():
     return max(1, min(1008, configured))
 
 
+def _is_normal_ws_close_reason(reason):
+    """Return True for ordinary peer/TCP closes that should reconnect quietly."""
+    value = str(reason or "").casefold()
+    return any(
+        marker in value
+        for marker in (
+            "socket closed",
+            "websocket closed by server",
+            "websocket closed during server bootstrap",
+            "code': 1000",
+            '"code": 1000',
+        )
+    )
+
+
 def encode_live_invitation(inviter: str, target: str, token: str,
                            room_id: str, room_name: str, invitation_id: str) -> bytes:
     """Encode the manual Talkin live invitation packet captured from the app.
@@ -21407,13 +21422,22 @@ class TalkinBot:
             except Exception as e:
                 self.last_error = str(e)
                 raw_reason = self._redact_connection_secrets(e)
+                normal_transport_close = _is_normal_ws_close_reason(raw_reason)
                 if "code': 1000" in raw_reason or '"code": 1000' in raw_reason:
                     raw_reason = "الخادم أغلق WebSocket إغلاقًا طبيعياً (1000): " + raw_reason
                 if "1009" in raw_reason:
                     raw_reason = "الخادم أغلق WebSocket بسبب حجم الرسالة (1009): " + raw_reason
-                if self.room:
-                    raw_reason = f"{raw_reason[:850]} | آخر غرفة: {self.room}"
-                self._pending_reconnect_reason = raw_reason[:1200]
+                if normal_transport_close:
+                    # A peer can close an idle TCP/WebSocket connection without
+                    # a close frame. Reconnect, but do not report it as a bot
+                    # failure or send a noisy "connection returned" alert.
+                    self.log("[WS] socket closed normally; reconnecting quietly")
+                    self._pending_reconnect_reason = ""
+                    self._reconnect_delay = 10.0
+                else:
+                    if self.room:
+                        raw_reason = f"{raw_reason[:850]} | آخر غرفة: {self.room}"
+                    self._pending_reconnect_reason = raw_reason[:1200]
                 if isinstance(getattr(self, "_inflight_command", None), dict):
                     self._pending_reconnect_command = dict(self._inflight_command)
                 if DEBUG and not QUIET_MODE:

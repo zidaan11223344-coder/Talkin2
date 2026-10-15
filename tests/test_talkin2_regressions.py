@@ -472,6 +472,12 @@ class RoomExclusionRegressions(unittest.TestCase):
 
 
 class RawWebSocketTransportRegressions(unittest.TestCase):
+    def test_socket_closed_is_classified_as_quiet_reconnect(self):
+        self.assertTrue(bot_module._is_normal_ws_close_reason("socket closed"))
+        self.assertTrue(bot_module._is_normal_ws_close_reason("WebSocket closed by server"))
+        self.assertTrue(bot_module._is_normal_ws_close_reason("close code': 1000"))
+        self.assertFalse(bot_module._is_normal_ws_close_reason("TLS handshake failed"))
+
     def test_recv_drops_inbound_payload_over_1008_without_closing_socket(self):
         class FakeSocket:
             def __init__(self, payload):
