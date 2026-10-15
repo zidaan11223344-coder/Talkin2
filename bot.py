@@ -260,7 +260,25 @@ GIFT_IMAGE_FILES.update({
     "28": [ASSETS_DIR / "gift_28_cupcake.jpg"],
     "29": [ASSETS_DIR / "gift_29_dolphin.jpg"],
     "30": [ASSETS_DIR / "gift_30_island.jpg"],
+    "31": [ASSETS_DIR / "gift_31_rose_bouquet.jpg"],
+    "32": [ASSETS_DIR / "gift_32_heart_pendant.jpg"],
+    "33": [ASSETS_DIR / "gift_33_love_letter.jpg"],
+    "34": [ASSETS_DIR / "gift_34_chocolate_box.jpg"],
+    "35": [ASSETS_DIR / "gift_35_teddy_heart.jpg"],
+    "36": [ASSETS_DIR / "gift_36_valentine_cake.jpg"],
+    "37": [ASSETS_DIR / "gift_37_diamond_ring.jpg"],
+    "38": [ASSETS_DIR / "gift_38_perfume.jpg"],
+    "39": [ASSETS_DIR / "gift_39_heart_balloons.jpg"],
+    "40": [ASSETS_DIR / "gift_40_love_hamper.jpg"],
 })
+# Curated human-only portraits for the social hunt games. Keep these explicit
+# so a future generic asset scan cannot accidentally select animal art.
+SOCIAL_HUNT_IMAGE_FILES = {
+    "woman": [ASSETS_DIR / f"game_hunt_woman{suffix}.jpg" for suffix in ("", "_02", "_03", "_04", "_05")],
+    "man": [ASSETS_DIR / f"game_hunt_man{suffix}.jpg" for suffix in ("", "_02", "_03", "_04", "_05")],
+}
+_SOCIAL_HUNT_LAST_PHOTO = {}
+_SOCIAL_HUNT_PHOTO_LOCK = threading.Lock()
 # الألعاب وصورها معطلة بناءً على إعداد البوت المطلوب؛ لا تُرسل صور ألعاب.
 GAME_IMAGE_FILES = {
     "bet": "game_bet.jpg",
@@ -440,6 +458,11 @@ GIFT_CATALOG = {
     "24": ("🎮", "جهاز ألعاب"), "25": ("🏆", "كأس ذهبي"),
     "26": ("🚁", "مروحية"), "27": ("⌚", "ساعة فاخرة"),
     "28": ("🧁", "كب كيك"), "29": ("🐬", "دلفين"), "30": ("🏝️", "جزيرة"),
+    "31": ("💐", "باقة ورود"), "32": ("💝", "قلادة قلب"),
+    "33": ("💌", "رسالة حب"), "34": ("🍫", "علبة شوكولاتة"),
+    "35": ("🧸", "دب الحب"), "36": ("🎂", "كيكة الحب"),
+    "37": ("💍", "خاتم ألماس"), "38": ("🌹", "عطر رومانسي"),
+    "39": ("🎈", "بالونات قلب"), "40": ("🧺", "سلة رومانسية"),
 }
 GIFT_CATALOG_EN = {
     "1": "Rose", "2": "Heart", "3": "Kiss", "4": "Teddy bear", "5": "Cake",
@@ -449,7 +472,10 @@ GIFT_CATALOG_EN = {
     "18": "Farm", "19": "Tractor", "20": "Barn", "21": "Diamond",
     "22": "Cat", "23": "Dog", "24": "Game console", "25": "Gold trophy",
     "26": "Helicopter", "27": "Luxury watch", "28": "Cupcake", "29": "Dolphin",
-    "30": "Island",
+    "30": "Island", "31": "Rose bouquet", "32": "Heart pendant",
+    "33": "Love letter", "34": "Chocolate box", "35": "Teddy bear with heart",
+    "36": "Valentine cake", "37": "Diamond ring", "38": "Romantic perfume",
+    "39": "Heart balloons", "40": "Romantic hamper",
 }
 
 # ============================================================
@@ -780,8 +806,8 @@ def _migrate_legacy_state_files():
 _migrate_legacy_state_files()
 # Restore state from GitHub after the data directory and legacy migration are ready.
 
-# Giant Chat gift costs/labels; images remain the local Giant assets.
-GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500,"15":525,"16":550,"17":575,"18":600,"19":625,"20":650,"21":700,"22":725,"23":750,"24":775,"25":800,"26":825,"27":850,"28":875,"29":900,"30":950}
+# Giant Chat gift costs/labels; images remain local assets.
+GIFT_COSTS = {"1":50,"2":75,"3":100,"4":125,"5":150,"6":175,"7":200,"8":250,"9":300,"10":350,"11":400,"12":425,"13":450,"14":500,"15":525,"16":550,"17":575,"18":600,"19":625,"20":650,"21":700,"22":725,"23":750,"24":775,"25":800,"26":825,"27":850,"28":875,"29":900,"30":950,"31":1000,"32":1100,"33":1050,"34":1150,"35":1250,"36":1300,"37":1500,"38":1400,"39":1200,"40":1800}
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://chatp.net/api?").rstrip("?") + "?"
@@ -12629,7 +12655,7 @@ class TalkinBot:
             "🥥":(65,700_000), "🥑":(70,850_000), "🥔":(75,1_000_000),
             "🍒":(90,2_000_000), "🍈":(120,5_000_000), "🫐":(180,10_000_000),
             "🍅":(240,25_000_000), "🥒":(360,50_000_000), "🧄":(480,100_000_000),
-            "🌻":(600,200_000_000), "🌾":(720,300_000_000), "🌳":(960,500_000_000),
+            "🌻":(600,200_000_000), "🌾":(720,300_000_000), "🌳":(90,500_000_000),
         }
         english = self._effective_room_language(room) == "en"
         if raw.casefold()=="زرع":
@@ -12766,9 +12792,9 @@ class TalkinBot:
         target_english = getattr(self, "_configured_room_language", lambda _room: "ar")(destination) == "en"
         target_plain, sender_plain = target.lstrip("@"), str(sender).lstrip("@")
         challenge = (
-            f"💣 A bomb was sent to {target_plain} by {sender_plain}!\nChoose a wire to defuse it:\n1️⃣ Red\n2️⃣ Yellow\n3️⃣ Green\n⏱️ You have 30 seconds; send one number."
+            f"💣 A bomb was sent to {target_plain} by {sender_plain}!\nChoose a wire to defuse it:\n1️⃣ Red\n2️⃣ Yellow\n3️⃣ Green\n⏱️ You have 30 seconds; send one number.\n🏆 Successfully defuse it to win 500,000 or 1,000,000 points."
             if target_english else
-            f"💣 وصلت قنبلة إلى {target_plain} من {sender_plain}!\nلتفكيكها اختر رقم السلك:\n1️⃣ أحمر\n2️⃣ أصفر\n3️⃣ أخضر\n⏱️ أمامك 30 ثانية؛ أرسل رقمًا واحدًا."
+            f"💣 وصلت قنبلة إلى {target_plain} من {sender_plain}!\nلتفكيكها اختر رقم السلك:\n1️⃣ أحمر\n2️⃣ أصفر\n3️⃣ أخضر\n⏱️ أمامك 30 ثانية؛ أرسل رقمًا واحدًا.\n🏆 إذا نجحت في التفكيك ستحصل على جائزة 500 ألف أو مليون نقطة."
         )
         try:
             send_result = self.send_room_text(destination, challenge)
@@ -12799,9 +12825,9 @@ class TalkinBot:
             )
             self.send_room_text(source_room, sent_notice)
         private_notice = (
-            f"💣 {sender_plain} sent you a bomb in {destination}. Go to that room and defuse it within 30 seconds by sending 1, 2, or 3."
+            f"💣 {sender_plain} sent you a bomb in {destination}. Go to that room and defuse it within 30 seconds by sending 1, 2, or 3. Successfully defuse it to win 500,000 or 1,000,000 points."
             if target_english else
-            f"💣 أرسل لك {sender_plain} قنبلة في غرفة {destination}. اذهب إلى الغرفة وفككها خلال 30 ثانية بإرسال رقم السلك 1 أو 2 أو 3."
+            f"💣 أرسل لك {sender_plain} قنبلة في غرفة {destination}. اذهب إلى الغرفة وفككها خلال 30 ثانية بإرسال رقم السلك 1 أو 2 أو 3. إذا نجحت في التفكيك ستحصل على جائزة 500 ألف أو مليون نقطة."
         )
         try:
             self.send_private_text(target_plain, private_notice)
@@ -15423,28 +15449,35 @@ class TalkinBot:
             return True
         target = secrets.choice(candidates)
         female_photo = str(command or "").strip() == "صيد مزه"
-        filename = "game_hunt_woman.jpg" if female_photo else "game_hunt_man.jpg"
-        label = "beauty hunt" if female_photo else "handsome man hunt"
+        photo_group = "woman" if female_photo else "man"
+        photo_key = (_norm_room(room), photo_group)
+        photo_pool = [path for path in SOCIAL_HUNT_IMAGE_FILES[photo_group] if path.is_file()]
         photo_url = ""
-        if (ASSETS_DIR / filename).is_file():
-            photo_url = self._game_public_image(ASSETS_DIR / filename, route="assets")
+        if photo_pool:
+            with _SOCIAL_HUNT_PHOTO_LOCK:
+                last_photo = _SOCIAL_HUNT_LAST_PHOTO.get(photo_key)
+                choices = [path for path in photo_pool if path.name != last_photo] or photo_pool
+                photo_path = random.choice(choices)
+                _SOCIAL_HUNT_LAST_PHOTO[photo_key] = photo_path.name
+            photo_url = self._game_public_image(photo_path, route="assets")
         image_sent = False
         if photo_url:
             try:
                 image_sent = self.send_room_media(room, photo_url, "image") is not False
             except Exception as exc:
                 self.log("[SOCIAL-HUNT] image delivery failed:", room, repr(exc))
+        hunter_plain, target_plain = str(sender).strip().lstrip("@"), str(target).strip().lstrip("@")
         if english:
-            result = (
-                f"🎯 {label.title()}! Random room pick: @{target}.\n"
-                "🖼️ This is a generic game photo, not a picture of the selected member."
-            )
+            label = "Beauty Hunt" if female_photo else "Handsome Hunt"
+            action = f"@{hunter_plain} caught a beauty: @{target_plain}" if female_photo else f"@{hunter_plain} caught a handsome man: @{target_plain}"
+            result = f"🎯 {label}!\n👤 {action}.\n🖼️ This is a generic game photo, not a picture of the selected member."
             if not image_sent:
                 result += "\n⚠️ The photo could not be sent; check the public media URL."
         else:
             label_ar = "صيد المزة" if female_photo else "صيد المز"
+            action = f"@{hunter_plain} اصطاد مزه: @{target_plain}" if female_photo else f"@{hunter_plain} اصطادت مز: @{target_plain}"
             result = (
-                f"🎯 {label_ar}! اختار البوت من أعضاء الغرفة: @{target}.\n"
+                f"🎯 {label_ar}!\n👤 {action}.\n"
                 "🖼️ الصورة عامة للعبة ولا تمثل صورة العضو المختار."
             )
             if not image_sent:

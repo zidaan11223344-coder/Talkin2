@@ -3550,9 +3550,14 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             "21": "gift_21_diamond.jpg", "22": "gift_22_cat.jpg", "23": "gift_23_dog.jpg",
             "24": "gift_24_console.jpg", "25": "gift_25_trophy.jpg", "26": "gift_26_helicopter.jpg",
             "27": "gift_27_watch.jpg", "28": "gift_28_cupcake.jpg", "29": "gift_29_dolphin.jpg",
-            "30": "gift_30_island.jpg",
+            "30": "gift_30_island.jpg", "31": "gift_31_rose_bouquet.jpg",
+            "32": "gift_32_heart_pendant.jpg", "33": "gift_33_love_letter.jpg",
+            "34": "gift_34_chocolate_box.jpg", "35": "gift_35_teddy_heart.jpg",
+            "36": "gift_36_valentine_cake.jpg", "37": "gift_37_diamond_ring.jpg",
+            "38": "gift_38_perfume.jpg", "39": "gift_39_heart_balloons.jpg",
+            "40": "gift_40_love_hamper.jpg",
         }
-        self.assertEqual(len(bot_module.GIFT_CATALOG), 30)
+        self.assertEqual(len(bot_module.GIFT_CATALOG), 40)
         for gift_id, expected_file in expected_gifts.items():
             self.assertIn(gift_id, bot_module.GIFT_CATALOG)
             self.assertEqual([path.name for path in bot_module.GIFT_IMAGE_FILES[gift_id]], [expected_file])
@@ -3572,26 +3577,31 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             self.assertTrue(bot._crop_command("Hall", "Player", "زرع@🌳"))
         plot = next(iter(bot.crop_plots.values()))
         self.assertEqual(plot["reward"], 500_000_000)
-        self.assertEqual(plot["minutes"], 960)
+        self.assertEqual(plot["minutes"], 90)
 
     def test_gift_help_shows_thirty_items_in_one_compact_list_and_ns_reports_end(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._effective_room_language = lambda _room: "en"
         bot._result_pages = {}
+        bot.help_pages = {}
         packets = []
         bot._send_text_packets = lambda packet_type, text, **kwargs: packets.append((packet_type, text, kwargs))
         bot._room_list_commands = lambda *_args, **_kwargs: False
         bot.gift_help("Hall", "Player")
         self.assertEqual(len(packets), 1)
         self.assertEqual(packets[0][0], "room_message")
-        self.assertIn("List 1/1", packets[0][1])
+        self.assertIn("List 1/2", packets[0][1])
         self.assertIn("30 🏝️ Island=", packets[0][1])
-        self.assertIn("sa@id@username", packets[0][1])
+        self.assertNotIn("31 💐 Rose bouquet=", packets[0][1])
+        self.assertNotIn("sa@id@username", packets[0][1])
         self.assertIn("ns for the next list", packets[0][1])
         self.assertLess(len(packets[0][1].encode("utf-8")), 1008)
         state = bot._result_pages[("room_message", "Hall", "Player")]
-        self.assertEqual(len(state["pages"]), 1)
+        self.assertEqual(len(state["pages"]), 2)
         self.assertTrue(bot._handle_management_command_impl("Hall", "ns", "Player", is_private=False))
+        self.assertIn("List 2/2", packets[-1][1])
+        self.assertIn("40 🧺 Romantic hamper=", packets[-1][1])
+        self.assertIn("sa@id@username", packets[-1][1])
         self.assertIn("End of list", packets[-1][1])
 
     def test_gift_help_uses_ns_for_each_thirty_item_page(self):
@@ -3644,17 +3654,30 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         media, texts = [], []
         bot.send_room_media = lambda room, url, kind: media.append((room, url, kind)) or True
         bot.send_room_text = lambda room, text: texts.append(text)
-        with patch.object(bot_module.secrets, "choice", return_value="Target"):
+        with patch.object(bot_module.secrets, "choice", side_effect=lambda seq: seq[0]), patch.object(
+            bot_module.random, "choice", side_effect=lambda seq: seq[0]
+        ):
             self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مزه"))
+            first_woman_photo = media[-1][1]
+            self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مزه"))
+            second_woman_photo = media[-1][1]
             self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مز"))
-        self.assertEqual(media[0][1], "https://media.example/assets/game_hunt_woman.jpg")
-        self.assertEqual(media[1][1], "https://media.example/assets/game_hunt_man.jpg")
+            first_man_photo = media[-1][1]
+            self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مز"))
+            second_man_photo = media[-1][1]
+        self.assertNotEqual(first_woman_photo, second_woman_photo)
+        self.assertNotEqual(first_man_photo, second_man_photo)
         self.assertTrue(all("@Target" in text and "لا تمثل صورة العضو" in text for text in texts))
+        self.assertIn("@Player اصطاد مزه: @Target", texts[0])
+        self.assertIn("@Player اصطادت مز: @Target", texts[2])
+        self.assertTrue(all(path.is_file() for paths in bot_module.SOCIAL_HUNT_IMAGE_FILES.values() for path in paths))
+        self.assertEqual(set(bot_module.SOCIAL_HUNT_IMAGE_FILES), {"woman", "man"})
         bot._effective_room_language = lambda _room: "en"
-        with patch.object(bot_module.secrets, "choice", return_value="Target"):
+        with patch.object(bot_module.secrets, "choice", side_effect=lambda seq: seq[0]):
             self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مزه"))
         self.assertIn("Beauty Hunt", texts[-1])
         self.assertIn("not a picture of the selected member", texts[-1])
+        self.assertIn("@Player caught a beauty: @Target", texts[-1])
         self.assertEqual(bot_module._normalize_game_command_text("hunt a beauty"), "صيد مزه")
         self.assertEqual(bot_module._normalize_game_command_text("my ex"), "طليقي")
         for command in ("صيد مزه", "صيد مز", "طليقي", "خلع", "طلاق"):
@@ -4022,12 +4045,14 @@ class NewFeatureRegressions(unittest.TestCase):
             self.assertNotIn("@Victim", challenge)
             self.assertNotIn("@Admin", challenge)
             self.assertIn("30 ثانية", challenge)
+            self.assertIn("إذا نجحت في التفكيك ستحصل على جائزة", challenge)
             self.assertIn("تم إرسال القنبلة", confirmation)
             self.assertIn("Other", confirmation)
             self.assertEqual(private_messages[-1][0], "Victim")
             self.assertIn("Admin", private_messages[-1][1])
             self.assertIn("Other", private_messages[-1][1])
             self.assertIn("30 ثانية", private_messages[-1][1])
+            self.assertIn("ستحصل على جائزة", private_messages[-1][1])
             self.assertIn("Other", bot.bomb_games[(bot_module._norm_room("Other"), bot_module._norm_user("Victim"))]["room"])
             bomb_key = (bot_module._norm_room("Other"), bot_module._norm_user("Victim"))
             self.assertAlmostEqual(bot.bomb_games[bomb_key]["expires_at"] - bot_module.time.time(), 30.0, delta=0.1)
