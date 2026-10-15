@@ -16630,7 +16630,7 @@ class TalkinBot:
                 return pkey, value
         return None, None
 
-    def _join_rooms_serially(self, rooms, sender=""):
+    def _join_rooms_serially(self, rooms, sender="", fast_restore=False):
         """Join rooms one at a time and wait for each server acknowledgement.
 
         Talkin's gateway is sensitive to a burst of room_join packets.  More
@@ -16646,7 +16646,13 @@ class TalkinBot:
         if not cleaned:
             return {"sent": 0, "skipped": 0}
         sent=0; skipped=0
-        gap=max(0.8, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
+        if fast_restore:
+            # Startup restore must not wait for one ACK per room. The reader
+            # remains free to process all ACKs/events while joins are sent at
+            # a small gateway-safe pace.
+            gap=max(0.08, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.15") or 0.15))
+        else:
+            gap=max(0.8, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
         timeout=max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20") or 20))
         with self._room_bulk_lock:
             for target in cleaned:
@@ -16668,11 +16674,12 @@ class TalkinBot:
                 try:
                     if self.join_room(target, force=False, requested_by=sender):
                         sent += 1
-                        # Wait for you_joined/you_rejoined (or the normal
-                        # timeout) before sending another room_join packet.
-                        deadline=time.time()+timeout+1.0
-                        while time.time() < deadline and key in getattr(self, "_pending_room_joins", {}):
-                            time.sleep(0.25)
+                        if not fast_restore:
+                            # Manual joins wait for you_joined/you_rejoined so
+                            # the next request cannot create an enter/leave loop.
+                            deadline=time.time()+timeout+1.0
+                            while time.time() < deadline and key in getattr(self, "_pending_room_joins", {}):
+                                time.sleep(0.25)
                     else:
                         skipped += 1
                 except Exception as exc:
@@ -21176,7 +21183,7 @@ class TalkinBot:
 
     def bootstrap_after_connect(self):
         """Wait briefly for the server bootstrap, then request the room lists."""
-        deadline = time.time() + float(os.getenv("BOOTSTRAP_WAIT", "6"))
+        deadline = time.time() + float(os.getenv("BOOTSTRAP_WAIT", "2"))
         got_server_frame = False
 
         while time.time() < deadline:
@@ -21228,7 +21235,7 @@ class TalkinBot:
                 self.log("[BOOTSTRAP] list request failed:", repr(e))
 
         # Give the server a short window to return list data before joining.
-        list_deadline = time.time() + float(os.getenv("LIST_BOOTSTRAP_WAIT", "2"))
+        list_deadline = time.time() + float(os.getenv("LIST_BOOTSTRAP_WAIT", "0.5"))
         while time.time() < list_deadline:
             remaining = min(0.8, max(0.1, list_deadline - time.time()))
             old_timeout = getattr(self.ws, "timeout", 20)
@@ -21267,8 +21274,8 @@ class TalkinBot:
         if rooms_to_restore:
             threading.Thread(
                 target=self._join_rooms_serially,
-                args=(sorted(rooms_to_restore), ""),
-                daemon=True, name="serial-room-restore",
+                args=(sorted(rooms_to_restore), "", True),
+                daemon=True, name="fast-room-restore",
             ).start()
     def run_once(self):
         # Start a fresh live-room view for this WebSocket session.

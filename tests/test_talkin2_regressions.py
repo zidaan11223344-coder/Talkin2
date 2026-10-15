@@ -1706,6 +1706,19 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(joined, [(["North", "South"], "Master")])
         self.assertIn("2 غرفة", sent[-1])
 
+    def test_fast_room_restore_sends_all_rooms_without_waiting_for_ack(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = set()
+        bot._pending_room_joins = {"north": {"created": time.time()}}
+        bot._room_bulk_lock = threading.RLock()
+        bot.join_room = lambda room, **_kwargs: True
+        bot.log = lambda *_args: None
+        with patch.dict(bot_module.os.environ, {"FAST_ROOM_RESTORE_DELAY_SECONDS": "0.08"}), patch.object(
+            bot_module.time, "sleep", lambda *_args: None
+        ):
+            result = bot._join_rooms_serially(["North", "South"], fast_restore=True)
+        self.assertEqual(result, {"sent": 2, "skipped": 0})
+
     def test_points_top_collapses_decorated_duplicate_accounts(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.send_private_text = lambda _user, text: setattr(bot, "top_message", text)
