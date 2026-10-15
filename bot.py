@@ -6236,6 +6236,7 @@ class TalkinBot:
         self._pending_room_joins = {}
         self._room_sync_jobs = {}
         self._server_room_catalog = []
+        self._room_restore_candidates = set()
         self._pending_full_room_sync = None
         if self.room and _norm_room(self.room) not in self.blocked_rooms:
             self.known_rooms.add(_norm_room(self.room))
@@ -16752,9 +16753,20 @@ class TalkinBot:
                     if sync_id:
                         self._record_room_sync_result(sync_id, target, True, "موجودة ومتصل بها البوت")
                     continue
+                if sender and key in getattr(self, "_room_restore_candidates", set()):
+                    try:
+                        self.send_private_text(sender, f"✅ البوت موجود داخل الغرفة: {target}")
+                    except Exception as exc:
+                        self.log("[ROOM] restored-room notice failed:", target, repr(exc))
+                    skipped += 1
+                    if sync_id:
+                        self._record_room_sync_result(sync_id, target, True, "تمت استعادتها عند تشغيل البوت")
+                    continue
                 try:
                     if self.join_room(target, force=bool(fast_restore), requested_by=sender):
                         sent += 1
+                        if fast_restore:
+                            getattr(self, "_room_restore_candidates", set()).add(key)
                         if not fast_restore:
                             # Manual joins wait for you_joined/you_rejoined so
                             # the next request cannot create an enter/leave loop.
@@ -18711,9 +18723,9 @@ class TalkinBot:
             _save_bot_blocked_users(self.bot_blocked_users)
             self.send_private_text(sender, f"✅ تم فك الحظر الداخلي عن @{target}.")
             return True
-        # "غرفي" must show only rooms that are actually connected in the
-        # current WebSocket session. known_rooms is historical and may contain
-        # rooms saved from an earlier run, so it must NOT be used here.
+        # "غرفي" must include the complete restored catalog. connected_rooms
+        # can be temporarily smaller while the fast reconnect ACKs are still
+        # arriving, so use the persistent room file as well.
         if low in ("جلب غرف السيرفر", "جلب الغرف من السيرفر", "قائمة غرف السيرفر", "get server rooms"):
             if not is_private:
                 self.send_room_text(room, "⏳ جاري طلب قائمة غرف السيرفر... سأرسل النتيجة في الخاص.")
@@ -18728,9 +18740,17 @@ class TalkinBot:
             self._start_server_room_join(catalog, sender)
             return True
         if low in ("غرفي", "غرفيّ", "myrooms", "my rooms"):
-            live = sorted({str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()}, key=str.casefold)
+            blocked = getattr(self, "blocked_rooms", set())
+            live = sorted({
+                str(r).strip() for r in (
+                    list(getattr(self, "connected_rooms", set()))
+                    + list(getattr(self, "room_users", {}).keys())
+                    + list(_persistent_rooms())
+                )
+                if str(r).strip() and _norm_room(r) not in blocked
+            }, key=str.casefold)
             if not is_private:
-                self.send_room_text(room, "📡 أعرض الآن الغرف التي أكد السيرفر اتصال البوت بها.")
+                self.send_room_text(room, "📡 أعرض كامل غرف البوت المستعادة والمؤكدة.")
             self._send_room_names_pages(
                 sender, room, live, from_server=True,
                 language=_detect_text_language(text) or self._effective_room_language(room),
@@ -20353,6 +20373,7 @@ class TalkinBot:
             }
             if event_type in failure_events:
                 blocked_room = _norm_room(room)
+                getattr(self, "_room_restore_candidates", set()).discard(blocked_room)
                 if any(_norm_room(item) == blocked_room for item in getattr(self, "connected_rooms", set())):
                     # A delayed/replayed rejection can arrive after the
                     # server has already emitted you_joined. The live ACK is
@@ -21488,6 +21509,9 @@ class TalkinBot:
             if self.room:
                 rooms_to_restore.add(str(self.room).strip())
         if rooms_to_restore:
+            self._room_restore_candidates = {
+                _norm_room(room_name) for room_name in rooms_to_restore if _norm_room(room_name)
+            }
             threading.Thread(
                 target=self._join_rooms_serially,
                 args=(sorted(rooms_to_restore), "", True),
