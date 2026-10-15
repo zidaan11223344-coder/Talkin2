@@ -4313,7 +4313,7 @@ class NewFeatureRegressions(unittest.TestCase):
 
 
 class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
-    def test_server_room_list_finishes_full_sync_and_starts_all_rooms(self):
+    def test_server_room_list_finishes_full_sync_without_starting_joins(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.blocked_rooms = set()
         bot.known_rooms = set()
@@ -4323,7 +4323,7 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         bot.send_private_text = lambda *_args: None
         bot.log = lambda *_args: None
         joined = []
-        bot._join_rooms_serially = lambda rooms, sender, fast, sync_id: joined.append((rooms, sender, fast, sync_id))
+        bot._join_rooms_serially = lambda *args: joined.append(args)
         class ImmediateThread:
             def __init__(self, target=None, args=(), **_kwargs):
                 self.target, self.args = target, args
@@ -4334,7 +4334,8 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         ):
             bot._process_room_list({"rooms": [{"name": "Room A"}, {"room": "Room B"}, {"title": "Room A"}]})
         self.assertIsNone(bot._pending_full_room_sync)
-        self.assertEqual(joined, [(["Room A", "Room B"], "Master", False, joined[0][3])])
+        self.assertEqual(joined, [])
+        self.assertEqual(bot._server_room_catalog, ["Room A", "Room B"])
         self.assertEqual(bot.known_rooms, {"Room A", "Room B"})
 
     def test_server_room_list_extracts_numeric_protobuf_room_fields(self):
@@ -4377,13 +4378,13 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         self.assertIn("Good", sent[0][1])
         self.assertIn("Bad: الغرفة محظورة", sent[0][1])
 
-    def test_enter_server_rooms_requests_server_list_before_joining(self):
+    def test_fetch_server_rooms_requests_server_list_without_joining(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._room_list_commands = lambda *_args: False
-        bot._request_full_room_sync = lambda sender, room, language=None: setattr(bot, "sync_request", (sender, room, language)) or True
+        bot._request_full_room_sync = lambda sender, room, language=None, join_after=False: setattr(bot, "sync_request", (sender, room, language, join_after)) or True
         bot.send_private_text = lambda *_args: None
         with patch.object(bot_module, "_is_master_name", return_value=True):
-            self.assertTrue(bot._handle_management_command_impl("", "دخول الغرف", "Master", is_private=True))
+            self.assertTrue(bot._handle_management_command_impl("", "جلب غرف السيرفر", "Master", is_private=True))
         self.assertEqual(bot.sync_request[0:2], ("Master", ""))
 
     def test_stock_room_wide_announcements_are_disabled_by_default(self):
