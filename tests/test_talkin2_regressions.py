@@ -1620,6 +1620,22 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 self.assertEqual(awards, ([ ("Player", 1_000_000_000) ] if won else []))
                 self.assertIn("تم الحصول على المليار" if won else "لم يحصل على المليار", sent[-1][1])
 
+    def test_master_can_open_and_close_million_and_billion_win_rates(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_list_commands = lambda *_args: False
+        replies = []
+        bot.send_private_text = lambda _user, text: replies.append(text)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            bot_module, "MONEY_GAME_SETTINGS_FILE", Path(temp_dir) / "money-settings.json"
+        ), patch.object(bot_module, "_is_master_name", return_value=True):
+            for command in ("فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار"):
+                self.assertTrue(bot._handle_management_command_impl("", command, "Master", is_private=True))
+            self.assertEqual(bot_module._load_local_json(bot_module.MONEY_GAME_SETTINGS_FILE, {}), {
+                "million": False, "billion": False,
+            })
+        self.assertIn("نسبة الربح الآن 30%", replies[0])
+        self.assertIn("عادت نسبة الربح إلى 3%", replies[1])
+
     def test_money_game_wins_are_separated_and_each_game_has_independent_persistent_gap(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
@@ -3652,6 +3668,10 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         bot._effective_room_language = lambda _room: "ar"
         bot._fun_room_members = lambda room, sender: ["MaleTarget", "FemaleTarget"]
         bot._picture_gender_hint = lambda name: "female" if name == "FemaleTarget" else "male"
+        bot.user_photos = {
+            "maletarget": "https://profiles.example/male.jpg",
+            "femaletarget": "https://profiles.example/female.jpg",
+        }
         bot._game_cooldown_notice = lambda *_args: True
         bot._game_public_image = lambda path, route="games": f"https://media.example/{route}/{path.name}"
         bot.log = lambda *_args: None
@@ -3669,9 +3689,11 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             first_man_photo = media[-1][1]
             self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مز"))
             second_man_photo = media[-1][1]
-        self.assertNotEqual(first_woman_photo, second_woman_photo)
-        self.assertNotEqual(first_man_photo, second_man_photo)
-        self.assertTrue(all("لا تمثل صورة العضو" in text for text in texts))
+        self.assertEqual(first_woman_photo, second_woman_photo)
+        self.assertEqual(first_man_photo, second_man_photo)
+        self.assertEqual(first_woman_photo, "https://profiles.example/female.jpg")
+        self.assertEqual(first_man_photo, "https://profiles.example/male.jpg")
+        self.assertTrue(all("صورة بروفايل العضو المختار" in text for text in texts))
         self.assertIn("@Player اصطاد مزه: @FemaleTarget", texts[0])
         self.assertIn("@Player اصطادت مز: @MaleTarget", texts[2])
         self.assertTrue(all(path.is_file() for paths in bot_module.SOCIAL_HUNT_IMAGE_FILES.values() for path in paths))
@@ -3680,7 +3702,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         with patch.object(bot_module.secrets, "choice", side_effect=lambda seq: seq[0]):
             self.assertTrue(bot._random_social_hunt_game("Hall", "Player", "صيد مزه"))
         self.assertIn("Beauty Hunt", texts[-1])
-        self.assertIn("not a picture of the selected member", texts[-1])
+        self.assertIn("selected member's profile photo", texts[-1])
         self.assertIn("@Player caught a beauty: @FemaleTarget", texts[-1])
         self.assertEqual(bot_module._normalize_game_command_text("hunt a beauty"), "صيد مزه")
         self.assertEqual(bot_module._normalize_game_command_text("my ex"), "طليقي")

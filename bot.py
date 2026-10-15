@@ -335,7 +335,9 @@ try:
     BILLION_GAME_COOLDOWN_SECONDS = max(1.0, float(os.getenv("BILLION_GAME_COOLDOWN_SECONDS", "60") or 60))
 except (TypeError, ValueError):
     BILLION_GAME_COOLDOWN_SECONDS = 60.0
-MONEY_GAME_WIN_CHANCE_PERCENT = 3
+MONEY_GAME_DEFAULT_WIN_CHANCE_PERCENT = 3
+MONEY_GAME_OPEN_WIN_CHANCE_PERCENT = 30
+MONEY_GAME_WIN_CHANCE_PERCENT = MONEY_GAME_DEFAULT_WIN_CHANCE_PERCENT
 MONEY_GAME_WIN_GAP_LOSSES = 1
 _MONEY_GAME_WIN_LOCK = threading.RLock()
 
@@ -753,6 +755,7 @@ FILTER_BANS_FILE = DATA_DIR / "filter_bans.json"
 BOT_BANS_FILE = DATA_DIR / "bot_bans.json"
 LAST_BOT_BANS_FILE = DATA_DIR / "last_bot_bans.json"
 MONEY_GAME_WIN_STATE_FILE = DATA_DIR / "money_game_win_state.json"
+MONEY_GAME_SETTINGS_FILE = DATA_DIR / "money_game_settings.json"
 PUBLISH_BANS_FILE = DATA_DIR / "publish_bans.json"
 PROTECTION_FILE = DATA_DIR / "room_protection.json"
 SNAKE_FILE = DATA_DIR / "snake_games.json"
@@ -1885,8 +1888,20 @@ def _save_local_json(path, data, *, persist_state_db=True):
     if github_save:
         github_save(path, data)
 
+def _set_money_game_open(game_name, enabled):
+    """Persist the master switch that raises a money game to 30% wins."""
+    game_name = str(game_name or "").strip().lower()
+    if game_name not in {"million", "billion"}:
+        raise ValueError("game_name must be million or billion")
+    settings = _load_local_json(MONEY_GAME_SETTINGS_FILE, {})
+    if not isinstance(settings, dict):
+        settings = {}
+    settings[game_name] = bool(enabled)
+    _save_local_json(MONEY_GAME_SETTINGS_FILE, settings)
+    return bool(enabled)
+
 def _money_game_roll(game_name):
-    """Roll a 3% money-game win with a persisted gap after each jackpot."""
+    """Roll a money-game win with a persisted gap after each jackpot."""
     game_name = str(game_name or "").strip().lower()
     if game_name not in {"million", "billion"}:
         raise ValueError("game_name must be million or billion")
@@ -1902,7 +1917,10 @@ def _money_game_roll(game_name):
             won = False
             forced_losses -= 1
         else:
-            won = secrets.randbelow(100) < MONEY_GAME_WIN_CHANCE_PERCENT
+            settings = _load_local_json(MONEY_GAME_SETTINGS_FILE, {})
+            is_open = isinstance(settings, dict) and bool(settings.get(game_name, False))
+            chance = MONEY_GAME_OPEN_WIN_CHANCE_PERCENT if is_open else MONEY_GAME_WIN_CHANCE_PERCENT
+            won = secrets.randbelow(100) < chance
             if won:
                 forced_losses = max(1, int(MONEY_GAME_WIN_GAP_LOSSES))
         state[game_name] = {
@@ -2748,7 +2766,7 @@ def _looks_like_bot_command(text):
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
@@ -2840,7 +2858,7 @@ def _looks_like_admin_command(text):
         ".u", "vi", "vi@", "vip", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
         "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق", "msb@", "-sb@",
         "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
-        "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
+        "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
     return low.startswith(prefixes)
 
@@ -15481,7 +15499,7 @@ class TalkinBot:
         return True
 
     def _random_social_hunt_game(self, room, sender, command):
-        """Pick a live room member and attach a generic, credited stock portrait."""
+        """Pick a live room member and send that member's profile photo."""
         english = self._effective_room_language(room) == "en"
         female_photo = str(command or "").strip() == "صيد مزه"
         requested_gender = "female" if female_photo else "male"
@@ -15508,17 +15526,10 @@ class TalkinBot:
         if not self._game_cooldown_notice(room, sender, 30.0, str(command)):
             return True
         target = secrets.choice(candidates)
-        photo_group = "woman" if female_photo else "man"
-        photo_key = (_norm_room(room), photo_group)
-        photo_pool = [path for path in SOCIAL_HUNT_IMAGE_FILES[photo_group] if path.is_file()]
-        photo_url = ""
-        if photo_pool:
-            with _SOCIAL_HUNT_PHOTO_LOCK:
-                last_photo = _SOCIAL_HUNT_LAST_PHOTO.get(photo_key)
-                choices = [path for path in photo_pool if path.name != last_photo] or photo_pool
-                photo_path = random.choice(choices)
-                _SOCIAL_HUNT_LAST_PHOTO[photo_key] = photo_path.name
-            photo_url = self._game_public_image(photo_path, route="assets")
+        target_key = _norm_user(target)
+        photo_url = str(getattr(self, "user_photos", {}).get(target_key, "") or "").strip()
+        if not photo_url:
+            photo_url = self._lookup_profile_photo(target)
         image_sent = False
         if photo_url:
             try:
@@ -15529,18 +15540,18 @@ class TalkinBot:
         if english:
             label = "Beauty Hunt" if female_photo else "Handsome Hunt"
             action = f"@{hunter_plain} caught a beauty: @{target_plain}" if female_photo else f"@{hunter_plain} caught a handsome man: @{target_plain}"
-            result = f"🎯 {label}!\n👤 {action}.\n🖼️ This is a generic game photo, not a picture of the selected member."
+            result = f"🎯 {label}!\n👤 {action}.\n🖼️ This is the selected member's profile photo."
             if not image_sent:
-                result += "\n⚠️ The photo could not be sent; check the public media URL."
+                result += "\n⚠️ No profile photo is available for this member."
         else:
             label_ar = "صيد المزة" if female_photo else "صيد المز"
             action = f"@{hunter_plain} اصطاد مزه: @{target_plain}" if female_photo else f"@{hunter_plain} اصطادت مز: @{target_plain}"
             result = (
                 f"🎯 {label_ar}!\n👤 {action}.\n"
-                "🖼️ الصورة عامة للعبة ولا تمثل صورة العضو المختار."
+                "🖼️ هذه صورة بروفايل العضو المختار."
             )
             if not image_sent:
-                result += "\n⚠️ تعذر إرسال الصورة؛ تحقق من رابط الوسائط العام."
+                result += "\n⚠️ لا توجد صورة بروفايل متاحة لهذا العضو."
         self.send_room_text(room, result)
         return True
 
@@ -17269,6 +17280,29 @@ class TalkinBot:
         text=str(body or "").strip()
         low=text.casefold()
         if self._room_list_commands(room, text, sender, is_private):
+            return True
+
+        money_toggle_commands = {
+            "فتح المليون": ("million", True, "المليون"),
+            "غلق المليون": ("million", False, "المليون"),
+            "فتح مليار": ("billion", True, "المليار"),
+            "غلق مليار": ("billion", False, "المليار"),
+            "فتح المليار": ("billion", True, "المليار"),
+            "غلق المليار": ("billion", False, "المليار"),
+        }
+        money_toggle = money_toggle_commands.get(low)
+        if money_toggle:
+            game_name, enabled, label = money_toggle
+            if not _is_master_name(sender):
+                self.send_private_text(sender, "🔒 أوامر فتح وإغلاق المليون والمليار مخصصة للماستر فقط.")
+                return True
+            _set_money_game_open(game_name, enabled)
+            self.send_private_text(
+                sender,
+                f"✅ تم فتح {label}. نسبة الربح الآن {MONEY_GAME_OPEN_WIN_CHANCE_PERCENT}%."
+                if enabled else
+                f"✅ تم غلق {label}. عادت نسبة الربح إلى {MONEY_GAME_WIN_CHANCE_PERCENT}%.",
+            )
             return True
 
         departure_toggle = re.fullmatch(r"(?:ds|توديع|وداع|farewell)@(on|off)", text, re.I)
