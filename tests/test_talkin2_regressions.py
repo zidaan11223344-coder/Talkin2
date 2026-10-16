@@ -2726,6 +2726,47 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
                 self.assertTrue(bot._handle_management_command_impl("North", command, "Player", is_private=True))
                 self.assertIn(expected, private[-1][1])
 
+    def test_points_top_shows_fifteen_and_points_summary_shows_full_file_rank(self):
+        accounts = {
+            f"Player{i}": {"username": f"Player{i}", "points": 2_000_000_000 - i * 10_000}
+            for i in range(1, 19)
+        }
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        private = []
+        bot.send_private_text = lambda user, text: private.append((user, text))
+        bot.send_room_text = lambda room, text: private.append((room, text))
+        with patch.object(bot_module, "_points_data", return_value=accounts), patch.object(
+            bot_module, "_get_points", return_value=2_000_000_000
+        ), patch.object(bot_module, "_game_level", return_value=(1551, "سيد الألعاب")):
+            self.assertTrue(bot._handle_management_command_impl("North", "توب النقاط", "Viewer", is_private=True))
+            top_message = private[-1][1]
+            self.assertIn("Player15", top_message)
+            self.assertNotIn("Player16", top_message)
+            summary = bot_module._points_summary_text("Player18")
+            top_summary = bot_module._points_summary_text("Player1")
+        self.assertIn("🏆 ترتيبك في ملف النقاط: #18", summary)
+        self.assertIn("🏆 ترتيب التوب: #1", top_summary)
+
+    def test_milyari_and_milyoni_commands_filter_current_point_balances(self):
+        accounts = {
+            "Billionaire": {"username": "Billionaire", "points": 1_500_000_000},
+            "Millionaire": {"username": "Millionaire", "points": 5_000_000},
+            "Below": {"username": "Below", "points": 999_999},
+        }
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        private = []
+        bot.send_private_text = lambda user, text: private.append((user, text))
+        bot.send_room_text = lambda room, text: private.append((room, text))
+        with patch.object(bot_module, "_points_data", return_value=accounts):
+            for command, included, excluded, title in (
+                ("ملياري", "@Billionaire", "@Millionaire", "توب الحاصلين على المليار"),
+                ("مليوني", "@Millionaire", "@Below", "توب الحاصلين على المليون"),
+            ):
+                self.assertTrue(bot._handle_management_command_impl("North", command, "Viewer", is_private=True))
+                self.assertIn(title, private[-1][1])
+                self.assertIn(included, private[-1][1])
+                self.assertNotIn(excluded, private[-1][1])
+
     def test_image_publish_schedules_worker_and_returns_without_waiting(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         sender = "publisher"
@@ -3401,7 +3442,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertEqual(bot_module._parse_stock_market_order("land 50000"), (4, 50000))
         self.assertIsNone(bot_module._parse_stock_market_order("market tomorrow"))
 
-    def test_manual_stock_command_opens_immediately_and_announces_to_all_rooms(self):
+    def test_manual_stock_command_opens_immediately_for_ten_minutes(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.stock_pending = {}
         bot.stock_investments = []
@@ -3431,11 +3472,11 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         for asset in ("ذهب", "فضة", "نفط", "أرض"):
             self.assertIn(asset, sent[0][1])
         self.assertIn("100000", sent[0][1])
-        self.assertEqual(bot.stock_market_round["ends_at"], 1_900.0)
-        self.assertEqual(bot._stock_market_next_announcement, 1_900.0)
+        self.assertEqual(bot.stock_market_round["ends_at"], 1_600.0)
+        self.assertEqual(bot._stock_market_next_announcement, 1_600.0)
         self.assertEqual(bot.stock_pending[(bot_module._norm_room("ArabicHall"), bot_module._norm_user("Player"))]["kind"], "market_choice")
 
-    def test_stock_investment_has_two_minute_cooldown_across_rounds(self):
+    def test_stock_investment_has_two_minute_cooldown_and_repeats_within_round(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._stock_market_lock = threading.RLock()
         bot.stock_market_round = {"id": 1, "started_at": 0.0, "ends_at": 5_000.0}
@@ -3455,13 +3496,14 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once):
             with patch.object(bot_module.time, "time", return_value=1_000.0):
                 bot._stock_market_invest("Market", "Player", 1, 100, expected_round_id=1)
-            bot.stock_market_round = {"id": 2, "started_at": 1_050.0, "ends_at": 5_000.0}
             with patch.object(bot_module.time, "time", return_value=1_100.0):
-                bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=2)
+                bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=1)
             with patch.object(bot_module.time, "time", return_value=1_120.0):
-                bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=2)
-        self.assertEqual([row[1] for row in point_ops], [-100, -100])
-        self.assertEqual(len(bot.stock_investments), 2)
+                bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=1)
+            with patch.object(bot_module.time, "time", return_value=1_240.0):
+                bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=1)
+        self.assertEqual([row[1] for row in point_ops], [-100, -100, -100])
+        self.assertEqual(len(bot.stock_investments), 3)
         self.assertTrue(any("2-minute cooldown" in text for _, text in messages))
 
     def test_stock_investment_settles_profit_or_loss_after_one_minute(self):
@@ -3514,8 +3556,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 self.assertTrue(point_ops[1][2].startswith("stock-market-payout:"))
                 self.assertFalse(bot.stock_investments)
                 result_by_room = dict(messages)
-                self.assertEqual(set(result_by_room), {"ArabicHall"})
-                self.assertNotIn("نتيجة البورصة", result_by_room["ArabicHall"])
+                self.assertEqual(set(result_by_room), {"ArabicHall", "EnglishHall"})
+                self.assertIn("نتيجة البورصة", result_by_room["ArabicHall"])
+                self.assertIn("Stock-market result", result_by_room["EnglishHall"])
                 result = private_messages[0][1]
                 self.assertIn(f"{expected_percent}%", result)
                 self.assertIn("الخسارة" if outcome == "loss" else "الربح", result)
@@ -4352,6 +4395,35 @@ class NewFeatureRegressions(unittest.TestCase):
 
 
 class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
+    def test_join_timeout_reports_success_when_room_is_already_connected(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._pending_room_joins = {"syria": {"room": "سورياالحب", "requested_by": "Master"}}
+        bot.connected_rooms = {"سورياالحب"}
+        bot.known_rooms = set()
+        bot.send_private_text = lambda user, text: sent.append((user, text))
+        bot.log = lambda *_args: None
+        sent = []
+        with patch.object(bot_module, "_save_persistent_rooms"):
+            bot._join_timeout("syria")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("✅ تم دخول البوت إلى الغرفة", sent[0][1])
+        self.assertIn("سورياالحب", bot.known_rooms)
+        self.assertEqual(bot.connected_rooms, {"سورياالحب"})
+
+    def test_server_room_catalog_alone_does_not_claim_join_succeeded(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._pending_room_joins = {"syria": {"room": "سورياالحب", "requested_by": "Master"}}
+        bot.connected_rooms = set()
+        bot.known_rooms = {"سورياالحب"}
+        bot._server_room_catalog = ["سورياالحب"]
+        bot.send_private_text = lambda user, text: sent.append((user, text))
+        bot.log = lambda *_args: None
+        sent = []
+        with patch.object(bot_module, "_save_persistent_rooms"):
+            bot._join_timeout("syria")
+        self.assertIn("❌ لم يتم دخول البوت إلى الغرفة", sent[0][1])
+        self.assertNotIn("سورياالحب", bot.known_rooms)
+
     def test_server_room_list_finishes_full_sync_without_starting_joins(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.blocked_rooms = set()
@@ -4438,15 +4510,9 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         self.assertTrue(any("لا يوجد اتصال" in text for text in sent))
         self.assertFalse(any("SavedRoom" in text for text in sent))
 
-    def test_stock_room_wide_announcements_are_disabled_by_default(self):
-        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
-        bot.log = lambda *_args: None
-        sent = []
-        bot.send_room_text = lambda room, text: sent.append((room, text))
-        with patch.object(bot_module, "STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED", False):
-            bot._queue_stock_market_round_broadcast(["Room A", "Room B"])
-            bot._broadcast_stock_market_result("Player", "Room A", 1, 100, "profit", 10, 10)
-        self.assertEqual(sent, [])
+    def test_stock_round_announcements_are_enabled_by_default(self):
+        self.assertTrue(bot_module.STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED)
+        self.assertEqual(bot_module.STOCK_MARKET_INTERVAL_SECONDS, 600.0)
 
 
 if __name__ == "__main__":

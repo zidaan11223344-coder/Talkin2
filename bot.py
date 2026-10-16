@@ -342,9 +342,9 @@ MONEY_GAME_WIN_GAP_LOSSES = 1
 _MONEY_GAME_WIN_LOCK = threading.RLock()
 
 try:
-    STOCK_MARKET_INTERVAL_SECONDS = max(60.0, float(os.getenv("STOCK_MARKET_INTERVAL_SECONDS", "900") or 900))
+    STOCK_MARKET_INTERVAL_SECONDS = max(60.0, float(os.getenv("STOCK_MARKET_INTERVAL_SECONDS", "600") or 600))
 except (TypeError, ValueError):
-    STOCK_MARKET_INTERVAL_SECONDS = 900.0
+    STOCK_MARKET_INTERVAL_SECONDS = 600.0
 try:
     STOCK_MARKET_SETTLEMENT_SECONDS = max(1.0, float(os.getenv("STOCK_MARKET_SETTLEMENT_SECONDS", "60") or 60))
 except (TypeError, ValueError):
@@ -353,9 +353,8 @@ try:
     STOCK_MARKET_PLAYER_COOLDOWN_SECONDS = max(0.0, float(os.getenv("STOCK_MARKET_PLAYER_COOLDOWN_SECONDS", "120") or 120))
 except (TypeError, ValueError):
     STOCK_MARKET_PLAYER_COOLDOWN_SECONDS = 120.0
-# Market investments remain available on request, but periodic/cross-room
-# announcements are disabled by default so they cannot flood every room.
-STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED = os.getenv("STOCK_MARKET_ROOM_ANNOUNCEMENTS", "0").strip().casefold() in {"1", "true", "yes", "on"}
+# Open the market and announce each round every 10 minutes by default.
+STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED = os.getenv("STOCK_MARKET_ROOM_ANNOUNCEMENTS", "1").strip().casefold() in {"1", "true", "yes", "on"}
 try:
     FISHING_SHOT_COOLDOWN_SECONDS = max(0.0, float(os.getenv("FISHING_SHOT_COOLDOWN_SECONDS", "120") or 120))
 except (TypeError, ValueError):
@@ -2799,7 +2798,7 @@ def _looks_like_bot_command(text):
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "هدايا", "gifts", "gv", "sher@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "ملياري", "مليوني", "هدايا", "gifts", "gv", "sher@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
@@ -3342,7 +3341,7 @@ def _game_star_rank(username):
         if plays:
             rows.append((level, plays, canonical, name))
     rows.sort(key=lambda row: (-row[0], -row[1], row[2]))
-    for rank, row in enumerate(rows[:10], 1):
+    for rank, row in enumerate(rows[:15], 1):
         if row[2] == _game_name_key(username):
             return rank
     return None
@@ -3363,7 +3362,7 @@ def _game_top10():
         )
     rows = list(rows_by_name.values())
     rows.sort(key=lambda row: (-row[0], -row[2], _norm_user(row[3])))
-    return rows[:10]
+    return rows[:15]
 
 
 def _game_top10_message():
@@ -3388,7 +3387,7 @@ def _save_game_levels_snapshot():
             ranked.append((level, plays, canonical, username))
     ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
     ranks = {canonical: index for index, (_level, _plays, canonical, _name)
-             in enumerate(ranked[:10], 1)}
+             in enumerate(ranked[:15], 1)}
     for canonical, item in aggregates.items():
         level, label, plays = _game_level_from_item(item)
         if plays:
@@ -3541,7 +3540,7 @@ def _game_level(username):
     return plays, label
 
 
-def _game_top(game_key, limit=10):
+def _game_top(game_key, limit=15):
     unique = {}
     for key, item in _game_stats_data().items():
         if not isinstance(item, dict): continue
@@ -4070,16 +4069,60 @@ DEFAULT_REPLY_MESSAGES = {
 }
 
 
+POINTS_LEADERBOARD_LIMIT = 15
+
+
+def _points_leaderboard_rows(min_balance=None):
+    """Return one deduplicated row per player, ordered by saved point balance."""
+    unique = {}
+    for key, value in _points_data().items():
+        if not isinstance(value, dict):
+            continue
+        username = str(value.get("username") or key or "").strip().lstrip("@")
+        canonical = _game_name_key(username)
+        if not canonical or _is_configured_master_account(username):
+            continue
+        points = _points_balance(value)
+        if min_balance is not None and points < int(min_balance):
+            continue
+        previous = unique.get(canonical)
+        if previous is None:
+            unique[canonical] = (points, username)
+        else:
+            unique[canonical] = (
+                max(points, previous[0]),
+                _preferred_display_name(previous[1], username),
+            )
+    rows = list(unique.values())
+    rows.sort(key=lambda item: (-item[0], _game_name_key(item[1])))
+    return rows
+
+
+def _points_rank(username):
+    """Return the player's one-based position in the full points-file ranking."""
+    wanted = _game_name_key(username)
+    if not wanted:
+        return None
+    for rank, (_points, display_name) in enumerate(_points_leaderboard_rows(), 1):
+        if _game_name_key(display_name) == wanted:
+            return rank
+    return None
+
+
 def _points_summary_text(username):
     # اعرض الرصيد المخزن للماستر مثل بقية المستخدمين. صلاحية النقاط
     # غير المحدودة تبقى مخفية وتُطبق فقط داخل منطق الألعاب/العمليات.
     pts = _get_points(username)
     plays, level = _game_level(username)
+    rank = _points_rank(username)
+    rank_text = f"#{rank}" if rank is not None else "غير موجود في ملف النقاط"
+    rank_label = "🏆 ترتيب التوب" if rank is not None and rank <= POINTS_LEADERBOARD_LIMIT else "🏆 ترتيبك في ملف النقاط"
     return (f"╭━━━〔 💎 نقاطي 〕━━━╮\n"
             f"┃ 👤 @{str(username).strip().lstrip('@')}\n"
             f"┃ 💰 الرصيد: {_fmt_points(pts)}\n"
             f"┃ ⭐ المستوى: {level}\n"
             f"┃ 🎮 مرات اللعب: {plays}\n"
+            f"┃ {rank_label}: {rank_text}\n"
             f"╰━━━━━━━━━━━━━━╯")
 
 def _ensure_replies_file():
@@ -7233,18 +7276,18 @@ class TalkinBot:
             return
         room = str(pending.get("room") or room_norm).strip()
         requester = str(pending.get("requested_by") or "").strip()
-        catalog = {
-            _norm_room(item) for item in getattr(self, "_server_room_catalog", [])
-            if str(item).strip()
-        }
-        if requester and _norm_room(room) in catalog:
-            # A complete server-room list is an authoritative membership
-            # snapshot. Some gateways deliver the you_joined event late, so a
-            # timer must not turn a successful room entry into a false error.
-            self.connected_rooms.add(room)
+        connected = any(
+            _norm_room(item) == _norm_room(room)
+            for item in getattr(self, "connected_rooms", set())
+            if str(item or "").strip()
+        )
+        if connected:
+            # The live session state is authoritative. Never send a timeout
+            # failure for a room that this bot has already entered.
             self.known_rooms.add(room)
             _save_persistent_rooms(self.known_rooms)
-            self.send_private_text(requester, f"✅ تم تأكيد وجود البوت في الغرفة: {room}")
+            if requester:
+                self.send_private_text(requester, f"✅ تم دخول البوت إلى الغرفة: {room}")
             return
         self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
@@ -7253,9 +7296,8 @@ class TalkinBot:
         if requester:
             self.send_private_text(
                 requester,
-                f"⚠️ تعذر تأكيد دخول البوت إلى الغرفة: {room}. "
-                "قد يكون البوت محظوراً من الغرفة أو تحتاج الغرفة إلى صلاحية مشرف/أونر. "
-                "تحقق من صلاحية البوت ثم أعد المحاولة.",
+                f"❌ لم يتم دخول البوت إلى الغرفة: {room}. "
+                "انتهت مهلة التأكيد ولم يظهر اتصال البوت بها؛ تحقق من صلاحياته ثم أعد المحاولة.",
             )
 
     def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
@@ -13703,8 +13745,8 @@ class TalkinBot:
 
     def _stock_market_announcement(self, language):
         if language == "en":
-            return "📈 Stock market is open! Type stock, choose an asset and amount. Result in 1 minute: profit or loss."
-        return "📈 بدأت البورصة! أرسل بورصة، واختر الأصل والمبلغ. النتيجة بعد دقيقة: ربح أو خسارة."
+            return "📈 Stock market is open! Type stock, choose an asset and amount. You can invest again every 2 minutes. Result in 1 minute: profit or loss."
+        return "📈 بدأت البورصة! أرسل بورصة، واختر الأصل والمبلغ. يمكنك الاستثمار مجدداً كل دقيقتين. النتيجة بعد دقيقة: ربح أو خسارة."
 
     def _broadcast_stock_market_round(self, rooms):
         for target_room in rooms:
@@ -13731,12 +13773,12 @@ class TalkinBot:
             return (
                 "📈 Stock market\n1️⃣ 🥇 Gold  2️⃣ 🥈 Silver  3️⃣ 🛢️ Oil  4️⃣ 🏞️ Land\n"
                 "Send a number then the amount, or type `gold 100000`.\n"
-                "⏱️ Result in 1 minute: 1–20% profit or loss.\n⏳ 2-minute cooldown between investments."
+                "⏱️ Result in 1 minute: 1–20% profit or loss.\n⏳ You can invest again every 2 minutes."
             )
         return (
             "📈 البورصة\n1️⃣ 🥇 ذهب  2️⃣ 🥈 فضة  3️⃣ 🛢️ نفط  4️⃣ 🏞️ أرض\n"
             "أرسل رقم الخيار ثم المبلغ، أو اكتب `ذهب 100000`.\n"
-            "⏱️ النتيجة بعد دقيقة: ربح أو خسارة من 1% إلى 20%.\n⏳ فاصل دقيقتين بين كل استثمار."
+            "⏱️ النتيجة بعد دقيقة: ربح أو خسارة من 1% إلى 20%.\n⏳ يمكنك الاستثمار مجدداً كل دقيقتين."
         )
 
     def _stock_market_is_open(self, now=None):
@@ -13827,29 +13869,24 @@ class TalkinBot:
                 if closed:
                     investment = None
                 else:
-                    seen_key = (str(round_id), user_key)
-                    if seen_key in self._stock_market_seen:
-                        duplicate = True
-                        investment = None
-                    else:
-                        duplicate = False
-                        previous_cooldown_present = user_key in cooldowns
-                        previous_cooldown = cooldowns.get(user_key)
-                        cooldowns[user_key] = now
-                        self._stock_market_user_cooldowns = cooldowns
-                        investment = {
-                            "id": uuid.uuid4().hex,
-                            "event_id": round_id,
-                            "username": str(sender).strip().lstrip("@"),
-                            "room": str(room or ""),
-                            "asset": asset,
-                            "amount": amount,
-                            "started_at": now,
-                            "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
-                            "status": "pending_debit",
-                        }
-                        self.stock_investments.append(investment)
-                        self._stock_market_seen.add(seen_key)
+                    previous_cooldown_present = user_key in cooldowns
+                    previous_cooldown = cooldowns.get(user_key)
+                    cooldowns[user_key] = now
+                    self._stock_market_user_cooldowns = cooldowns
+                    investment = {
+                        "id": uuid.uuid4().hex,
+                        "event_id": round_id,
+                        "username": str(sender).strip().lstrip("@"),
+                        "room": str(room or ""),
+                        "asset": asset,
+                        "amount": amount,
+                        "started_at": now,
+                        "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
+                        "status": "pending_debit",
+                    }
+                    self.stock_investments.append(investment)
+                    # A player may invest repeatedly during the same market round;
+                    # the two-minute cooldown is the only per-player restriction.
         if cooldown_remaining > 0:
             seconds = max(1, int(cooldown_remaining + 0.999))
             text = (
@@ -13917,9 +13954,9 @@ class TalkinBot:
             self.log("[STOCK] active state save deferred; recovery will reconcile:", repr(exc))
         data = STOCK_MARKET_ASSETS[asset]
         if language == "en":
-            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss."
+            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss.\n⏳ You can invest again in 2 minutes."
         else:
-            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة."
+            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة.\n⏳ يمكنك الاستثمار مجدداً بعد دقيقتين."
         self.send_room_text(room, text)
         return True
 
@@ -18225,6 +18262,30 @@ class TalkinBot:
                            f"🎟️ إجمالي الرهانات: {_fmt_points(stats['staked'])}")
             (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room, message)
             return True
+        balance_top_aliases = {
+            "ملياري": (1_000_000_000, "المليار"),
+            "مليوني": (1_000_000, "المليون"),
+        }
+        if low in balance_top_aliases:
+            threshold, label = balance_top_aliases[low]
+            rows = _points_leaderboard_rows(min_balance=threshold)[:POINTS_LEADERBOARD_LIMIT]
+            english = _detect_text_language(text) == "en"
+            title = f"🏆 Top players with {label}" if english else f"🏆 توب الحاصلين على {label} نقطة"
+            lines = [title, "━━━━━━━━━━━━"]
+            for rank, (points, username) in enumerate(rows, 1):
+                medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}️⃣")
+                lines.append(
+                    f"{medal} @{username} — {_fmt_points(points)} points" if english
+                    else f"{medal} @{username} — {_fmt_points(points)} نقطة"
+                )
+            if not rows:
+                lines.append("No qualifying players yet." if english else "لا يوجد لاعبون وصلوا لهذا الرصيد بعد.")
+            message = "\n".join(lines)
+            if is_private:
+                self.send_private_text(sender, message)
+            else:
+                self.send_room_text(room, message)
+            return True
         game_top_aliases = {
             "توب المليار": ("billion", "المليار"), "توب مليار": ("billion", "المليار"),
             "top b": ("billion", "Billion"), "topb": ("billion", "Billion"),
@@ -18271,36 +18332,10 @@ class TalkinBot:
                     return {1:"🥇",2:"🥈",3:"🥉"}.get(i, f"{i}️⃣")
                 msg=f"🏆 توب {game_label}\n━━━━━━━━━━━━\n" + ("\n".join(f"{_top_medal(i)} {str(u).strip().lstrip('@')} — {_fmt_points(p)} نقطة | {pl} لعب" for i,(p,st,pl,u) in enumerate(rows,1)) if rows else "لا توجد نتائج بعد.")
             else:
-                data=_points_data(); unique={}
-                for key, value in data.items():
-                    if not isinstance(value, dict):
-                        continue
-                    username = str(value.get("username") or key or "").strip().lstrip("@")
-                    if _is_configured_master_account(username):
-                        continue
-                    canonical = _game_name_key(username)
-                    if not canonical:
-                        continue
-                    try:
-                        points = int(value.get("points", 0) or 0)
-                    except Exception:
-                        continue
-                    # Old point files can contain several decorated spellings
-                    # of one account. They are snapshots, not separate users;
-                    # keep the largest balance and one display name.
-                    previous = unique.get(canonical)
-                    if previous is None:
-                        unique[canonical] = (points, username)
-                    else:
-                        unique[canonical] = (
-                            max(points, previous[0]),
-                            _preferred_display_name(previous[1], username),
-                        )
-                rows=list(unique.values())
-                rows.sort(key=lambda item: (-item[0], _game_name_key(item[1])))
+                rows = _points_leaderboard_rows()[:POINTS_LEADERBOARD_LIMIT]
                 def _top_medal(i):
                     return {1:"🥇",2:"🥈",3:"🥉"}.get(i, f"{i}️⃣")
-                msg="🏆 توب النقاط\n━━━━━━━━━━━━\n"+"\n".join(f"{_top_medal(i)} {str(u).strip().lstrip('@')} — {_fmt_points(p)}" for i,(p,u) in enumerate(rows[:10],1)) if rows else "🏆 لا توجد نقاط بعد."
+                msg="🏆 توب النقاط\n━━━━━━━━━━━━\n"+"\n".join(f"{_top_medal(i)} {str(u).strip().lstrip('@')} — {_fmt_points(p)}" for i,(p,u) in enumerate(rows,1)) if rows else "🏆 لا توجد نقاط بعد."
             if is_private: self.send_private_text(sender,msg)
             else: self.send_room_text(room,msg)
             return True
@@ -20060,7 +20095,13 @@ class TalkinBot:
         frm = str(event.get(2, ""))
         to = str(event.get(3, ""))
         body = str(event.get(6, ""))
-        room = str(event.get(13, self.room))
+        room = str(event.get(13) or self.room or "").strip()
+        # Receiving an actual room text event proves this session can see that
+        # room, even if the server omitted/reordered the explicit join ack.
+        if room and event_type == "text":
+            if not hasattr(self, "connected_rooms") or not isinstance(self.connected_rooms, set):
+                self.connected_rooms = set()
+            self.connected_rooms.add(room)
         if body:
             self._remember_inflight_command(room, body, frm, is_private=False)
         if room and room != BOT_MASTER and _norm_room(room) not in getattr(self, "blocked_rooms", set()):
@@ -21156,8 +21197,44 @@ class TalkinBot:
                 if ROOM_EVENT_DEBUG:
                     self.log("[ROOM_ADMIN]", result["room_admin"])
             if result.get("chat_message"):
-                # Private master commands are also accepted as ChatMessage frames.
                 cm = result["chat_message"]
+                # Some server versions wrap room chat as ChatMessage. Route it
+                # through the same room handler using the embedded room field;
+                # never infer a room for genuine private messages.
+                if not result.get("room_event") and isinstance(cm, dict):
+                    cm_room = str(cm.get(4, "") or cm.get(13, "") or "").strip()
+                    live_rooms = {
+                        _norm_room(value) for value in getattr(self, "connected_rooms", set())
+                        if str(value or "").strip()
+                    }
+                    # An inbound user message can arrive before the explicit
+                    # join acknowledgement; a known room identity confirms
+                    # this session can see that room.
+                    candidate_rooms = set(live_rooms)
+                    candidate_rooms.update(
+                        _norm_room(value) for value in getattr(self, "known_rooms", set())
+                        if str(value or "").strip()
+                    )
+                    try:
+                        candidate_rooms.update(
+                            _norm_room(value) for value in self._active_rooms()
+                            if str(value or "").strip()
+                        )
+                    except Exception:
+                        pass
+                    if cm_room and _norm_room(cm_room) in candidate_rooms:
+                        connected = getattr(self, "connected_rooms", None)
+                        if not isinstance(connected, set):
+                            connected = set()
+                            self.connected_rooms = connected
+                        connected.add(cm_room)
+                        self.handle_room_event({"room_event": {
+                            1: "text", 2: str(cm.get(3, "") or ""),
+                            6: str(cm.get(5, "") or ""), 13: cm_room,
+                            41: str(cm.get(41, "") or ""),
+                        }})
+                        return
+                # Private master commands are also accepted as ChatMessage frames.
                 try:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
