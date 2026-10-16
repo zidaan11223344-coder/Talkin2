@@ -7241,14 +7241,9 @@ class TalkinBot:
         target = str(target or "").strip()
         room = str(room or "").strip()
         username = str(username or target or "").strip().lstrip("@")
-        master_display = os.getenv("MASTER_DISPLAY_NAME", "").strip()
-        is_master_display = bool(username) and (
-            _is_configured_master_account(username)
-            or (master_display and _norm_user(username) == _norm_user(master_display))
-        )
         notice = (
             f"👤 @{username} تم تجاهل رسالتك بسبب حجم كبير."
-            if username and not is_master_display
+            if username
             else "👤 اسم المستخدم تم تجاهل رسالتك بسبب حجم كبير."
         )
         if packet_type == "chat_message" and target:
