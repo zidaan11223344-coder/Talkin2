@@ -16604,7 +16604,10 @@ class TalkinBot:
                 )
 
         join_command = bool(re.match(r"^(?:دخول|join)\s*@\s*.+$", str(body or "").strip(), re.I))
-        join_all_command = str(body or "").strip().casefold() in {"دخول الكل", "دخولكل", "join all"}
+        join_all_command = str(body or "").strip().casefold() in {
+            "دخول الكل", "دخولكل", "دخول الغرف", "دخول غرف السيرفر",
+            "دخول كل غرف السيرفر", "join all", "join server rooms",
+        }
         verification_manager_command = _is_verification_manager_command(body) or str(body or "").strip().casefold() in {
             "vi", "vip", "ماستر توثيق"
         }
@@ -18826,12 +18829,16 @@ class TalkinBot:
             self._request_full_room_sync(sender, room, language=_detect_text_language(text) or self._effective_room_language(room), join_after=False)
             return True
         if low in ("دخول الغرف", "دخول غرف السيرفر", "دخول كل غرف السيرفر", "join server rooms"):
-            catalog = [str(item).strip() for item in getattr(self, "_server_room_catalog", []) if str(item).strip()]
-            if not catalog:
-                self.send_private_text(sender, "📭 لا توجد قائمة غرف سيرفر مجلوبة حالياً. أرسل أولاً: جلب غرف السيرفر")
-                return True
-            self.send_private_text(sender, f"🚪 بدأ دخول غرف السيرفر المجلوبة ({len(catalog)} غرفة) بالتتالي...")
-            self._start_server_room_join(catalog, sender)
+            # Match Talkin1: fetch the authoritative catalog and then join it
+            # serially in one operation. The old two-command flow could report
+            # "no catalog" even though the server had already returned rooms.
+            if not is_private:
+                self.send_room_text(room, "⏳ جاري جلب غرف السيرفر ثم دخولها بالتتابع؛ سأرسل النتيجة الفعلية في الخاص.")
+            self._request_full_room_sync(
+                sender, room,
+                language=_detect_text_language(text) or self._effective_room_language(room),
+                join_after=True,
+            )
             return True
         if low in ("غرفي", "غرفيّ", "myrooms", "my rooms"):
             blocked = getattr(self, "blocked_rooms", set())
@@ -20935,9 +20942,18 @@ class TalkinBot:
         walk(rooms)
         blocked = getattr(self, "blocked_rooms", set())
         found = {room for room in found if _norm_room(room) not in blocked}
+        # An empty list is still a real server response. Finish an explicit
+        # sync immediately instead of misreporting a timeout later.
         if not found:
+            pending = getattr(self, "_pending_full_room_sync", None)
+            if isinstance(pending, dict):
+                self._finish_full_room_sync(
+                    [], from_server=True,
+                    join_after=bool(pending.get("join_after")),
+                )
             return
         self.log("[ROOM-LIST] loaded", len(found), "rooms")
+        self._server_room_catalog = sorted(found, key=str.casefold)
         # Keep every server-returned room so reconnect and `غرفي` use the
         # authoritative list instead of the truncated local view.
         self.known_rooms.update(found)

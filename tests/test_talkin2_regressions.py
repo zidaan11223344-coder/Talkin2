@@ -1706,6 +1706,25 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(joined, [(["North", "South"], "Master")])
         self.assertIn("2 غرفة", sent[-1])
 
+    def test_enter_server_rooms_fetches_then_joins_in_one_operation(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.known_rooms = set()
+        bot._room_list_commands = lambda *_args: False
+        bot._effective_room_language = lambda _room: "ar"
+        requested = []
+        bot._request_full_room_sync = lambda sender, room, language=None, join_after=False: requested.append(
+            (sender, room, language, join_after)
+        ) or True
+        bot.send_private_text = lambda *_args: None
+        with patch.object(bot_module, "_is_primary_master", return_value=True), patch.object(
+            bot_module, "_is_master_name", return_value=True
+        ):
+            self.assertTrue(
+                bot._handle_management_command_impl("", "دخول الغرف", "Master", is_private=True)
+            )
+        self.assertEqual(requested, [("Master", "", "ar", True)])
+
     def test_fast_room_restore_sends_all_rooms_without_waiting_for_ack(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.connected_rooms = set()
@@ -4448,6 +4467,21 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         self.assertEqual(joined, [])
         self.assertEqual(bot._server_room_catalog, ["Room A", "Room B"])
         self.assertEqual(bot.known_rooms, {"Room A", "Room B"})
+
+    def test_empty_server_room_list_is_reported_as_a_real_response(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.blocked_rooms = set()
+        bot.known_rooms = set()
+        bot._pending_full_room_sync = {
+            "token": "x", "sender": "Master", "room": "", "join_after": True
+        }
+        bot.log = lambda *_args: None
+        finished = []
+        bot._finish_full_room_sync = lambda rooms, from_server=False, join_after=False: finished.append(
+            (rooms, from_server, join_after)
+        ) or True
+        bot._process_room_list({"rooms": []})
+        self.assertEqual(finished, [([], True, True)])
 
     def test_server_room_list_extracts_numeric_protobuf_room_fields(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
