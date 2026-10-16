@@ -4170,6 +4170,62 @@ def _points_threshold_top_message(threshold, label, *, english=False, limit=POIN
     return "\n".join(lines)
 
 
+def _safe_text_pages_from_items(packet_type, route_fields, heading_lines, item_lines, *, max_items_per_page=None, language="ar"):
+    """Build numbered list pages whose complete protobuf packets fit the WS limit."""
+    limit = _ws_payload_limit()
+    english = str(language or "ar").casefold() == "en"
+    marker = "📄 List" if english else "📄 القائمة"
+    next_footer = "\n\n📌 Type ns for the next list." if english else "\n\n📌 اكتب ns للقائمة التالية."
+
+    def render(items, page_no, total):
+        return "\n".join([
+            *[str(line) for line in heading_lines],
+            f"{marker} {page_no}/{total}",
+            *items,
+        ])
+
+    def packet_size(text):
+        fields = dict(route_fields or {})
+        fields.update({"type_": "text", "body": text})
+        return len(encode_query(packet_type, **fields))
+
+    def fits(items):
+        # The largest plausible marker plus the longer continuation footer
+        # reserves enough bytes for the final page number and navigation.
+        probe = render(items, "999999", "999999") + next_footer
+        return packet_size(probe) <= limit
+
+    def shorten_line(line):
+        if fits([line]):
+            return line
+        low, high = 0, len(line)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = line[:middle].rstrip() + "…"
+            if fits([candidate]):
+                low = middle
+            else:
+                high = middle - 1
+        return line[:low].rstrip() + "…"
+
+    item_pages = []
+    current = []
+    for raw_item in item_lines:
+        item = str(raw_item)
+        count_full = max_items_per_page and len(current) >= int(max_items_per_page)
+        if current and (count_full or not fits(current + [item])):
+            item_pages.append(current)
+            current = []
+        if not fits(current + [item]):
+            item = shorten_line(item)
+        current.append(item)
+    if current or not item_pages:
+        item_pages.append(current)
+
+    total = len(item_pages)
+    return [render(page, page_no, total) for page_no, page in enumerate(item_pages, 1)]
+
+
 def _points_rank(username):
     """Return the player's one-based position in the full points-file ranking."""
     wanted = _game_name_key(username)
@@ -16637,17 +16693,18 @@ class TalkinBot:
                             and candidate_key[2] == str(sender or "")):
                         result_key, result_state = candidate_key, candidate_state
                         break
-            if result_state:
-                pages = result_state.get("pages") or []
-                part = int(result_state.get("part", 1) or 1)
-                if part < len(pages):
-                    part += 1
-                    result_state["part"] = part
-                    chunk = pages[part - 1]
+                if result_state:
+                    pages = result_state.get("pages") or []
+                    part = int(result_state.get("part", 1) or 1)
+                    result_english = str(result_state.get("language") or "ar").casefold() == "en"
                     if part < len(pages):
-                        chunk += "\n\n📌 للقائمة التالية اكتب Ns"
-                    else:
-                        chunk += "\n\n✅ انتهت القوائم."
+                        part += 1
+                        result_state["part"] = part
+                        chunk = pages[part - 1]
+                        if part < len(pages):
+                            chunk += "\n\n📌 Type ns for the next list." if result_english else "\n\n📌 للقائمة التالية اكتب ns"
+                        else:
+                            chunk += "\n\n✅ End of list." if result_english else "\n\n✅ انتهت القوائم."
                     payload = dict(result_state.get("kwargs") or {})
                     payload["type_"] = "text"
                     payload["body"] = chunk
@@ -18396,6 +18453,7 @@ class TalkinBot:
         balance_top_aliases = {
             "ملياري": (1_000_000_000, "المليار"),
             "مليارات": (1_000_000_000, "المليار"),
+            "مليارت": (1_000_000_000, "المليار"),
             "مليوني": (1_000_000, "المليون"),
             "ملايين": (1_000_000, "المليون"),
         }
@@ -18403,10 +18461,17 @@ class TalkinBot:
             threshold, label = balance_top_aliases[low]
             english = _detect_text_language(text) == "en"
             message = _points_threshold_top_message(threshold, label, english=english)
-            if is_private:
-                self.send_private_text(sender, message)
-            else:
-                self.send_room_text(room, message)
+            lines = message.splitlines()
+            packet_type = "chat_message" if is_private else "room_message"
+            route_fields = {"to": str(sender or "")} if is_private else {"room": str(room or "")}
+            pages = _safe_text_pages_from_items(
+                packet_type, route_fields, lines[:2], lines[2:],
+                language="en" if english else "ar",
+            )
+            self._send_paginated_text_pages(
+                sender, room, packet_type, pages, route_fields,
+                language="en" if english else "ar",
+            )
             return True
         game_top_aliases = {
             "توب المليار": ("billion", "المليار"), "توب مليار": ("billion", "المليار"),
@@ -21089,8 +21154,40 @@ class TalkinBot:
                 join_after=bool(pending.get("join_after")),
             )
 
+    def _send_paginated_text_pages(self, sender, room, packet_type, pages, route_fields, language="ar"):
+        """Store a result list for `ns` and send its first safe page."""
+        if not pages:
+            return False
+        result_pages = getattr(self, "_result_pages", {})
+        if not isinstance(result_pages, dict):
+            result_pages = {}
+        key_room = "" if packet_type == "chat_message" else str(room or "")
+        key = (packet_type, key_room, str(sender or ""))
+        if len(pages) > 1:
+            result_pages[key] = {
+                "pages": pages, "part": 1, "kwargs": dict(route_fields or {}),
+                "language": language,
+            }
+        else:
+            result_pages.pop(key, None)
+        self._result_pages = result_pages
+
+        english = str(language or "ar").casefold() == "en"
+        if len(pages) > 1:
+            footer = "\n\n📌 Type ns for the next list." if english else "\n\n📌 اكتب ns للقائمة التالية."
+        else:
+            footer = "\n\n✅ End of list." if english else "\n\n✅ انتهت القوائم."
+        message = pages[0] + footer
+        if packet_type == "chat_message":
+            if getattr(self, "ws", None):
+                return self._send_text_packets(packet_type, message, **dict(route_fields or {}))
+            return self.send_private_text(sender, message)
+        if getattr(self, "ws", None):
+            return self._send_text_packets(packet_type, message, **dict(route_fields or {}))
+        return self.send_room_text(room, message)
+
     def _send_room_names_pages(self, sender, room, rooms, from_server=False, language=None):
-        """Display all room names with safe pagination."""
+        """Display all room names in pages bounded by both count and wire bytes."""
         names = sorted({str(item).strip() for item in rooms or [] if str(item).strip()}, key=str.casefold)
         language = language or self._effective_room_language(room)
         if not names:
@@ -21100,29 +21197,16 @@ class TalkinBot:
             else:
                 self.send_private_text(sender, text)
             return
-        total = (len(names) + 29) // 30
-        pages = []
-        for offset in range(0, len(names), 30):
-            page_no = offset // 30 + 1
-            title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else f"🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else f"🏠 Bot rooms — rooms file")
-            lines = [title, f"📄 القائمة {page_no}/{total}"]
-            lines.extend(f"{i}. {name}" for i, name in enumerate(names[offset:offset + 30], offset + 1))
-            pages.append("\n".join(lines))
-        key = ("chat_message", "", str(sender or ""))
-        result_pages = getattr(self, "_result_pages", {})
-        if not isinstance(result_pages, dict):
-            result_pages = {}
-        result_pages[key] = {"pages": pages, "part": 1, "kwargs": {"to": str(sender or "")}, "language": language}
-        self._result_pages = result_pages
-        first = pages[0]
-        first += "\n\n📌 اكتب ns للقائمة التالية." if total > 1 and language == "ar" else ("\n\n📌 Type ns for the next list." if total > 1 else "\n\n✅ انتهت القوائم.")
-        if total == 1:
-            result_pages.pop(key, None)
-            self._result_pages = result_pages
-        if getattr(self, "ws", None):
-            self._send_text_packets("chat_message", first, to=str(sender or ""))
-        else:
-            self.send_private_text(sender, first)
+        title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else "🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else "🏠 Bot rooms — rooms file")
+        items = [f"{index}. {name}" for index, name in enumerate(names, 1)]
+        route_fields = {"to": str(sender or "")}
+        pages = _safe_text_pages_from_items(
+            "chat_message", route_fields, [title], items,
+            max_items_per_page=30, language=language,
+        )
+        self._send_paginated_text_pages(
+            sender, "", "chat_message", pages, route_fields, language=language,
+        )
 
     def _finish_full_room_sync(self, rooms, from_server=False, join_after=False):
         state = getattr(self, "_pending_full_room_sync", None)

@@ -2851,7 +2851,10 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         with patch.object(bot_module, "_points_data", return_value=accounts):
             for command, included, excluded, title in (
                 ("ملياري", "@Billionaire", "@Millionaire", "توب الحاصلين على المليار"),
+                ("مليارات", "@Billionaire", "@Millionaire", "توب الحاصلين على المليار"),
+                ("مليارت", "@Billionaire", "@Millionaire", "توب الحاصلين على المليار"),
                 ("مليوني", "@Millionaire", "@Below", "توب الحاصلين على المليون"),
+                ("ملايين", "@Millionaire", "@Below", "توب الحاصلين على المليون"),
             ):
                 self.assertTrue(bot._handle_management_command_impl("North", command, "Viewer", is_private=True))
                 self.assertIn(title, private[-1][1])
@@ -2879,6 +2882,44 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertNotIn("Billionaire16", message)
         self.assertNotIn("MillionOnly", message)
         self.assertEqual(message.count("—"), 15)
+
+    def test_milliart_and_threshold_lists_paginate_long_display_names_safely(self):
+        names = [f"𓆩〭〬🌸⃝{'م' * 24}{i:02d}𓆪" for i in range(15)]
+        accounts = {
+            name: {"username": name, "points": 2_000_000_000 - index}
+            for index, name in enumerate(names)
+        }
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._result_pages = {}
+        bot._transfer_log_pages = {}
+        bot.help_pages = {}
+        bot.help_page_part = {}
+        bot.help_game_part = {}
+        sent = []
+        next_packets = []
+        bot.send_private_text = lambda user, text: sent.append((user, text))
+        bot.send_query = lambda payload: next_packets.append(bytes(payload)) or True
+        with patch.object(bot_module, "_points_data", return_value=accounts):
+            self.assertTrue(bot._handle_management_command_impl("", "مليارت", "Viewer", is_private=True))
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("القائمة 1/", sent[0][1])
+        self.assertIn("اكتب ns", sent[0][1])
+        state = bot._result_pages[("chat_message", "", "Viewer")]
+        self.assertGreater(len(state["pages"]), 1)
+        combined = "\n".join(state["pages"])
+        for name in names:
+            self.assertIn(name, combined)
+        for index, page in enumerate(state["pages"]):
+            footer = "\n\n📌 اكتب ns للقائمة التالية." if index < len(state["pages"]) - 1 else "\n\n✅ انتهت القوائم."
+            payload = bot_module.encode_query(
+                "chat_message", type_="text", to="Viewer", body=page + footer
+            )
+            self.assertLessEqual(len(payload), 1008)
+        self.assertTrue(bot._handle_management_command_impl("", "ns", "Viewer", is_private=True))
+        next_body = bot_module.as_text(bot_module.decode_message(next_packets[-1])[5][0])
+        self.assertIn(state["pages"][1], next_body)
+        self.assertLessEqual(len(next_packets[-1]), 1008)
 
     def test_image_publish_schedules_worker_and_returns_without_waiting(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -3494,10 +3535,33 @@ class FollowupFeatureRegressions(unittest.TestCase):
         self.assertIn("Complete bot rooms (31) — server", private_sent[0])
         self.assertIn("Type ns for the next list", private_sent[0])
         self.assertEqual(len(self.sent), 1)
-        self.assertIn("📄 القائمة 2/2", self.sent[0][1])
+        self.assertIn("📄 List 2/2", self.sent[0][1])
         self.assertIn("Room 31", self.sent[0][1])
         self.assertIn("✅ End of list", self.sent[0][1])
         self.assertFalse(bot._result_pages)
+
+    def test_myrooms_long_names_are_paginated_under_the_websocket_limit(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._result_pages = {}
+        bot._effective_room_language = lambda _room: "ar"
+        sent = []
+        bot.send_private_text = lambda _user, text: sent.append(text)
+        names = [f"𓆩〭〬🌸⃝{'م' * 24}{i:02d}𓆪" for i in range(30)]
+        bot._send_room_names_pages("Master", "", names, from_server=True, language="ar")
+
+        state = bot._result_pages[("chat_message", "", "Master")]
+        self.assertGreater(len(state["pages"]), 1)
+        self.assertIn("📄 القائمة 1/", sent[0])
+        self.assertIn("اكتب ns", sent[0])
+        combined = "\n".join(state["pages"])
+        for name in names:
+            self.assertIn(name, combined)
+        for index, page in enumerate(state["pages"]):
+            footer = "\n\n📌 اكتب ns للقائمة التالية." if index < len(state["pages"]) - 1 else "\n\n✅ انتهت القوائم."
+            payload = bot_module.encode_query(
+                "chat_message", type_="text", to="Master", body=page + footer
+            )
+            self.assertLessEqual(len(payload), 1008)
 
 
 class NewMarketAndModerationRegressions(unittest.TestCase):
