@@ -20449,13 +20449,18 @@ class TalkinBot:
             if room:
                 self.known_rooms.add(room)
                 _save_persistent_rooms(self.known_rooms)
+            requester = str((pending_join or {}).get("requested_by", "") or "").strip()
+            # Confirm immediately when the server ACK arrives. Roster loading
+            # can involve a slow database/WebSocket round trip and must never
+            # delay the user's entry confirmation.
+            if requester:
+                self.send_private_text(requester, f"✅ أكد الخادم دخول البوت إلى الغرفة: {room}")
+            if room:
                 try:
                     self.request_room_occupants(room)
                 except Exception as exc:
                     self.log("[ROOM] occupants refresh after join failed:", repr(exc))
-            requester = str((pending_join or {}).get("requested_by", "") or "").strip()
             if requester:
-                self.send_private_text(requester, f"✅ أكد الخادم دخول البوت إلى الغرفة: {room}")
                 self.send_room_text(room, "مرحبا لقد عدت ادري وحشتكم🙂😋")
         elif event_type in (
             "room_full", "room_unauthorized", "room_wrong_password",
