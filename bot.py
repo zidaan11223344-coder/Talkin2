@@ -47,11 +47,16 @@ try:
     import pymysql
 except Exception:
     pymysql = None
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from cricket_integration import CricketIntegration
-# The existing project .env is optional for local deployments. Hosting
-# variables remain authoritative and are never replaced by the file.
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
+# Public defaults live in the tracked project settings file. Empty values are
+# ignored so required secrets must come from Railway Variables, while an
+# explicitly injected Railway value always wins over the repository defaults.
+_ENV_BASE_DIR = Path(__file__).resolve().parent
+for _key, _value in dotenv_values(_ENV_BASE_DIR / ".env.example").items():
+    if _key and _value not in (None, "") and _key not in os.environ:
+        os.environ[_key] = _value
+load_dotenv(dotenv_path=_ENV_BASE_DIR / ".env", override=False)
 
 
 # ============================================================
