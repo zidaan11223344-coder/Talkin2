@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import tempfile
 import sys
@@ -1611,14 +1612,18 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 bot._send_game_winner_card = lambda *_args, **_kwargs: None
                 with tempfile.TemporaryDirectory() as temp_dir, patch.object(
                     bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
+                ), patch.object(
+                    bot_module, "MONEY_GAME_WIN_HISTORY_FILE", Path(temp_dir) / "money-winners.json"
                 ), patch.object(bot_module.secrets, "randbelow", return_value=roll), patch.object(
                     bot_module, "_record_game", return_value=None
                 ):
                     self.assertTrue(bot._million_bank_game("North", "Player"))
+                    history = bot_module._load_local_json(bot_module.MONEY_GAME_WIN_HISTORY_FILE, {})
                 self.assertEqual(cooldowns, [60.0])
                 self.assertEqual(bool(awards), won)
                 self.assertEqual(awards, ([ ("Player", 1_000_000) ] if won else []))
                 self.assertIn("تم الحصول على المليون" if won else "لم يحالفه الحظ", sent[-1][1])
+                self.assertEqual(bool(history.get("million")), won)
 
     def test_billion_uses_configured_one_minute_cooldown_and_three_percent_win_chance(self):
         for roll, won in ((2, True), (3, False)):
@@ -1639,16 +1644,20 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 bot._game_award = lambda user, amount: awards.append((user, amount))
                 with tempfile.TemporaryDirectory() as temp_dir, patch.object(
                     bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
+                ), patch.object(
+                    bot_module, "MONEY_GAME_WIN_HISTORY_FILE", Path(temp_dir) / "money-winners.json"
                 ), patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
                     bot_module, "_games_enabled_for_room", return_value=True
                 ), patch.object(bot_module.secrets, "randbelow", return_value=roll), patch.object(
                     bot_module, "_record_game", return_value=None
                 ), patch.object(bot_module, "_public_base_url", return_value=""):
                     self.assertTrue(bot.handle_game_command("North", "billion", "Player"))
+                    history = bot_module._load_local_json(bot_module.MONEY_GAME_WIN_HISTORY_FILE, {})
                 self.assertEqual(cooldowns, [60.0])
                 self.assertEqual(bool(awards), won)
                 self.assertEqual(awards, ([ ("Player", 1_000_000_000) ] if won else []))
                 self.assertIn("تم الحصول على المليار" if won else "لم يحصل على المليار", sent[-1][1])
+                self.assertEqual(bool(history.get("billion")), won)
 
     def test_master_can_open_and_close_million_and_billion_win_rates(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -2838,69 +2847,89 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertIn("🏆 ترتيبك في ملف النقاط: #18", summary)
         self.assertIn("🏆 ترتيب التوب: #1", top_summary)
 
-    def test_milyari_and_milyoni_commands_filter_current_point_balances(self):
-        accounts = {
-            "Billionaire": {"username": "Billionaire", "points": 1_500_000_000},
-            "Millionaire": {"username": "Millionaire", "points": 5_000_000},
-            "Below": {"username": "Below", "points": 999_999},
+    def test_milyari_and_milyoni_show_last_month_game_winners_not_balances(self):
+        now = int(time.time())
+        history = {
+            "billion": [
+                {"username": "BillionWinner", "at": now - 60},
+                {"username": "BillionWinner", "at": now - 120},
+                {"username": "OldBillionWinner", "at": now - 31 * 86400},
+            ],
+            "million": [
+                {"username": "MillionWinner", "at": now - 90},
+                {"username": "OldMillionWinner", "at": now - 31 * 86400},
+            ],
         }
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._result_pages = {}
         private = []
         bot.send_private_text = lambda user, text: private.append((user, text))
-        bot.send_room_text = lambda room, text: private.append((room, text))
-        with patch.object(bot_module, "_points_data", return_value=accounts):
-            for command, included, excluded, title in (
-                ("ملياري", "@Billionaire", "@Millionaire", "توب الحاصلين على المليار"),
-                ("مليارات", "@Billionaire", "@Millionaire", "توب الحاصلين على المليار"),
-                ("مليارت", "@Billionaire", "@Millionaire", "توب الحاصلين على المليار"),
-                ("مليوني", "@Millionaire", "@Below", "توب الحاصلين على المليون"),
-                ("ملايين", "@Millionaire", "@Below", "توب الحاصلين على المليون"),
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "money-winners.json"
+            history_path.write_text(json.dumps(history), encoding="utf-8")
+            with patch.object(bot_module, "MONEY_GAME_WIN_HISTORY_FILE", history_path), patch.object(
+                bot_module, "_points_data", side_effect=AssertionError("wallet balances must not be read")
             ):
-                self.assertTrue(bot._handle_management_command_impl("North", command, "Viewer", is_private=True))
-                self.assertIn(title, private[-1][1])
-                self.assertIn(included, private[-1][1])
-                self.assertNotIn(excluded, private[-1][1])
+                for command, expected, excluded, title in (
+                    ("ملياري", "@BillionWinner", "@OldBillionWinner", "توب الفائزين بلعبة المليار"),
+                    ("مليارات", "@BillionWinner", "@OldBillionWinner", "توب الفائزين بلعبة المليار"),
+                    ("مليارت", "@BillionWinner", "@OldBillionWinner", "توب الفائزين بلعبة المليار"),
+                    ("مليوني", "@MillionWinner", "@OldMillionWinner", "توب الفائزين بلعبة المليون"),
+                    ("ملايين", "@MillionWinner", "@OldMillionWinner", "توب الفائزين بلعبة المليون"),
+                ):
+                    self.assertTrue(bot._handle_management_command_impl("", command, "Viewer", is_private=True))
+                    message = private[-1][1]
+                    self.assertIn(title, message)
+                    self.assertIn(expected, message)
+                    self.assertNotIn(excluded, message)
+                    self.assertNotIn("رصيد", message)
+                    self.assertNotIn("نقطة", message)
 
-    def test_threshold_top_commands_use_one_sorted_fifteen_member_list(self):
-        accounts = {
-            f"Billionaire{i}": {
-                "username": f"Billionaire{i}",
-                "points": 2_000_000_000 - i * 1_000_000,
-            }
+    def test_milyari_top_is_sorted_by_wins_and_limited_to_fifteen_members(self):
+        now = int(time.time())
+        records = [
+            {"username": f"Billionaire{i}", "at": now - i * 100 - win_index}
             for i in range(1, 18)
-        }
-        accounts["MillionOnly"] = {"username": "MillionOnly", "points": 1_000_000}
+            for win_index in range(18 - i)
+        ]
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._result_pages = {}
         sent = []
         bot.send_private_text = lambda user, text: sent.append(text)
-        bot.send_room_text = lambda room, text: sent.append(text)
-        with patch.object(bot_module, "_points_data", return_value=accounts):
-            self.assertTrue(bot._handle_management_command_impl("North", "مليارات", "Viewer", is_private=True))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "money-winners.json"
+            history_path.write_text(json.dumps({"billion": records}), encoding="utf-8")
+            with patch.object(bot_module, "MONEY_GAME_WIN_HISTORY_FILE", history_path), patch.object(
+                bot_module, "_points_data", side_effect=AssertionError("wallet balances must not be read")
+            ):
+                self.assertTrue(bot._handle_management_command_impl("", "ملياري", "Viewer", is_private=True))
         message = sent[-1]
-        self.assertIn("Billionaire1", message)
-        self.assertIn("Billionaire15", message)
-        self.assertNotIn("Billionaire16", message)
-        self.assertNotIn("MillionOnly", message)
-        self.assertEqual(message.count("—"), 15)
+        self.assertIn("@Billionaire1 — 17 فوز", message)
+        self.assertIn("@Billionaire15 — 3 فوز", message)
+        self.assertNotIn("@Billionaire16", message)
+        self.assertLess(message.index("@Billionaire1"), message.index("@Billionaire15"))
+        self.assertNotIn("رصيد", message)
+        self.assertNotIn("نقطة", message)
 
-    def test_milliart_and_threshold_lists_paginate_long_display_names_safely(self):
+    def test_money_winner_top_list_paginates_long_names_and_ns_advances(self):
+        now = int(time.time())
         names = [f"𓆩〭〬🌸⃝{'م' * 24}{i:02d}𓆪" for i in range(15)]
-        accounts = {
-            name: {"username": name, "points": 2_000_000_000 - index}
-            for index, name in enumerate(names)
-        }
+        records = [{"username": name, "at": now - index} for index, name in enumerate(names)]
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._result_pages = {}
         bot._transfer_log_pages = {}
         bot.help_pages = {}
         bot.help_page_part = {}
         bot.help_game_part = {}
-        sent = []
-        next_packets = []
+        bot._room_list_commands = lambda *_args: False
+        sent, next_packets = [], []
         bot.send_private_text = lambda user, text: sent.append((user, text))
         bot.send_query = lambda payload: next_packets.append(bytes(payload)) or True
-        with patch.object(bot_module, "_points_data", return_value=accounts):
-            self.assertTrue(bot._handle_management_command_impl("", "مليارت", "Viewer", is_private=True))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "money-winners.json"
+            history_path.write_text(json.dumps({"billion": records}), encoding="utf-8")
+            with patch.object(bot_module, "MONEY_GAME_WIN_HISTORY_FILE", history_path):
+                self.assertTrue(bot._handle_management_command_impl("", "ملياري", "Viewer", is_private=True))
 
         self.assertEqual(len(sent), 1)
         self.assertIn("القائمة 1/", sent[0][1])
@@ -2912,14 +2941,43 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
             self.assertIn(name, combined)
         for index, page in enumerate(state["pages"]):
             footer = "\n\n📌 اكتب ns للقائمة التالية." if index < len(state["pages"]) - 1 else "\n\n✅ انتهت القوائم."
-            payload = bot_module.encode_query(
-                "chat_message", type_="text", to="Viewer", body=page + footer
-            )
+            payload = bot_module.encode_query("chat_message", type_="text", to="Viewer", body=page + footer)
             self.assertLessEqual(len(payload), 1008)
         self.assertTrue(bot._handle_management_command_impl("", "ns", "Viewer", is_private=True))
         next_body = bot_module.as_text(bot_module.decode_message(next_packets[-1])[5][0])
         self.assertIn(state["pages"][1], next_body)
         self.assertLessEqual(len(next_packets[-1]), 1008)
+
+    def test_room_command_content_is_not_logged_when_room_message_logging_is_disabled(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        logs = []
+        bot.log = lambda *args: logs.append(" ".join(map(str, args)))
+        with patch.object(bot_module, "LOG_ROOM_MESSAGES", False), patch.object(
+            bot_module, "_save_local_json"
+        ) as save_action:
+            bot._remember_bot_action("SecretRoom", "ذهب 1b", "PrivateName")
+        self.assertEqual(logs, [])
+        save_action.assert_called_once()
+        self.assertEqual(save_action.call_args.args[1]["command"], "ذهب 1b")
+
+    def test_successful_github_file_sync_logs_are_quiet_by_default(self):
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        missing = Response()
+        missing.status_code = 404
+        with patch.object(bot_module, "GITHUB_SYNC_ENABLED", True), patch.object(
+            bot_module, "LOG_GITHUB_SYNC_SUCCESS", False
+        ), patch.object(bot_module, "_github_url", return_value="https://example.invalid/file"), patch.object(
+            bot_module, "_github_headers", return_value={}
+        ), patch.object(bot_module.requests, "get", return_value=missing), patch.object(
+            bot_module.requests, "put", return_value=Response()
+        ), patch("builtins.print") as printed:
+            self.assertTrue(bot_module._github_put_file("points.json", {}))
+            printed.assert_not_called()
 
     def test_image_publish_schedules_worker_and_returns_without_waiting(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -4601,7 +4659,7 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
         with patch.object(bot_module, "_save_persistent_rooms"):
             bot._join_timeout("syria")
         self.assertEqual(len(sent), 1)
-        self.assertIn("✅ تم دخول البوت إلى الغرفة", sent[0][1])
+        self.assertIn("✅ البوت داخل الغرفة", sent[0][1])
         self.assertIn("سورياالحب", bot.known_rooms)
         self.assertEqual(bot.connected_rooms, {"سورياالحب"})
 
@@ -4723,6 +4781,131 @@ class RoomSyncAndAnnouncementRegressions(unittest.TestCase):
     def test_stock_round_announcements_are_enabled_by_default(self):
         self.assertTrue(bot_module.STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED)
         self.assertEqual(bot_module.STOCK_MARKET_INTERVAL_SECONDS, 600.0)
+
+
+class MessageBackgroundDeliveryRegressions(unittest.TestCase):
+    def test_direct_private_message_names_sender_and_confirms_success_privately(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_private_text = lambda user, text: sent.append((user, text)) or True
+        bot.log = lambda *_args: None
+
+        self.assertTrue(bot._deliver_user_private_message("Sender", "Target", "hello"))
+        self.assertEqual(sent[0][0], "Target")
+        self.assertIn("📩 لديك رسالة من Sender", sent[0][1])
+        self.assertIn("hello", sent[0][1])
+        self.assertEqual(sent[1][0], "Sender")
+        self.assertIn("✅ تم إرسال الرسالة", sent[1][1])
+
+    def test_direct_private_message_reports_failed_delivery(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+
+        def fake_send(user, text):
+            sent.append((user, text))
+            return user != "Target"
+
+        bot.send_private_text = fake_send
+        bot.log = lambda *_args: None
+        self.assertFalse(bot._deliver_user_private_message("Sender", "Target", "hello"))
+        self.assertIn("❌ فشل إرسال الرسالة", sent[-1][1])
+
+    def test_room_broadcast_command_starts_background_thread(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._room_list_commands = lambda *_args: False
+        bot._active_rooms = lambda: ["Room A", "Room B"]
+        bot._broadcast_room_message_worker = lambda *_args: self.fail("worker ran synchronously")
+        sent = []
+        bot.send_private_text = lambda user, text: sent.append((user, text)) or True
+        bot.log = lambda *_args: None
+        threads = []
+
+        class DeferredThread:
+            def __init__(self, target=None, args=(), **kwargs):
+                self.target, self.args, self.kwargs = target, args, kwargs
+                self.started = False
+                threads.append(self)
+
+            def start(self):
+                self.started = True
+
+        with patch.object(bot_module, "_is_primary_master", return_value=True), patch.object(
+            bot_module.threading, "Thread", DeferredThread
+        ):
+            handled = bot._handle_management_command_impl(
+                "", "رساله غرفه@تنبيه", "Master", is_private=True
+            )
+        self.assertTrue(handled)
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(threads[0].started)
+        self.assertIn("الخلفية", sent[-1][1])
+        with patch.object(bot_module, "_is_primary_master", return_value=True), patch.object(
+            bot_module.threading, "Thread", DeferredThread
+        ):
+            handled = bot._handle_management_command_impl(
+                "", "room message@Hello all", "Master", is_private=True
+            )
+        self.assertTrue(handled)
+        self.assertEqual(len(threads), 2)
+        self.assertIn("Background broadcast started", sent[-1][1])
+
+    def test_room_broadcast_worker_reports_per_room_send_results(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._active_rooms = lambda: ["Room A", "Room B"]
+        bot._room_bulk_lock = threading.Lock()
+        sent_rooms = []
+        bot.send_room_text = lambda room, _text: sent_rooms.append(room) or (room == "Room A")
+        private = []
+        bot.send_private_text = lambda user, text: private.append((user, text)) or True
+        bot.log = lambda *_args: None
+        with patch.object(bot_module.time, "sleep", return_value=None):
+            bot._broadcast_room_message_worker("Master", "notice")
+        self.assertEqual(sent_rooms, ["Room A", "Room B"])
+        self.assertIn("وصلت إلى 1 غرفة، وفشل 1 من 2", private[-1][1])
+
+    def test_unknown_cached_room_role_does_not_preempt_server_stream_authorization(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.music_last = {}
+        bot._bot_room_role = lambda _room: ""
+        bot._bot_is_room_owner = lambda _room: False
+        bot._capture_room_response_language = lambda *_args: "ar"
+        room_messages = []
+        bot.send_room_text = lambda _room, text: room_messages.append(text) or True
+        bot.log = lambda *_args: None
+        threads = []
+
+        class DeferredThread:
+            def __init__(self, target=None, args=(), **kwargs):
+                self.target, self.args = target, args
+                threads.append(self)
+
+            def start(self):
+                pass
+
+        with patch.object(bot_module.threading, "Thread", DeferredThread):
+            self.assertTrue(bot.handle_music_command("Room", ".sa song", "User", live_stream=True))
+        self.assertEqual(len(threads), 1)
+        self.assertFalse(any("يجب أن تكون رتبة البوت" in text for text in room_messages))
+        self.assertFalse(any("must be an Owner" in text for text in room_messages))
+
+    def test_stale_room_restore_candidate_is_not_reported_as_connected(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = set()
+        bot._room_restore_candidates = {"room"}
+        bot._pending_room_joins = {}
+        bot._room_bulk_lock = threading.Lock()
+        bot.blocked_rooms = set()
+        bot._blocked_room_reasons = {}
+        bot._join_lock = threading.Lock()
+        bot._last_join_sent = {}
+        sent = []
+        joins = []
+        bot.send_private_text = lambda user, text: sent.append((user, text))
+        bot.log = lambda *_args: None
+        bot.join_room = lambda target, **_kwargs: joins.append(target) or True
+        bot._join_rooms_serially(["Room"], "Master", fast_restore=False)
+        self.assertEqual(joins, ["Room"])
+        self.assertFalse(any("البوت داخل الغرفة" in text for _user, text in sent))
 
 
 if __name__ == "__main__":

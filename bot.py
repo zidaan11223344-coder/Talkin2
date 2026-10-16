@@ -288,8 +288,9 @@ _SOCIAL_HUNT_PHOTO_LOCK = threading.Lock()
 # الألعاب وصورها معطلة بناءً على إعداد البوت المطلوب؛ لا تُرسل صور ألعاب.
 GAME_IMAGE_FILES = {
     "bet": "game_bet.jpg",
-    "billion": "game_billion.jpg",
-    "بنك مليون": "game_million_bank.jpg",
+    "billion": "game_billion_prize.jpg",
+    "million": "game_million_prize.jpg",
+    "بنك مليون": "game_million_prize.jpg",
     "duel": "game_duel.jpg",
     "luck": "game_luck.jpg",
     "investment": "game_investment.jpg",
@@ -346,6 +347,7 @@ MONEY_GAME_OPEN_WIN_CHANCE_PERCENT = 30
 MONEY_GAME_WIN_CHANCE_PERCENT = MONEY_GAME_DEFAULT_WIN_CHANCE_PERCENT
 MONEY_GAME_WIN_GAP_LOSSES = 1
 _MONEY_GAME_WIN_LOCK = threading.RLock()
+_MONEY_GAME_WIN_HISTORY_LOCK = threading.RLock()
 
 try:
     STOCK_MARKET_INTERVAL_SECONDS = max(60.0, float(os.getenv("STOCK_MARKET_INTERVAL_SECONDS", "600") or 600))
@@ -763,6 +765,7 @@ FILTER_BANS_FILE = DATA_DIR / "filter_bans.json"
 BOT_BANS_FILE = DATA_DIR / "bot_bans.json"
 LAST_BOT_BANS_FILE = DATA_DIR / "last_bot_bans.json"
 MONEY_GAME_WIN_STATE_FILE = DATA_DIR / "money_game_win_state.json"
+MONEY_GAME_WIN_HISTORY_FILE = DATA_DIR / "money_game_winners.json"
 MONEY_GAME_SETTINGS_FILE = DATA_DIR / "money_game_settings.json"
 PUBLISH_BANS_FILE = DATA_DIR / "publish_bans.json"
 PROTECTION_FILE = DATA_DIR / "room_protection.json"
@@ -777,7 +780,7 @@ _STATE_FILE_NAMES = (
     "masters.json", "vip_users.json", "verified_users.json", "points.json",
     "messages.json", "published_posts.json", "media_stats.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
-    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "money_game_win_state.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
+    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "money_game_win_state.json", "money_game_winners.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
     "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "backup_manifest.json",
 )
 
@@ -920,6 +923,8 @@ QUIET_MODE = os.getenv("QUIET_MODE", "1").strip() == "1"
 # Room chat is high-volume and must never be copied into the host/runtime log.
 # Keep this opt-in for short, controlled debugging only.
 LOG_ROOM_MESSAGES = os.getenv("LOG_ROOM_MESSAGES", "0").strip() == "1"
+# Successful per-file backup messages are noisy; errors always remain visible.
+LOG_GITHUB_SYNC_SUCCESS = os.getenv("LOG_GITHUB_SYNC_SUCCESS", "0").strip() == "1"
 # Runtime room-event diagnostics are disabled by default. Set ROOM_EVENT_DEBUG=1 only while debugging.
 ROOM_EVENT_DEBUG = os.getenv("ROOM_EVENT_DEBUG", "0").strip() == "1"
 
@@ -1780,6 +1785,9 @@ _STATE_DB_CONDITION = threading.Condition()
 _STATE_DB_PENDING = {}
 _STATE_DB_WORKER_STARTED = False
 _STATE_DB_HAS_DATA = False
+_STATE_DB_INFLIGHT = 0
+_STATE_DB_LAST_SYNC_AT = 0.0
+_STATE_DB_LAST_SYNC_ERROR = ""
 
 class PersistentStateDatabase:
     """JSON state store for one row per local bot state file."""
@@ -1970,6 +1978,108 @@ def _money_game_roll(game_name):
         _save_local_json(MONEY_GAME_WIN_STATE_FILE, state)
         return won
 
+
+def _record_money_game_winner(game_name, username, at=None):
+    """Persist a rolling 30-day jackpot history, without recording losing plays."""
+    game_name = str(game_name or "").strip().lower()
+    username = str(username or "").strip().lstrip("@")
+    if game_name not in {"million", "billion"} or not username:
+        return False
+    timestamp = int(time.time() if at is None else at)
+    cutoff = timestamp - 30 * 24 * 60 * 60
+    with _MONEY_GAME_WIN_HISTORY_LOCK:
+        history = _load_local_json(MONEY_GAME_WIN_HISTORY_FILE, {})
+        if not isinstance(history, dict):
+            history = {}
+        for game in ("million", "billion"):
+            records = history.get(game, [])
+            if not isinstance(records, list):
+                records = []
+            retained = []
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    record_time = int(record.get("at", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if record_time >= cutoff:
+                    retained.append(record)
+            history[game] = retained
+        canonical = _game_name_key(username)
+        records = history[game_name]
+        if not any(
+            _game_name_key(record.get("username", "")) == canonical
+            and int(record.get("at", 0) or 0) == timestamp
+            for record in records
+        ):
+            records.append({"username": username, "at": timestamp})
+        _save_local_json(MONEY_GAME_WIN_HISTORY_FILE, history)
+    return True
+
+
+def _money_game_winner_rows(game_name, now=None, limit=15):
+    """Return top jackpot winners from the last 30 days, ranked by win count."""
+    game_name = str(game_name or "").strip().lower()
+    if game_name not in {"million", "billion"}:
+        return []
+    current_time = int(time.time() if now is None else now)
+    cutoff = current_time - 30 * 24 * 60 * 60
+    with _MONEY_GAME_WIN_HISTORY_LOCK:
+        history = _load_local_json(MONEY_GAME_WIN_HISTORY_FILE, {})
+        records = history.get(game_name, []) if isinstance(history, dict) else []
+        if not isinstance(records, list):
+            return []
+        winners = {}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            username = str(record.get("username") or "").strip().lstrip("@")
+            try:
+                won_at = int(record.get("at", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not username or not cutoff <= won_at <= current_time:
+                continue
+            key = _game_name_key(username)
+            if not key:
+                continue
+            row = winners.setdefault(key, {"username": username, "wins": 0, "last_at": won_at})
+            row["wins"] += 1
+            row["last_at"] = max(int(row["last_at"]), won_at)
+            row["username"] = _preferred_display_name(row["username"], username)
+    ranked = sorted(
+        winners.values(),
+        key=lambda row: (-int(row["wins"]), -int(row["last_at"]), _norm_user(row["username"])),
+    )
+    return ranked[:max(1, int(limit or 15))]
+
+
+def _money_game_winners_message(game_name, english=False):
+    game_name = str(game_name or "").strip().lower()
+    rows = _money_game_winner_rows(game_name, limit=15)
+    arabic_label = "المليار" if game_name == "billion" else "المليون"
+    english_label = "Billion" if game_name == "billion" else "Million"
+    if english:
+        lines = [f"🏆 Top {english_label} Game Winners — Last 30 Days", "━━━━━━━━━━━━"]
+        if not rows:
+            lines.append("No winners recorded in the last 30 days.")
+        else:
+            lines.extend(
+                f"{rank}. @{row['username']} — {row['wins']} {'win' if row['wins'] == 1 else 'wins'}"
+                for rank, row in enumerate(rows, 1)
+            )
+    else:
+        lines = [f"🏆 توب الفائزين بلعبة {arabic_label} — آخر 30 يومًا", "━━━━━━━━━━━━"]
+        if not rows:
+            lines.append("لا توجد جوائز مسجلة خلال آخر 30 يومًا.")
+        else:
+            lines.extend(
+                f"{rank}. @{row['username']} — {row['wins']} فوز"
+                for rank, row in enumerate(rows, 1)
+            )
+    return "\n".join(lines)
+
 # GitHub-backed persistent state. Runtime stays in Talkin1; durable state is
 # backed up to Talkin4 asynchronously so message handling is not blocked by
 # GitHub network requests. Set GITHUB_TOKEN in the hosting environment.
@@ -1992,6 +2102,8 @@ _GITHUB_PENDING_CONDITION = threading.Condition()
 _GITHUB_INFLIGHT = 0
 _GITHUB_WORKER_STARTED = False
 _GITHUB_BACKUP_REQUESTS = []
+_GITHUB_LAST_SYNC_AT = 0.0
+_GITHUB_LAST_SYNC_ERROR = ""
 
 def _queue_local_json_save(path, data):
     """Queue a local JSON snapshot for background persistence.
@@ -2183,7 +2295,8 @@ def _github_put_file(local_path, data, sha=None):
                     )
 
         r.raise_for_status()
-        print(f"[GITHUB] saved {name}", flush=True)
+        if LOG_GITHUB_SYNC_SUCCESS:
+            print(f"[GITHUB] saved {name}", flush=True)
         return True
     except Exception as exc:
         print(f"[GITHUB] write failed for {name}: {exc}", flush=True)
@@ -2332,8 +2445,9 @@ def _merge_points_snapshots(authoritative, secondary):
     return {"version": 2, "accounts": merged, "transfer_history": history[-1000:]}
 
 def _restore_or_seed_postgres_state():
-    global _STATE_DB_HAS_DATA
+    global _STATE_DB_HAS_DATA, _STATE_DB_LAST_SYNC_AT, _STATE_DB_LAST_SYNC_ERROR
     if not _STATE_DB_ENABLED or not _STATE_DB: return
+    had_error = False
     names=set(_STATE_FILE_NAMES) | {x.name for x in DATA_DIR.glob("*.json")}
     for name in sorted(names):
         path=DATA_DIR/name
@@ -2348,9 +2462,16 @@ def _restore_or_seed_postgres_state():
                         name, remote,
                         lambda current: (_merge_points_snapshots(current, local), None),
                     )
-                _save_local_json(path, remote)
-            elif _state_has_data(local): _STATE_DB.save(name, local)
-        except Exception as exc: print(f"[STATE-DB] startup state failed for {name}: {exc}", flush=True)
+                _save_local_json(path, remote, persist_state_db=False)
+            elif _state_has_data(local) and not _STATE_DB.save(name, local):
+                raise RuntimeError(f"database seed returned false for {name}")
+        except Exception as exc:
+            had_error = True
+            _STATE_DB_LAST_SYNC_ERROR = str(exc)[:240]
+            print(f"[STATE-DB] startup state failed for {name}: {exc}", flush=True)
+    if not had_error:
+        _STATE_DB_LAST_SYNC_AT = time.time()
+        _STATE_DB_LAST_SYNC_ERROR = ""
 
 if _STATE_DB_ENABLED:
     try:
@@ -2466,15 +2587,33 @@ def _request_github_full_backup(bot, sender):
 
 
 def _state_db_worker():
+    global _STATE_DB_INFLIGHT, _STATE_DB_LAST_SYNC_AT, _STATE_DB_LAST_SYNC_ERROR
     while True:
         with _STATE_DB_CONDITION:
             while not _STATE_DB_PENDING: _STATE_DB_CONDITION.wait()
             _STATE_DB_CONDITION.wait(timeout=0.15)
             pending=dict(_STATE_DB_PENDING); _STATE_DB_PENDING.clear()
+            _STATE_DB_INFLIGHT += len(pending)
+        retry_needed = False
         for path,data in pending.items():
             try:
-                if _STATE_DB: _STATE_DB.save(Path(path).name, data)
-            except Exception as exc: print(f"[STATE-DB] background save failed: {exc}", flush=True)
+                if not _STATE_DB or not _STATE_DB.save(Path(path).name, data):
+                    raise RuntimeError("database save returned false")
+                with _STATE_DB_CONDITION:
+                    _STATE_DB_LAST_SYNC_AT = time.time()
+                    _STATE_DB_LAST_SYNC_ERROR = ""
+            except Exception as exc:
+                retry_needed = True
+                with _STATE_DB_CONDITION:
+                    _STATE_DB_LAST_SYNC_ERROR = str(exc)[:240]
+                    _STATE_DB_PENDING.setdefault(path, data)
+                print(f"[STATE-DB] background save failed: {exc}", flush=True)
+            finally:
+                with _STATE_DB_CONDITION:
+                    _STATE_DB_INFLIGHT = max(0, _STATE_DB_INFLIGHT - 1)
+                    _STATE_DB_CONDITION.notify_all()
+        if retry_needed:
+            time.sleep(max(5.0, float(os.getenv("STATE_DB_RETRY_SECONDS", "30") or 30)))
 
 def _database_backup_worker():
     interval=max(900.0,float(os.getenv("DATABASE_BACKUP_INTERVAL_SECONDS","21600") or 21600))
@@ -2485,7 +2624,7 @@ def _database_backup_worker():
             except Exception as exc: print("[BACKUP] periodic backup failed:", repr(exc), flush=True)
 
 def _github_sync_worker():
-    global _GITHUB_INFLIGHT
+    global _GITHUB_INFLIGHT, _GITHUB_LAST_SYNC_AT, _GITHUB_LAST_SYNC_ERROR
     while True:
         with _GITHUB_PENDING_CONDITION:
             while not _GITHUB_PENDING:
@@ -2496,6 +2635,7 @@ def _github_sync_worker():
             _GITHUB_PENDING.clear()
             _GITHUB_INFLIGHT += 1
         backup_ok = True
+        failed_paths = []
         try:
             for path in pending:
                 try:
@@ -2505,12 +2645,21 @@ def _github_sync_worker():
                     with _GITHUB_SYNC_LOCK:
                         if not _github_put_file(path, data):
                             backup_ok = False
+                            failed_paths.append(path)
                 except Exception as exc:
                     backup_ok = False
+                    failed_paths.append(path)
                     print(f"[GITHUB] background sync failed for {Path(path).name}: {exc}", flush=True)
         finally:
             with _GITHUB_PENDING_CONDITION:
                 _GITHUB_INFLIGHT = max(0, _GITHUB_INFLIGHT - 1)
+                for failed_path in failed_paths:
+                    _GITHUB_PENDING.setdefault(failed_path, None)
+                if backup_ok:
+                    _GITHUB_LAST_SYNC_AT = time.time()
+                    _GITHUB_LAST_SYNC_ERROR = ""
+                else:
+                    _GITHUB_LAST_SYNC_ERROR = "رفع ملف أو أكثر لم ينجح"
                 _GITHUB_PENDING_CONDITION.notify_all()
         with _GITHUB_PENDING_CONDITION:
             requests_to_notify = list(_GITHUB_BACKUP_REQUESTS)
@@ -2525,6 +2674,45 @@ def _github_sync_worker():
                 bot.send_private_text(sender, notice)
             except Exception as exc:
                 print(f"[GITHUB] backup completion notice failed: {exc}", flush=True)
+        if not backup_ok:
+            time.sleep(max(5.0, float(os.getenv("GITHUB_SYNC_RETRY_SECONDS", "30") or 30)))
+
+
+def _database_sync_status_text():
+    """Describe local/remote copy synchronization from in-memory worker state only."""
+    with _STATE_DB_CONDITION:
+        state_pending = len(_STATE_DB_PENDING)
+        state_inflight = int(_STATE_DB_INFLIGHT or 0)
+        state_last_at = float(_STATE_DB_LAST_SYNC_AT or 0)
+        state_error = str(_STATE_DB_LAST_SYNC_ERROR or "")
+    with _GITHUB_PENDING_CONDITION:
+        github_pending = len(_GITHUB_PENDING)
+        github_inflight = int(_GITHUB_INFLIGHT or 0)
+        github_last_at = float(_GITHUB_LAST_SYNC_AT or 0)
+        github_error = str(_GITHUB_LAST_SYNC_ERROR or "")
+
+    def status_line(configured, pending, inflight, last_at, error):
+        if not configured:
+            return "⚪ غير مفعّل / Disabled"
+        if pending or inflight:
+            return f"🟡 غير متزامن / Pending — معلّق: {pending}، جارٍ: {inflight}"
+        if error:
+            return f"🔴 غير متزامن / Error — {error[:140]}"
+        if last_at:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_at))
+            return f"🟢 متزامن / In sync — آخر نجاح / last success: {timestamp}"
+        return "🟠 غير مؤكد / Not verified yet"
+
+    state_enabled = bool(_STATE_DB_ENABLED and _STATE_DB is not None)
+    github_enabled = bool(GITHUB_SYNC_ENABLED)
+    return (
+        "🗄️ حالة مزامنة النسخ / Database copy synchronization\n"
+        "• ملفات الحالة المحلية / Local JSON: 🟢 تعمل / Active\n"
+        f"• قاعدة البيانات الدائمة ({RIVEN_DATABASE_KIND.upper()}) / Persistent DB: "
+        f"{status_line(state_enabled, state_pending, state_inflight, state_last_at, state_error)}\n"
+        f"• نسخة GitHub (Talkin4) / GitHub backup: "
+        f"{status_line(github_enabled, github_pending, github_inflight, github_last_at, github_error)}"
+    )
 
 
 if not _LOCAL_BG_WORKER_STARTED:
@@ -2866,7 +3054,9 @@ def _looks_like_bot_command(text):
         "gold ", "silver ", "oil ", "land ",
         "سجل التحويل", "سجل تحويلاتي", "سجل المليار", "سجل مليار", "سجل المليون", "سجل مليون",
         "transfer history", "transfer log", "billion record", "billion history", "million record", "million history",
-        "top b", "topb", "top m", "topm",
+        "top b", "topb", "top m", "topm", "room message@", "rooms message@", "room broadcast@",
+        "حالة قاعدة البيانات", "حاله قاعده البيانات",
+        "حالة النسخ", "database status", "database sync status", "db status", "dbsync",
     )
     normalized_low = low.replace("ة", "ه")
     normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
@@ -5572,6 +5762,9 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url="", language
     """
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبت")
+    if str(game_key) in {"million", "billion", "بنك مليون"}:
+        money_key = "million" if str(game_key) in {"million", "بنك مليون"} else "billion"
+        return render_money_game_winner_card(money_key, winner_name, winner_photo_url, language)
     source_name = GAME_IMAGE_FILES.get(game_key) or GAME_IMAGE_FILES.get("billion")
     source = ASSETS_DIR / source_name
     if not source.is_file():
@@ -5685,6 +5878,74 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url="", language
             image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
             if out.stat().st_size <= 300 * 1024:
                 break
+    return out
+
+
+def render_money_game_winner_card(game_key, winner_name, winner_photo_url="", language="ar"):
+    """Render the million/billion artwork with one shared, low-profile winner bar."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبت")
+    game_key = "million" if str(game_key).casefold() in {"million", "بنك مليون"} else "billion"
+    source_name = GAME_IMAGE_FILES.get(game_key)
+    source = ASSETS_DIR / source_name if source_name else None
+    if not source or not source.is_file():
+        raise FileNotFoundError(f"صورة الجائزة غير موجودة: {source}")
+
+    image = Image.open(source).convert("RGBA")
+    target_w = 1100
+    target_h = max(1, round(target_w * image.height / image.width))
+    image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    w, h = image.size
+    gold = (244, 196, 92, 255)
+    panel = (3, 28, 31, 235)
+    panel_box = (int(w * .07), int(h * .785), int(w * .93), int(h * .94))
+    draw.rounded_rectangle(
+        panel_box, radius=max(20, int(w * .025)), fill=panel,
+        outline=gold, width=max(3, int(w * .004)),
+    )
+
+    avatar_size = min(max(96, int(h * .075)), panel_box[3] - panel_box[1] - 28)
+    avatar = _load_sender_avatar(winner_photo_url, avatar_size)
+    margin = max(20, int(w * .035))
+    if avatar is not None:
+        # Arabic is right-to-left: keep the small winner photo on the right,
+        # beside the winner's name inside the same bottom rectangle.
+        avatar_x = panel_box[2] - margin - avatar_size
+        avatar_y = panel_box[1] + (panel_box[3] - panel_box[1] - avatar_size) // 2
+        overlay.alpha_composite(avatar, (int(avatar_x), int(avatar_y)))
+        text_left = panel_box[0] + margin
+        text_right = avatar_x - max(18, int(w * .025))
+    else:
+        text_left = panel_box[0] + margin
+        text_right = panel_box[2] - margin
+
+    english = str(language or "ar").casefold().startswith("en")
+    title = ("Million winner" if game_key == "million" else "Billion winner") if english else (
+        "الفائز بالمليون" if game_key == "million" else "الفائز بالمليار"
+    )
+    text_center = ((text_left + text_right) / 2, panel_box[1] + (panel_box[3] - panel_box[1]) * .34)
+    _draw_centered(draw, text_center, "🏆 " + title, max(28, int(h * .038)),
+                   (255, 224, 145, 255), max(80, text_right - text_left))
+    name_center = ((text_left + text_right) / 2, panel_box[1] + (panel_box[3] - panel_box[1]) * .70)
+    _draw_name_centered(draw, name_center, "@" + str(winner_name or ""), max(34, int(h * .044)),
+                        (255, 255, 255, 255), max(80, text_right - text_left))
+
+    image = Image.alpha_composite(image, overlay).convert("RGB")
+    out_dir = BASE_DIR / "generated_games"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        old = sorted((x for x in out_dir.iterdir() if x.is_file()), key=lambda x: x.stat().st_mtime, reverse=True)
+        for fp in old[29:]:
+            fp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    out = out_dir / f"{game_key}_winner_{uuid.uuid4().hex}.jpg"
+    for quality in (92, 88, 84, 80, 76):
+        image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+        if out.stat().st_size <= 300 * 1024:
+            break
     return out
 
 def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
@@ -7380,7 +7641,8 @@ class TalkinBot:
                     return
                 try:
                     ws.send_control(0x9, b"talkin-heartbeat")
-                    self.log("[WS] heartbeat ping sent")
+                    if DEBUG and not QUIET_MODE:
+                        self.log("[WS] heartbeat ping sent")
                 except Exception as exc:
                     self.log("[WS] heartbeat failed:", repr(exc))
                     return
@@ -7444,7 +7706,7 @@ class TalkinBot:
             self.known_rooms.add(room)
             _save_persistent_rooms(self.known_rooms)
             if requester:
-                self.send_private_text(requester, f"✅ تم دخول البوت إلى الغرفة: {room}")
+                self.send_private_text(requester, f"✅ البوت داخل الغرفة: {room}")
             return
         self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
@@ -7958,21 +8220,54 @@ class TalkinBot:
         )
         return sorted(rooms)
 
-    def broadcast_all_rooms(self, text: str):
+    def broadcast_all_rooms(self, text: str, *, return_details=False):
         """Send a room-wide announcement serially without disturbing joins."""
-        sent = 0
+        sent = failed = 0
         rooms=self._active_rooms()
         delay=max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
         with self._room_bulk_lock:
             for index, target_room in enumerate(rooms):
                 try:
-                    self.send_room_text(target_room, text)
-                    sent += 1
+                    result = self.send_room_text(target_room, text)
+                    if result is False:
+                        failed += 1
+                    else:
+                        sent += 1
                 except Exception as exc:
+                    failed += 1
                     self.log("[BROADCAST] failed", target_room, repr(exc))
                 if index+1 < len(rooms):
                     time.sleep(delay)
-        return sent
+        return {"sent": sent, "failed": failed, "total": len(rooms)} if return_details else sent
+
+    def _broadcast_room_message_worker(self, sender, text, english=False):
+        """Run slow all-room message delivery away from the WebSocket reader."""
+        try:
+            result = self.broadcast_all_rooms(text, return_details=True)
+            sent = int(result.get("sent", 0) or 0) if isinstance(result, dict) else int(result or 0)
+            failed = int(result.get("failed", 0) or 0) if isinstance(result, dict) else 0
+            total = int(result.get("total", sent + failed) or 0) if isinstance(result, dict) else sent
+            notice = (
+                f"✅ Background room message finished: delivered to {sent} rooms; {failed}/{total} failed."
+                if english and sent else
+                f"❌ Failed to send the message to rooms (0/{total})."
+                if english else
+                f"✅ اكتمل إرسال الرسالة بالخلفية: وصلت إلى {sent} غرفة، وفشل {failed} من {total}."
+                if sent else f"❌ فشل إرسال الرسالة إلى الغرف (0/{total})."
+            )
+            if sender:
+                self.send_private_text(sender, notice)
+        except Exception as exc:
+            self.log("[BROADCAST] background worker failed:", repr(exc))
+            if sender:
+                try:
+                    self.send_private_text(
+                        sender,
+                        "❌ Failed to broadcast the message; check the Railway logs."
+                        if english else "❌ فشل إرسال الرسالة إلى الغرف؛ راجع سجل Railway."
+                    )
+                except Exception:
+                    pass
 
     def broadcast_game_rooms(self, text: str, first_room: str = ""):
         """Quickly announce a game, delivering to its initiating room first."""
@@ -8390,7 +8685,8 @@ class TalkinBot:
             _save_local_json(DATA_DIR / "last_action.json", action)
         except Exception as exc:
             self.log("[UNDO] save last action failed:", repr(exc))
-        self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
+        if LOG_ROOM_MESSAGES:
+            self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
 
     def _cleanup_memory_state(self):
         """Prune bounded runtime caches and force Python GC without touching persistent data."""
@@ -8789,6 +9085,40 @@ class TalkinBot:
         if not username or username == BOT_ID:
             return False
         return self._send_text_packets("chat_message", text, to=username)
+
+    def _deliver_user_private_message(self, sender, target, message_text, english=False):
+        """Deliver a user message privately and confirm only to its sender."""
+        sender_name = str(sender or "").strip().lstrip("@")
+        target_name = str(target or "").strip().lstrip("@")
+        text = str(message_text or "").strip()
+        if not sender_name or not target_name or not text:
+            return False
+        payload = (
+            f"📩 You have a message from {sender_name}\n\n{text}"
+            if english else f"📩 لديك رسالة من {sender_name}\n\n{text}"
+        )
+        try:
+            delivered = self.send_private_text(target_name, payload) is not False
+        except Exception as exc:
+            delivered = False
+            self.log("[DIRECT-MESSAGE] failed", target_name, repr(exc))
+        notice = (
+            f"✅ Message sent to @{target_name}." if english else f"✅ تم إرسال الرسالة إلى @{target_name} بنجاح."
+        ) if delivered else (
+            f"❌ Failed to send the message to @{target_name}." if english else f"❌ فشل إرسال الرسالة إلى @{target_name}."
+        )
+        reply_state = getattr(self, "_master_reply_local", None)
+        old_rerouting = getattr(reply_state, "rerouting", False) if reply_state else False
+        try:
+            if reply_state:
+                reply_state.rerouting = True
+            self.send_private_text(sender_name, notice)
+        except Exception as exc:
+            self.log("[DIRECT-MESSAGE] sender confirmation failed", repr(exc))
+        finally:
+            if reply_state:
+                reply_state.rerouting = old_rerouting
+        return delivered
 
     def send_private_media(self, username: str, media_url: str, media_type: str, duration: int = 0):
         """Send media to a private chat using the same Query media fields as rooms.
@@ -10570,10 +10900,10 @@ class TalkinBot:
         occupants response populates ``bot_room_roles`` after joining, so this
         check stays local and does not add a roster request to every command.
         """
-        role = self._bot_room_role(room)
+        role = re.sub(r"[\s-]+", "_", self._bot_room_role(room).casefold().strip())
         return role in {
-            "owner", "creator", "room_owner", "room_creator", "host",
-            "مالك", "اونر", "أونر", "صانع", "صانع_الغرفة",
+            "owner", "creator", "room_owner", "room_creator", "roomowner", "roomcreator", "host",
+            "مالك", "مالك_الغرفة", "اونر", "أونر", "صانع", "صانع_الغرفة", "صانع_الغرفه",
         }
 
     def _inv_bot_owner_allowed(self, room):
@@ -11912,14 +12242,27 @@ class TalkinBot:
             self.send_room_text(room, "❌ اكتب: .sa اسم الأغنية")
             return True
         if live_stream and not self._bot_is_room_owner(room):
-            role = self._bot_room_role(room) or "غير معروفة"
-            self.send_room_text(
-                room,
-                "⚠️ لم يتم تشغيل البث.\n"
-                "👑 يجب أن تكون رتبة البوت Owner في الغرفة قبل تشغيل البث.\n"
-                f"📌 الرتبة الحالية: {role}"
-            )
-            return True
+            role = self._bot_room_role(room)
+            role_key = re.sub(r"[\s-]+", "_", role.casefold().strip())
+            unknown_roles = {"", "none", "unknown", "غير_معروفة", "غير_معروف"}
+            if role_key not in unknown_roles:
+                if self._effective_room_language(room) == "en":
+                    notice = (
+                        "⚠️ Stream not started.\n"
+                        "👑 The bot must be an Owner of the room to start a broadcast.\n"
+                        f"📌 Current role: {role}"
+                    )
+                else:
+                    notice = (
+                        "⚠️ لم يتم تشغيل البث.\n"
+                        "👑 يجب أن تكون رتبة البوت Owner في الغرفة قبل تشغيل البث.\n"
+                        f"📌 الرتبة الحالية: {role}"
+                    )
+                self.send_room_text(room, notice)
+                return True
+            # The role cache can be empty after reconnect even when the server
+            # recognizes the bot as Owner. Let Talkin authorize the request.
+            self.log("[STREAM] room role unknown; relying on server authorization:", room)
         now = time.time()
         last = self.music_last.get(requester, 0)
         if now - last < MUSIC_COOLDOWN:
@@ -12566,7 +12909,7 @@ class TalkinBot:
                 winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
                 if not winner_photo:
                     winner_photo = self._lookup_profile_photo(winner_name)
-                language = self._effective_room_language(target_rooms[0]) if game_key == "hunt_dragon" and target_rooms else "ar"
+                language = self._effective_room_language(target_rooms[0]) if target_rooms else "ar"
                 card = render_game_winner_card(game_key, winner_name, winner_photo, language=language)
                 url = f"{base}/games/{card.name}"
             self._verify_public_media_url(url, "image")
@@ -15021,6 +15364,7 @@ class TalkinBot:
             self.send_room_text(room, loss_text)
             return True
         self._game_award(sender_name, reward)
+        _record_money_game_winner("million", sender_name)
         winner_photo = self.user_photos.get(_norm_user(sender_name), "") or self._lookup_profile_photo(sender_name)
 
         # IMPORTANT: for the bank-win broadcast use only rooms confirmed as
@@ -15047,7 +15391,7 @@ class TalkinBot:
             if index + 1 < len(target_rooms):
                 time.sleep(0.05)
 
-        self._send_game_winner_card("بنك مليون", sender_name, target_rooms, send_delay=0.35)
+        self._send_game_winner_card("million", sender_name, target_rooms, send_delay=0.35)
         return True
 
     def _handle_pending_bot_choice(self, room, text, sender_name):
@@ -16358,6 +16702,7 @@ class TalkinBot:
 
             if won:
                 self._game_award(sender_name, reward)
+                _record_money_game_winner("billion", sender_name)
                 # Prefer the latest live profile URL; DB lookup is only a fallback.
                 winner_key = _norm_user(sender_name)
                 winner_photo = self.user_photos.get(winner_key, "")
@@ -16375,19 +16720,7 @@ class TalkinBot:
                     if index + 1 < len(target_rooms):
                         time.sleep(0.05)
 
-                try:
-                    base = _public_base_url()
-                    if not base:
-                        raise RuntimeError("PUBLIC_BASE_URL أو RAILWAY_PUBLIC_DOMAIN غير مضبوط")
-                    card = render_billion_card(sender_name, winner_photo)
-                    url = f"{base}/billion/{card.name}"
-                    self._verify_public_media_url(url, "image")
-                    # Publish the same generated winner card to every active room.
-                    for target_room in target_rooms:
-                        self.send_room_media(target_room, url, "image")
-                    self.log("[GAME] billion winner card sent", sender_name, len(target_rooms))
-                except Exception as exc:
-                    self.log("[GAME] billion winner card failed:", repr(exc))
+                self._send_game_winner_card("billion", sender_name, target_rooms, send_delay=0.35)
             else:
                 loss_text = (f"🎰🍀 Billion game\n━━━━━━━━━━━━━━\n❌ {sender_name} did not get the billion this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
                              if english else f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحصل على المليار هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
@@ -17038,14 +17371,37 @@ class TalkinBot:
                         self._record_room_sync_result(sync_id, target, True, "موجودة ومتصل بها البوت")
                     continue
                 if sender and key in getattr(self, "_room_restore_candidates", set()):
-                    try:
-                        self.send_private_text(sender, f"✅ البوت موجود داخل الغرفة: {target}")
-                    except Exception as exc:
-                        self.log("[ROOM] restored-room notice failed:", target, repr(exc))
-                    skipped += 1
-                    if sync_id:
-                        self._record_room_sync_result(sync_id, target, True, "تمت استعادتها عند تشغيل البوت")
-                    continue
+                    # A restore candidate is only a queued join, never proof of
+                    # membership. Wait for the pending server acknowledgement;
+                    # do not tell the requester the bot is present prematurely.
+                    pending_joins = getattr(self, "_pending_room_joins", {})
+                    if key in pending_joins:
+                        deadline = time.time() + timeout + 1.0
+                        while time.time() < deadline:
+                            if any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set())):
+                                break
+                            if key not in pending_joins:
+                                break
+                            time.sleep(0.25)
+                    if any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set())):
+                        try:
+                            self.send_private_text(sender, f"✅ البوت داخل الغرفة: {target}")
+                        except Exception as exc:
+                            self.log("[ROOM] confirmed restore notice failed:", target, repr(exc))
+                        skipped += 1
+                        if sync_id:
+                            self._record_room_sync_result(sync_id, target, True, "أكد الخادم وجود البوت في الغرفة")
+                        continue
+                    if key in getattr(self, "_pending_room_joins", {}):
+                        try:
+                            self.send_private_text(sender, f"⏳ طلب دخول البوت إلى {target} ما زال بانتظار تأكيد الخادم؛ لم أؤكد وجوده بعد.")
+                        except Exception:
+                            pass
+                        skipped += 1
+                        if sync_id:
+                            self._record_room_sync_result(sync_id, target, False, "طلب الدخول ما زال بانتظار تأكيد الخادم")
+                        continue
+                    getattr(self, "_room_restore_candidates", set()).discard(key)
                 try:
                     if self.join_room(target, force=bool(fast_restore), requested_by=sender):
                         sent += 1
@@ -17915,6 +18271,21 @@ class TalkinBot:
             self.send_private_text(sender, status_text)
             return True
 
+        if low in ("حالة قاعدة البيانات", "حاله قاعده البيانات", "حالة النسخ", "database status", "database sync status", "db status", "dbsync"):
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 أمر حالة مزامنة النسخ مخصص للماستر الأساسي فقط.")
+                return True
+            response_thread = getattr(self, "_master_reply_local", None)
+            old_rerouting = getattr(response_thread, "rerouting", False) if response_thread else False
+            try:
+                if response_thread:
+                    response_thread.rerouting = True
+                self.send_private_text(sender, _database_sync_status_text())
+            finally:
+                if response_thread:
+                    response_thread.rerouting = old_rerouting
+            return True
+
         # Overall bot health/status for the master. This is diagnostic, not a
         # generic success message, and reports the live state the bot knows.
         if low in ("حالة البوت", "حاله البوت", "status", "bot status"):
@@ -17942,7 +18313,10 @@ class TalkinBot:
             return True
 
         # Master-only room broadcast: رسالهغرف@النص / رسالةغرف@النص.
-        m_room_broadcast = re.fullmatch(r"(?:رسالهغرف|رسالةغرف|رساله\s+غرفه|رسالة\s+غرفه)@(.+)", text, re.I | re.S)
+        m_room_broadcast = re.fullmatch(
+            r"(?:رسالهغرف|رسالةغرف|رساله\s+غرفه|رسالة\s+غرفه|room\s+message|rooms\s+message|room\s+broadcast)@(.+)",
+            text, re.I | re.S,
+        )
         if m_room_broadcast:
             if not _is_primary_master(sender):
                 self.send_private_text(sender, "🔒 هذا الأمر مخصص للماستر الأساسي فقط.")
@@ -17951,8 +18325,39 @@ class TalkinBot:
             if not message_text:
                 self.send_private_text(sender, "❌ الصيغة: رساله غرفه@نص الرسالة")
                 return True
-            count=self.broadcast_all_rooms(message_text)
-            self.send_private_text(sender, f"📣 تم إرسال الرسالة إلى {count} غرفة.")
+            rooms = self._active_rooms()
+            if not rooms:
+                self.send_private_text(
+                    sender,
+                    "❌ No rooms are available for this broadcast."
+                    if text.casefold().startswith(("room", "rooms")) else "❌ لا توجد غرف لإرسال الرسالة إليها."
+                )
+                return True
+            english = text.casefold().startswith(("room", "rooms"))
+            if room:
+                try:
+                    english = english or self._effective_room_language(room) == "en"
+                except Exception:
+                    pass
+            try:
+                threading.Thread(
+                    target=self._broadcast_room_message_worker,
+                    args=(str(sender or ""), message_text, english),
+                    daemon=True,
+                    name="room-message-broadcast",
+                ).start()
+                self.send_private_text(
+                    sender,
+                    f"📨 Background broadcast started for {len(rooms)} rooms; you can keep using the bot."
+                    if english else f"📨 بدأ إرسال الرسالة بالخلفية إلى {len(rooms)} غرفة؛ يمكنك متابعة استخدام البوت."
+                )
+            except Exception as exc:
+                self.log("[BROADCAST] could not start background worker:", repr(exc))
+                self.send_private_text(
+                    sender,
+                    "❌ Could not start the room broadcast."
+                    if text.casefold().startswith(("room", "rooms")) else "❌ تعذر بدء إرسال الرسالة إلى الغرف."
+                )
             return True
 
         # Ordinary-user private message: رساله@اسم_المستخدم نص الرسالة
@@ -17960,20 +18365,21 @@ class TalkinBot:
         # The message itself is NEVER echoed to the room. The recipient gets
         # a private notification containing the sender, room and message,
         # while the requester gets a private success/failure result.
-        m_user_private = re.fullmatch(r"(?:رساله|رسالة)(?:@|\s+)@?([^\s@]+)\s+(.+)", text, re.I | re.S)
+        m_user_private = re.fullmatch(r"(?:رساله|رسالة|message)(?:@|\s+)@?([^\s@]+)\s+(.+)", text, re.I | re.S)
         if m_user_private:
             target = m_user_private.group(1).strip().lstrip("@")
             message_text = m_user_private.group(2).strip()
             if not target or not message_text:
                 return True
 
+            english = text.casefold().startswith("message")
             private_payload = (
-                f"📩 لديك رسالة خاصة من @{sender}\n"
-                f"🏠 الغرفة: {str(room or 'غير محددة').strip()}\n"
-                f"📝 نص الرسالة: {message_text}"
+                f"📩 You have a message from {str(sender or '').strip()}\n\n{message_text}"
+                if english else
+                f"📩 لديك رسالة من {str(sender or '').strip()}\n\n{message_text}"
             )
             try:
-                sent = bool(self.send_private_text(target, private_payload))
+                sent = self.send_private_text(target, private_payload) is not False
             except Exception as exc:
                 sent = False
                 self.log("[PRIVATE-MSG] failed", repr(exc))
@@ -17984,9 +18390,9 @@ class TalkinBot:
             try:
                 self._master_reply_local.rerouting = True
                 if sent:
-                    self.send_private_text(sender, f"✅ تم إرسال الرسالة إلى @{target} بنجاح.")
+                    self.send_private_text(sender, f"✅ Message sent to @{target}." if english else f"✅ تم إرسال الرسالة إلى @{target} بنجاح.")
                 else:
-                    self.send_private_text(sender, f"❌ فشل إرسال الرسالة إلى @{target}.")
+                    self.send_private_text(sender, f"❌ Failed to send the message to @{target}." if english else f"❌ فشل إرسال الرسالة إلى @{target}.")
             finally:
                 self._master_reply_local.rerouting = old_rerouting
             return True
@@ -18450,17 +18856,17 @@ class TalkinBot:
                            f"🎟️ إجمالي الرهانات: {_fmt_points(stats['staked'])}")
             (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room, message)
             return True
-        balance_top_aliases = {
-            "ملياري": (1_000_000_000, "المليار"),
-            "مليارات": (1_000_000_000, "المليار"),
-            "مليارت": (1_000_000_000, "المليار"),
-            "مليوني": (1_000_000, "المليون"),
-            "ملايين": (1_000_000, "المليون"),
+        money_game_winner_aliases = {
+            "ملياري": "billion",
+            "مليارات": "billion",
+            "مليارت": "billion",
+            "مليوني": "million",
+            "ملايين": "million",
         }
-        if low in balance_top_aliases:
-            threshold, label = balance_top_aliases[low]
+        if low in money_game_winner_aliases:
+            game_name = money_game_winner_aliases[low]
             english = _detect_text_language(text) == "en"
-            message = _points_threshold_top_message(threshold, label, english=english)
+            message = _money_game_winners_message(game_name, english=english)
             lines = message.splitlines()
             packet_type = "chat_message" if is_private else "room_message"
             route_fields = {"to": str(sender or "")} if is_private else {"room": str(room or "")}
@@ -20638,14 +21044,12 @@ class TalkinBot:
             # can involve a slow database/WebSocket round trip and must never
             # delay the user's entry confirmation.
             if requester:
-                self.send_private_text(requester, f"✅ أكد الخادم دخول البوت إلى الغرفة: {room}")
+                self.send_private_text(requester, f"✅ البوت داخل الغرفة: {room}")
             if room:
                 try:
                     self.request_room_occupants(room)
                 except Exception as exc:
                     self.log("[ROOM] occupants refresh after join failed:", repr(exc))
-            if requester:
-                self.send_room_text(room, "مرحبا لقد عدت ادري وحشتكم🙂😋")
         elif event_type in (
             "room_full", "room_unauthorized", "room_wrong_password",
             "room_needs_captcha", "room_needs_password", "room_membership_required",
@@ -20788,16 +21192,18 @@ class TalkinBot:
         #   رساله اسم_المستخدم نص الرسالة
         #   رساله@اسم_المستخدم نص الرسالة
         # This MUST be intercepted before the admin-command gate so it is
-        # never echoed to the room. No public confirmation is sent either.
-        m_direct_public = re.fullmatch(r"(?:رساله|رسالة)\s*@?([^\s@]+)\s+(.+)", body.strip(), re.I | re.S)
+        # never echoed to the room; delivery status is sent privately.
+        m_direct_public = re.fullmatch(r"(?:رساله|رسالة|message)\s*@?([^\s@]+)\s+(.+)", body.strip(), re.I | re.S)
         if m_direct_public:
-            target = m_direct_public.group(1).strip()
+            target = m_direct_public.group(1).strip().lstrip("@")
             message_text = m_direct_public.group(2).strip()
             if target and message_text:
+                english = body.strip().casefold().startswith("message")
                 try:
-                    self.send_private_text(target, message_text)
-                except Exception as exc:
-                    self.log("[DIRECT-MESSAGE] failed", target, repr(exc))
+                    english = english or self._effective_room_language(room) == "en"
+                except Exception:
+                    pass
+                self._deliver_user_private_message(frm, target, message_text, english=english)
                 return
 
         # Personal bot ban: silently ignore subsequent traffic except for a
@@ -21734,7 +22140,7 @@ class TalkinBot:
             self.last_error = str(e)
             self.log("[WS] decode error:", repr(e))
             if DEBUG and isinstance(message, (bytes, bytearray)):
-                self.log("[WS] raw:", bytes(message).hex()[:1000])
+                self.log("[WS] raw frame omitted; bytes:", len(message))
 
     def on_open(self, ws):
         # Room join is deliberately performed once by bootstrap_after_connect(),
