@@ -50,7 +50,8 @@ except Exception:
 from dotenv import load_dotenv
 from cricket_integration import CricketIntegration
 
-load_dotenv()
+# Prefer the project-local .env over variables injected by the hosting platform.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
 
 # ============================================================

@@ -1,8 +1,9 @@
 from flask import Flask, jsonify, request
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
 app = Flask(__name__)
 
