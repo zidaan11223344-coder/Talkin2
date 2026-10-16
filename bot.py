@@ -49,9 +49,9 @@ except Exception:
     pymysql = None
 from dotenv import load_dotenv
 from cricket_integration import CricketIntegration
-
-# Prefer the project-local .env over variables injected by the hosting platform.
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
+# The existing project .env is optional for local deployments. Hosting
+# variables remain authoritative and are never replaced by the file.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 
 # ============================================================
@@ -1973,15 +1973,18 @@ def _money_game_roll(game_name):
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 # State backups are intentionally restricted to Talkin4. Do not allow a
 # deployment variable to redirect the bot into the main Talkin1 source repo.
-GITHUB_REPO = "zidaan11223344-coder/Talkin4"  # durable data repository
+GITHUB_REPO = (os.getenv("GITHUB_REPO", "zidaan11223344-coder/Talkin4").strip()
+               or "zidaan11223344-coder/Talkin4")  # durable data repository
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
 GITHUB_DATA_DIR = os.getenv("GITHUB_DATA_DIR", "bot_data").strip().strip("/")
 GITHUB_SYNC_ENABLED = bool(GITHUB_TOKEN and GITHUB_REPO and os.getenv("GITHUB_SYNC", "1").strip().lower() not in {"0", "false", "no", "off"})
+GITHUB_BACKUP_WAIT_SECONDS = max(1.0, float(os.getenv("GITHUB_BACKUP_WAIT_SECONDS", "20") or 20))
 _GITHUB_SYNC_LOCK = threading.RLock()
 _GITHUB_SYNC_LAST = {}
 _GITHUB_RESTORING = False
 _GITHUB_PENDING = {}
 _GITHUB_PENDING_CONDITION = threading.Condition()
+_GITHUB_INFLIGHT = 0
 _GITHUB_WORKER_STARTED = False
 _GITHUB_BACKUP_REQUESTS = []
 
@@ -2400,6 +2403,46 @@ def _queue_github_full_backup():
     return queued
 
 
+def _flush_local_persistence(timeout=5.0):
+    """Write queued JSON snapshots before a durability-critical backup."""
+    deadline = time.monotonic() + max(0.1, float(timeout or 5.0))
+    while time.monotonic() < deadline:
+        with _LOCAL_BG_CONDITION:
+            pending = dict(_LOCAL_BG_PENDING)
+            _LOCAL_BG_PENDING.clear()
+        if not pending:
+            return True
+        for path, data in pending.items():
+            try:
+                _save_local_json(path, data)
+            except Exception as exc:
+                print(f"[LOCAL] critical flush failed for {Path(path).name}: {exc}", flush=True)
+                return False
+    return False
+
+
+def _flush_github_backup(timeout=None):
+    """Persist the newest local state and wait for the GitHub worker."""
+    if not GITHUB_SYNC_ENABLED:
+        return False
+    timeout = GITHUB_BACKUP_WAIT_SECONDS if timeout is None else max(0.1, float(timeout))
+    deadline = time.monotonic() + timeout
+    if not _flush_local_persistence(min(5.0, timeout)):
+        return False
+    queued = _queue_github_full_backup()
+    if not queued:
+        return False
+    with _GITHUB_PENDING_CONDITION:
+        _GITHUB_PENDING_CONDITION.notify_all()
+        while _GITHUB_PENDING or _GITHUB_INFLIGHT:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("[GITHUB] durability flush timed out", flush=True)
+                return False
+            _GITHUB_PENDING_CONDITION.wait(timeout=remaining)
+    return True
+
+
 def _request_github_full_backup(bot, sender):
     """Queue a full backup and remember who should receive its result."""
     queued = _queue_github_full_backup()
@@ -2437,6 +2480,7 @@ def _database_backup_worker():
             except Exception as exc: print("[BACKUP] periodic backup failed:", repr(exc), flush=True)
 
 def _github_sync_worker():
+    global _GITHUB_INFLIGHT
     while True:
         with _GITHUB_PENDING_CONDITION:
             while not _GITHUB_PENDING:
@@ -2445,18 +2489,24 @@ def _github_sync_worker():
             _GITHUB_PENDING_CONDITION.wait(timeout=0.75)
             pending = dict(_GITHUB_PENDING)
             _GITHUB_PENDING.clear()
+            _GITHUB_INFLIGHT += 1
         backup_ok = True
-        for path in pending:
-            try:
-                data = _load_local_json(path, None)
-                if data is None:
-                    continue
-                with _GITHUB_SYNC_LOCK:
-                    if not _github_put_file(path, data):
-                        backup_ok = False
-            except Exception as exc:
-                backup_ok = False
-                print(f"[GITHUB] background sync failed for {Path(path).name}: {exc}", flush=True)
+        try:
+            for path in pending:
+                try:
+                    data = _load_local_json(path, None)
+                    if data is None:
+                        continue
+                    with _GITHUB_SYNC_LOCK:
+                        if not _github_put_file(path, data):
+                            backup_ok = False
+                except Exception as exc:
+                    backup_ok = False
+                    print(f"[GITHUB] background sync failed for {Path(path).name}: {exc}", flush=True)
+        finally:
+            with _GITHUB_PENDING_CONDITION:
+                _GITHUB_INFLIGHT = max(0, _GITHUB_INFLIGHT - 1)
+                _GITHUB_PENDING_CONDITION.notify_all()
         with _GITHUB_PENDING_CONDITION:
             requests_to_notify = list(_GITHUB_BACKUP_REQUESTS)
             _GITHUB_BACKUP_REQUESTS.clear()
@@ -7550,6 +7600,8 @@ class TalkinBot:
         room = str(room or "").strip()
         if not room:
             return False
+        backup_ok = _flush_github_backup()
+        self.log("[BACKUP_BEFORE_LEAVE]", room, "complete" if backup_ok else "not-confirmed")
         if not hasattr(self, "_intentional_leaves"):
             self._intentional_leaves = set()
         self._intentional_leaves.add(_norm_room(room))
@@ -7596,6 +7648,9 @@ class TalkinBot:
         rooms = [str(r).strip() for r in self.known_rooms if str(r).strip()]
         if not hasattr(self, "_intentional_leaves"):
             self._intentional_leaves = set()
+        if rooms:
+            backup_ok = _flush_github_backup()
+            self.log("[BACKUP_BEFORE_LEAVE_ALL]", "complete" if backup_ok else "not-confirmed")
         for room in rooms:
             try:
                 room_key = _norm_room(room)
@@ -21621,6 +21676,12 @@ class TalkinBot:
         # none of them may be reported by "غرفي" until the server confirms
         # them again after reconnect. The historical list remains on disk.
         self._reset_room_connection_state()
+        threading.Thread(
+            target=_flush_github_backup,
+            kwargs={"timeout": GITHUB_BACKUP_WAIT_SECONDS},
+            daemon=True,
+            name="backup-before-reconnect",
+        ).start()
         self.log("[WS] closed:", code, msg)
 
     def bootstrap_after_connect(self):
@@ -21834,6 +21895,13 @@ class TalkinBot:
                         self._stop_heartbeat()
                         last_error = e
                         self.log("[WS] host/path failed:", host, port, path, repr(e))
+                        if self._had_connection:
+                            threading.Thread(
+                                target=_flush_github_backup,
+                                kwargs={"timeout": GITHUB_BACKUP_WAIT_SECONDS},
+                                daemon=True,
+                                name="backup-before-reconnect",
+                            ).start()
                         try:
                             if self.ws:
                                 self.ws.close()

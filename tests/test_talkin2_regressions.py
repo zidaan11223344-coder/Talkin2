@@ -3954,6 +3954,25 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertEqual(bot.connected_rooms, {"North"})
         self.assertFalse(leave_calls)
 
+    def test_leave_room_flushes_backup_before_room_leave_packet(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._intentional_leaves = set()
+        bot.blocked_rooms = set()
+        bot.known_rooms = {"North"}
+        bot.connected_rooms = {"North"}
+        bot.room_users = {"North": {}}
+        bot._last_join_sent = {}
+        bot._join_lock = threading.RLock()
+        bot._server_room_catalog = ["North"]
+        bot.log = lambda *_args: None
+        events = []
+        bot.send_query = lambda _payload: events.append("leave") or True
+        with patch.object(bot_module, "_flush_github_backup", side_effect=lambda: events.append("backup") or True), patch.object(
+            bot_module, "_save_persistent_rooms"
+        ):
+            self.assertTrue(bot.leave_room("North"))
+        self.assertEqual(events[:2], ["backup", "leave"])
+
 
 class NewFeatureRegressions(unittest.TestCase):
     def test_compact_money_amounts_for_stock_and_wagers(self):
