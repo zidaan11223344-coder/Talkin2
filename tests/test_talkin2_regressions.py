@@ -2203,9 +2203,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "5000"}):
             self.assertFalse(bot.send_query(payload))
 
-        self.assertEqual(len(sent), 1)
-        notice_fields = bot_module.decode_message(sent[0])
-        self.assertIn("تم تجاهل رسالتك بسبب حجم كبير", bot_module.as_text(notice_fields[5][0]))
+        # Low-level transport has no command-sender context. It must drop and
+        # log only; _send_text_packets owns the single user-facing notice.
+        self.assertEqual(sent, [])
         self.assertEqual(telegram, [])
 
     def test_oversized_private_text_is_dropped_and_notifies_recipient(self):

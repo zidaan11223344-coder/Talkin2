@@ -7284,11 +7284,10 @@ class TalkinBot:
                 packet_type, target, room, len(payload),
                 f"حزمة WebSocket تجاوزت الحد الصلب ({max_bytes} بايت)؛ أُسقطت محلياً"
             )
-            # The user-facing notice is reserved for the protocol hard cap.
-            # A lower deployment limit may intentionally drop a packet, but
-            # must not claim that it exceeded 1008 bytes.
-            if len(payload) > 1008:
-                self._send_oversize_notice(packet_type, target=target, room=room)
+            # User-facing notices are emitted only by _send_text_packets,
+            # which has the original command executor in its context. The
+            # low-level transport must only drop/log this packet; notifying
+            # here would create duplicate or context-free replies.
             return False
 
         # Keep a compact trace of the live protocol. This is intentionally
@@ -7850,8 +7849,9 @@ class TalkinBot:
             return encode_query(packet_type, **payload)
 
         # Measure the COMPLETE WebSocket/protobuf payload, not just text bytes.
-        if len(make_payload(text)) <= limit:
-            self.send_query(make_payload(text))
+        packet = make_payload(text)
+        if len(packet) <= limit:
+            self.send_query(packet)
             return True
 
         # Drop complete oversized messages locally instead of splitting them,
@@ -7860,10 +7860,10 @@ class TalkinBot:
             packet_type,
             str(kwargs.get("to") or ""),
             str(kwargs.get("room") or ""),
-            len(make_payload(text)),
+            len(packet),
             f"حزمة النص تجاوزت الحد الصلب ({limit} بايت)؛ أُسقطت محلياً",
         )
-        if len(make_payload(text)) > 1008:
+        if len(packet) > 1008:
             self._send_oversize_notice(
                 packet_type,
                 target=str(kwargs.get("to") or ""),
