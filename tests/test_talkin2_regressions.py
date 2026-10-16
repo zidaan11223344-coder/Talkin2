@@ -3575,9 +3575,8 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 self.assertTrue(point_ops[1][2].startswith("stock-market-payout:"))
                 self.assertFalse(bot.stock_investments)
                 result_by_room = dict(messages)
-                self.assertEqual(set(result_by_room), {"ArabicHall", "EnglishHall"})
+                self.assertEqual(set(result_by_room), {"ArabicHall"})
                 self.assertIn("نتيجة البورصة", result_by_room["ArabicHall"])
-                self.assertIn("Stock-market result", result_by_room["EnglishHall"])
                 result = private_messages[0][1]
                 self.assertIn(f"{expected_percent}%", result)
                 self.assertIn("الخسارة" if outcome == "loss" else "الربح", result)

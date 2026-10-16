@@ -13749,7 +13749,8 @@ class TalkinBot:
         return "📈 بدأت البورصة! أرسل بورصة، واختر الأصل والمبلغ. يمكنك الاستثمار مجدداً كل دقيقتين. النتيجة بعد دقيقة: ربح أو خسارة."
 
     def _broadcast_stock_market_round(self, rooms):
-        for target_room in rooms:
+        # A round belongs to one room; never announce it across all rooms.
+        for target_room in list(rooms)[:1]:
             language = self._configured_room_language(target_room)
             try:
                 self.send_room_text(target_room, self._stock_market_announcement(language))
@@ -13804,16 +13805,13 @@ class TalkinBot:
             self.stock_market_round = event
             self._stock_market_seen = set()
             self._stock_market_next_announcement = now + STOCK_MARKET_INTERVAL_SECONDS
+        # Manual rounds announce only in their originating room. Scheduled
+        # rounds pick one active room rather than broadcasting to every room.
         try:
-            rooms = set(self._active_rooms())
+            active_rooms = {str(room).strip() for room in self._active_rooms() if str(room).strip()}
         except Exception:
-            rooms = {str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}
-        if first_room:
-            rooms.add(str(first_room).strip())
-        ordered_rooms = sorted(rooms, key=str.casefold)
-        if first_room and first_room in ordered_rooms:
-            ordered_rooms.remove(first_room)
-            ordered_rooms.insert(0, first_room)
+            active_rooms = {str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}
+        ordered_rooms = [str(first_room).strip()] if first_room else sorted(active_rooms, key=str.casefold)[:1]
         self._queue_stock_market_round_broadcast(ordered_rooms)
         return event
 
@@ -13961,47 +13959,37 @@ class TalkinBot:
         return True
 
     def _broadcast_stock_market_result(self, username, source_room, asset, amount, outcome, change_percent, change):
-        """Announce one settled investment in every room the bot is currently in."""
+        """Announce a settled investment only in its source room."""
         if not STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED:
             return
-        rooms = set()
-        try:
-            rooms.update(str(value).strip() for value in self._active_rooms() if str(value).strip())
-        except Exception as exc:
-            self.log("[STOCK] active-room lookup failed during result broadcast:", repr(exc))
-        for field in ("connected_rooms",):
-            try:
-                rooms.update(str(value).strip() for value in getattr(self, field, set()) if str(value).strip())
-            except Exception:
-                pass
-        if source_room:
-            rooms.add(str(source_room).strip())
+        target_room = str(source_room or "").strip()
+        if not target_room:
+            return
         data = STOCK_MARKET_ASSETS.get(int(asset), {})
         is_profit = str(outcome) == "profit"
         sign = "+" if is_profit else "-"
         display_user = _transfer_log_safe_field(username, max_bytes=80)
-        for target_room in sorted(rooms, key=str.casefold):
-            english = self._configured_room_language(target_room) == "en"
-            if english:
-                label = "PROFIT" if is_profit else "LOSS"
-                text = (
-                    f"📈 Stock-market result — {label}\n"
-                    f"👤 Investor: @{display_user}\n"
-                    f"{data.get('icon', '📈')} {data.get('en', 'Market')} | Invested: {_fmt_points(amount)} points\n"
-                    f"📊 {label}: {int(change_percent)}% ({sign}{_fmt_points(change)})"
-                )
-            else:
-                label = "ربح" if is_profit else "خسارة"
-                text = (
-                    f"📈 نتيجة البورصة — {label}\n"
-                    f"👤 المستثمر: @{display_user}\n"
-                    f"{data.get('icon', '📈')} {data.get('ar', 'البورصة')} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
-                    f"📊 {label}: {int(change_percent)}% ({sign}{_fmt_points(change)})"
-                )
-            try:
-                self.send_room_text(target_room, text)
-            except Exception as exc:
-                self.log("[STOCK] result broadcast failed:", target_room, repr(exc))
+        english = self._configured_room_language(target_room) == "en"
+        if english:
+            label = "PROFIT" if is_profit else "LOSS"
+            text = (
+                f"📈 Stock-market result — {label}\n"
+                f"👤 Investor: @{display_user}\n"
+                f"{data.get('icon', '📈')} {data.get('en', 'Market')} | Invested: {_fmt_points(amount)} points\n"
+                f"📊 {label}: {int(change_percent)}% ({sign}{_fmt_points(change)})"
+            )
+        else:
+            label = "ربح" if is_profit else "خسارة"
+            text = (
+                f"📈 نتيجة البورصة — {label}\n"
+                f"👤 المستثمر: @{display_user}\n"
+                f"{data.get('icon', '📈')} {data.get('ar', 'البورصة')} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
+                f"📊 {label}: {int(change_percent)}% ({sign}{_fmt_points(change)})"
+            )
+        try:
+            self.send_room_text(target_room, text)
+        except Exception as exc:
+            self.log("[STOCK] result broadcast failed:", target_room, repr(exc))
 
     def _process_stock_market_investments(self, now=None):
         now = time.time() if now is None else float(now)
