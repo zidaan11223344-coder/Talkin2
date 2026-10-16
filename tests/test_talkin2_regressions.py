@@ -2786,6 +2786,28 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
                 self.assertIn(included, private[-1][1])
                 self.assertNotIn(excluded, private[-1][1])
 
+    def test_threshold_top_commands_use_one_sorted_fifteen_member_list(self):
+        accounts = {
+            f"Billionaire{i}": {
+                "username": f"Billionaire{i}",
+                "points": 2_000_000_000 - i * 1_000_000,
+            }
+            for i in range(1, 18)
+        }
+        accounts["MillionOnly"] = {"username": "MillionOnly", "points": 1_000_000}
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_private_text = lambda user, text: sent.append(text)
+        bot.send_room_text = lambda room, text: sent.append(text)
+        with patch.object(bot_module, "_points_data", return_value=accounts):
+            self.assertTrue(bot._handle_management_command_impl("North", "مليارات", "Viewer", is_private=True))
+        message = sent[-1]
+        self.assertIn("Billionaire1", message)
+        self.assertIn("Billionaire15", message)
+        self.assertNotIn("Billionaire16", message)
+        self.assertNotIn("MillionOnly", message)
+        self.assertEqual(message.count("—"), 15)
+
     def test_image_publish_schedules_worker_and_returns_without_waiting(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         sender = "publisher"

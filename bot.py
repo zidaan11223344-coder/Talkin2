@@ -4099,6 +4099,22 @@ def _points_leaderboard_rows(min_balance=None):
     return rows
 
 
+def _points_threshold_top_message(threshold, label, *, english=False, limit=POINTS_LEADERBOARD_LIMIT):
+    """Format one capped leaderboard for players who reached a balance threshold."""
+    rows = _points_leaderboard_rows(min_balance=threshold)[:max(1, int(limit))]
+    title = f"🏆 Top players with {label}" if english else f"🏆 توب الحاصلين على {label} نقطة"
+    lines = [title, "━━━━━━━━━━━━"]
+    for rank, (points, username) in enumerate(rows, 1):
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}️⃣")
+        if english:
+            lines.append(f"{medal} @{username} — {_fmt_points(points)} points")
+        else:
+            lines.append(f"{medal} @{username} — {_fmt_points(points)} نقطة")
+    if not rows:
+        lines.append("No qualifying players yet." if english else "لا يوجد لاعبون وصلوا لهذا الرصيد بعد.")
+    return "\n".join(lines)
+
+
 def _points_rank(username):
     """Return the player's one-based position in the full points-file ranking."""
     wanted = _game_name_key(username)
@@ -18280,23 +18296,14 @@ class TalkinBot:
             return True
         balance_top_aliases = {
             "ملياري": (1_000_000_000, "المليار"),
+            "مليارات": (1_000_000_000, "المليار"),
             "مليوني": (1_000_000, "المليون"),
+            "ملايين": (1_000_000, "المليون"),
         }
         if low in balance_top_aliases:
             threshold, label = balance_top_aliases[low]
-            rows = _points_leaderboard_rows(min_balance=threshold)[:15]
             english = _detect_text_language(text) == "en"
-            title = f"🏆 Top players with {label}" if english else f"🏆 توب الحاصلين على {label} نقطة"
-            lines = [title, "━━━━━━━━━━━━"]
-            for rank, (points, username) in enumerate(rows, 1):
-                medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}️⃣")
-                lines.append(
-                    f"{medal} @{username} — {_fmt_points(points)} points" if english
-                    else f"{medal} @{username} — {_fmt_points(points)} نقطة"
-                )
-            if not rows:
-                lines.append("No qualifying players yet." if english else "لا يوجد لاعبون وصلوا لهذا الرصيد بعد.")
-            message = "\n".join(lines)
+            message = _points_threshold_top_message(threshold, label, english=english)
             if is_private:
                 self.send_private_text(sender, message)
             else:
