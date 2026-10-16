@@ -2253,6 +2253,29 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             self.assertFalse(bot._send_text_packets("chat_message", "x" * 700, to="Player"))
         self.assertEqual(sent, [])
 
+    def test_only_payloads_over_1008_bytes_are_dropped_and_notified(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_query = lambda payload: sent.append(bytes(payload)) or True
+        bot.log = lambda *_args: None
+        exactly_1008 = "x" * 979
+        exactly_1009 = "x" * 980
+        self.assertEqual(
+            len(bot_module.encode_query("room_message", type_="text", body=exactly_1008, room="Hall")),
+            1008,
+        )
+        self.assertEqual(
+            len(bot_module.encode_query("room_message", type_="text", body=exactly_1009, room="Hall")),
+            1009,
+        )
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
+            self.assertTrue(bot._send_text_packets("room_message", exactly_1008, room="Hall"))
+            self.assertFalse(bot._send_text_packets("room_message", exactly_1009, room="Hall"))
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent[0]), 1008)
+        self.assertNotIn(exactly_1009, bot_module.as_text(bot_module.decode_message(sent[1])[5][0]))
+        self.assertIn("تم تجاهل رسالتك بسبب حجم كبير", bot_module.as_text(bot_module.decode_message(sent[1])[5][0]))
+
     def test_games_command_opens_the_a3_catalog_and_sets_ns_navigation(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.stock_pending = {}
