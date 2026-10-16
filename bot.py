@@ -11145,13 +11145,19 @@ class TalkinBot:
         made Talkin accept the packet but discard the image/audio payload.
         """
         if media_type == "audio":
-            return self.send_query(encode_query(
+            packet = encode_query(
                 "room_message", type_="audio",
                 length=str(max(0, int(duration or 0))), room=room, url=media_url
-            ))
-        return self.send_query(encode_query(
-            "room_message", type_=media_type, room=room, url=media_url
-        ))
+            )
+        else:
+            packet = encode_query(
+                "room_message", type_=media_type, room=room, url=media_url
+            )
+        limit = _ws_payload_limit()
+        if len(packet) > limit:
+            self.log("[WS] media packet dropped before hard payload limit:", media_type, len(packet), limit)
+            return False
+        return self.send_query(packet)
 
     def _audius_live_source(self, query):
         """Find a streamable Audius track for live broadcast without downloading it.
@@ -15777,6 +15783,24 @@ class TalkinBot:
                 image_sent = self.send_room_media(room, photo_url, "image") is not False
             except Exception as exc:
                 self.log("[SOCIAL-HUNT] image delivery failed:", room, repr(exc))
+        if not image_sent and not fallback_used:
+            # A saved profile URL may be stale or inaccessible; retry with a
+            # gender-matched public portrait before reporting a missing image.
+            query = "beautiful woman portrait safe for work" if female_photo else "handsome man portrait safe for work"
+            try:
+                fallback_url = _search_lookalike_image(query, exclude_urls=[photo_url] if photo_url else None)
+            except Exception as exc:
+                self.log("[SOCIAL-HUNT] fallback image search failed:", repr(exc))
+                fallback_url = None
+            if not fallback_url:
+                lock = secrets.randbelow(1_000_000) + 1
+                tags = "woman,portrait" if female_photo else "man,portrait"
+                fallback_url = f"https://loremflickr.com/640/480/{tags}?lock={lock}"
+            try:
+                image_sent = self.send_room_media(room, fallback_url, "image") is not False
+                fallback_used = image_sent
+            except Exception as exc:
+                self.log("[SOCIAL-HUNT] fallback image delivery failed:", room, repr(exc))
         hunter_plain, target_plain = str(sender).strip().lstrip("@"), str(target).strip().lstrip("@")
         if english:
             label = "Beauty Hunt" if female_photo else "Handsome Hunt"
@@ -18260,7 +18284,7 @@ class TalkinBot:
         }
         if low in balance_top_aliases:
             threshold, label = balance_top_aliases[low]
-            rows = _points_leaderboard_rows(min_balance=threshold)[:POINTS_LEADERBOARD_LIMIT]
+            rows = _points_leaderboard_rows(min_balance=threshold)[:15]
             english = _detect_text_language(text) == "en"
             title = f"🏆 Top players with {label}" if english else f"🏆 توب الحاصلين على {label} نقطة"
             lines = [title, "━━━━━━━━━━━━"]
@@ -18286,7 +18310,7 @@ class TalkinBot:
         }
         if low in game_top_aliases:
             game_key, label = game_top_aliases[low]
-            rows = _game_top(game_key)
+            rows = _game_top(game_key, limit=15)[:15]
             english = _detect_text_language(text) == "en"
             title = f"🏆 Top {label}" if english else f"🏆 توب {label}"
             lines = [title, "━━━━━━━━━━━━"]
