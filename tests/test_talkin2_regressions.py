@@ -2213,12 +2213,47 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         sent = []
         bot.send_query = lambda payload: sent.append(payload) or True
         bot.log = lambda *_args: None
+        username = "SenderUser"
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
-            self.assertFalse(bot._send_text_packets("chat_message", "x" * 2000, to="Player"))
+            self.assertFalse(bot._send_text_packets(
+                "chat_message", "x" * 2000, to=username,
+                oversize_notice_user=username,
+            ))
         self.assertEqual(len(sent), 1)
         notice_fields = bot_module.decode_message(sent[0])
-        self.assertEqual(bot_module.as_text(notice_fields[4][0]), "Player")
-        self.assertIn("@Player تم تجاهل رسالتك بسبب حجم كبير", bot_module.as_text(notice_fields[5][0]))
+        self.assertEqual(bot_module.as_text(notice_fields[4][0]), username)
+        self.assertEqual(
+            bot_module.as_text(notice_fields[5][0]),
+            f"👤 @{username} تم تجاهل رسالتك بسبب حجم كبير.",
+        )
+
+    def test_oversized_notice_does_not_use_decorated_master_name(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_query = lambda payload: sent.append(payload) or True
+        bot.log = lambda *_args: None
+        decorated_master = "∫♚∫اݪـــۛــ⃮ـۿــ𓏺𓏺ـيّـــّٰـبــۃ∫♚∫"
+        with patch.object(bot_module, "_is_configured_master_account", return_value=True), patch.dict(
+            bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}
+        ):
+            self.assertFalse(bot._send_text_packets(
+                "chat_message", "x" * 2000, to=decorated_master,
+                oversize_notice_user=decorated_master,
+            ))
+        notice_fields = bot_module.decode_message(sent[0])
+        self.assertEqual(
+            bot_module.as_text(notice_fields[5][0]),
+            "👤 اسم المستخدم تم تجاهل رسالتك بسبب حجم كبير.",
+        )
+
+    def test_lower_configured_limit_drops_without_1008_notice(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_query = lambda payload: sent.append(payload) or True
+        bot.log = lambda *_args: None
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "500"}):
+            self.assertFalse(bot._send_text_packets("chat_message", "x" * 700, to="Player"))
+        self.assertEqual(sent, [])
 
     def test_games_command_opens_the_a3_catalog_and_sets_ns_navigation(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

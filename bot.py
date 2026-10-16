@@ -7236,8 +7236,16 @@ class TalkinBot:
         target = str(target or "").strip()
         room = str(room or "").strip()
         username = str(username or target or "").strip().lstrip("@")
-        notice = (f"👤 @{username} تم تجاهل رسالتك بسبب حجم كبير."
-                  if username else "⚠️ تم تجاهل رسالتك بسبب حجم كبير.")
+        master_display = os.getenv("MASTER_DISPLAY_NAME", "").strip()
+        is_master_display = bool(username) and (
+            _is_configured_master_account(username)
+            or (master_display and _norm_user(username) == _norm_user(master_display))
+        )
+        notice = (
+            f"👤 @{username} تم تجاهل رسالتك بسبب حجم كبير."
+            if username and not is_master_display
+            else "👤 اسم المستخدم تم تجاهل رسالتك بسبب حجم كبير."
+        )
         if packet_type == "chat_message" and target:
             payload = encode_query("chat_message", type_="text", to=target, body=notice)
         elif packet_type == "room_message" and room:
@@ -7276,7 +7284,11 @@ class TalkinBot:
                 packet_type, target, room, len(payload),
                 f"حزمة WebSocket تجاوزت الحد الصلب ({max_bytes} بايت)؛ أُسقطت محلياً"
             )
-            self._send_oversize_notice(packet_type, target=target, room=room)
+            # The user-facing notice is reserved for the protocol hard cap.
+            # A lower deployment limit may intentionally drop a packet, but
+            # must not claim that it exceeded 1008 bytes.
+            if len(payload) > 1008:
+                self._send_oversize_notice(packet_type, target=target, room=room)
             return False
 
         # Keep a compact trace of the live protocol. This is intentionally
@@ -7851,12 +7863,13 @@ class TalkinBot:
             len(make_payload(text)),
             f"حزمة النص تجاوزت الحد الصلب ({limit} بايت)؛ أُسقطت محلياً",
         )
-        self._send_oversize_notice(
-            packet_type,
-            target=str(kwargs.get("to") or ""),
-            room=str(kwargs.get("room") or ""),
-            username=oversize_notice_user,
-        )
+        if len(make_payload(text)) > 1008:
+            self._send_oversize_notice(
+                packet_type,
+                target=str(kwargs.get("to") or ""),
+                room=str(kwargs.get("room") or ""),
+                username=oversize_notice_user,
+            )
         return False
 
     def _send_help_chunks(self, packet_type: str, text: str, limit: int = 320, **kwargs):
