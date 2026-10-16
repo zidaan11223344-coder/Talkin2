@@ -7181,6 +7181,28 @@ class TalkinBot:
         # must never be forwarded to Telegram or the Talkin WebSocket.
         self.log("[WS_OVERSIZE_HANDLED]", master_msg.replace("\n", " | "))
 
+    def _send_oversize_notice(self, packet_type, target="", room="", username=""):
+        """Tell the affected user/room after dropping an oversized packet."""
+        target = str(target or "").strip()
+        room = str(room or "").strip()
+        username = str(username or target or "").strip().lstrip("@")
+        notice = (f"👤 @{username} تم تجاهل رسالتك بسبب حجم كبير."
+                  if username else "⚠️ تم تجاهل رسالتك بسبب حجم كبير.")
+        if packet_type == "chat_message" and target:
+            payload = encode_query("chat_message", type_="text", to=target, body=notice)
+        elif packet_type == "room_message" and room:
+            payload = encode_query("room_message", type_="text", room=room, body=notice)
+        else:
+            return False
+        if len(payload) > _ws_payload_limit():
+            self.log("[WS_OVERSIZE] oversize notice did not fit", packet_type, len(payload))
+            return False
+        try:
+            return bool(self.send_query(payload))
+        except Exception as exc:
+            self.log("[WS_OVERSIZE] notice failed:", repr(exc))
+            return False
+
     def send_query(self, payload: bytes):
         if not self.ws:
             raise RuntimeError("WebSocket is not connected")
@@ -7204,6 +7226,7 @@ class TalkinBot:
                 packet_type, target, room, len(payload),
                 f"حزمة WebSocket تجاوزت الحد الصلب ({max_bytes} بايت)؛ أُسقطت محلياً"
             )
+            self._send_oversize_notice(packet_type, target=target, room=room)
             return False
 
         # Keep a compact trace of the live protocol. This is intentionally
@@ -7745,7 +7768,7 @@ class TalkinBot:
             self.log("[WS] long-text notice failed:", repr(exc))
             return False
 
-    def _send_text_packets(self, packet_type: str, text: str, **kwargs):
+    def _send_text_packets(self, packet_type: str, text: str, *, oversize_notice_user="", **kwargs):
         """Send text only when its full protobuf packet fits the hard limit."""
         text = str(text or "")
         if not text:
@@ -7772,6 +7795,12 @@ class TalkinBot:
             str(kwargs.get("room") or ""),
             len(make_payload(text)),
             f"حزمة النص تجاوزت الحد الصلب ({limit} بايت)؛ أُسقطت محلياً",
+        )
+        self._send_oversize_notice(
+            packet_type,
+            target=str(kwargs.get("to") or ""),
+            room=str(kwargs.get("room") or ""),
+            username=oversize_notice_user,
         )
         return False
 
@@ -8194,12 +8223,14 @@ class TalkinBot:
 
     def send_room_text(self, room: str, text: str):
         text = self._localize_room_text(room, text)
-        text = _fit_text_to_packet("room_message", text, room=room)
         if getattr(self._master_reply_local, "tracking", False):
             self._master_reply_local.replied = True
         if getattr(self._silent_master_local, "active", False):
             return True
-        return self._send_text_packets("room_message", text, room=room)
+        notice_user = getattr(self._master_reply_local, "command_sender", "")
+        return self._send_text_packets(
+            "room_message", text, room=room, oversize_notice_user=notice_user
+        )
 
     def send_room_lines(self, room: str, lines):
         for line in lines:

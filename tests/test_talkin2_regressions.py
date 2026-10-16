@@ -2185,7 +2185,9 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
             self.assertFalse(bot._send_text_packets("room_message", text, room="North"))
 
-        self.assertEqual(packets, [])
+        self.assertEqual(len(packets), 1)
+        notice_fields = bot_module.decode_message(packets[0])
+        self.assertIn("تم تجاهل رسالتك بسبب حجم كبير", bot_module.as_text(notice_fields[5][0]))
         self.assertEqual(telegram, [])
 
     def test_send_query_hard_caps_payload_at_1008_and_drops_text_locally(self):
@@ -2201,8 +2203,22 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "5000"}):
             self.assertFalse(bot.send_query(payload))
 
-        self.assertEqual(sent, [])
+        self.assertEqual(len(sent), 1)
+        notice_fields = bot_module.decode_message(sent[0])
+        self.assertIn("تم تجاهل رسالتك بسبب حجم كبير", bot_module.as_text(notice_fields[5][0]))
         self.assertEqual(telegram, [])
+
+    def test_oversized_private_text_is_dropped_and_notifies_recipient(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_query = lambda payload: sent.append(payload) or True
+        bot.log = lambda *_args: None
+        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
+            self.assertFalse(bot._send_text_packets("chat_message", "x" * 2000, to="Player"))
+        self.assertEqual(len(sent), 1)
+        notice_fields = bot_module.decode_message(sent[0])
+        self.assertEqual(bot_module.as_text(notice_fields[4][0]), "Player")
+        self.assertIn("@Player تم تجاهل رسالتك بسبب حجم كبير", bot_module.as_text(notice_fields[5][0]))
 
     def test_games_command_opens_the_a3_catalog_and_sets_ns_navigation(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
