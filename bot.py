@@ -49,6 +49,7 @@ except Exception:
     pymysql = None
 from dotenv import dotenv_values, load_dotenv
 from cricket_integration import CricketIntegration
+import shop as member_shop
 # Public defaults live in the tracked project settings file. Empty values are
 # ignored so required secrets must come from Railway Variables, while an
 # explicitly injected Railway value always wins over the repository defaults.
@@ -698,6 +699,7 @@ def _select_persistent_data_dir():
     return BASE_DIR / "data"
 
 DATA_DIR = _select_persistent_data_dir()
+member_shop.SHOP_PATH = DATA_DIR / "shop_data.json"
 
 # Telegram diagnostics: only the bot token is required. The first incoming
 # Telegram message is used to learn and persist the chat_id automatically.
@@ -781,7 +783,7 @@ _STATE_FILE_NAMES = (
     "messages.json", "published_posts.json", "media_stats.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
     "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "money_game_win_state.json", "money_game_winners.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
-    "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "backup_manifest.json",
+    "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "shop_data.json", "backup_manifest.json",
 )
 
 def _json_has_real_data(path):
@@ -3042,7 +3044,7 @@ def _looks_like_bot_command(text):
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "ملياري", "مليارات", "مليوني", "ملايين", "هدايا", "gifts", "gv", "sher@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "ملياري", "مليارات", "مليوني", "ملايين", "هدايا", "gifts", "gv", "sher@", "sby", "متجر", "shop", "store", "story", "la@", "ترحيب@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
@@ -4956,7 +4958,7 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
             '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — بعد دقيقة؛ ربح أو خسارة 1–20%. بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
-            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
+            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 1,000,000,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا (حتى 30 هدية في القائمة)\ngifts / gv — قائمة الهدايا؛ اكتب ns للتالي\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -7771,8 +7773,13 @@ class TalkinBot:
             if requester:
                 self.send_private_text(requester, f"✅ البوت داخل الغرفة: {room}")
             return
-        self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
+        if requester:
+            self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
+        else:
+            # A timeout during automatic recovery is not a user-requested exit.
+            # Keep the room tracked and schedule another bounded attempt.
+            self.known_rooms.add(room)
         _save_persistent_rooms(self.known_rooms)
         self.log("[ROOM] join confirmation timeout:", room)
         if requester:
@@ -7781,6 +7788,8 @@ class TalkinBot:
                 f"❌ لم يتم دخول البوت إلى الغرفة: {room}. "
                 "انتهت مهلة التأكيد ولم يظهر اتصال البوت بها؛ تحقق من صلاحياته ثم أعد المحاولة.",
             )
+        elif _norm_room(room) not in getattr(self, "blocked_rooms", set()):
+            self._schedule_auto_rejoin(room, delay=3.0)
 
     def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
         """Rejoin after a departure with bounded attempts and exponential backoff."""
@@ -7811,9 +7820,9 @@ class TalkinBot:
             if state.get("joined_at") and now - float(state["joined_at"]) >= 120.0:
                 state["attempts"] = []
             recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
-            if len(recent_attempts) >= 5:
+            if len(recent_attempts) >= 10:
                 state["attempts"] = recent_attempts
-                self.log(f"[AUTO_REJOIN] stopping after 5 attempts in 15 minutes: {room}")
+                self.log(f"[AUTO_REJOIN] stopping after 10 attempts in 15 minutes: {room}")
                 return
             state["attempts"] = recent_attempts + [now]
             delay = max(float(delay), min(60.0, 1.2 * (2 ** len(recent_attempts))))
@@ -13627,6 +13636,12 @@ class TalkinBot:
         if _norm_user(target) == _norm_user(sender):
             self.send_room_text(source_room, "❌ You cannot target yourself." if english else "❌ لا يمكنك اختيار نفسك هدفًا للقنبلة.")
             return True
+        if member_shop.active("user_bomb", username=target):
+            self.send_room_text(source_room, f"🛡️ @{target} محمي من القنابل حالياً.")
+            return True
+        if member_shop.active("room_bomb", room=destination):
+            self.send_room_text(source_room, f"🏰 الغرفة {destination} محمية من القنابل حالياً.")
+            return True
         active_rooms = {_norm_room(r): str(r).strip() for r in self._active_rooms() if str(r).strip()}
         if _norm_room(destination) not in active_rooms:
             self.send_room_text(source_room, f"❌ The bot is not connected to {destination}." if english else f"❌ البوت غير متصل بالغرفة {destination}.")
@@ -15172,6 +15187,9 @@ class TalkinBot:
         target = m.group(1).strip().lstrip("@").strip()
         if not target:
             self.send_room_text(room, "❌ الصيغة: شبيه@اسم_المستخدم")
+            return True
+        if member_shop.active("user_search", username=target):
+            self.send_room_text(room, f"🕵️ @{target} فعّل حماية البحث عن النك.")
             return True
         # Avoid several expensive web searches by the same user at once.
         # Also remember a small rolling set of the last images used for this
@@ -18057,6 +18075,23 @@ class TalkinBot:
                     break
             return self._request_next_presence(pending.get("presence_token"))
 
+        if pending.get("code") == "la":
+            users = self._extract_room_list_users(result)
+            names = []
+            seen = set()
+            for user in users:
+                name = str(user.get("username") or "").strip().lstrip("@")
+                key = _norm_user(name)
+                if name and key != _norm_user(BOT_ID) and key not in seen:
+                    seen.add(key)
+                    names.append({"username": name})
+            title = f"🟢 المتواجدون الآن في {source_room}"
+            if pending.get("private_response"):
+                self._send_private_list(pending.get("sender"), title, names, "📭 لا يوجد متواجدون الآن.")
+            else:
+                self._send_room_list(source_room, title, names, "📭 لا يوجد متواجدون الآن.", sender=pending.get("sender"))
+            return True
+
         # L@a / L@m / L@o / L@b: the APK sends the actual roster in
         # ResultMessage.users[] (or the equivalent RoomAdmin wrapper).
         code = str(pending.get("code") or "").lower()
@@ -18288,6 +18323,35 @@ class TalkinBot:
         return True
 
     def _room_list_commands(self, room, text, sender, is_private):
+        live_room = re.fullmatch(r"la@(.+)", str(text or "").strip(), re.I)
+        if live_room:
+            target_room = live_room.group(1).strip()
+            if not target_room:
+                self.send_private_text(sender, "⚠️ اكتب اسم الغرفة بعد la@.")
+                return True
+            if member_shop.active("room_roster", room=target_room):
+                self.send_private_text(sender, f"🌫️ قائمة المتواجدين في {target_room} مخفية بحماية المتجر.")
+                return True
+            if not getattr(self, "ws", None):
+                self.send_private_text(sender, "❌ يلزم اتصال مباشر بالخادم لجلب المتواجدين الآن.")
+                return True
+            try:
+                request_id = secrets.token_urlsafe(15)[:20]
+                self._pending_room_lists[_norm_room(target_room)] = {
+                    "room": target_room, "code": "la", "sender": str(sender or "").strip(),
+                    "request_type": "occupants_list", "request_id": request_id,
+                    "requested_at": time.time(), "private_response": bool(is_private),
+                }
+                self.send_query(encode_query(
+                    "room_admin", type_="occupants_list", room=target_room,
+                    to=BOT_ID, value="none", id_=request_id,
+                ))
+                self.send_private_text(sender, f"⏳ جارٍ جلب المتواجدين الآن في {target_room}...")
+            except Exception as exc:
+                self._pending_room_lists.pop(_norm_room(target_room), None)
+                self.log("[ROOM-PRESENCE] la@ request failed", repr(exc))
+                self.send_private_text(sender, "❌ تعذر طلب قائمة المتواجدين من الخادم.")
+            return True
         match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
         if match:
             if not room:
@@ -18392,6 +18456,64 @@ class TalkinBot:
         text=str(body or "").strip()
         low=text.casefold()
         if self._room_list_commands(room, text, sender, is_private):
+            return True
+
+        if low in {"متجر", "shop", "store", "story"}:
+            self.send_private_text(sender, member_shop.render_catalog())
+            return True
+        buy = re.fullmatch(r"sby\s+([1-6])", text, re.I)
+        if buy:
+            item_id = int(buy.group(1))
+            item = member_shop.ITEMS[item_id]
+            target_room = str(room or getattr(self, "room", "") or "").strip()
+            if item["kind"].startswith("room_") and not target_room:
+                self.send_private_text(sender, "⚠️ اشترِ حماية الغرفة من داخل الغرفة المطلوبة.")
+                return True
+            account = _resolve_points_account(_points_data(), sender)
+            balance = _points_balance(account[1]) if account else 0
+            if balance < int(item["cost"]):
+                self.send_private_text(sender, f"❌ رصيدك غير كافٍ. السعر {item['cost']:,} نقطة، رصيدك {balance:,}.")
+                return True
+            try:
+                _add_points(sender, -int(item["cost"]))
+            except (PointsInsufficientError, PointsPersistenceError):
+                self.send_private_text(sender, "❌ تعذر خصم النقاط؛ لم يتم الشراء.")
+                return True
+            success, error = member_shop.purchase(sender, item_id, target_room)
+            if not success:
+                try:
+                    _add_points(sender, int(item["cost"]))
+                except Exception as exc:
+                    self.log("[SHOP] refund failed after rejected purchase", repr(exc))
+                self.send_private_text(sender, error)
+                return True
+            _github_sync_after_local_save(member_shop.SHOP_PATH, None)
+            if item["kind"] in {"custom_welcome", "image_welcome"}:
+                extra = "\nبعدها استخدم: ترحيب@النص" if item["kind"] == "custom_welcome" else "\nميزة الصورة مفعّلة للحساب، أرسل صورة الترحيب في الغرفة مع الأمر ترحيب_صورة."
+            else:
+                extra = "\n⏱️ تنتهي الحماية بعد ساعة."
+            self.send_private_text(sender, f"✅ تم شراء {item['icon']} {item['name']} مقابل {item['cost']:,} نقطة.{extra}")
+            return True
+        custom_welcome = re.fullmatch(r"ترحيب@(.+)", text, re.S)
+        if custom_welcome:
+            if not member_shop.active("custom_welcome", username=sender):
+                self.send_private_text(sender, "🔒 افتح ميزة الترحيب المخصص من المتجر أولاً: sby 5.")
+                return True
+            welcome = custom_welcome.group(1).strip()[:300]
+            if welcome:
+                self.custom_welcomes[_norm_user(sender)] = {"username": sender, "message": welcome}
+                self.custom_welcome_enabled = True
+                self._save_social_features()
+                self.send_private_text(sender, "✅ تم حفظ ترحيبك المخصص.")
+            return True
+        if low in {"ترحيب_صورة", "welcome_image"}:
+            if not member_shop.active("image_welcome", username=sender):
+                self.send_private_text(sender, "🔒 افتح ميزة الترحيب بصورة من المتجر أولاً: sby 6.")
+                return True
+            if not isinstance(getattr(self, "custom_welcome_image_pending", None), dict):
+                self.custom_welcome_image_pending = {}
+            self.custom_welcome_image_pending[_norm_user(sender)] = {"username": sender, "created_at": time.time()}
+            self.send_private_text(sender, "🖼️ أرسل صورة الترحيب الآن في الخاص أو أي غرفة خلال دقيقتين.")
             return True
 
         money_toggle_commands = {
@@ -18935,6 +19057,18 @@ class TalkinBot:
             result_key = (packet_type, "" if is_private else str(room or ""), str(sender or ""))
             result_pages = getattr(self, "_result_pages", {})
             result_state = result_pages.get(result_key)
+            if not isinstance(result_state, dict):
+                # Talkin can put a display alias in one event and the canonical
+                # username in another. Match the same route+room by identity.
+                wanted = _norm_user(sender)
+                for candidate_key, candidate_state in list(result_pages.items()):
+                    if (isinstance(candidate_key, tuple) and len(candidate_key) == 3
+                            and candidate_key[0] == packet_type
+                            and candidate_key[1] == ("" if is_private else str(room or ""))
+                            and _norm_user(candidate_key[2]) == wanted
+                            and isinstance(candidate_state, dict)):
+                        result_key, result_state = candidate_key, candidate_state
+                        break
             if not isinstance(result_state, dict) and not is_private:
                 # Some commands (including personal logs) deliberately answer
                 # in DM even when issued in a room. Let `ns` sent from that room
@@ -21105,6 +21239,13 @@ class TalkinBot:
                 else:
                     hunter_welcome = f"🐉 أهلاً بعودة صائد التنين @{username}!"
                 welcome = f"{welcome}\n{hunter_welcome}" if welcome else hunter_welcome
+            custom_entry = getattr(self, "custom_welcomes", {}).get(_norm_user(username), {})
+            welcome_image = str(custom_entry.get("image_url") or "") if isinstance(custom_entry, dict) else ""
+            if welcome_image:
+                try:
+                    self.send_room_media(room, welcome_image, "image")
+                except Exception as exc:
+                    self.log("[WELCOME] image send failed", repr(exc))
             if welcome:
                 self.send_room_text(room, welcome)
         if event_type in ("you_joined", "you_rejoined"):
@@ -21400,6 +21541,28 @@ class TalkinBot:
             if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
                 media_senders.append(candidate)
 
+        # A purchased custom-image welcome consumes the next image from that
+        # account and stores it with the existing custom welcome profile.
+        if media_url and getattr(self, "custom_welcome_image_pending", {}):
+            pending_welcomes = getattr(self, "custom_welcome_image_pending", {})
+            for image_sender in media_senders:
+                key = _norm_user(image_sender)
+                pending = pending_welcomes.get(key)
+                if not isinstance(pending, dict):
+                    continue
+                if time.time() - float(pending.get("created_at", 0) or 0) > 120:
+                    pending_welcomes.pop(key, None)
+                    self.send_private_text(image_sender, "⌛ انتهت مهلة صورة الترحيب؛ أرسل ترحيب_صورة من جديد.")
+                    return
+                entry = getattr(self, "custom_welcomes", {}).setdefault(key, {"username": image_sender})
+                entry["username"] = str(entry.get("username") or image_sender)
+                entry["image_url"] = media_url
+                self.custom_welcome_enabled = True
+                self._save_social_features()
+                pending_welcomes.pop(key, None)
+                self.send_private_text(image_sender, "✅ تم حفظ صورة الترحيب المخصص.")
+                return
+
         # sav@ owns the next image from the same sender and has priority over
         # the generic public-image publisher.
         if media_url and getattr(self, "custom_gift_pending", {}):
@@ -21596,7 +21759,21 @@ class TalkinBot:
                 self.send_room_text(room, notice)
                 if publisher and _norm_user(publisher) != _norm_user(frm):
                     private_notice = notice + f"\n🏠 الغرفة: {room}"
-                    self.send_private_text(publisher, private_notice)
+                    reply_state = getattr(self, "_master_reply_local", None)
+                    old_rerouting = getattr(reply_state, "rerouting", False) if reply_state else False
+                    try:
+                        # This is a notification to the publisher, not a reply
+                        # to the room command. Bypass management reply reroutes.
+                        if reply_state:
+                            reply_state.rerouting = True
+                        delivered = self.send_private_text(publisher, private_notice)
+                        if delivered is False:
+                            self.log("[REACTION] private publisher notice was rejected", publisher)
+                    except Exception as exc:
+                        self.log("[REACTION] private publisher notice failed", repr(exc))
+                    finally:
+                        if reply_state:
+                            reply_state.rerouting = old_rerouting
                 return
 
         # نقاطي متاح للجميع ولا يحتاج توثيقاً.

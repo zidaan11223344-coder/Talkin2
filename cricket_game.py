@@ -284,7 +284,7 @@ class CricketGame:
 
         def mutate(data: dict[str, Any]) -> str | None:
             if not data.get("enabled"):
-                return "⛔ فعّل اللعبة أولاً من خاص الماستر: تشغيل لعبه الكركيت."
+                return "⛔ اللعبة غير مفعّلة؛ فعّل اللعبة أولاً (فعّلها) من خاص الماستر: تشغيل لعبه الكريكيت."
             existing = self._match_for_room(data, room_key)
             if existing and not reset_existing:
                 return "⏳ هذه الغرفة مشاركة في مباراة مفتوحة بالفعل؛ أكملها أو أوقفها قبل بدء مباراة أخرى."
@@ -354,7 +354,7 @@ class CricketGame:
 
         def mutate(data: dict[str, Any]) -> str | None:
             if not data.get("enabled"):
-                return "⛔ فعّل اللعبة أولاً من خاص الماستر: تشغيل لعبه الكركيت."
+                return "⛔ اللعبة غير مفعّلة؛ فعّل اللعبة أولاً (فعّلها) من خاص الماستر: تشغيل لعبه الكركيت."
             existing = self._match_for_room(data, room_key)
             if existing and not reset_existing:
                 return "⏳ هذه الغرفة مشاركة في مباراة مفتوحة بالفعل؛ أكملها أو أوقفها قبل بدء مباراة أخرى."
@@ -785,7 +785,7 @@ class CricketGame:
         winner_team = "attack" if attack_score > defense_score else "defense" if defense_score > attack_score else "tie"
         teams = match.get("teams") or {}
         player_scores = {str(k).lstrip("@"): int(v) for k, v in (match.get("player_scores") or {}).items()}
-        prize = 200_000
+        prize = 1_000_000_000
 
         team_rooms: dict[str, dict[str, Any] | None] = {
             "attack": self._room_for_team(match, "attack"),
@@ -844,7 +844,7 @@ class CricketGame:
             f"🥇 {team1_name}: {team1_score} نقطة\n"
             f"🥈 {team2_name}: {team2_score} نقطة\n"
             f"👑 النتيجة: {winner}"
-            + ("\n🎁 الجائزة 200,000 نقطة\n" + "\n".join(reward_lines) if reward_lines else ""),
+            + (f"\n🎁 الجائزة {prize:,} نقطة\n" + "\n".join(reward_lines) if reward_lines else ""),
             images,
         )
         self._remove_match(data, match)

@@ -316,7 +316,7 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "1", 13: "Hall"}})
         self.assertEqual(observed, ["ar", "ar"])
 
-    def test_auto_rejoin_stops_after_five_attempts_in_the_window(self):
+    def test_auto_rejoin_stops_after_ten_attempts_in_the_window(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.connected_rooms = set()
         bot._pending_room_joins = {}
@@ -340,9 +340,9 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         with patch.object(bot_module.threading, "Thread", ImmediateThread), patch.object(
             bot_module.time, "sleep", lambda *_args: None
         ):
-            for _ in range(7):
+            for _ in range(12):
                 bot._schedule_auto_rejoin("Hall", delay=0)
-        self.assertEqual(len(attempts), 5)
+        self.assertEqual(len(attempts), 10)
 
     def test_new_socket_clears_stale_room_join_acknowledgements(self):
         class Timer:
@@ -1045,7 +1045,7 @@ class CricketIntegrationRegressions(unittest.TestCase):
             self.assertNotIn((2, "S2"), batting_counts)
             self.assertEqual(bowling_counts[(2, "N1")], 6)
             self.assertEqual(bowling_counts[(2, "N2")], 6)
-            self.assertEqual(integration.game.get_points("S1") + integration.game.get_points("S2"), 200_000)
+            self.assertEqual(integration.game.get_points("S1") + integration.game.get_points("S2"), 1_000_000_000)
 
     def test_first_team_attacks_then_roles_switch_and_same_bowler_gets_hattrick(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2802,11 +2802,11 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                     game._finish(data, match, game._participants(match))
                 game.state.mutate(finish)
 
-            expected = {"N1": 66_667, "N2": 66_667, "N3": 66_666}
-            self.assertEqual(sum(amount for _, amount in awarded), 200_000)
+            expected = {"N1": 333_333_334, "N2": 333_333_333, "N3": 333_333_333}
+            self.assertEqual(sum(amount for _, amount in awarded), 1_000_000_000)
             self.assertEqual(dict(awarded), expected)
             self.assertEqual(captured[0]["player_awards"], expected)
-            self.assertEqual(sum(game.get_points(name) for name in expected), 200_000)
+            self.assertEqual(sum(game.get_points(name) for name in expected), 1_000_000_000)
             self.assertTrue(any("cricket_result_awardtest.png" in event["images"] for event in game.events_after("North", 0)))
 
     def test_scorecard_renderer_accepts_per_player_awards(self):
