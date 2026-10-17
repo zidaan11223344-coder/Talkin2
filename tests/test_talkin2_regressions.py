@@ -3639,16 +3639,36 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
     def test_stock_points_delta_is_atomic_idempotent_and_never_overdraws(self):
         accounts = {"player": {"username": "Player", "points": 500}}
         history = []
+        investment = {
+            "id": "market-1", "event_id": 7, "username": "Player", "room": "Hall",
+            "asset": 1, "amount": 100, "started_at": 10.0, "due_at": 70.0,
+            "status": "pending_debit",
+        }
         with patch.object(bot_module, "_POINTS_CACHE", accounts), patch.object(
             bot_module, "_POINTS_TRANSFER_CACHE", history
         ), patch.object(bot_module, "_STATE_DB_ENABLED", False), patch.object(
             bot_module, "_save_local_json", return_value=None
         ):
-            first = bot_module._apply_points_delta_once("PLAYER", -100, "market-debit-1", "stock market")
-            retry = bot_module._apply_points_delta_once("Player", -100, "market-debit-1", "stock market")
+            first = bot_module._apply_points_delta_once(
+                "PLAYER", -100, "stock-market-debit:market-1", "stock market",
+                stock_market_investment=investment,
+            )
+            retry = bot_module._apply_points_delta_once(
+                "Player", -100, "stock-market-debit:market-1", "stock market",
+                stock_market_investment=investment,
+            )
             self.assertEqual(first["balance"], 400)
             self.assertTrue(retry["already_applied"])
             self.assertEqual(retry["balance"], 400)
+            self.assertEqual(bot_module._POINTS_TRANSFER_CACHE[0]["stock_market_investment"], investment)
+            bot_module._POINTS_TRANSFER_CACHE[0].pop("stock_market_investment")
+            enriched_retry = bot_module._apply_points_delta_once(
+                "Player", -100, "stock-market-debit:market-1", "stock market",
+                stock_market_investment=investment,
+            )
+            self.assertTrue(enriched_retry["already_applied"])
+            self.assertEqual(enriched_retry["balance"], 400)
+            self.assertEqual(bot_module._POINTS_TRANSFER_CACHE[0]["stock_market_investment"], investment)
             overdraw = bot_module._apply_points_delta_once("Player", -500, "market-debit-2", "stock market")
             self.assertEqual(overdraw["error"], "insufficient")
             credit = bot_module._apply_points_delta_once("Player", 25, "market-credit-1", "stock market")
@@ -3657,6 +3677,76 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             self.assertTrue(credit_retry["already_applied"])
             self.assertEqual(credit_retry["balance"], 425)
             self.assertEqual(len(bot_module._POINTS_TRANSFER_CACHE), 2)
+
+    def test_missing_stock_file_investment_is_recovered_from_point_debit_journal(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_investments = []
+        bot.stock_market_history = []
+        bot.log = lambda *_args: None
+        saved = []
+        bot._save_stock_investments = lambda: saved.append([dict(row) for row in bot.stock_investments])
+        investment = {
+            "id": "recover-1", "event_id": 8, "username": "Player", "room": "Hall",
+            "asset": 2, "amount": 100_000, "started_at": 100.0, "due_at": 160.0,
+        }
+        transactions = [{
+            "id": "stock-market-debit:recover-1", "timestamp": 110, "sender": "Player",
+            "amount": 100_000, "stock_market_investment": investment,
+        }]
+        with patch.object(bot_module, "_POINTS_TRANSFER_CACHE", transactions), patch.object(
+            bot_module, "_points_data", return_value={}
+        ):
+            self.assertEqual(bot._recover_stock_market_investments_from_points_history(), 1)
+            self.assertEqual(bot._recover_stock_market_investments_from_points_history(), 0)
+        self.assertEqual(len(bot.stock_investments), 1)
+        self.assertEqual(bot.stock_investments[0]["id"], "recover-1")
+        self.assertEqual(bot.stock_investments[0]["status"], "pending_debit")
+        self.assertEqual(bot.stock_investments[0]["due_at"], 160.0)
+        self.assertEqual(len(saved), 1)
+
+    def test_stock_recovery_skips_investment_with_existing_payout_transaction(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_investments = []
+        bot.stock_market_history = []
+        bot.log = lambda *_args: None
+        bot._save_stock_investments = lambda: self.fail("settled investment must not be reconstructed")
+        investment = {
+            "id": "paid-1", "username": "Player", "room": "Hall", "asset": 1,
+            "amount": 100, "started_at": 100.0, "due_at": 160.0,
+        }
+        transactions = [
+            {"id": "stock-market-debit:paid-1", "sender": "Player", "amount": 100,
+             "stock_market_investment": investment},
+            {"id": "stock-market-payout:paid-1", "sender": "stock_market", "amount": 105},
+        ]
+        with patch.object(bot_module, "_POINTS_TRANSFER_CACHE", transactions), patch.object(
+            bot_module, "_points_data", return_value={}
+        ):
+            self.assertEqual(bot._recover_stock_market_investments_from_points_history(), 0)
+        self.assertEqual(bot.stock_investments, [])
+
+    def test_pending_debit_recovery_reuses_idempotent_debit_and_refreshes_journal(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_investments = [{
+            "id": "resume-1", "event_id": 2, "username": "Player", "room": "Hall",
+            "asset": 1, "amount": 100, "started_at": 100.0, "due_at": 1_000.0,
+            "status": "pending_debit",
+        }]
+        bot._save_stock_investments = lambda: None
+        calls = []
+
+        def apply_once(username, delta, transaction_id, reason, **kwargs):
+            calls.append(kwargs)
+            return {"ok": True, "already_applied": True, "balance": 400}
+
+        with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once):
+            self.assertEqual(bot._process_stock_market_investments(now=500.0), 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["stock_market_investment"]["id"], "resume-1")
+        self.assertEqual(bot.stock_investments[0]["status"], "active")
 
     def test_billion_cooldown_can_be_set_through_environment(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3724,7 +3814,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         messages, point_ops = [], []
         bot.send_room_text = lambda room, text: messages.append((room, text))
 
-        def apply_once(username, delta, transaction_id, reason):
+        def apply_once(username, delta, transaction_id, reason, **kwargs):
             point_ops.append((username, delta, transaction_id, reason))
             return {"ok": True, "balance": 1_000}
 
@@ -3763,7 +3853,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 bot.send_private_text = lambda user, text: private_messages.append((user, text))
                 point_ops = []
 
-                def apply_once(username, delta, transaction_id, reason):
+                def apply_once(username, delta, transaction_id, reason, **kwargs):
                     point_ops.append((username, delta, transaction_id, reason))
                     return {"ok": True, "balance": delta if delta > 0 else 0}
 

@@ -3973,7 +3973,7 @@ def _add_points(username, amount):
         raise PointsPersistenceError("Could not persist points mutation") from exc
 
 
-def _apply_points_delta_once(username, delta, transaction_id, reason):
+def _apply_points_delta_once(username, delta, transaction_id, reason, *, stock_market_investment=None):
     """Atomically apply one idempotent game debit/credit and audit it."""
     try:
         delta = int(delta)
@@ -3984,11 +3984,24 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
     if not _norm_user(display_name) or not txid or delta == 0:
         return {"ok": False, "error": "invalid_transaction"}
 
+    has_stock_metadata = (
+        isinstance(stock_market_investment, dict)
+        and txid == f"stock-market-debit:{stock_market_investment.get('id') or ''}"
+    )
+
     def update(accounts, history):
-        if any(isinstance(row, dict) and str(row.get("id") or "") == txid for row in history):
+        existing_transaction = next(
+            (row for row in history if isinstance(row, dict) and str(row.get("id") or "") == txid),
+            None,
+        )
+        if existing_transaction is not None:
             existing = _resolve_points_account(accounts, display_name)
-            return {"ok": True, "already_applied": True,
-                    "balance": _points_balance(existing[1]) if existing else 0}, False
+            result = {"ok": True, "already_applied": True,
+                      "balance": _points_balance(existing[1]) if existing else 0}
+            if has_stock_metadata and not isinstance(existing_transaction.get("stock_market_investment"), dict):
+                existing_transaction["stock_market_investment"] = copy.deepcopy(stock_market_investment)
+                return result, True
+            return result, False
         resolved = _resolve_points_account(accounts, display_name)
         if not resolved:
             if delta < 0:
@@ -4006,7 +4019,7 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
         item["points"] = new_balance
         accounts[key] = item
         positive = delta > 0
-        history.append({
+        entry = {
             "id": txid, "timestamp": int(time.time()),
             "sender": (
                 "wager_refund" if positive and str(reason or "").casefold().startswith("refund expired")
@@ -4018,7 +4031,10 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
             "amount": abs(delta), "sender_balance_after": None if positive else new_balance,
             "recipient_balance_after": new_balance if positive else None,
             "reason": str(reason or "stock_market"),
-        })
+        }
+        if has_stock_metadata:
+            entry["stock_market_investment"] = copy.deepcopy(stock_market_investment)
+        history.append(entry)
         del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
         return {"ok": True, "already_applied": False, "balance": new_balance}, True
 
@@ -6762,6 +6778,7 @@ class TalkinBot:
             row for row in saved_stock_rows
             if isinstance(row, dict) and row.get("id") and row.get("username")
         ] if isinstance(saved_stock_rows, list) else []
+        self._recover_stock_market_investments_from_points_history()
         # Global wager queues, crop timers, and fruit-match state.
         self.wager_waiting = {}
         # Global fixed-prize PvP queues: one open challenge per game name.
@@ -14170,6 +14187,85 @@ class TalkinBot:
             snapshot = [dict(row) for row in self.stock_investments if isinstance(row, dict)]
         _save_local_json(STOCK_MARKET_FILE, {"version": 1, "investments": snapshot})
 
+    def _recover_stock_market_investments_from_points_history(self):
+        """Rebuild debit intents if async Talkin4 sync missed the separate market file."""
+        try:
+            _points_data()
+            with _GAME_STATE_LOCK:
+                transactions = copy.deepcopy(_POINTS_TRANSFER_CACHE or [])
+        except Exception as exc:
+            self.log("[STOCK] point journal recovery read failed:", repr(exc))
+            return 0
+
+        transaction_ids = {
+            str(row.get("id") or "") for row in transactions if isinstance(row, dict)
+        }
+        with self._stock_market_lock:
+            existing_ids = {
+                str(row.get("id") or "") for row in self.stock_investments if isinstance(row, dict)
+            }
+            settled_ids = {
+                str(row.get("id") or "")
+                for row in getattr(self, "stock_market_history", []) if isinstance(row, dict)
+            }
+            recovered = []
+            for transaction in transactions:
+                if not isinstance(transaction, dict):
+                    continue
+                transaction_id = str(transaction.get("id") or "")
+                if not transaction_id.startswith("stock-market-debit:"):
+                    continue
+                metadata = transaction.get("stock_market_investment")
+                if not isinstance(metadata, dict):
+                    continue
+                investment_id = str(metadata.get("id") or "")
+                username = str(metadata.get("username") or "").strip().lstrip("@")
+                try:
+                    amount = int(metadata.get("amount", 0) or 0)
+                    asset = int(metadata.get("asset", 0) or 0)
+                    started_at = float(metadata.get("started_at", 0) or 0)
+                    due_at = float(metadata.get("due_at", 0) or 0)
+                    transaction_amount = int(transaction.get("amount", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (
+                    not investment_id
+                    or transaction_id != f"stock-market-debit:{investment_id}"
+                    or investment_id in existing_ids
+                    or investment_id in settled_ids
+                    or f"stock-market-payout:{investment_id}" in transaction_ids
+                    or not username
+                    or _norm_user(transaction.get("sender")) != _norm_user(username)
+                    or amount <= 0
+                    or transaction_amount != amount
+                    or asset not in STOCK_MARKET_ASSETS
+                    or due_at <= 0
+                ):
+                    continue
+                recovered_row = {
+                    "id": investment_id,
+                    "event_id": metadata.get("event_id"),
+                    "username": username,
+                    "room": str(metadata.get("room") or ""),
+                    "asset": asset,
+                    "amount": amount,
+                    "started_at": started_at,
+                    "due_at": due_at,
+                    "status": "pending_debit",
+                }
+                recovered.append(recovered_row)
+                existing_ids.add(investment_id)
+            if recovered:
+                self.stock_investments.extend(recovered)
+
+        if recovered:
+            try:
+                self._save_stock_investments()
+            except Exception as exc:
+                self.log("[STOCK] recovered investment save failed:", repr(exc))
+            self.log(f"[STOCK] recovered {len(recovered)} unresolved investment(s) from point history")
+        return len(recovered)
+
     def _record_stock_market_history(self, result):
         """Persist one completed investment exactly once for the user's بورصتي log."""
         if not isinstance(result, dict) or not result.get("id") or not result.get("username"):
@@ -14439,6 +14535,7 @@ class TalkinBot:
         debit = _apply_points_delta_once(
             sender, -amount, f"stock-market-debit:{investment['id']}",
             f"stock market investment in {STOCK_MARKET_ASSETS[asset]['en']}",
+            stock_market_investment=investment,
         )
         if not debit.get("ok"):
             with self._stock_market_lock:
@@ -14533,6 +14630,7 @@ class TalkinBot:
                 debit = _apply_points_delta_once(
                     username, -amount, f"stock-market-debit:{investment_id}",
                     f"stock market investment in {STOCK_MARKET_ASSETS[asset]['en']}",
+                    stock_market_investment=row,
                 )
                 if not debit.get("ok"):
                     if debit.get("error") == "persistence_failed":
