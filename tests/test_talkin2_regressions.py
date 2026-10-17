@@ -1609,7 +1609,13 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 bot.connected_rooms = set()
                 bot.log = lambda *_args: None
                 bot._game_award = lambda user, amount: awards.append((user, amount))
-                bot._send_game_winner_card = lambda *_args, **_kwargs: None
+
+                def send_card(_game, _winner, rooms, send_delay=0.0, before_each_room=None):
+                    if before_each_room:
+                        for target_room in rooms:
+                            before_each_room(target_room)
+
+                bot._send_game_winner_card = send_card
                 with tempfile.TemporaryDirectory() as temp_dir, patch.object(
                     bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
                 ), patch.object(
@@ -1663,10 +1669,18 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         for game in ("million", "billion"):
             with self.subTest(game=game):
                 bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
-                sent, cards, awards = [], [], []
+                sent, cards, awards, pair_order = [], [], [], []
                 bot._game_cooldown_notice = lambda *_args: True
                 bot._configured_room_language = lambda room: "en" if room == "South" else "ar"
-                bot.send_room_text = lambda room, text: sent.append((room, text))
+                expected_local = bot_module._money_game_win_text(game, "Player", "ar")
+                expected_remote = bot_module._money_game_short_win_text(game, "Player", "en")
+
+                def send_text(target_room, text):
+                    sent.append((target_room, text))
+                    if text in (expected_local, expected_remote):
+                        pair_order.append(("text", target_room))
+
+                bot.send_room_text = send_text
                 bot.send_room_media = lambda *_args: None
                 bot.user_photos = {}
                 bot._lookup_profile_photo = lambda _user: ""
@@ -1674,7 +1688,15 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 bot._active_rooms = lambda: ["South", "North"]
                 bot.log = lambda *_args: None
                 bot._game_award = lambda user, amount: awards.append((user, amount))
-                bot._send_game_winner_card = lambda *args, **kwargs: cards.append((args, kwargs))
+
+                def send_winner_card(game_key, winner_name, target_rooms, send_delay=0.0,
+                                     before_each_room=None):
+                    cards.append((game_key, winner_name, target_rooms, send_delay))
+                    for target_room in target_rooms:
+                        before_each_room(target_room)
+                        pair_order.append(("image", target_room))
+
+                bot._send_game_winner_card = send_winner_card
                 if game == "billion":
                     bot._snake_command = lambda *_args: False
                     bot._ludo_command = lambda *_args: False
@@ -1705,8 +1727,41 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 self.assertEqual(winner_texts[1], ("South", bot_module._money_game_short_win_text(game, "Player", "en")))
                 self.assertIn("🌹", winner_texts[1][1])
                 self.assertNotIn("Prize:", winner_texts[1][1])
-                self.assertEqual(cards[0][0][2], ["North", "South"])
+                self.assertEqual(cards[0][2], ["North", "South"])
+                self.assertEqual(pair_order, [
+                    ("text", "North"), ("image", "North"),
+                    ("text", "South"), ("image", "South"),
+                ])
                 self.assertTrue(awards)
+
+    def test_winner_card_sends_room_callback_immediately_before_each_image(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        order = []
+        bot.user_photos = {}
+        bot._lookup_profile_photo = lambda _user: ""
+        bot._effective_room_language = lambda _room: "ar"
+        bot.send_room_media = lambda room, _url, _kind: order.append(("image", room))
+        bot._verify_public_media_url = lambda *_args: True
+        bot.log = lambda *_args: None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            assets_dir = Path(temp_dir)
+            (assets_dir / "prize.jpg").write_bytes(b"test-image")
+            with patch.object(bot_module, "ASSETS_DIR", assets_dir), patch.object(
+                bot_module, "GAME_IMAGE_FILES", {"million": "prize.jpg"}
+            ), patch.object(bot_module, "_public_base_url", return_value="https://media.example"), patch.object(
+                bot_module, "render_game_winner_card", return_value=type("Card", (), {"name": "winner.jpg"})()
+            ):
+                result = bot._send_game_winner_card(
+                    "million", "Winner", ["North", "South"],
+                    before_each_room=lambda room: order.append(("text", room)),
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(order, [
+            ("text", "North"), ("image", "North"),
+            ("text", "South"), ("image", "South"),
+        ])
 
     def test_master_can_open_and_close_million_and_billion_win_rates(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

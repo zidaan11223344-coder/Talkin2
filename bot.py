@@ -12940,21 +12940,52 @@ class TalkinBot:
         if winner_name and game_key:
             self._send_game_winner_card(game_key, winner_name, target_rooms or [room])
 
-    def _send_game_winner_card(self, game_key, winner_name, target_rooms, send_delay=0.0):
+    def _send_game_winner_card(
+        self, game_key, winner_name, target_rooms, send_delay=0.0, before_each_room=None
+    ):
         """Render the existing game artwork and send it safely room-by-room.
 
         ``send_delay`` is used by multi-room game broadcasts to avoid a burst
         of media packets that can trigger the TalkinChat server to close the
         WebSocket. Existing callers keep the original zero-delay behaviour.
+        ``before_each_room`` can send the matching text immediately before
+        that room's image; if the image is unavailable, text is still sent.
         """
+        rooms = []
+        seen = set()
+        for room in (target_rooms or []):
+            room = str(room or "").strip()
+            key = room.casefold()
+            if room and key not in seen:
+                seen.add(key)
+                rooms.append(room)
+
+        announced = set()
+
+        def announce_room(room):
+            key = room.casefold()
+            if before_each_room is None or key in announced:
+                return
+            announced.add(key)
+            try:
+                before_each_room(room)
+            except Exception as exc:
+                self.log("[GAME] winner text room send failed:", room, repr(exc))
+
+        def announce_remaining_rooms():
+            for room in rooms:
+                announce_room(room)
+
         base = _public_base_url()
         if not base:
             self.log("[GAME] winner card skipped: public media URL is not configured")
+            announce_remaining_rooms()
             return False
         filename = GAME_IMAGE_FILES.get(game_key)
         image = ASSETS_DIR / filename if filename else None
         if not image or not image.is_file():
             self.log("[GAME] winner card skipped: no artwork", game_key)
+            announce_remaining_rooms()
             return False
         try:
             if game_key == "اسرق_فشل":
@@ -12974,18 +13005,12 @@ class TalkinBot:
                 card = render_game_winner_card(game_key, winner_name, winner_photo, language=language)
                 url = f"{base}/games/{card.name}"
             self._verify_public_media_url(url, "image")
-            rooms = []
-            seen = set()
-            for r in (target_rooms or []):
-                r = str(r or "").strip()
-                k = r.casefold()
-                if r and k not in seen:
-                    seen.add(k); rooms.append(r)
             for index, r in enumerate(rooms):
                 # Send sequentially. A short pause is important for an image
                 # broadcast: the server may close the realtime socket when
                 # several room-media packets arrive back-to-back.
                 try:
+                    announce_room(r)
                     self.send_room_media(r, url, "image")
                 except Exception as exc:
                     self.log("[GAME] winner card room send failed:", r, repr(exc))
@@ -12995,6 +13020,7 @@ class TalkinBot:
             return bool(rooms)
         except Exception as exc:
             self.log("[GAME] winner card send failed:", game_key, repr(exc))
+            announce_remaining_rooms()
             return False
 
     def game_help(self, room, sender=None):
@@ -15521,24 +15547,19 @@ class TalkinBot:
         if not target_rooms:
             target_rooms = [preferred_room]
 
-        # Do not burst all room packets at once. The short pacing keeps the
-        # realtime connection alive while preserving the existing all-room
-        # winner announcement and image behaviour.
-        for index, target_room in enumerate(target_rooms):
-            try:
-                language = self._configured_room_language(target_room)
-                announcement = (
-                    _money_game_win_text("million", sender_name, language)
-                    if _norm_room(target_room) == _norm_room(room)
-                    else _money_game_short_win_text("million", sender_name, language)
-                )
-                self.send_room_text(target_room, announcement)
-            except Exception as exc:
-                self.log("[GAME] bank winner text send failed:", target_room, repr(exc))
-            if index + 1 < len(target_rooms):
-                time.sleep(0.05)
+        def announce_winner_text(target_room):
+            language = self._configured_room_language(target_room)
+            announcement = (
+                _money_game_win_text("million", sender_name, language)
+                if _norm_room(target_room) == _norm_room(room)
+                else _money_game_short_win_text("million", sender_name, language)
+            )
+            self.send_room_text(target_room, announcement)
 
-        self._send_game_winner_card("million", sender_name, target_rooms, send_delay=0.35)
+        self._send_game_winner_card(
+            "million", sender_name, target_rooms, send_delay=0.35,
+            before_each_room=announce_winner_text,
+        )
         return True
 
     def _handle_pending_bot_choice(self, room, text, sender_name):
@@ -16861,7 +16882,7 @@ class TalkinBot:
                     target_room for target_room in target_rooms
                     if _norm_room(target_room) != _norm_room(room)
                 ]
-                for index, target_room in enumerate(target_rooms):
+                def announce_winner_text(target_room):
                     language = self._configured_room_language(target_room)
                     announcement = (
                         _money_game_win_text("billion", sender_name, language)
@@ -16869,10 +16890,11 @@ class TalkinBot:
                         else _money_game_short_win_text("billion", sender_name, language)
                     )
                     self.send_room_text(target_room, announcement)
-                    if index + 1 < len(target_rooms):
-                        time.sleep(0.05)
 
-                self._send_game_winner_card("billion", sender_name, target_rooms, send_delay=0.35)
+                self._send_game_winner_card(
+                    "billion", sender_name, target_rooms, send_delay=0.35,
+                    before_each_room=announce_winner_text,
+                )
             else:
                 loss_text = (f"🎰🍀 Billion game\n━━━━━━━━━━━━━━\n❌ {sender_name} did not get the billion this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
                              if english else f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحصل على المليار هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
