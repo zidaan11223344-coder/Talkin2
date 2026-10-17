@@ -316,7 +316,7 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "1", 13: "Hall"}})
         self.assertEqual(observed, ["ar", "ar"])
 
-    def test_auto_rejoin_stops_after_ten_attempts_in_the_window(self):
+    def test_auto_rejoin_keeps_retrying_after_ten_attempts_in_the_window(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.connected_rooms = set()
         bot._pending_room_joins = {}
@@ -342,7 +342,9 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         ):
             for _ in range(12):
                 bot._schedule_auto_rejoin("Hall", delay=0)
-        self.assertEqual(len(attempts), 10)
+        self.assertEqual(len(attempts), 12)
+        state = next(iter(bot._auto_rejoin_state.values()))
+        self.assertEqual(len(state["attempts"]), 12)
 
     def test_new_socket_clears_stale_room_join_acknowledgements(self):
         class Timer:

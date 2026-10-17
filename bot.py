@@ -7368,7 +7368,7 @@ class TalkinBot:
             else:
                 reason = f"الخادم أرسل حدث {event_type} دون سبب تفصيلي."
         message = (
-            "⚠️ غادر بوت Talkin الغرفة وسيحاول العودة تلقائيًا."
+            "⚠️ رصد البوت انقطاعه عن الغرفة؛ سيواصل محاولة العودة تلقائيًا حتى يؤكد الخادم دخوله."
             f"\n📍 الغرفة: {str(room or 'غير معروفة')[:120]}"
             f"\n🧾 السبب المسجل: {reason}"
         )
@@ -7792,7 +7792,7 @@ class TalkinBot:
             self._schedule_auto_rejoin(room, delay=3.0)
 
     def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
-        """Rejoin after a departure with bounded attempts and exponential backoff."""
+        """Keep retrying a lost room indefinitely, with a capped backoff."""
         if not room:
             return
         room_key = _norm_room(room)
@@ -7820,12 +7820,10 @@ class TalkinBot:
             if state.get("joined_at") and now - float(state["joined_at"]) >= 120.0:
                 state["attempts"] = []
             recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
-            if len(recent_attempts) >= 10:
-                state["attempts"] = recent_attempts
-                self.log(f"[AUTO_REJOIN] stopping after 10 attempts in 15 minutes: {room}")
-                return
             state["attempts"] = recent_attempts + [now]
-            delay = max(float(delay), min(60.0, 1.2 * (2 ** len(recent_attempts))))
+            # Never permanently give up after repeated transient disconnects.
+            # Cap retries at one every five minutes to avoid flooding the server.
+            delay = max(float(delay), min(300.0, 1.2 * (2 ** min(len(recent_attempts), 8))))
             generation = int(getattr(self, "_connection_generation", 0))
             self._auto_rejoin_pending.add(room_key)
         def _rejoin_worker():
