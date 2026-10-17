@@ -1659,6 +1659,55 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 self.assertIn("تم الحصول على المليار" if won else "لم يحصل على المليار", sent[-1][1])
                 self.assertEqual(bool(history.get("billion")), won)
 
+    def test_money_winner_long_text_is_local_and_short_rose_text_and_card_go_to_other_rooms(self):
+        for game in ("million", "billion"):
+            with self.subTest(game=game):
+                bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+                sent, cards, awards = [], [], []
+                bot._game_cooldown_notice = lambda *_args: True
+                bot._configured_room_language = lambda room: "en" if room == "South" else "ar"
+                bot.send_room_text = lambda room, text: sent.append((room, text))
+                bot.send_room_media = lambda *_args: None
+                bot.user_photos = {}
+                bot._lookup_profile_photo = lambda _user: ""
+                bot.connected_rooms = {"North", "South"}
+                bot._active_rooms = lambda: ["South", "North"]
+                bot.log = lambda *_args: None
+                bot._game_award = lambda user, amount: awards.append((user, amount))
+                bot._send_game_winner_card = lambda *args, **kwargs: cards.append((args, kwargs))
+                if game == "billion":
+                    bot._snake_command = lambda *_args: False
+                    bot._ludo_command = lambda *_args: False
+                    bot.stock_pending = {}
+                    bot._handle_pending_bot_choice = lambda *_args: False
+
+                with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+                    bot_module, "MONEY_GAME_WIN_STATE_FILE", Path(temp_dir) / "money-state.json"
+                ), patch.object(
+                    bot_module, "MONEY_GAME_WIN_HISTORY_FILE", Path(temp_dir) / "money-winners.json"
+                ), patch.object(bot_module.secrets, "randbelow", return_value=0), patch.object(
+                    bot_module, "_record_game", return_value=None
+                ), patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+                    bot_module, "_games_enabled_for_room", return_value=True
+                ), patch.object(bot_module, "_public_base_url", return_value=""), patch.object(
+                    bot_module.time, "sleep", return_value=None
+                ):
+                    if game == "million":
+                        bot._million_bank_game("North", "Player")
+                    else:
+                        bot.handle_game_command("North", "billion", "Player")
+
+                winner_texts = [
+                    (room, text) for room, text in sent
+                    if "جاري البحث" not in text and "Searching for" not in text
+                ]
+                self.assertEqual(winner_texts[0], ("North", bot_module._money_game_win_text(game, "Player", "ar")))
+                self.assertEqual(winner_texts[1], ("South", bot_module._money_game_short_win_text(game, "Player", "en")))
+                self.assertIn("🌹", winner_texts[1][1])
+                self.assertNotIn("Prize:", winner_texts[1][1])
+                self.assertEqual(cards[0][0][2], ["North", "South"])
+                self.assertTrue(awards)
+
     def test_master_can_open_and_close_million_and_billion_win_rates(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._room_list_commands = lambda *_args: False
@@ -3105,6 +3154,47 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertIn("North", bot.connected_rooms)
         self.assertNotIn("Target", bot.room_users["North"])
 
+    def test_unexpected_bot_leave_reports_server_reason_to_master_privately(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.room_users = {"North": {"test-bot": "owner"}}
+        bot.known_rooms = {"North"}
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot.connected_rooms = {"North"}
+        bot._master_online_rooms = set()
+        bot._room_entry_times = {}
+        bot._room_entry_users = {}
+        bot._intentional_leaves = set()
+        bot.custom_welcome_enabled = False
+        bot.custom_welcomes = {}
+        bot.pending_admin_lock = threading.Lock()
+        bot.pending_admin_actions = {}
+        bot.last_admin_actions = {}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        bot._schedule_auto_rejoin = lambda *_args, **_kwargs: None
+        bot.send_room_text = lambda *_args: None
+        private_notices = []
+        bot.send_private_text = lambda user, text: private_notices.append((user, text)) or True
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
+            bot_module, "BOT_MASTER", "Master"
+        ), patch.object(bot_module, "_room_protection_cfg", return_value={}), patch.object(
+            bot_module, "_save_persistent_rooms"
+        ), patch.object(bot_module, "_remember_roster"):
+            bot._handle_room_event_impl({"room_event": {
+                1: "user_left", 13: "North", 17: "test-bot", 22: "RoomAdmin",
+                "reason": "removed by room admin",
+            }})
+        self.assertEqual(len(private_notices), 1)
+        self.assertEqual(private_notices[0][0], "Master")
+        self.assertIn("North", private_notices[0][1])
+        self.assertIn("removed by room admin", private_notices[0][1])
+        self.assertIn("RoomAdmin", private_notices[0][1])
+
     def test_explicit_role_change_of_bot_still_triggers_rejoin_recovery(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room = ""
@@ -3123,8 +3213,12 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         scheduled = []
         bot._schedule_auto_rejoin = lambda room, **_kwargs: scheduled.append(room)
         bot.log = lambda *_args: None
+        private_notices = []
+        bot.send_private_text = lambda user, text: private_notices.append((user, text)) or True
 
         with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
+            bot_module, "BOT_MASTER", "Master"
+        ), patch.object(
             bot_module, "_save_persistent_rooms"
         ):
             bot._handle_room_event_impl({"room_event": {
@@ -3134,6 +3228,8 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
 
         self.assertNotIn("North", bot.connected_rooms)
         self.assertEqual(scheduled, ["North"])
+        self.assertEqual(private_notices[0][0], "Master")
+        self.assertIn("outcast", private_notices[0][1])
 
     def test_telegram_poll_loop_is_inert_when_this_process_is_not_the_owner(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

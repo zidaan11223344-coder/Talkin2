@@ -4320,6 +4320,18 @@ def _money_game_win_text(game, username, language="ar"):
             f"✅ {name}\n💰 مبلغ الفوز: +{amount} نقطة\n🎉 مبروك يا بطل!\n{stars}")
 
 
+def _money_game_short_win_text(game, username, language="ar"):
+    """Compact winner notice for rooms other than the game origin."""
+    game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
+    name = str(username or "").strip().lstrip("@")
+    title = ("billion" if game == "billion" else "million") if language == "en" else (
+        "المليار" if game == "billion" else "المليون"
+    )
+    if language == "en":
+        return f"🌹✨ @{name} won the {title}! ✨🌹"
+    return f"🌹✨ حصل @{name} على {title}! ✨🌹"
+
+
 DEFAULT_REPLY_MESSAGES = {
     "master_silent": "",
     "master_denied": "",
@@ -7332,6 +7344,38 @@ class TalkinBot:
             r"\1\2[محذوف]", text,
         )
         return text[:1200]
+
+    def _send_master_room_departure_notice(self, room, event_type, event=None, role=""):
+        """Send the master a concise server-reported reason for an unexpected room exit."""
+        master = str(BOT_MASTER or "").strip()
+        if not master or _norm_user(master) == _norm_user(BOT_ID):
+            return False
+        event = event if isinstance(event, dict) else {}
+        reason = ""
+        for field in ("reason", "detail", "message", "description", "cause", "status_reason"):
+            value = event.get(field)
+            if isinstance(value, str) and value.strip():
+                reason = self._redact_connection_secrets(value.strip())[:350]
+                break
+        if not reason:
+            role = str(role or event.get(31, "") or event.get("role", "")).strip().lower()
+            if event_type == "role_changed" and role:
+                reason = f"غيّر الخادم دور البوت إلى {role} (إزالة أو حظر من الغرفة)."
+            else:
+                reason = f"الخادم أرسل حدث {event_type} دون سبب تفصيلي."
+        message = (
+            "⚠️ غادر بوت Talkin الغرفة وسيحاول العودة تلقائيًا."
+            f"\n📍 الغرفة: {str(room or 'غير معروفة')[:120]}"
+            f"\n🧾 السبب المسجل: {reason}"
+        )
+        actor = str(event.get(22, "") or "").strip()
+        if actor and _norm_user(actor) != _norm_user(BOT_ID):
+            message += f"\n📎 حساب آخر مذكور في الحدث: @{actor[:120]}"
+        try:
+            return bool(self.send_private_text(master, message))
+        except Exception as exc:
+            self.log("[ROOM_DEPARTURE_NOTICE] master DM failed:", repr(exc))
+            return False
 
     def _send_reconnect_notice(self, reason, command=None):
         """Deliver a sanitized connection-recovery diagnostic to both channels."""
@@ -15483,7 +15527,12 @@ class TalkinBot:
         for index, target_room in enumerate(target_rooms):
             try:
                 language = self._configured_room_language(target_room)
-                self.send_room_text(target_room, _money_game_win_text("million", sender_name, language))
+                announcement = (
+                    _money_game_win_text("million", sender_name, language)
+                    if _norm_room(target_room) == _norm_room(room)
+                    else _money_game_short_win_text("million", sender_name, language)
+                )
+                self.send_room_text(target_room, announcement)
             except Exception as exc:
                 self.log("[GAME] bank winner text send failed:", target_room, repr(exc))
             if index + 1 < len(target_rooms):
@@ -16814,7 +16863,12 @@ class TalkinBot:
                 ]
                 for index, target_room in enumerate(target_rooms):
                     language = self._configured_room_language(target_room)
-                    self.send_room_text(target_room, _money_game_win_text("billion", sender_name, language))
+                    announcement = (
+                        _money_game_win_text("billion", sender_name, language)
+                        if _norm_room(target_room) == _norm_room(room)
+                        else _money_game_short_win_text("billion", sender_name, language)
+                    )
+                    self.send_room_text(target_room, announcement)
                     if index + 1 < len(target_rooms):
                         time.sleep(0.05)
 
@@ -20986,6 +21040,7 @@ class TalkinBot:
                 if getattr(self, "_intentional_leaves", None) and _norm_room(room) in self._intentional_leaves:
                     self.log(f"[USER_LEFT_DETECTED] Bot left {room} intentionally; skipping auto-rejoin.")
                 else:
+                    self._send_master_room_departure_notice(room, event_type, event)
                     self.log(f"[USER_LEFT_DETECTED] Bot left {room}; rejoining automatically...")
                     self._schedule_auto_rejoin(room)
             if _norm_user(username) == _norm_user(BOT_MASTER):
@@ -21041,6 +21096,13 @@ class TalkinBot:
                             connected for connected in self.connected_rooms
                             if _norm_room(connected) != _norm_room(room)
                         }
+                        if not (
+                            getattr(self, "_intentional_leaves", None)
+                            and _norm_room(room) in self._intentional_leaves
+                        ):
+                            self._send_master_room_departure_notice(
+                                room, event_type, event, role=changed_role
+                            )
                         self.log(f"[KICK_DETECTED] Bot was removed from {room}; rejoining automatically...")
                         self._schedule_auto_rejoin(room)
                 else:
