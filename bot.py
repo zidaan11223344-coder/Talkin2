@@ -6792,6 +6792,7 @@ class TalkinBot:
             if isinstance(row, dict) and row.get("id") and row.get("username")
         ] if isinstance(saved_stock_rows, list) else []
         self._recover_stock_market_investments_from_points_history()
+        self._migrate_legacy_stock_market_investments()
         # Global wager queues, crop timers, and fruit-match state.
         self.wager_waiting = {}
         # Global fixed-prize PvP queues: one open challenge per game name.
@@ -14337,6 +14338,73 @@ class TalkinBot:
             self.log(f"[STOCK] recovered {len(recovered)} unresolved investment(s) from point history")
         return len(recovered)
 
+    def _migrate_legacy_stock_market_investments(self):
+        """Undo entry-time debits on unresolved legacy rows before deferred settlement."""
+        try:
+            _points_data()
+            with _GAME_STATE_LOCK:
+                transaction_ids = {
+                    str(row.get("id") or "") for row in (_POINTS_TRANSFER_CACHE or [])
+                    if isinstance(row, dict)
+                }
+        except Exception as exc:
+            self.log("[STOCK] legacy investment migration journal read failed:", repr(exc))
+            return 0
+
+        changed = 0
+        with self._stock_market_lock:
+            for row in self.stock_investments:
+                if not isinstance(row, dict) or row.get("balance_mode") == "deferred":
+                    continue
+                status = str(row.get("status") or "pending_debit")
+                if status not in {"pending_debit", "active", "paying"}:
+                    continue
+                investment_id = str(row.get("id") or "")
+                username = str(row.get("username") or "").strip().lstrip("@")
+                try:
+                    amount = int(row.get("amount", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not investment_id or not username or amount <= 0:
+                    continue
+
+                # Completed old payouts must stay on the legacy idempotent path.
+                debit_id = f"stock-market-debit:{investment_id}"
+                if (f"stock-market-payout:{investment_id}" in transaction_ids
+                        or f"stock-market-settlement:{investment_id}" in transaction_ids):
+                    continue
+                was_debited = debit_id in transaction_ids
+                if status in {"active", "paying"} and not was_debited:
+                    # An active legacy row means the old code had already
+                    # applied its debit. If its journal entry is absent (for
+                    # example, an unsynchronized backup snapshot), do not risk
+                    # crediting the principal twice; retain legacy settlement.
+                    continue
+                if was_debited:
+                    refund = _apply_points_delta_once(
+                        username, amount, f"stock-market-migration-refund:{investment_id}",
+                        "stock market migration: return legacy reserved principal",
+                    )
+                    if not refund.get("ok"):
+                        self.log("[STOCK] legacy reservation refund failed; keeping old state:",
+                                 investment_id, refund.get("error"))
+                        continue
+                    transaction_ids.add(f"stock-market-migration-refund:{investment_id}")
+
+                row["balance_mode"] = "deferred"
+                row["status"] = "paying" if status == "paying" else "pending_settlement"
+                row["migrated_from_entry_debit"] = bool(was_debited)
+                changed += 1
+
+        if changed:
+            try:
+                self._save_stock_investments()
+            except Exception as exc:
+                self.log("[STOCK] legacy investment migration save failed:", repr(exc))
+                return 0
+            self.log(f"[STOCK] migrated {changed} unresolved legacy investment(s) to deferred settlement")
+        return changed
+
     def _record_stock_market_history(self, result):
         """Persist one completed investment exactly once for the user's بورصتي log."""
         if not isinstance(result, dict) or not result.get("id") or not result.get("username"):
@@ -14391,7 +14459,7 @@ class TalkinBot:
             amount = int(row.get("amount", 0) or 0)
             status = str(row.get("status") or "settled")
             room_name = _transfer_log_safe_field(row.get("room"), 36)
-            if status in {"pending_debit", "active", "paying"}:
+            if status in {"pending_debit", "active", "paying", "pending_settlement"}:
                 line = (f"{when} | {asset.get('icon', '📈')} {asset_name} | {_fmt_points(amount)} | "
                         f"{'Pending settlement' if english else 'قيد التسوية'} | {room_name}")
             else:
@@ -14531,6 +14599,8 @@ class TalkinBot:
         previous_cooldown = None
         previous_cooldown_present = False
         cooldown_remaining = 0.0
+        insufficient_balance = False
+        available_balance = 0
         with self._stock_market_lock:
             cooldowns = getattr(self, "_stock_market_user_cooldowns", {})
             if not isinstance(cooldowns, dict):
@@ -14555,24 +14625,43 @@ class TalkinBot:
                 if closed:
                     investment = None
                 else:
-                    previous_cooldown_present = user_key in cooldowns
-                    previous_cooldown = cooldowns.get(user_key)
-                    cooldowns[user_key] = now
-                    self._stock_market_user_cooldowns = cooldowns
-                    investment = {
-                        "id": uuid.uuid4().hex,
-                        "event_id": round_id,
-                        "username": str(sender).strip().lstrip("@"),
-                        "room": str(room or ""),
-                        "asset": asset,
-                        "amount": amount,
-                        "started_at": now,
-                        "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
-                        "status": "pending_debit",
-                    }
-                    self.stock_investments.append(investment)
-                    # A player may invest repeatedly during the same market round;
-                    # the two-minute cooldown is the only per-player restriction.
+                    committed = 0
+                    for pending_row in self.stock_investments:
+                        if not (
+                            isinstance(pending_row, dict)
+                            and pending_row.get("balance_mode") == "deferred"
+                            and _norm_user(pending_row.get("username")) == user_key
+                            and str(pending_row.get("status") or "") in {"pending_settlement", "paying"}
+                        ):
+                            continue
+                        try:
+                            committed += max(0, int(pending_row.get("amount", 0) or 0))
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                    available_balance = max(0, int(_get_points(sender) or 0) - committed)
+                    if available_balance < amount:
+                        insufficient_balance = True
+                        investment = None
+                    else:
+                        previous_cooldown_present = user_key in cooldowns
+                        previous_cooldown = cooldowns.get(user_key)
+                        cooldowns[user_key] = now
+                        self._stock_market_user_cooldowns = cooldowns
+                        investment = {
+                            "id": uuid.uuid4().hex,
+                            "event_id": round_id,
+                            "username": str(sender).strip().lstrip("@"),
+                            "room": str(room or ""),
+                            "asset": asset,
+                            "amount": amount,
+                            "started_at": now,
+                            "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
+                            "status": "pending_settlement",
+                            "balance_mode": "deferred",
+                        }
+                        self.stock_investments.append(investment)
+                        # The principal is not moved now. Pending stakes only
+                        # reduce this user's available balance for new entries.
         if cooldown_remaining > 0:
             seconds = max(1, int(cooldown_remaining + 0.999))
             text = (
@@ -14584,6 +14673,14 @@ class TalkinBot:
             return True
         if closed:
             self.send_room_text(room, "⌛ انتهت جولة البورصة؛ انتظر الإعلان التالي أو اكتب بورصة لبدء جولة." if language != "en" else "⌛ This market round has closed. Wait for the next announcement or type stock to start a round.")
+            return True
+        if insufficient_balance:
+            text = (
+                f"❌ رصيدك المتاح لا يكفي. المتاح بعد احتساب استثماراتك المعلقة: {_fmt_points(available_balance)} نقطة."
+                if language != "en" else
+                f"❌ Not enough available points. Available after pending investments: {_fmt_points(available_balance)} points."
+            )
+            self.send_room_text(room, text)
             return True
         if investment is None:
             self.send_room_text(room, "⚠️ استثمرت مرة واحدة في هذه الجولة؛ انتظر النتيجة أو الجولة التالية." if language != "en" else "⚠️ You already invested in this round. Wait for the result or next round.")
@@ -14603,47 +14700,11 @@ class TalkinBot:
             self.log("[STOCK] could not save pending investment:", repr(exc))
             self.send_room_text(room, "❌ تعذر حفظ الاستثمار، لم يُخصم أي رصيد." if language != "en" else "❌ The investment could not be saved; no points were deducted.")
             return True
-        debit = _apply_points_delta_once(
-            sender, -amount, f"stock-market-debit:{investment['id']}",
-            f"stock market investment in {STOCK_MARKET_ASSETS[asset]['en']}",
-            stock_market_investment=investment,
-        )
-        if not debit.get("ok"):
-            with self._stock_market_lock:
-                self.stock_investments = [row for row in self.stock_investments if row.get("id") != investment["id"]]
-                self._stock_market_seen.discard((str(round_id), _norm_user(sender)))
-                cooldowns = getattr(self, "_stock_market_user_cooldowns", {})
-                if isinstance(cooldowns, dict) and cooldowns.get(user_key) == now:
-                    if previous_cooldown_present:
-                        cooldowns[user_key] = previous_cooldown
-                    else:
-                        cooldowns.pop(user_key, None)
-            try:
-                self._save_stock_investments()
-            except Exception as exc:
-                self.log("[STOCK] failed to remove rejected investment:", repr(exc))
-            if debit.get("error") == "insufficient":
-                text = f"❌ رصيدك لا يكفي لاستثمار {_fmt_points(amount)} نقطة." if language != "en" else f"❌ You do not have enough points to invest {_fmt_points(amount)}."
-            else:
-                text = "❌ تعذر خصم مبلغ الاستثمار بأمان؛ لم تُعتمد العملية." if language != "en" else "❌ The investment debit could not be committed safely."
-            self.send_room_text(room, text)
-            return True
-        with self._stock_market_lock:
-            for row in self.stock_investments:
-                if row.get("id") == investment["id"]:
-                    row["status"] = "active"
-                    break
-        try:
-            self._save_stock_investments()
-        except Exception as exc:
-            # The durable pending_debit record is recoverable because the debit
-            # itself has a stable transaction id and cannot be applied twice.
-            self.log("[STOCK] active state save deferred; recovery will reconcile:", repr(exc))
         data = STOCK_MARKET_ASSETS[asset]
         if language == "en":
-            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss.\n⏳ You can invest again in 2 minutes."
+            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss.\n💳 Points change only after the result.\n⏳ You can invest again in 2 minutes."
         else:
-            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة.\n⏳ يمكنك الاستثمار مجدداً بعد دقيقتين."
+            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة.\n💳 لا يتغير رصيدك إلا بعد ظهور النتيجة.\n⏳ يمكنك الاستثمار مجدداً بعد دقيقتين."
         self.send_room_text(room, text)
         return True
 
@@ -14697,6 +14758,8 @@ class TalkinBot:
             if not investment_id or not username or amount <= 0 or asset not in STOCK_MARKET_ASSETS:
                 continue
             status = str(row.get("status") or "pending_debit")
+            # Legacy rows were debited when accepted. New deferred rows never
+            # touch points until the final profit/loss is known.
             if status == "pending_debit":
                 debit = _apply_points_delta_once(
                     username, -amount, f"stock-market-debit:{investment_id}",
@@ -14762,18 +14825,22 @@ class TalkinBot:
                 self.log("[STOCK] payout state save failed; retrying:", repr(exc))
                 continue
             payout = max(0, amount - change) if outcome == "loss" else amount + change
-            credit = _apply_points_delta_once(
-                username, payout, f"stock-market-payout:{investment_id}",
+            deferred_balance = str(row.get("balance_mode") or "") == "deferred"
+            settlement_delta = (change if outcome == "profit" else -change) if deferred_balance else payout
+            transaction_prefix = "stock-market-settlement" if deferred_balance else "stock-market-payout"
+            settlement = _apply_points_delta_once(
+                username, settlement_delta, f"{transaction_prefix}:{investment_id}",
                 f"stock market {outcome} {change_percent}% settlement",
             )
-            if not credit.get("ok"):
-                self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, credit.get("error"))
+            if not settlement.get("ok"):
+                self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, settlement.get("error"))
                 continue
-            net_change = payout - amount
+            net_change = settlement_delta if deferred_balance else payout - amount
             history_row = dict(row)
             history_row.update({
                 "status": "settled", "payout": payout, "net_change": net_change,
-                "balance_after": int(credit.get("balance", 0) or 0), "settled_at": now,
+                "balance_change": settlement_delta,
+                "balance_after": int(settlement.get("balance", 0) or 0), "settled_at": now,
             })
             if not self._record_stock_market_history(history_row):
                 # Keep the paying row so the idempotent credit and history write
@@ -14791,7 +14858,7 @@ class TalkinBot:
                     f"📈 Your stock-market result — {result_label}\n👤 Investor: @{display_user}\n"
                     f"{data['icon']} {data['en']} | Invested: {_fmt_points(amount)} points\n"
                     f"📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
-                    f"💳 Balance: {_fmt_points(credit['balance'])}"
+                    f"💳 Balance: {_fmt_points(settlement['balance'])}"
                 )
             else:
                 result_label = "الخسارة" if outcome == "loss" else "الربح"
@@ -14799,7 +14866,7 @@ class TalkinBot:
                     f"📈 نتيجتك في البورصة — {result_label}\n👤 المستثمر: @{display_user}\n"
                     f"{data['icon']} {data['ar']} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
                     f"📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
-                    f"💳 الرصيد: {_fmt_points(credit['balance'])}"
+                    f"💳 الرصيد: {_fmt_points(settlement['balance'])}"
                 )
             try:
                 self._broadcast_stock_market_result(

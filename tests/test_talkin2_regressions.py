@@ -3885,6 +3885,45 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             self.assertEqual(bot._recover_stock_market_investments_from_points_history(), 0)
         self.assertEqual(bot.stock_investments, [])
 
+    def test_legacy_pending_stock_migration_refunds_old_debit_once(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_market_history = []
+        bot.stock_investments = [
+            {"id": "legacy-active", "username": "Player", "amount": 500,
+             "status": "active", "due_at": 160.0},
+            {"id": "legacy-not-debited", "username": "Player", "amount": 300,
+             "status": "pending_debit", "due_at": 170.0},
+            {"id": "legacy-active-no-journal", "username": "Player", "amount": 200,
+             "status": "active", "due_at": 180.0},
+        ]
+        bot.log = lambda *_args: None
+        saved = []
+        bot._save_stock_investments = lambda: saved.append([dict(row) for row in bot.stock_investments])
+        point_ops = []
+
+        def apply_once(username, delta, transaction_id, reason):
+            point_ops.append((username, delta, transaction_id, reason))
+            return {"ok": True, "balance": 1_000}
+
+        transactions = [{"id": "stock-market-debit:legacy-active"}]
+        with patch.object(bot_module, "_points_data", return_value={}), patch.object(
+            bot_module, "_POINTS_TRANSFER_CACHE", transactions
+        ), patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once):
+            self.assertEqual(bot._migrate_legacy_stock_market_investments(), 2)
+            self.assertEqual(bot._migrate_legacy_stock_market_investments(), 0)
+
+        self.assertEqual(len(point_ops), 1)
+        self.assertEqual(point_ops[0][1], 500)
+        self.assertEqual(point_ops[0][2], "stock-market-migration-refund:legacy-active")
+        self.assertEqual(bot.stock_investments[0]["status"], "pending_settlement")
+        self.assertEqual(bot.stock_investments[0]["balance_mode"], "deferred")
+        self.assertEqual(bot.stock_investments[1]["status"], "pending_settlement")
+        self.assertFalse(bot.stock_investments[1]["migrated_from_entry_debit"])
+        self.assertEqual(bot.stock_investments[2]["status"], "active")
+        self.assertNotIn("balance_mode", bot.stock_investments[2])
+        self.assertEqual(len(saved), 1)
+
     def test_pending_debit_recovery_reuses_idempotent_debit_and_refreshes_journal(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._stock_market_lock = threading.RLock()
@@ -3976,7 +4015,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             point_ops.append((username, delta, transaction_id, reason))
             return {"ok": True, "balance": 1_000}
 
-        with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once):
+        with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), patch.object(
+            bot_module, "_get_points", return_value=1_000
+        ):
             with patch.object(bot_module.time, "time", return_value=1_000.0):
                 bot._stock_market_invest("Market", "Player", 1, 100, expected_round_id=1)
             with patch.object(bot_module.time, "time", return_value=1_100.0):
@@ -3985,9 +4026,35 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=1)
             with patch.object(bot_module.time, "time", return_value=1_240.0):
                 bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=1)
-        self.assertEqual([row[1] for row in point_ops], [-100, -100, -100])
+        self.assertEqual(point_ops, [])
         self.assertEqual(len(bot.stock_investments), 3)
         self.assertTrue(any("2-minute cooldown" in text for _, text in messages))
+
+    def test_stock_investment_checks_balance_and_pending_commitments_without_debit(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._stock_market_lock = threading.RLock()
+        bot.stock_market_round = {"id": 1, "started_at": 0.0, "ends_at": 5_000.0}
+        bot._stock_market_seen = set()
+        bot._stock_market_user_cooldowns = {}
+        bot.stock_investments = [{
+            "id": "pending-1", "username": "Player", "amount": 50,
+            "status": "pending_settlement", "balance_mode": "deferred",
+        }]
+        bot._save_stock_investments = lambda: None
+        bot._configured_room_language = lambda _room: "ar"
+        bot.log = lambda *_args: None
+        messages = []
+        bot.send_room_text = lambda room, text: messages.append((room, text))
+
+        with patch.object(bot_module, "_get_points", return_value=100), patch.object(
+            bot_module.time, "time", return_value=1_000.0
+        ), patch.object(bot_module, "_apply_points_delta_once") as apply_once:
+            bot._stock_market_invest("Market", "Player", 1, 60, expected_round_id=1)
+
+        apply_once.assert_not_called()
+        self.assertEqual(len(bot.stock_investments), 1)
+        self.assertIn("50 نقطة", messages[-1][1])
+        self.assertNotIn("Player", bot._stock_market_user_cooldowns)
 
     def test_stock_investment_settles_profit_or_loss_after_one_minute(self):
         cases = (
@@ -4017,14 +4084,20 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
 
                 with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), patch.object(
                     bot_module.time, "time", return_value=1_000.0
-                ):
+                ), patch.object(bot_module, "_get_points", return_value=1_000_000):
                     bot._stock_market_invest("ArabicHall", "Player", 1, 100_000, expected_round_id=7)
                     bot._stock_market_invest("ArabicHall", "Player", 1, 100_000, expected_round_id=7)
-                self.assertEqual(len(point_ops), 1)
-                self.assertEqual(point_ops[0][1], -100_000)
-                self.assertTrue(point_ops[0][2].startswith("stock-market-debit:"))
+                self.assertEqual(point_ops, [])
                 self.assertEqual(len(bot.stock_investments), 1)
                 self.assertEqual(bot.stock_investments[0]["due_at"], 1_060.0)
+                self.assertEqual(bot.stock_investments[0]["balance_mode"], "deferred")
+
+                # Simulate the pending record being loaded after a restart:
+                # it must remain untouched until its one-minute result time.
+                with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once):
+                    self.assertEqual(bot._process_stock_market_investments(now=1_030.0), 0)
+                self.assertEqual(point_ops, [])
+                self.assertEqual(bot.stock_investments[0]["status"], "pending_settlement")
 
                 with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), patch.object(
                     bot_module.secrets, "randbelow", side_effect=[outcome_draw, percent_draw]
@@ -4032,11 +4105,11 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                     bot_module, "_save_local_json", return_value=None
                 ):
                     self.assertEqual(bot._process_stock_market_investments(now=1_300.0), 1)
-                self.assertEqual(len(point_ops), 2)
+                self.assertEqual(len(point_ops), 1)
                 change = 100_000 * expected_percent // 100
-                expected_payout = 100_000 - change if outcome == "loss" else 100_000 + change
-                self.assertEqual(point_ops[1][1], expected_payout)
-                self.assertTrue(point_ops[1][2].startswith("stock-market-payout:"))
+                expected_delta = -change if outcome == "loss" else change
+                self.assertEqual(point_ops[0][1], expected_delta)
+                self.assertTrue(point_ops[0][2].startswith("stock-market-settlement:"))
                 self.assertFalse(bot.stock_investments)
                 result_by_room = dict(messages)
                 self.assertEqual(set(result_by_room), {"ArabicHall"})
