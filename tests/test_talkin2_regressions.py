@@ -1665,7 +1665,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 self.assertIn("تم الحصول على المليار" if won else "لم يحصل على المليار", sent[-1][1])
                 self.assertEqual(bool(history.get("billion")), won)
 
-    def test_money_winner_long_text_is_local_and_short_rose_text_and_card_go_to_other_rooms(self):
+    def test_money_winner_long_text_is_local_and_short_game_specific_text_precedes_card(self):
         for game in ("million", "billion"):
             with self.subTest(game=game):
                 bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -1725,7 +1725,14 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 ]
                 self.assertEqual(winner_texts[0], ("North", bot_module._money_game_win_text(game, "Player", "ar")))
                 self.assertEqual(winner_texts[1], ("South", bot_module._money_game_short_win_text(game, "Player", "en")))
-                self.assertIn("🌹", winner_texts[1][1])
+                self.assertNotIn("🌹", winner_texts[1][1])
+                arabic_short = bot_module._money_game_short_win_text(game, "Player", "ar")
+                if game == "billion":
+                    self.assertIn("💵", winner_texts[1][1])
+                    self.assertIn("💸", arabic_short)
+                else:
+                    self.assertIn("🟩", winner_texts[1][1])
+                    self.assertIn("🟨", arabic_short)
                 self.assertNotIn("Prize:", winner_texts[1][1])
                 self.assertEqual(cards[0][2], ["North", "South"])
                 self.assertEqual(pair_order, [

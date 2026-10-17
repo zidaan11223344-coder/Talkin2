@@ -4327,9 +4327,10 @@ def _money_game_short_win_text(game, username, language="ar"):
     title = ("billion" if game == "billion" else "million") if language == "en" else (
         "المليار" if game == "billion" else "المليون"
     )
+    decoration = "💵💸" if game == "billion" else "🟩🟨🏆"
     if language == "en":
-        return f"🌹✨ @{name} won the {title}! ✨🌹"
-    return f"🌹✨ حصل @{name} على {title}! ✨🌹"
+        return f"{decoration}✨ @{name} won the {title}! ✨{decoration}"
+    return f"{decoration}✨ حصل @{name} على {title}! ✨{decoration}"
 
 
 DEFAULT_REPLY_MESSAGES = {
