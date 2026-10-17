@@ -17275,33 +17275,45 @@ class TalkinBot:
             # Room lists are keyed by room and requester too, so one user's
             # ns command cannot advance another user's pending roster.
             result_key_user = str(sender or "")
-            result_key = ("chat_message" if is_private else "room_message", result_key_room, result_key_user)
+            result_packet_type = "chat_message" if is_private else "room_message"
+            result_key = (result_packet_type, "" if is_private else result_key_room, result_key_user)
             result_state = result_pages.get(result_key)
             if not result_state:
-                # l@sr is often issued from a room but replies privately to
-                # the master.  Accept Ns from that private chat as well as
-                # from the original command context.
+                # Talkin can provide a display alias in one event and the
+                # canonical username in another. Match the same route+room.
+                wanted = _norm_user(sender)
                 for candidate_key, candidate_state in reversed(list(result_pages.items())):
-                    if (candidate_key[0] == "chat_message"
-                            and candidate_key[2] == str(sender or "")):
+                    if (isinstance(candidate_key, tuple) and len(candidate_key) == 3
+                            and candidate_key[0] == result_packet_type
+                            and candidate_key[1] == ("" if is_private else result_key_room)
+                            and _norm_user(candidate_key[2]) == wanted):
                         result_key, result_state = candidate_key, candidate_state
                         break
-                if result_state:
-                    pages = result_state.get("pages") or []
-                    part = int(result_state.get("part", 1) or 1)
-                    result_english = str(result_state.get("language") or "ar").casefold() == "en"
+            if not result_state and not is_private:
+                # Some room commands deliberately answer in DM.
+                wanted = _norm_user(sender)
+                for candidate_key, candidate_state in reversed(list(result_pages.items())):
+                    if (isinstance(candidate_key, tuple) and len(candidate_key) == 3
+                            and candidate_key[0] == "chat_message"
+                            and _norm_user(candidate_key[2]) == wanted):
+                        result_key, result_state = candidate_key, candidate_state
+                        break
+            if result_state:
+                pages = result_state.get("pages") or []
+                part = int(result_state.get("part", 1) or 1)
+                result_english = str(result_state.get("language") or "ar").casefold() == "en"
+                if part < len(pages):
+                    part += 1
+                    result_state["part"] = part
+                    chunk = pages[part - 1]
                     if part < len(pages):
-                        part += 1
-                        result_state["part"] = part
-                        chunk = pages[part - 1]
-                        if part < len(pages):
-                            chunk += "\n\n📌 Type ns for the next list." if result_english else "\n\n📌 للقائمة التالية اكتب ns"
-                        else:
-                            chunk += "\n\n✅ End of list." if result_english else "\n\n✅ انتهت القوائم."
+                        chunk += "\n\n📌 Type ns for the next list." if result_english else "\n\n📌 للقائمة التالية اكتب ns"
+                    else:
+                        chunk += "\n\n✅ End of list." if result_english else "\n\n✅ انتهت القوائم."
                     payload = dict(result_state.get("kwargs") or {})
                     payload["type_"] = "text"
                     payload["body"] = chunk
-                    self.send_query(encode_query("chat_message" if is_private else "room_message", **payload))
+                    self.send_query(encode_query(result_key[0], **payload))
                 else:
                     result_pages.pop(result_key, None)
                     msg = "✅ انتهت القوائم.\n📌 أرسل الأمر من جديد لعرض النتائج من البداية."
@@ -17961,10 +17973,20 @@ class TalkinBot:
             "o": "👑 قائمة الأونرات",
             "b": "🚫 قائمة المحظورين",
         }.get(label, "📋 قائمة الغرفة")
-        self._send_room_list(
-            room, f"{title} — {room}", names,
-            "📭 لم تصل أسماء فعلية من السيرفر.", sender=pending.get("sender")
-        )
+        if pending.get("code") == "la":
+            title = f"🟢 المتواجدون الآن في {pending.get('room') or room}"
+            if pending.get("private_response"):
+                self._send_private_list(pending.get("sender"), title, names, "📭 لا يوجد متواجدون الآن.")
+            else:
+                self._send_room_list(
+                    pending.get("response_room") or room, title, names,
+                    "📭 لا يوجد متواجدون الآن.", sender=pending.get("sender")
+                )
+        else:
+            self._send_room_list(
+                room, f"{title} — {room}", names,
+                "📭 لم تصل أسماء فعلية من السيرفر.", sender=pending.get("sender")
+            )
 
         try:
             self.send_private_text(
@@ -18085,11 +18107,12 @@ class TalkinBot:
                 if name and key != _norm_user(BOT_ID) and key not in seen:
                     seen.add(key)
                     names.append({"username": name})
+            response_room = str(pending.get("response_room") or source_room)
             title = f"🟢 المتواجدون الآن في {source_room}"
             if pending.get("private_response"):
                 self._send_private_list(pending.get("sender"), title, names, "📭 لا يوجد متواجدون الآن.")
             else:
-                self._send_room_list(source_room, title, names, "📭 لا يوجد متواجدون الآن.", sender=pending.get("sender"))
+                self._send_room_list(response_room, title, names, "📭 لا يوجد متواجدون الآن.", sender=pending.get("sender"))
             return True
 
         # L@a / L@m / L@o / L@b: the APK sends the actual roster in
@@ -18186,15 +18209,17 @@ class TalkinBot:
             return
         rows.sort(key=_norm_user)
         limit = max(240, int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008")) - 120)
-        pages=[]; current=[f"{title} ({len(rows)}):"]
-        for index, name in enumerate(rows, 1):
-            line = f"{index}. @{name}"
+        pages=[]; current=[f"{title} ({len(rows)}):"]; page_items=0
+        for name in rows:
+            line = f"{page_items + 1}. @{name}"
             candidate = "\n".join(current + [line])
-            if len(candidate.encode("utf-8")) > limit and len(current) > 1:
+            if (page_items >= 30 or len(candidate.encode("utf-8")) > limit) and page_items > 0:
                 pages.append("\n".join(current))
-                current=[f"{title} ({len(rows)}):", line]
-            else:
-                current.append(line)
+                current=[f"{title} ({len(rows)}):"]
+                page_items=0
+                line = f"{page_items + 1}. @{name}"
+            current.append(line)
+            page_items += 1
         if len(current) > 1:
             pages.append("\n".join(current))
 
@@ -18322,18 +18347,35 @@ class TalkinBot:
         self.send_query(encode_query("room_admin",type_=types[code],room=state["room"],to=BOT_ID,value="none",id_=rid))
         return True
 
+    def _room_list_response_timeout(self, room_key, request_id):
+        pending_lists = getattr(self, "_pending_room_lists", {})
+        pending = pending_lists.get(room_key)
+        if (not isinstance(pending, dict) or pending.get("code") != "la"
+                or str(pending.get("request_id") or "") != str(request_id or "")):
+            return False
+        pending_lists.pop(room_key, None)
+        notice = "⚠️ لم يصل رد المتواجدين من الخادم. تأكد أن البوت متصل بالغرفة ثم أعد la@اسم_الغرفة."
+        if pending.get("private_response"):
+            self.send_private_text(pending.get("sender"), notice)
+        else:
+            self.send_room_text(pending.get("response_room") or pending.get("room"), notice)
+        return True
+
     def _room_list_commands(self, room, text, sender, is_private):
         live_room = re.fullmatch(r"la@(.+)", str(text or "").strip(), re.I)
         if live_room:
             target_room = live_room.group(1).strip()
             if not target_room:
-                self.send_private_text(sender, "⚠️ اكتب اسم الغرفة بعد la@.")
+                (self.send_private_text(sender, "⚠️ اكتب اسم الغرفة بعد la@.") if is_private
+                 else self.send_room_text(room, "⚠️ اكتب اسم الغرفة بعد la@."))
                 return True
             if member_shop.active("room_roster", room=target_room):
-                self.send_private_text(sender, f"🌫️ قائمة المتواجدين في {target_room} مخفية بحماية المتجر.")
+                text = f"🌫️ قائمة المتواجدين في {target_room} مخفية بحماية المتجر."
+                (self.send_private_text(sender, text) if is_private else self.send_room_text(room, text))
                 return True
             if not getattr(self, "ws", None):
-                self.send_private_text(sender, "❌ يلزم اتصال مباشر بالخادم لجلب المتواجدين الآن.")
+                text = "❌ يلزم اتصال مباشر بالخادم لجلب المتواجدين الآن."
+                (self.send_private_text(sender, text) if is_private else self.send_room_text(room, text))
                 return True
             try:
                 request_id = secrets.token_urlsafe(15)[:20]
@@ -18341,16 +18383,24 @@ class TalkinBot:
                     "room": target_room, "code": "la", "sender": str(sender or "").strip(),
                     "request_type": "occupants_list", "request_id": request_id,
                     "requested_at": time.time(), "private_response": bool(is_private),
+                    "response_room": str(room or "").strip(),
                 }
                 self.send_query(encode_query(
                     "room_admin", type_="occupants_list", room=target_room,
                     to=BOT_ID, value="none", id_=request_id,
                 ))
-                self.send_private_text(sender, f"⏳ جارٍ جلب المتواجدين الآن في {target_room}...")
+                timeout = max(5.0, float(os.getenv("ROOM_OCCUPANTS_TIMEOUT_SECONDS", "15")))
+                timer = threading.Timer(
+                    timeout, self._room_list_response_timeout,
+                    args=(_norm_room(target_room), request_id),
+                )
+                timer.daemon = True
+                timer.start()
             except Exception as exc:
                 self._pending_room_lists.pop(_norm_room(target_room), None)
                 self.log("[ROOM-PRESENCE] la@ request failed", repr(exc))
-                self.send_private_text(sender, "❌ تعذر طلب قائمة المتواجدين من الخادم.")
+                text = "❌ تعذر طلب قائمة المتواجدين من الخادم."
+                (self.send_private_text(sender, text) if is_private else self.send_room_text(room, text))
             return True
         match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
         if match:
@@ -21024,6 +21074,74 @@ class TalkinBot:
         self.log("[JOINLEAVE] ignored automatic member restore after ban:", room, username)
         return False
 
+    def _handle_reaction_command(self, room, body, sender):
+        """Handle reaction tokens; reports are private to the configured master."""
+        reaction = re.match(r"^(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?$", str(body or "").strip(), re.I)
+        if not reaction:
+            return False
+        action, code = reaction.group(1).lower(), reaction.group(2).lower()
+        extra = (reaction.group(3) or "").strip()
+        info = getattr(self, "reaction_targets", {}).get(code)
+        if not info or time.time() - float(info.get("created_at", 0) or 0) > 86400:
+            return False
+
+        publisher = str(info.get("publisher") or "").strip()
+        labels = {"lk": "👍 إعجاب", "lv": "❤️ حب", "dl": "👎 عدم إعجاب", "cm": "💬 تعليق", "report": "🚨 بلاغ"}
+        source_desc = str(info.get("description") or info.get("title") or "").strip()
+        owner_label = "صاحب الأغنية" if str(info.get("kind") or "").lower() == "music" else "اسم الناشر"
+
+        if action == "report":
+            master = str(BOT_MASTER or "").strip().lstrip("@")
+            if not master:
+                self.log("[REACTION] report could not be delivered: BOT_MASTER is not configured")
+                return True
+            notice = (
+                "🚨 بلاغ جديد عن أغنية/صورة\n"
+                f"🧾 الرمز: {code}\n👤 المبلّغ: {sender}\n"
+                f"👤 الناشر: {publisher or 'غير معروف'}\n"
+                f"📌 النوع: {owner_label}\n🏠 الغرفة: {room}"
+            )
+            if source_desc:
+                notice += f"\n📝 المحتوى: {source_desc}"
+            if extra:
+                notice += f"\n💬 تفاصيل البلاغ: {extra}"
+            notice = _fit_text_to_packet("chat_message", notice, to=master)
+            reply_state = getattr(self, "_master_reply_local", None)
+            old_rerouting = getattr(reply_state, "rerouting", False) if reply_state else False
+            try:
+                if reply_state:
+                    reply_state.rerouting = True
+                if self.send_private_text(master, notice) is False:
+                    self.log("[REACTION] private master report was rejected", master)
+            except Exception as exc:
+                self.log("[REACTION] private master report failed", repr(exc))
+            finally:
+                if reply_state:
+                    reply_state.rerouting = old_rerouting
+            return True
+
+        notice = f"لقد تفاعلت مع {labels.get(action, action)}\n👤 المتفاعل: {sender}\n📌 {owner_label}: {publisher}"
+        if source_desc:
+            notice += f"\n📝 المحتوى: {source_desc}"
+        if extra:
+            notice += f"\n💬 رسالة التفاعل: {extra}"
+        self.send_room_text(room, notice)
+        if publisher and _norm_user(publisher) != _norm_user(sender):
+            private_notice = notice + f"\n🏠 الغرفة: {room}"
+            reply_state = getattr(self, "_master_reply_local", None)
+            old_rerouting = getattr(reply_state, "rerouting", False) if reply_state else False
+            try:
+                if reply_state:
+                    reply_state.rerouting = True
+                if self.send_private_text(publisher, private_notice) is False:
+                    self.log("[REACTION] private publisher notice was rejected", publisher)
+            except Exception as exc:
+                self.log("[REACTION] private publisher notice failed", repr(exc))
+            finally:
+                if reply_state:
+                    reply_state.rerouting = old_rerouting
+        return True
+
     def handle_room_event(self, result):
         event = (result.get("room_event") or {}) if isinstance(result, dict) else {}
         event_type = str(event.get(1, ""))
@@ -21741,40 +21859,10 @@ class TalkinBot:
         if self._handle_lookalike_command(room, body, frm):
             return
 
-        # Reactions/comments/reports: notify the original publisher privately.
-        reaction=re.match(r"^(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?$", body.strip(), re.I)
-        if reaction:
-            action,code,extra=reaction.group(1).lower(),reaction.group(2).lower(),(reaction.group(3) or "").strip()
-            info=self.reaction_targets.get(code)
-            if info and time.time()-float(info.get("created_at",0)) <= 86400:
-                publisher=str(info.get("publisher") or "").strip()
-                labels={"lk":"👍 إعجاب","lv":"❤️ حب","dl":"👎 عدم إعجاب","cm":"💬 تعليق","report":"🚨 بلاغ"}
-                source_desc = str(info.get("description") or info.get("title") or "").strip()
-                owner_label = "صاحب الأغنية" if str(info.get("kind") or "").lower() == "music" else "اسم الناشر"
-                notice=f"لقد تفاعلت مع {labels.get(action,action)}\n👤 المتفاعل: {frm}\n📌 {owner_label}: {publisher}"
-                if source_desc: notice += f"\n📝 المحتوى: {source_desc}"
-                if extra: notice += f"\n💬 رسالة التفاعل: {extra}"
-                # التفاعل يظهر داخل نفس الغرفة، وتصل نسخة مطابقة أيضاً
-                # إلى صاحب الصورة/الأغنية على الخاص.
-                self.send_room_text(room, notice)
-                if publisher and _norm_user(publisher) != _norm_user(frm):
-                    private_notice = notice + f"\n🏠 الغرفة: {room}"
-                    reply_state = getattr(self, "_master_reply_local", None)
-                    old_rerouting = getattr(reply_state, "rerouting", False) if reply_state else False
-                    try:
-                        # This is a notification to the publisher, not a reply
-                        # to the room command. Bypass management reply reroutes.
-                        if reply_state:
-                            reply_state.rerouting = True
-                        delivered = self.send_private_text(publisher, private_notice)
-                        if delivered is False:
-                            self.log("[REACTION] private publisher notice was rejected", publisher)
-                    except Exception as exc:
-                        self.log("[REACTION] private publisher notice failed", repr(exc))
-                    finally:
-                        if reply_state:
-                            reply_state.rerouting = old_rerouting
-                return
+        # Reports go to the master privately; other reactions retain their
+        # existing room and publisher notifications.
+        if self._handle_reaction_command(room, body, frm):
+            return
 
         # نقاطي متاح للجميع ولا يحتاج توثيقاً.
         if body.strip().casefold() in ("نقاطي", "points"):

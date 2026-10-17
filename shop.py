@@ -93,12 +93,19 @@ def remaining(kind: str, *, username: str = "", room: str = "") -> int:
 
 
 def render_catalog() -> str:
-    lines = ["🛍️ متجر الأعضاء — الأسعار بالنقاط", "━━━━━━━━━━━━━━"]
-    lines.extend(f"{i} {item['icon']} {item['name']} — {item['cost']:,} نقطة" for i, item in ITEMS.items())
-    lines.extend([
-        "━━━━━━━━━━━━━━",
-        "للشراء: sby 1 إلى sby 6 (يلزم وجود النقاط في رصيدك).",
-        "الترحيب النصي: بعد فتحه استخدم ترحيب@النص داخل الغرفة.",
-        "كل حماية مؤقتة تدوم ساعة، ولا تتراكم مع شراء حماية فعالة.",
-    ])
+    # Keep the entire catalog below Talkin's 1008-byte protobuf ceiling.
+    # The previous verbose Arabic names were ~1030 bytes after encoding and
+    # were dropped by the transport before members could see the shop.
+    lines = [
+        "🛍️ متجر الأعضاء — الأسعار بالنقاط",
+        "1 🛡️ قنابل شخصية/ساعة: 10,000,000",
+        "2 🏰 قنابل الغرفة/ساعة: 25,000,000",
+        "3 🕵️ إخفاء النك عن البحث/ساعة: 8,000,000",
+        "4 🌫️ إخفاء قائمة الغرفة/ساعة: 15,000,000",
+        "5 💌 ترحيب نصي مخصص: 5,000,000",
+        "6 🖼️ ترحيب بصورة: 12,000,000",
+        "للشراء: sby 1 إلى sby 6",
+        "الترحيب: ترحيب@النص أو ترحيب_صورة",
+        "الحمايات ساعة ولا تتراكم.",
+    ]
     return "\n".join(lines)
