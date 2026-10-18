@@ -6,7 +6,7 @@ GITHUB_SYNC=1
 GITHUB_REPO=zidaan11223344-coder/Talkin1
 GITHUB_BRANCH=main
 GITHUB_DATA_DIR=bot_data
-GITHUB_TOKEN=<REDACTED_IN_ARCHIVE>
+GITHUB_TOKEN=التوكن الخاص بك
 
 مهم:
 - لا تضع GITHUB_TOKEN داخل bot.py.
