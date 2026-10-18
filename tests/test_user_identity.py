@@ -41,7 +41,9 @@ def test_legacy_game_and_points_records_resolve_through_numeric_id(monkeypatch):
     matches = bot_module._game_record_matches(legacy_games, "NewName")
     assert len(matches) == 1
     assert matches[0][0] == "oldname"
-    assert bot_module._user_identity_key("NewName") == "id:7654321"
+    # Names are the primary live-command key; the numeric ID remains a
+    # compatibility fallback for legacy records and background persistence.
+    assert bot_module._user_identity_key("NewName") == "newname"
 
     legacy_points = {"oldname": {"username": "OldName", "points": 1234}}
     candidates = bot_module._points_account_candidates(legacy_points, "NewName")

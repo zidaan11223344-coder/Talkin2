@@ -2987,8 +2987,14 @@ def _stored_user_aliases(username, preferred_room=""):
 
 
 def _user_identity_key(username, preferred_room=""):
-    user_id = _stored_user_id(username, preferred_room)
-    return f"id:{user_id}" if user_id else _norm_user(username)
+    # Commands and game state are keyed by the name received in the message.
+    # A native numeric ID is deliberately only a fallback when the transport
+    # supplies no usable username; never make a command wait for roster data.
+    raw = str(username or "").strip().lstrip("@")
+    if raw and not raw.isdigit():
+        return _norm_user(raw)
+    user_id = _stored_user_id(raw, preferred_room)
+    return f"id:{user_id}" if user_id else _norm_user(raw)
 
 
 def _save_persistent_rosters(rosters):
@@ -3702,18 +3708,26 @@ def _game_record_matches(data, username):
     if not isinstance(data, dict):
         return []
     wanted = _game_name_key(username)
-    wanted_id = _stored_user_id(username)
     matches = []
     for key, candidate in data.items():
         if not isinstance(candidate, dict):
             continue
         stored_name = candidate.get("username") or key
+        if _game_name_key(stored_name) == wanted:
+            matches.append((str(key), candidate))
+    if matches:
+        return matches
+    # Only consult the saved/native ID when the current username has no direct
+    # record. This preserves old renamed accounts without slowing normal games.
+    wanted_id = _stored_user_id(username)
+    if not wanted_id:
+        return []
+    for key, candidate in data.items():
+        if not isinstance(candidate, dict):
+            continue
+        stored_name = candidate.get("username") or key
         stored_id = str(candidate.get("user_id") or _stored_user_id(stored_name) or "").strip()
-        if wanted_id and stored_id == wanted_id:
-            matches.append((str(key), candidate))
-        elif wanted_id and not stored_id and _game_name_key(stored_name) == wanted:
-            matches.append((str(key), candidate))
-        elif not wanted_id and _game_name_key(stored_name) == wanted:
+        if stored_id == wanted_id:
             matches.append((str(key), candidate))
     return matches
 
@@ -3726,8 +3740,10 @@ def _merged_game_item(data, username):
     player's history when an old migration duplicated a record.
     """
     exact_key = _norm_user(username)
-    wanted_id = _stored_user_id(username)
     matches = _game_record_matches(data, username)
+    # A normal username match is complete; only legacy/renamed records need
+    # the compatibility ID lookup performed by _game_record_matches.
+    wanted_id = _stored_user_id(username) if not matches else ""
     if not matches:
         return _user_identity_key(username), {}
     # Prefer an exact non-empty key for the canonical record; otherwise keep
@@ -4050,9 +4066,8 @@ def _record_game(username, game_key, points_delta=0, stake=0):
         key = existing_key or key
         item = item if isinstance(item, dict) else {}
         item.setdefault("username", str(username).strip().lstrip("@"))
-        user_id = _stored_user_id(username)
-        if user_id:
-            item["user_id"] = user_id
+        # Native IDs are background metadata; never read room_users.json while
+        # processing a live game command.
         games = item.get("games") if isinstance(item.get("games"), dict) else {}
         g = games.get(game_key, {"plays": 0, "points": 0, "staked": 0})
         g["plays"] = int(g.get("plays", 0) or 0) + 1
@@ -4187,17 +4202,6 @@ def _points_account_candidates(data, username, *, exact_only=False):
     wanted = _norm_user(username)
     if not wanted or not isinstance(data, dict):
         return []
-    wanted_id = _stored_user_id(username)
-    if wanted_id:
-        by_id = []
-        for key, item in data.items():
-            if not isinstance(item, dict):
-                continue
-            saved_id = str(item.get("user_id") or _stored_user_id(item.get("username") or key) or "").strip()
-            if saved_id == wanted_id:
-                by_id.append((str(key), item))
-        if by_id:
-            return by_id
     exact = []
     for key, item in data.items():
         if not isinstance(item, dict):
@@ -4206,6 +4210,19 @@ def _points_account_candidates(data, username, *, exact_only=False):
             exact.append((str(key), item))
     if exact or exact_only:
         return exact
+    # ID lookup is a compatibility fallback for renamed/legacy accounts only.
+    wanted_id = _stored_user_id(username)
+    if wanted_id:
+        by_id = []
+        for key, item in data.items():
+            if not isinstance(item, dict):
+                continue
+            saved_name = item.get("username") or key
+            saved_id = str(item.get("user_id") or _stored_user_id(saved_name) or "").strip()
+            if saved_id == wanted_id:
+                by_id.append((str(key), item))
+        if by_id:
+            return by_id
     canonical = _game_name_key(username)
     if not canonical:
         return []
