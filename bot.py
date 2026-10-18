@@ -20604,6 +20604,15 @@ class TalkinBot:
             if not saved_rooms:
                 self.send_private_text(sender, "📭 لا توجد غرف محفوظة في ملف الغرف.")
                 return True
+            bulk_lock = getattr(self, "_room_bulk_lock", None)
+            if bulk_lock is not None and not bulk_lock.acquire(blocking=False):
+                self.send_private_text(
+                    sender,
+                    "⏳ توجد عملية دخول غرف قيد التنفيذ حالياً؛ لن أبدأ عملية ثانية حتى لا يتوقف البوت.",
+                )
+                return True
+            if bulk_lock is not None:
+                bulk_lock.release()
             threading.Thread(
                 target=self._join_rooms_serially, args=(saved_rooms, sender, True),
                 daemon=True, name="manual-join-my-rooms",
