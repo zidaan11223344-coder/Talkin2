@@ -3542,11 +3542,11 @@ def _game_stats_data():
 
 
 GAME_LEVEL_CATEGORIES = (
-    ("النجوم الفضية", "⭐", (
+    ("النجوم الفضية", "✩", (
         "مبتدئ", "لاعب ناشئ", "مقاتل", "برونزي", "فضي",
         "ذهبي", "محترف", "خبير", "أسطورة", "أسطورة فضية",
     )),
-    ("النجوم الذهبية", "🌟", (
+    ("النجوم الذهبية", "⭐", (
         "ذهبي مبتدئ", "محارب ذهبي", "ذهبي محترف", "ذهبي متألق", "ذهبي نادر",
         "أمير الذهب", "فارس الذهب", "قائد الذهب", "أسطورة الذهب", "ملك الذهب",
     )),
@@ -3554,33 +3554,40 @@ GAME_LEVEL_CATEGORIES = (
         "ماسي مبتدئ", "ماسي متألق", "ماسي محترف", "فارس الماس", "الماسي النادر",
         "أمير الماس", "قائد الماس", "أسطورة الماس", "إمبراطور الماس", "ملك الماس الأزرق",
     )),
-    ("الماس البرونزي", "🟤", (
+    ("الماس البرونزي", "🔶", (
         "برونزي نادر", "فارس البرونز", "برونزي محترف", "البرونزي المتألق", "سيد البرونز",
         "أمير البرونز", "قائد البرونز", "أسطورة البرونز", "إمبراطور البرونز", "ملك الماس البرونزي",
     )),
-    ("الماس الأحمر", "❤️", (
+    ("الماس الأحمر", "♦️", (
         "أحمر نادر", "محارب الماس الأحمر", "أحمر محترف", "فارس الماس الأحمر", "أمير الماس الأحمر",
         "قائد الماس الأحمر", "أسطورة الماس الأحمر", "سيد الماس الأحمر", "إمبراطور الماس الأحمر", "ملك الماس الأحمر",
     )),
-    ("الماس الأسود", "🖤", (
+    ("الماس الأسود", "◆", (
         "أسود نادر", "محارب أسود", "متألق أسود", "محترف أسود", "فارس أسود",
         "أمير الأسود", "سيد الأسود", "أسطورة الأسود", "إمبراطور الأسود", "ملك الماس الأسود",
     )),
-    ("الماس البنفسجي", "💜", (
+    ("الماس البنفسجي", "🟣💎", (
         "بنفسجي نادر", "محارب بنفسجي", "متألق بنفسجي", "محترف بنفسجي", "فارس بنفسجي",
         "أمير البنفسج", "سيد البنفسج", "أسطورة البنفسج", "إمبراطور البنفسج", "ملك الماس البنفسجي",
     )),
     ("الماس الملكي", "👑", (
         "ملكي نادر", "محارب ملكي", "متألق ملكي", "محترف ملكي", "فارس ملكي",
-        "أمير ملكي", "سيد الملك", "أسطورة ملكية", "إمبراطور الماس", "ملك الملوك",
+        "أمير ملكي", "سيد الملك", "أسطورة ملكية", "إمبراطور الماس", "تاج الملوك الأبدي",
     )),
 )
-GAME_LEVEL_FUTURE_SYMBOLS = ("🔷", "🔶", "🟣", "🟢", "🟠", "⚫", "⚪")
+GAME_LEVEL_FUTURE_CATEGORIES = (
+    ("الماس الخالد", "💠", (
+        "بداية الخلود", "حارس الخلود", "نبض الخلود", "فارس الخلود", "سيد الخلود",
+        "أمير الخلود", "أسطورة الخلود", "إمبراطور الخلود", "عرش الخلود", "تاج الخلود",
+    )),
+    ("الماس الكوني", "🔷", (
+        "بداية الكون", "حارس النجوم", "سائر المجرات", "فارس المجرة", "سيد الكون",
+        "أمير المجرات", "أسطورة المجرات", "إمبراطور الكون", "عرش المجرات", "سيّد المجرات",
+    )),
+)
 GAME_LEVEL_FUTURE_TITLES = (
     "مستكشف", "مبتدئ", "متألق", "محترف", "فارس", "نادر", "أمير", "قائد", "أسطورة", "إمبراطور",
 )
-
-
 def _game_level_details_from_plays(plays):
     try:
         plays = max(0, int(plays or 0))
@@ -3592,12 +3599,16 @@ def _game_level_details_from_plays(plays):
         category_name, symbol, titles = GAME_LEVEL_CATEGORIES[category_index]
         label = titles[level_number - 1]
     else:
-        future_category = category_index - len(GAME_LEVEL_CATEGORIES) + 1
-        category_name = f"الماس الأسطوري {future_category}"
-        symbol = GAME_LEVEL_FUTURE_SYMBOLS[(future_category - 1) % len(GAME_LEVEL_FUTURE_SYMBOLS)]
-        label = f"{GAME_LEVEL_FUTURE_TITLES[level_number - 1]} {category_name}"
+        future_index = category_index - len(GAME_LEVEL_CATEGORIES)
+        if future_index < len(GAME_LEVEL_FUTURE_CATEGORIES):
+            category_name, symbol, titles = GAME_LEVEL_FUTURE_CATEGORIES[future_index]
+            label = titles[level_number - 1]
+        else:
+            dynamic_index = future_index - len(GAME_LEVEL_FUTURE_CATEGORIES) + 1
+            category_name = f"الماس الكوني {dynamic_index}"
+            symbol = GAME_LEVEL_FUTURE_CATEGORIES[-1][1]
+            label = f"{GAME_LEVEL_FUTURE_TITLES[level_number - 1]} {category_name}"
     return category_index, level_number, category_name, label, symbol, plays
-
 def _game_name_key(name):
     """Compare decorated usernames without changing their displayed form."""
     raw = unicodedata.normalize("NFKC", str(name or "")).strip().lstrip("@")
@@ -17820,16 +17831,19 @@ class TalkinBot:
                 "الماس الأسود": "المستوى الماسي الأسود",
                 "الماس البنفسجي": "المستوى الماسي البنفسجي",
                 "الماس الملكي": "المستوى الماسي الملكي",
+                "الماس الخالد": "المستوى الماسي الخالد",
+                "الماس الكوني": "المستوى الماسي الكوني",
             }
-            for tier_index in range(len(GAME_LEVEL_CATEGORIES) + 1):
+            category_count = len(GAME_LEVEL_CATEGORIES) + len(GAME_LEVEL_FUTURE_CATEGORIES)
+            for tier_index in range(category_count):
                 tier_start = tier_index * 5000
                 _category_index, _level_number, category, _title, symbol, _plays = _game_level_details_from_plays(tier_start)
                 tier_title = tier_titles.get(category, f"المستوى {category}")
-                item_lines.extend((tier_title, f"{symbol} {category}"))
+                item_lines.extend((tier_title, symbol * 10))
                 for level_in_tier in range(1, 11):
                     plays = tier_start + (level_in_tier - 1) * 500
-                    _category_index, _level_number, _category, title, level_symbol, _plays = _game_level_details_from_plays(plays)
-                    item_lines.append(f"{level_in_tier}: {level_symbol * level_in_tier} — {title}")
+                    _category_index, _level_number, _category, title, _level_symbol, _plays = _game_level_details_from_plays(plays)
+                    item_lines.append(f"مستوى {level_in_tier}: {title}")
             headings = ["📚 مستويات تقدم الألعاب", "كل مستوى يحتاج 500 لعبة"]
             packet_type = "chat_message" if is_private else "room_message"
             route_fields = {"to": str(sender or "")} if is_private else {"room": str(room or "")}

@@ -6,7 +6,7 @@ import bot as bot_module
 from treasure_mining import DIAMOND_KEYS, MiningStore
 
 
-def test_levels_command_shows_one_complete_tier_per_numbered_page_and_ns_advances():
+def test_levels_command_shows_ten_complete_tiers_with_requested_symbols_and_ns():
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
     bot.help_pages = {}
     bot.help_page_part = {}
@@ -23,26 +23,39 @@ def test_levels_command_shows_one_complete_tier_per_numbered_page_and_ns_advance
     assert bot._handle_management_command("North", "مستويات", "Player", is_private=False)
     assert len(messages) == 1
     first_page = messages[0][1]
-    assert first_page.index("📄 القائمة 1/") < first_page.index("📚 مستويات تقدم الألعاب")
+    assert first_page.splitlines()[0] == "📄 القائمة 1/10"
+    assert "📚 مستويات تقدم الألعاب" in first_page
     assert "كل مستوى يحتاج 500 لعبة" in first_page
     assert "المستوى الفضي" in first_page
-    assert "⭐ النجوم الفضية" in first_page
-    assert "1: ⭐ — مبتدئ" in first_page
-    assert "2: ⭐⭐ — لاعب ناشئ" in first_page
-    assert f"10: {'⭐' * 10} — أسطورة فضية" in first_page
-    assert "المستوى الذهبي" not in first_page
-    assert "من 0 إلى" not in first_page
-    assert "500 إلى" not in first_page
+    assert "✩" * 10 in first_page
+    assert "مستوى 1: مبتدئ" in first_page
+    assert "مستوى 10: أسطورة فضية" in first_page
+    level_lines = [line for line in first_page.splitlines() if line.startswith("مستوى ")]
+    assert len(level_lines) == 10
+    assert all(not any(symbol in line for symbol in ("✩", "⭐", "💎", "🔶", "♦️", "◆", "🟣", "👑")) for line in level_lines)
 
     result_key = ("room_message", "North", "Player")
-    assert len(bot._result_pages[result_key]["pages"]) >= len(bot_module.GAME_LEVEL_CATEGORIES)
+    pages = bot._result_pages[result_key]["pages"]
+    assert len(pages) == 10
     assert bot._handle_management_command("North", "ns", "Player", is_private=False)
     assert bot._result_pages[result_key]["part"] == 2
     next_text = bot_module.as_text(bot_module.decode_message(packets[0])[5][0])
-    assert next_text.startswith("📄 القائمة 2/")
+    assert next_text.startswith("📄 القائمة 2/10")
     assert "المستوى الذهبي" in next_text
-    assert "🌟 النجوم الذهبية" in next_text
-    assert "1: 🌟 — ذهبي مبتدئ" in next_text
+    assert "⭐" * 10 in next_text
+    assert "مستوى 1: ذهبي مبتدئ" in next_text
+    assert all(not line.startswith(("✩", "⭐", "💎", "🔶", "♦️", "◆", "🟣", "👑"))
+               for line in next_text.splitlines() if line.startswith("مستوى "))
+
+    categories = [line for page in pages for line in page.splitlines() if line.startswith("المستوى ")]
+    assert len(categories) == 10
+    assert len(set(categories)) == 10
+    assert "♦️" in pages[4]
+    assert "❤️" not in pages[4]
+    assert "المستوى الماسي الخالد" in pages[8]
+    assert "تاج الخلود" in pages[8]
+    assert "المستوى الماسي الكوني" in pages[9]
+    assert "سيّد المجرات" in pages[9]
 
 
 def test_master_diamond_check_rotates_inventory_item_and_sends_room_image(tmp_path, monkeypatch):
