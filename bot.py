@@ -23213,7 +23213,9 @@ class TalkinBot:
             except queue.Empty:
                 continue
             try:
-                self._process_message(ws, message)
+                # Keep the socket worker free: private and room commands can
+                # invoke games, media, roster sync, or network-backed work.
+                self._dispatch_incoming_message(ws, message)
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log("[EVENT-WORKER] processing failed:", repr(exc))
@@ -23222,6 +23224,26 @@ class TalkinBot:
                     self._event_queue.task_done()
                 except Exception:
                     pass
+
+    def _dispatch_incoming_message(self, ws, message):
+        """Submit every inbound frame to a bounded command executor."""
+        executor = getattr(self, "_incoming_executor", None)
+        if executor is None:
+            lock = getattr(self, "_incoming_executor_lock", None)
+            if lock is None:
+                lock = self._incoming_executor_lock = threading.Lock()
+            with lock:
+                executor = getattr(self, "_incoming_executor", None)
+                if executor is None:
+                    executor = self._incoming_executor = ThreadPoolExecutor(
+                        max_workers=max(2, int(os.getenv("INCOMING_COMMAND_WORKERS", "6") or 6)),
+                        thread_name_prefix="incoming-command",
+                    )
+        try:
+            return executor.submit(self._process_message, ws, message)
+        except Exception as exc:
+            self.log("[EVENT-DISPATCH] async submit failed; processing inline:", repr(exc))
+            return self._process_message(ws, message)
 
     def _dispatch_room_event(self, result):
         """Process room text outside the transport worker.
@@ -23282,7 +23304,7 @@ class TalkinBot:
                 # low-priority pressure rather than blocking the socket.
                 if priority == 0:
                     try:
-                        self._process_message(ws, bytes(message))
+                        self._dispatch_incoming_message(ws, bytes(message))
                     except Exception as exc:
                         self.log("[EVENT-WORKER] urgent frame failed:", repr(exc))
                 else:
