@@ -37,6 +37,26 @@ def test_welcome_perks_are_persistent_unlocks(tmp_path, monkeypatch):
     assert shop.active("image_welcome", username="Player")
 
 
+def test_shop_entitlements_follow_numeric_identity_across_display_name_changes(tmp_path, monkeypatch):
+    monkeypatch.setattr(shop, "SHOP_PATH", tmp_path / "shop.json")
+    ok, error = shop.purchase("OldName", 5)
+    assert ok and not error
+
+    # A numeric ID plus the saved prior name finds and migrates the legacy row.
+    assert shop.active(
+        "custom_welcome", username="NewName", user_id="3456782", aliases=["OldName"]
+    )
+    duplicate, message = shop.purchase(
+        "NewName", 5, user_id="3456782", aliases=["OldName"]
+    )
+    assert not duplicate and "بالفعل" in message
+
+    ok, error = shop.purchase("NewName", 1, user_id="3456782")
+    assert ok and not error
+    assert shop.active("user_bomb", username="OldName", user_id="3456782")
+    assert shop.remaining("user_bomb", username="NewName", user_id="3456782") > 0
+
+
 def test_shop_catalog_fits_talkin_message_limit():
     text = shop.render_catalog()
     packet = bot_module.encode_query("chat_message", type_="text", to="Player", body=text)

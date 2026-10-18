@@ -1264,7 +1264,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             level, _label, plays = bot_module._game_level_info(decorated)
             stats = bot_module._game_stats(decorated, "star")
         self.assertEqual(plays, 3890)
-        self.assertEqual(level, 7)
+        self.assertEqual(level, 8)
         self.assertEqual(stats["plays"], 3890)
 
     def test_record_game_merges_into_legacy_compact_stats(self):
@@ -1364,22 +1364,21 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         }):
             level, label, plays = bot_module._game_level_info(decorated)
             welcome = bot_module._game_welcome(decorated, "North")
-            self.assertEqual(level, 3)
+            self.assertEqual(level, 1)
             self.assertEqual(plays, 50)
             self.assertIn(label, welcome)
             self.assertIn(decorated, welcome)
-            self.assertIn("🏅 مستوى الألعاب: 3", welcome)
+            self.assertIn("🏅 مستوى الألعاب: 1", welcome)
 
     def test_new_player_gets_level_and_star_welcome(self):
         decorated = "♥☼هـــــ☼ـــادي☼♥اا"
         with patch.object(bot_module, "_game_stats_data", return_value={}):
             welcome = bot_module._game_welcome(decorated, "North")
             self.assertIn(decorated, welcome)
-            self.assertNotIn("🏅 مستوى الألعاب", welcome)
-            self.assertNotIn("⭐ ترتيب النجوم", welcome)
-            self.assertIn("🎯 جولاتك: 0", welcome)
+            self.assertIn("🏅 مستوى الألعاب: 1", welcome)
+            self.assertIn("🎯 عدد الألعاب: 0", welcome)
 
-    def test_game_level_welcome_starts_at_exactly_50_games(self):
+    def test_game_level_advances_every_500_games_not_at_50(self):
         with patch.object(bot_module, "_game_stats_data", return_value={
             "player": {"username": "player", "games": {"star": {"plays": 49}}}
         }):
@@ -1388,15 +1387,22 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             "player": {"username": "player", "games": {"star": {"plays": 50}}}
         }):
             after = bot_module._game_welcome("player", "North")
-        self.assertNotIn("🏅 مستوى الألعاب", before)
-        self.assertIn("🏅 مستوى الألعاب", after)
+        self.assertIn("🏅 مستوى الألعاب: 1", before)
+        self.assertIn("🏅 مستوى الألعاب: 1", after)
+        with patch.object(bot_module, "_game_stats_data", return_value={
+            "player": {"username": "player", "games": {"star": {"plays": 500}}}
+        }):
+            next_level = bot_module._game_welcome("player", "North")
+        self.assertIn("🏅 مستوى الألعاب: 2", next_level)
 
-    def test_join_welcome_uses_vip_only_before_50_games(self):
+    def test_join_welcome_uses_game_level_for_every_member_including_vip(self):
         with patch.object(bot_module, "_is_vip_user", side_effect=lambda name: name == "vip"):
             with patch.object(bot_module, "_game_stats_data", return_value={}):
-                self.assertIsNone(bot_module._join_welcome_message("regular", "North"))
+                regular_welcome = bot_module._join_welcome_message("regular", "North")
                 vip_welcome = bot_module._join_welcome_message("vip", "North")
+            self.assertIn("🏅 مستوى الألعاب: 1", regular_welcome)
             self.assertIn("عضو Vip", vip_welcome)
+            self.assertIn("🏅 مستوى الألعاب: 1", vip_welcome)
 
     def test_join_welcome_uses_game_level_at_50_games(self):
         records = {"regular": {"username": "regular", "games": {"star": {"plays": 50}}}}
@@ -1405,6 +1411,17 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         ):
             welcome = bot_module._join_welcome_message("regular", "North")
         self.assertIn("🏅 مستوى الألعاب", welcome)
+
+    def test_master_join_welcome_uses_the_same_game_profile_as_members(self):
+        records = {"master": {"username": "Master", "games": {"star": {"plays": 1234}}}}
+        with patch.object(bot_module, "BOT_MASTER", "Master"), patch.object(
+            bot_module, "_is_vip_user", return_value=False
+        ), patch.object(bot_module, "_game_stats_data", return_value=records):
+            master_welcome = bot_module._join_welcome_message("Master", "North")
+            regular_welcome = bot_module._join_welcome_message("Member", "North")
+            self.assertEqual(master_welcome, bot_module._game_welcome("Master", "North"))
+        self.assertIn("عدد الألعاب: 1234", master_welcome)
+        self.assertIn("عدد الألعاب: 0", regular_welcome)
 
     def test_sb_uses_sender_balance_and_msb_is_master_private_only(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
