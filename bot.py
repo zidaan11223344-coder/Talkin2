@@ -20605,10 +20605,14 @@ class TalkinBot:
                 self.send_private_text(sender, "📭 لا توجد غرف محفوظة في ملف الغرف.")
                 return True
             threading.Thread(
-                target=self._join_rooms_serially, args=(saved_rooms, sender),
+                target=self._join_rooms_serially, args=(saved_rooms, sender, True),
                 daemon=True, name="manual-join-my-rooms",
             ).start()
-            self.send_private_text(sender, f"⏳ جاري دخول غرفي ({len(saved_rooms)} غرفة) بالتتابع...")
+            self.send_private_text(
+                sender,
+                f"📨 أرسلت طلبات دخول {len(saved_rooms)} غرفة بسرعة. "
+                "لن أعتبر أي غرفة دخلتها إلا بعد تأكيد الخادم، وستظهر رسالة الدخول داخل كل غرفة.",
+            )
             return True
 
         # Bulk room join: enter every room currently saved in tracked_rooms.json.

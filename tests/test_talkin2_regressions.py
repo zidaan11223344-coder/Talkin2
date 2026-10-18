@@ -1965,10 +1965,12 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         with patch.object(bot_module, "_persistent_rooms", return_value=["North", "South", "North"]), patch.object(
             bot_module, "_is_primary_master", return_value=True
         ), patch.object(bot_module.threading, "Thread", ImmediateThread):
-            bot._join_rooms_serially = lambda rooms, sender: joined.append((rooms, sender))
+            bot._join_rooms_serially = lambda rooms, sender, fast_restore=False: joined.append(
+                (rooms, sender, fast_restore)
+            )
             self.assertTrue(bot._handle_management_command_impl("", "دخول غرفي", "Master", is_private=True))
 
-        self.assertEqual(joined, [(["North", "South"], "Master")])
+        self.assertEqual(joined, [(["North", "South"], "Master", True)])
         self.assertIn("2 غرفة", sent[-1])
 
     def test_enter_server_rooms_fetches_then_joins_in_one_operation(self):
