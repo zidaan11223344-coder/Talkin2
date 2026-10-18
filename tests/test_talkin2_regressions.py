@@ -368,6 +368,33 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         self.assertTrue(timer.cancelled)
 
 
+class ProtectionAuthorizationRegressions(unittest.TestCase):
+    def test_legacy_protection_flags_are_disabled_without_authorization_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            protection = root / "room_protection.json"
+            moderation = root / "moderation.json"
+            mf = root / "mf.json"
+            protection.write_text(json.dumps({"rooms": {"Hall": {
+                "swear": True, "flood": True, "joinleave": True, "no_photo": True,
+                "repeat_limit": 11,
+            }}}), encoding="utf-8")
+            moderation.write_text(json.dumps({"rooms": {"Hall": {"enabled": True}} ,
+                                               "bot_protection_enabled": True}), encoding="utf-8")
+            mf.write_text(json.dumps({"enabled": True, "words": ["bad"]}), encoding="utf-8")
+            with patch.object(bot_module, "PROTECTION_FILE", protection), patch.object(
+                bot_module, "MODERATION_FILE", moderation
+            ), patch.object(bot_module, "MF_FILE", mf):
+                self.assertEqual(
+                    bot_module._room_protection_cfg("Hall"),
+                    {"swear": False, "flood": False, "joinleave": False,
+                     "no_photo": False, "repeat_limit": 11},
+                )
+                self.assertFalse(bot_module._room_moderation_config("Hall")["enabled"])
+                self.assertFalse(bot_module._bot_protection_enabled())
+                self.assertFalse(bot_module._load_moderation_config()[0])
+
+
 class RoomExclusionRegressions(unittest.TestCase):
     def test_unauthorized_room_is_persisted_skipped_and_only_manual_join_clears_it(self):
         class NoOpTimer:
@@ -1934,7 +1961,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
                 bot_module, "_save_room_moderation", lambda *_args, **_kwargs: None
             ):
                 # A room creator/master may use the numbered menu in the same room.
-                with patch.object(bot_module, "_room_manager", return_value=True):
+                with patch.object(bot_module, "_is_room_creator", return_value=True):
                     self.assertTrue(bot._handle_management_command_impl("North", "3", "Master", is_private=False))
                 self.assertEqual(saved, [("North", {"flood": True})])
                 self.assertTrue(public)
@@ -1955,7 +1982,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         bot._room_list_commands = lambda *_args: False
         bot.send_room_text = lambda *_args: None
         saved = []
-        with patch.object(bot_module, "_room_manager", return_value=True), patch.object(
+        with patch.object(bot_module, "_is_room_creator", return_value=True), patch.object(
             bot_module, "_is_master_name", return_value=False
         ), patch.object(bot_module, "_is_primary_master", return_value=False), patch.object(
             bot_module, "_save_room_protection", side_effect=lambda room, **changes: saved.append((room, changes))

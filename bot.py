@@ -4574,8 +4574,11 @@ def _load_moderation_config():
             words = sorted(BANNED_WORDS)
 
     words = [str(w).strip() for w in words if _valid_filter_word(w)]
+    # Legacy enabled state has no record of who enabled it. Keep it off once,
+    # then preserve future choices made through the restricted master command.
+    authorized_state = bool(mf_data.get("_creator_master_only_v1"))
     raw_enabled = mf_data.get("enabled", moderation_data.get("enabled", AUTO_BAN_WORDS))
-    enabled = bool(raw_enabled) if isinstance(raw_enabled, (bool, int)) else AUTO_BAN_WORDS
+    enabled = (bool(raw_enabled) if isinstance(raw_enabled, (bool, int)) else AUTO_BAN_WORDS) if authorized_state else False
 
     # Ensure the dedicated file exists immediately so filter data is visibly
     # stored separately from the main moderation settings.
@@ -4593,7 +4596,10 @@ def _save_mf_config(enabled, words):
         if key and key not in seen:
             seen.add(key)
             clean.append(word)
-    _save_local_json(MF_FILE, {"enabled": bool(enabled), "words": clean})
+    _save_local_json(MF_FILE, {
+        "enabled": bool(enabled), "words": clean,
+        "_creator_master_only_v1": True,
+    })
     return clean
 
 
@@ -4700,7 +4706,18 @@ def _publish_ban_rows():
 
 def _room_protection_data():
     data=_load_local_json(PROTECTION_FILE,{})
-    return data if isinstance(data,dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    if not data.get("_creator_master_only_v1"):
+        rooms = data.get("rooms", {})
+        if isinstance(rooms, dict):
+            for cfg in rooms.values():
+                if isinstance(cfg, dict):
+                    for key in ("swear", "flood", "joinleave", "no_photo"):
+                        cfg[key] = False
+        data["_creator_master_only_v1"] = True
+        _save_local_json(PROTECTION_FILE, data)
+    return data
 
 def _room_protection_cfg(room):
     data=_room_protection_data(); rooms=data.get("rooms",{}) if isinstance(data.get("rooms"),dict) else {}
@@ -4730,7 +4747,17 @@ def _save_moderation_config(enabled, words):
 
 def _room_moderation_data():
     data = _load_local_json(MODERATION_FILE, {})
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    if not data.get("_room_protection_creator_master_only_v1"):
+        rooms = data.get("rooms", {})
+        if isinstance(rooms, dict):
+            for cfg in rooms.values():
+                if isinstance(cfg, dict):
+                    cfg["enabled"] = False
+        data["_room_protection_creator_master_only_v1"] = True
+        _save_local_json(MODERATION_FILE, data)
+    return data
 
 def _room_moderation_config(room):
     data = _room_moderation_data()
@@ -4761,6 +4788,10 @@ def _bot_protection_data():
     data = _load_local_json(MODERATION_FILE, {})
     if not isinstance(data, dict):
         data = {}
+    if not data.get("_bot_protection_master_only_v1"):
+        data["bot_protection_enabled"] = False
+        data["_bot_protection_master_only_v1"] = True
+        _save_local_json(MODERATION_FILE, data)
     blocked = data.get("bot_blocked_users", [])
     if not isinstance(blocked, list):
         blocked = []
@@ -4771,11 +4802,12 @@ def _bot_blocked_users():
     return set(_bot_protection_data().get("bot_blocked_users", []))
 
 def _bot_protection_enabled():
-    return bool(_bot_protection_data().get("bot_protection_enabled", True))
+    return bool(_bot_protection_data().get("bot_protection_enabled", False))
 
 def _save_bot_protection_enabled(enabled):
     data = _bot_protection_data()
     data["bot_protection_enabled"] = bool(enabled)
+    data["_bot_protection_master_only_v1"] = True
     _save_local_json(MODERATION_FILE, data)
     return bool(enabled)
 
@@ -18656,7 +18688,8 @@ class TalkinBot:
             if not target_room:
                 self.send_private_text(sender, "⚠️ لا توجد غرفة محددة لفحص الحماية.")
                 return True
-            if not (_is_master_name(sender) or _room_manager(self, target_room, sender)):
+            if not (_is_primary_master(sender) or _is_master_name(sender)
+                    or _is_room_creator(target_room, sender)):
                 return True
             pcfg = _room_protection_cfg(target_room)
             mcfg = _room_moderation_config(target_room)
@@ -18667,8 +18700,8 @@ class TalkinBot:
                     f"🛡️ Protection status — {target_room}\n"
                     f"• Room protection: {protection_state(mcfg.get('enabled'))}\n"
                     f"• Profanity filter: {protection_state(pcfg.get('swear'))}\n"
-                    f"• Repeated-message protection: {protection_state(pcfg.get('repeat'))}\n"
-                    f"• Join/leave protection: {protection_state(pcfg.get('flood'))}\n"
+                    f"• Repeated-message protection: {protection_state(pcfg.get('flood'))}\n"
+                    f"• Join/leave protection: {protection_state(pcfg.get('joinleave'))}\n"
                     f"• Repetition limit: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
                     f"• Internal bot protection: {protection_state(bot_prot)}"
                 )
@@ -18677,8 +18710,8 @@ class TalkinBot:
                     f"🛡️ حالة الحماية — {target_room}\n"
                     f"• حماية الغرفة: {'🟢 شغالة' if mcfg.get('enabled') else '🔴 متوقفة'}\n"
                     f"• فلتر الكلمات: {'🟢 شغال' if pcfg.get('swear') else '🔴 متوقف'}\n"
-                    f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('repeat') else '🔴 متوقفة'}\n"
-                    f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
+                    f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
+                    f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('joinleave') else '🔴 متوقفة'}\n"
                     f"• حد التكرار: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
                     f"• حماية البوت الداخلية: {'🟢 شغالة' if bot_prot else '🔴 متوقفة'}"
                 )
@@ -18865,7 +18898,7 @@ class TalkinBot:
         protection_match = re.fullmatch(r"(?:حماية|حمايه|حماية الغرفة|حمايه الغرفه|protection|room protection)(?:@([^@]+)|\s+(.+))?", text, re.I)
         if protection_match:
             room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
-                                          or _room_manager(self, room, sender)))
+                                          or _is_room_creator(room, sender)))
             if not ((_is_primary_master(sender) and is_private) or room_manager):
                 if room and not is_private:
                     self.send_room_text(room, "🚫 قائمة الحماية لصانع الغرفة أو الماستر فقط.")
@@ -18907,7 +18940,7 @@ class TalkinBot:
         st=pending_protection.get(protection_key,{})
         if st.get("awaiting_number") and re.fullmatch(r"\d+",low):
             room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
-                                          or _room_manager(self, room, sender)))
+                                          or _is_room_creator(str(st.get("room") or room), sender)))
             if not ((is_private and _is_primary_master(sender)) or (not is_private and room_manager)):
                 return True
             try:
@@ -18927,7 +18960,7 @@ class TalkinBot:
         if protection_key in pending_protection and low.isdigit():
             st=pending_protection.get(protection_key,{})
             room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
-                                          or _room_manager(self, room, sender)))
+                                          or _is_room_creator(str(st.get("room") or room), sender)))
             if not ((is_private and _is_primary_master(sender)) or (not is_private and room_manager)):
                 if is_private and _is_primary_master(sender):
                     self.send_private_text(sender, "🔒 أرسل رقم الخيار من خاص البوت أو داخل الغرفة بصفتك صانعاً.")
@@ -18983,7 +19016,7 @@ class TalkinBot:
 
         if low in ("تشغيل الحماية", "تشغيل الحمايه", "الحماية تشغيل", "الحمايه تشغيل", "enable protection", "enable room protection"):
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
-                                or _room_manager(self, room, sender)):
+                                or _is_room_creator(room, sender)):
                 return True
             cfg = _save_room_moderation(room, enabled=True)
             _save_room_protection(room, swear=True, flood=True)
@@ -18991,7 +19024,7 @@ class TalkinBot:
             return True
         if low in ("إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "الحماية إيقاف", "الحمايه ايقاف", "disable protection", "disable room protection"):
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
-                                or _room_manager(self, room, sender)):
+                                or _is_room_creator(room, sender)):
                 return True
             _save_room_moderation(room, enabled=False)
             _save_room_protection(room, swear=False, flood=False)
@@ -19000,7 +19033,7 @@ class TalkinBot:
         m_repeat = re.fullmatch(r"mr@(\d+)", text, re.I)
         if m_repeat:
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
-                                or _room_manager(self, room, sender)):
+                                or _is_room_creator(room, sender)):
                 return True
             limit = max(2, min(50, int(m_repeat.group(1))))
             _save_room_moderation(room, repeat_limit=limit)
@@ -19822,6 +19855,9 @@ class TalkinBot:
                 self.send_private_text(sender, f"✅ تم حذف @{target} من قائمة المحظورين.")
                 return True
         if low in ("حمايه البوت", "حماية البوت", "bot protection", "bot_protection"):
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 إعداد حماية البوت الداخلية للماستر الأساسي فقط.")
+                return True
             self._bot_protection_menu_state = _norm_user(sender)
             self.send_private_text(sender, "🛡️ حماية البوت\n1. تشغيل\n2. إيقاف\n3. عرض المحظورين\n4. حذف محظور\n\nأرسل رقم العملية.")
             return True
