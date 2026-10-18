@@ -20879,9 +20879,9 @@ class TalkinBot:
             _save_bot_blocked_users(self.bot_blocked_users)
             self.send_private_text(sender, f"✅ تم فك الحظر الداخلي عن @{target}.")
             return True
-        # "غرفي" must include the complete restored catalog. connected_rooms
-        # can be temporarily smaller while the fast reconnect ACKs are still
-        # arriving, so use the persistent room file as well.
+        # "غرفي" must show only rooms confirmed by the server in this session.
+        # Saved rooms and room_users are restore/roster data, not proof that the
+        # current WebSocket session actually joined those rooms.
         if low in ("جلب غرف السيرفر", "جلب الغرف من السيرفر", "قائمة غرف السيرفر", "get server rooms"):
             if not is_private:
                 self.send_room_text(room, "⏳ جاري طلب قائمة غرف السيرفر... سأرسل النتيجة في الخاص.")
@@ -20904,13 +20904,11 @@ class TalkinBot:
             live = sorted({
                 str(r).strip() for r in (
                     list(getattr(self, "connected_rooms", set()))
-                    + list(getattr(self, "room_users", {}).keys())
-                    + list(_persistent_rooms())
                 )
                 if str(r).strip() and _norm_room(r) not in blocked
             }, key=str.casefold)
             if not is_private:
-                self.send_room_text(room, "📡 أعرض كامل غرف البوت المستعادة والمؤكدة.")
+                self.send_room_text(room, "📡 أعرض الغرف التي أكد الخادم دخول البوت إليها فعليًا.")
             self._send_room_names_pages(
                 sender, room, live, from_server=True,
                 language=_detect_text_language(text) or self._effective_room_language(room),
