@@ -3131,6 +3131,21 @@ def _remember_roster(room, users):
     _save_persistent_rosters(rosters)
 
 
+def _remember_roster_async(room, users):
+    """Persist newly observed username/ID pairs without blocking commands."""
+    snapshot = [dict(user) for user in (users or []) if isinstance(user, dict)]
+    if not snapshot:
+        return False
+    worker = threading.Thread(
+        target=_remember_roster,
+        args=(room, snapshot),
+        name="persist-member-identity",
+        daemon=True,
+    )
+    worker.start()
+    return True
+
+
 def _game_control_data():
     data = _load_local_json(GAME_CONTROL_FILE, {})
     if not isinstance(data, dict):
@@ -3542,11 +3557,11 @@ def _game_stats_data():
 
 
 GAME_LEVEL_CATEGORIES = (
-    ("النجوم الفضية", "✩", (
+    ("النجوم الفضية", "⭐", (
         "مبتدئ", "لاعب ناشئ", "مقاتل", "برونزي", "فضي",
         "ذهبي", "محترف", "خبير", "أسطورة", "أسطورة فضية",
     )),
-    ("النجوم الذهبية", "⭐", (
+    ("النجوم الذهبية", "🌟", (
         "ذهبي مبتدئ", "محارب ذهبي", "ذهبي محترف", "ذهبي متألق", "ذهبي نادر",
         "أمير الذهب", "فارس الذهب", "قائد الذهب", "أسطورة الذهب", "ملك الذهب",
     )),
@@ -3554,19 +3569,19 @@ GAME_LEVEL_CATEGORIES = (
         "ماسي مبتدئ", "ماسي متألق", "ماسي محترف", "فارس الماس", "الماسي النادر",
         "أمير الماس", "قائد الماس", "أسطورة الماس", "إمبراطور الماس", "ملك الماس الأزرق",
     )),
-    ("الماس البرونزي", "🔶", (
+    ("الماس البرونزي", "🟤", (
         "برونزي نادر", "فارس البرونز", "برونزي محترف", "البرونزي المتألق", "سيد البرونز",
         "أمير البرونز", "قائد البرونز", "أسطورة البرونز", "إمبراطور البرونز", "ملك الماس البرونزي",
     )),
-    ("الماس الأحمر", "♦️", (
+    ("الماس الأحمر", "❤️", (
         "أحمر نادر", "محارب الماس الأحمر", "أحمر محترف", "فارس الماس الأحمر", "أمير الماس الأحمر",
         "قائد الماس الأحمر", "أسطورة الماس الأحمر", "سيد الماس الأحمر", "إمبراطور الماس الأحمر", "ملك الماس الأحمر",
     )),
-    ("الماس الأسود", "◆", (
+    ("الماس الأسود", "🖤", (
         "أسود نادر", "محارب أسود", "متألق أسود", "محترف أسود", "فارس أسود",
         "أمير الأسود", "سيد الأسود", "أسطورة الأسود", "إمبراطور الأسود", "ملك الماس الأسود",
     )),
-    ("الماس البنفسجي", "🟣💎", (
+    ("الماس البنفسجي", "💜", (
         "بنفسجي نادر", "محارب بنفسجي", "متألق بنفسجي", "محترف بنفسجي", "فارس بنفسجي",
         "أمير البنفسج", "سيد البنفسج", "أسطورة البنفسج", "إمبراطور البنفسج", "ملك الماس البنفسجي",
     )),
@@ -22131,9 +22146,43 @@ class TalkinBot:
         to = str(event.get(3, ""))
         body = str(event.get(6, ""))
         room = str(event.get(13) or self.room or "").strip()
-        sender_id = _stored_user_id(frm, room) if frm else ""
-        if sender_id and frm.isdigit():
-            frm = _stored_username_for_id(sender_id, room) or frm
+        # Talkin has several event layouts. For text messages field 2 may be
+        # the numeric account ID while field 22 (or, on older servers, field
+        # 17) contains the username. Commands must use the username now;
+        # waiting for members_list here made the bot appear unresponsive.
+        event_id_candidates = (
+            event.get(14), event.get("user_id"),
+            event.get(2) if str(event.get(2, "")).strip().isdigit() else "",
+        )
+        sender_id = next(
+            (str(value).strip() for value in event_id_candidates
+             if str(value or "").strip().isdigit()),
+            "",
+        )
+        identity_candidates = (
+            event.get(22), event.get(17), event.get("username"),
+            frm if not frm.strip().isdigit() else "",
+        )
+        event_username = next(
+            (str(value).strip().lstrip("@") for value in identity_candidates
+             if str(value or "").strip() and not str(value).strip().isdigit()),
+            "",
+        )
+        if not sender_id and event_username:
+            sender_id = _stored_user_id(event_username, room)
+        if sender_id:
+            event_username = event_username or _stored_username_for_id(sender_id, room)
+        if event_username:
+            # The username is the command identity even before its numeric ID
+            # is known. Save the ID opportunistically whenever an event carries
+            # it, without making command processing wait for roster sync.
+            frm = event_username
+            if sender_id and _stored_user_id(event_username, room) != sender_id:
+                _remember_roster_async(room, [{
+                    "username": event_username,
+                    "user_id": sender_id,
+                    "role": str(event.get(8, event.get("role", "none")) or "none"),
+                }])
         if event_type == "text" and frm:
             self._last_message_identity = {
                 "user_id": sender_id,
