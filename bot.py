@@ -2814,6 +2814,31 @@ def _persistent_rosters():
     data = _load_local_json(ROOM_USERS_FILE, {})
     return data if isinstance(data, dict) else {}
 
+def _stored_user_id(username, preferred_room=""):
+    """Return a numeric Talkin user_id already learned from native room data."""
+    wanted = _norm_user(str(username or "").strip().lstrip("@"))
+    if not wanted:
+        return ""
+    data = _persistent_rosters()
+    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+    if not isinstance(rooms, dict):
+        return ""
+    room_names = list(rooms)
+    preferred = _norm_room(preferred_room)
+    room_names.sort(key=lambda name: 0 if preferred and _norm_room(name) == preferred else 1)
+    for room_name in room_names:
+        roster = rooms.get(room_name)
+        if not isinstance(roster, dict):
+            continue
+        for key, value in roster.items():
+            if not isinstance(value, dict):
+                continue
+            saved_name = str(value.get("username") or key).strip().lstrip("@")
+            user_id = str(value.get("user_id") or "").strip()
+            if _norm_user(saved_name) == wanted and user_id.isdigit():
+                return user_id
+    return ""
+
 def _save_persistent_rosters(rosters):
     _save_local_json(ROOM_USERS_FILE, {"version": 1, "rooms": rosters})
 
@@ -3044,7 +3069,7 @@ def _looks_like_bot_command(text):
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "ملياري", "مليارات", "مليوني", "ملايين", "هدايا", "gifts", "gv", "sher@", "sby", "متجر", "shop", "store", "story", "la@", "ترحيب@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "ملياري", "مليارات", "مليوني", "ملايين", "هدايا", "gifts", "gv", "sher@", "sby", "متجر", "shop", "store", "story", "la@", "ترحيب@", "ايدي", "أيدي", "id@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
@@ -3066,7 +3091,7 @@ def _looks_like_bot_command(text):
     return (
         low.startswith(prefixes)
         or normalized_low.startswith(normalized_prefixes)
-        or low in ("help", "مساعدة", "games", "game", "bom", "vi", "vip")
+        or low in ("help", "مساعدة", "games", "game", "bom", "vi", "vip", "id")
         or normalized_low in ("مساعده", "games", "game")
         or low in {x.casefold() for x in GAME_COMMANDS}
         or normalized_low in normalized_games
@@ -9466,7 +9491,7 @@ class TalkinBot:
                 lk_ws = getattr(self, f"_livekit_ws_{room}", None)
                 socket_healthy = bool(lk_ws and getattr(lk_ws, "sock", None))
                 self.log(f"[STREAM_VERIFY] فحص جاهزية البث في {room}: audio_sent={audio_sent}, livekit_active={lk_active}, socket_ok={socket_healthy}")
-                
+
                 # دورة إدارة تشغيل الأغنية في خيط مستقل لضمان استمرار البث حتى انتهاء الملف
                 # وتوقف الصوت بأمان دون مغادرة البوت أو إغلاق LiveKit
                 def _playback_lifecycle(target_room, r_id, s_id, track_len):
@@ -16201,7 +16226,7 @@ class TalkinBot:
             if final>=100:
                 photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender); win_img=self._render_snake_board(game,winner_name=sender)
                 new_points = _add_points(sender, self.SNAKE_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
+                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,"");
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.snake_games.pop(key,None)
@@ -16446,7 +16471,7 @@ class TalkinBot:
             if new>=58:
                 win_img=self._render_ludo_board(game,winner_name=sender); photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
                 new_points = _add_points(sender, self.LUDO_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
+                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,"");
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.ludo_games.pop(key,None); return True
@@ -17218,6 +17243,13 @@ class TalkinBot:
         # master-only management gate below.
         _body_text = str(body or "").strip()
         _body_low = _body_text.casefold()
+        # ID lookup is intentionally public: run it before the master-only
+        # management gate so any member can retrieve their own server ID.
+        if re.fullmatch(r"(?:ايدي|أيدي|id)(?:@(.+))?", _body_text, re.I):
+            return self._room_list_commands(room, _body_text, sender, is_private)
+        # Live room presence is also a public utility, not a management action.
+        if re.fullmatch(r"la@.+", _body_text, re.I):
+            return self._room_list_commands(room, _body_text, sender, is_private)
         # أمر استعلام تواجد المستخدم is@اسم أو is اسم
         m_is = re.fullmatch(r"(?:is@|is\s+@?)([^\s@]+)", _body_text, re.I)
         if m_is:
@@ -17469,6 +17501,11 @@ class TalkinBot:
         public_top_command = str(body or "").strip().casefold() in {
             "توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top", "ملياري", "مليارات", "مليوني", "ملايين"
         }
+        public_shop_command = bool(
+            str(body or "").strip().casefold() in {"متجر", "shop", "store", "story", "ترحيب_صورة", "welcome_image"}
+            or re.fullmatch(r"sby\s+[1-6]", str(body or "").strip(), re.I)
+            or re.fullmatch(r"ترحيب@.+", str(body or "").strip(), re.S)
+        )
         is_game_cmd = str(body or "").strip().casefold() in ("تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب")
         is_creator_cmd = bool(re.match(r"^[+-]?صانع(?:ي| الغرفة| الغرفه)?(?:@.+)?$", str(body or "").strip(), re.I))
         pending_protection_choice = bool(
@@ -17523,6 +17560,7 @@ class TalkinBot:
             return True
         if (not _is_master_name(sender)
                 and not public_top_command
+                and not public_shop_command
                 and not (verification_manager_command and _is_mvip_master(sender))
                 and not (is_publish and _is_verified_user(sender))
                 and not (points_transfer_command and _is_verified_user(sender))
@@ -18142,8 +18180,28 @@ class TalkinBot:
                     break
             return self._request_next_presence(pending.get("presence_token"))
 
+        if pending.get("code") == "uid":
+            users = self._extract_room_list_users(result)
+            if users:
+                _remember_roster(source_room, users)
+            wanted = _norm_user(pending.get("target"))
+            match = next((user for user in users
+                          if _norm_user(user.get("username")) == wanted
+                          and str(user.get("user_id") or "").strip().isdigit()), None)
+            if match:
+                response = str(match.get("user_id")).strip()
+            else:
+                response = f"📭 لم يعثر الخادم على ID رقمي لـ @{pending.get('target')} في {source_room}."
+            if pending.get("private_response"):
+                self.send_private_text(pending.get("sender"), response)
+            else:
+                self.send_room_text(pending.get("response_room") or source_room, response)
+            return True
+
         if pending.get("code") == "la":
             users = self._extract_room_list_users(result)
+            if users:
+                _remember_roster(source_room, users)
             names = []
             seen = set()
             for user in users:
@@ -18407,6 +18465,45 @@ class TalkinBot:
         return True
 
     def _room_list_commands(self, room, text, sender, is_private):
+        id_request = re.fullmatch(r"(?:ايدي|أيدي|id)(?:@(.+))?", str(text or "").strip(), re.I)
+        if id_request:
+            target = str(id_request.group(1) or sender or "").strip().lstrip("@")
+            if not target:
+                self.send_private_text(sender, "⚠️ تعذر تحديد اسم المستخدم. استخدم ايدي أو ايدي@اسم_المستخدم.")
+                return True
+            cached_id = _stored_user_id(target, room)
+            if cached_id:
+                response = cached_id
+                (self.send_private_text(sender, response) if is_private else self.send_room_text(room, response))
+                return True
+            connected = sorted(getattr(self, "connected_rooms", set()) or [], key=_norm_room)
+            query_room = str(room or getattr(self, "room", "") or (connected[0] if connected else "")).strip()
+            if not query_room or not getattr(self, "ws", None):
+                response = f"📭 لا يوجد ID محفوظ لـ @{target} بعد. نفّذ الأمر داخل غرفة متصل بها البوت."
+                (self.send_private_text(sender, response) if is_private else self.send_room_text(room, response))
+                return True
+            if _norm_room(query_room) in getattr(self, "_pending_room_lists", {}):
+                response = f"⏳ يوجد طلب قائمة آخر قيد التنفيذ في {query_room}؛ أعد المحاولة بعد قليل."
+                (self.send_private_text(sender, response) if is_private else self.send_room_text(room, response))
+                return True
+            try:
+                request_id = secrets.token_urlsafe(15)[:20]
+                self._pending_room_lists[_norm_room(query_room)] = {
+                    "room": query_room, "code": "uid", "sender": str(sender or "").strip(),
+                    "target": target, "request_type": "members_list", "request_id": request_id,
+                    "requested_at": time.time(), "private_response": bool(is_private),
+                    "response_room": str(room or query_room),
+                }
+                self.send_query(encode_query(
+                    "room_admin", type_="members_list", room=query_room,
+                    to=BOT_ID, value="none", id_=request_id,
+                ))
+            except Exception as exc:
+                self._pending_room_lists.pop(_norm_room(query_room), None)
+                self.log("[USER-ID] native lookup failed", repr(exc))
+                self.send_private_text(sender, "❌ تعذر طلب معرّف المستخدم من الخادم.")
+            return True
+
         live_room = re.fullmatch(r"la@(.+)", str(text or "").strip(), re.I)
         if live_room:
             target_room = live_room.group(1).strip()
@@ -19703,7 +19800,7 @@ class TalkinBot:
             self._save_blocked_rooms()
             _save_persistent_rooms(self.known_rooms)
             response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
-            
+
             # Accept immediately, but send one room_join at a time.
             if not hasattr(self, "room_languages"):
                 self.room_languages = {}
@@ -19719,7 +19816,7 @@ class TalkinBot:
                 self.send_room_text(response_room, confirm_msg)
             else:
                 self.send_private_text(sender, confirm_msg)
-                
+
             return True
         m_master_transfer = re.fullmatch(r"msb@([^@]+)@(\d+)", text, re.I)
         if m_master_transfer and is_private and _is_primary_master(sender):
@@ -20082,7 +20179,7 @@ class TalkinBot:
             self.send_private_text(target, f"✅ تم توثيق حسابك @{target} بنجاح.\n🎉 يمكنك الآن استخدام أوامر البوت.")
             self.send_private_text(sender, f"✅ تم توثيق @{target}.")
             return True
-        if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("سحب التوثيق@") or low.startswith("uns@"): 
+        if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("سحب التوثيق@") or low.startswith("uns@"):
             if not _is_verification_manager(sender):
                 return True
             prefix = "uns@" if low.startswith("uns@") else ("سحب التوثيق@" if low.startswith("سحب التوثيق@") else text.split("@",1)[0]+"@")
@@ -21360,7 +21457,7 @@ class TalkinBot:
                         self.send_room_text(room, f"🚫 تم حظر @{username} (حظر IP) بسبب تكرار الدخول والخروج.")
                     except Exception as exc:
                         self.log("[JOINLEAVE] ban failed", repr(exc))
-        
+
         if event_type == "user_joined" and username:
             # Optional room protection: reject accounts with no profile photo.
             # Field 3 is the native UserItem photo field; the cache is used as

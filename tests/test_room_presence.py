@@ -159,3 +159,90 @@ def test_new_commands_are_classified_before_verification_gate():
     assert bot_module._looks_like_bot_command("sby 1")
     assert bot_module._looks_like_bot_command("store")
     assert bot_module._looks_like_bot_command("متجر")
+    assert bot_module._looks_like_bot_command("ايدي")
+    assert bot_module._looks_like_bot_command("id@Ahmed")
+
+
+def test_id_command_queries_server_and_returns_numeric_user_id():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot.ws = object()
+    bot._pending_room_lists = {}
+    queries = []
+    replies = []
+    bot.send_query = lambda query: queries.append(query)
+    bot.send_room_text = lambda room, text: replies.append((room, text))
+    bot.send_private_text = lambda user, text: replies.append((user, text))
+    bot._extract_room_list_users = lambda _result: [
+        {"username": "Ahmed", "user_id": "3456782", "role": "member"}
+    ]
+
+    with patch.object(bot_module, "_stored_user_id", return_value=""), patch.object(
+        bot_module, "_remember_roster"
+    ):
+        assert bot._room_list_commands("Hall", "ايدي@Ahmed", "Requester", is_private=False)
+        pending = bot._pending_room_lists[bot_module._norm_room("Hall")]
+        assert pending["code"] == "uid"
+        assert pending["target"] == "Ahmed"
+        assert pending["request_type"] == "members_list"
+        assert bot._complete_pending_room_list({"_occupants_room": "Hall"})
+
+    assert len(queries) == 1
+    assert replies[-1][0] == "Hall"
+    assert replies[-1][1] == "3456782"
+
+
+def test_id_command_returns_cached_id_as_plain_number():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    replies = []
+    bot.send_room_text = lambda room, text: replies.append((room, text))
+    with patch.object(bot_module, "_stored_user_id", return_value="3456782"):
+        assert bot._room_list_commands("Hall", "ايدي", "Ahmed", is_private=False)
+    assert replies == [("Hall", "3456782")]
+
+
+def test_id_command_is_routed_before_master_only_management_gate():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    calls = []
+    bot._room_list_commands = lambda room, text, sender, is_private: calls.append(
+        (room, text, sender, is_private)
+    ) or True
+
+    assert bot._handle_management_command("Hall", "ايدي", "RegularMember", is_private=False)
+    assert calls == [("Hall", "ايدي", "RegularMember", False)]
+
+
+def test_la_command_is_routed_before_master_only_management_gate():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    calls = []
+    bot._room_list_commands = lambda room, text, sender, is_private: calls.append(
+        (room, text, sender, is_private)
+    ) or True
+
+    assert bot._handle_management_command("Hall", "la@سوريانا", "RegularMember", is_private=False)
+    assert calls == [("Hall", "la@سوريانا", "RegularMember", False)]
+
+
+def test_shop_and_purchase_commands_pass_for_regular_members():
+    import threading
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot._room_list_commands = lambda *_args, **_kwargs: False
+    bot._pending_named_commands = {}
+    bot._pending_protection_number = {}
+    bot._master_reply_local = threading.local()
+    calls = []
+    bot._handle_management_command_impl = lambda room, body, sender, is_private=False: calls.append(
+        (room, body, sender, is_private)
+    ) or True
+    bot._remember_bot_action = lambda *_args, **_kwargs: None
+
+    assert bot._handle_management_command("Hall", "store", "RegularMember", is_private=False)
+    assert bot._handle_management_command("Hall", "sby 1", "RegularMember", is_private=False)
+    assert [call[1] for call in calls] == ["store", "sby 1"]
+
+
+def test_stored_user_id_looks_up_case_insensitively_across_rooms():
+    with patch.object(bot_module, "_persistent_rosters", return_value={
+        "version": 1,
+        "rooms": {"hall": {"ahmed": {"username": "Ahmed", "user_id": "3456782"}}},
+    }):
+        assert bot_module._stored_user_id("@AHMED", "Hall") == "3456782"
