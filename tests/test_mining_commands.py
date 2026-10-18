@@ -76,8 +76,15 @@ def test_mining_commands_use_stable_id_and_redeem_inventory_idempotently(tmp_pat
     assert len(packet) <= 1008
 
 
-def test_generated_treasure_assets_are_served_with_their_real_image_type():
+def test_compressed_treasure_asset_is_served_as_jpeg():
     handler = bot_module._MediaHandler.__new__(bot_module._MediaHandler)
-    generated_png_named_jpg = Path(bot_module.ASSETS_DIR) / "treasures" / "diamond_clear.jpg"
-    assert generated_png_named_jpg.is_file()
-    assert handler._ctype(generated_png_named_jpg) == "image/png"
+    compressed_jpeg = Path(bot_module.ASSETS_DIR) / "treasures" / "diamond_clear.jpg"
+    assert compressed_jpeg.is_file()
+    assert handler._ctype(compressed_jpeg) == "image/jpeg"
+
+
+def test_media_type_uses_image_signature_when_extension_is_wrong(tmp_path):
+    handler = bot_module._MediaHandler.__new__(bot_module._MediaHandler)
+    mislabeled = tmp_path / "image.jpg"
+    mislabeled.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+    assert handler._ctype(mislabeled) == "image/png"
