@@ -3133,6 +3133,8 @@ def _format_saved_accounts(title, data, empty_text):
 
 
 _ROSTER_PERSIST_LOCK = threading.RLock()
+_ROSTER_ASYNC_STATE_LOCK = threading.Lock()
+_ROSTER_ASYNC_LAST = {}
 
 
 def _remember_roster(room, users):
@@ -3220,6 +3222,22 @@ def _remember_roster_async(room, users):
     """Persist newly observed username/ID pairs without blocking commands."""
     snapshot = [dict(user) for user in (users or []) if isinstance(user, dict)]
     if not snapshot:
+        return False
+    # Room text events can repeat the same sender identity for every game
+    # command. Do not start a JSON write thread for each message; that thread
+    # storm competes with game workers even though the identity is unchanged.
+    now = time.monotonic()
+    for user in snapshot:
+        username = _norm_user(user.get("username"))
+        user_id = str(user.get("user_id") or "").strip()
+        key = (_norm_room(room), username)
+        with _ROSTER_ASYNC_STATE_LOCK:
+            previous = _ROSTER_ASYNC_LAST.get(key)
+            if previous and previous[0] == user_id and now - previous[1] < 60.0:
+                continue
+            _ROSTER_ASYNC_LAST[key] = (user_id, now)
+        break
+    else:
         return False
     def persist():
         try:
