@@ -686,21 +686,39 @@ def _stop_master_process():
 # bot state across deployments. When no volume is mounted, the code falls back
 # to a local data/ directory beside bot.py and migrates any old JSON files there.
 def _select_persistent_data_dir():
+    """Choose a writable data directory; immutable app roots are common on PaaS."""
     configured = (os.getenv("BOT_DATA_DIR") or os.getenv("PERSISTENT_DATA_DIR") or "").strip()
     candidates = []
     if configured:
         candidates.append(Path(configured).expanduser())
-    candidates.append(BASE_DIR / "data")
+    # Common mounted-volume locations first, then writable home/temp locations.
+    candidates.extend([
+        Path("/data"),
+        Path("/var/data"),
+        Path.home() / ".talkin-data",
+        Path("/tmp/talkin-data"),
+        BASE_DIR / "data",
+    ])
+    seen = set()
     for candidate in candidates:
         try:
+            candidate = candidate.resolve()
+            if str(candidate) in seen:
+                continue
+            seen.add(str(candidate))
             candidate.mkdir(parents=True, exist_ok=True)
-            probe = candidate / ".write_test"
+            probe = candidate / f".write_test_{os.getpid()}"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
             return candidate
         except Exception:
             continue
-    return BASE_DIR / "data"
+    # Last-resort writable location lets the bot start even without a mounted
+    # persistent volume. Configure BOT_DATA_DIR to a platform volume to retain
+    # data across restarts/redeploys.
+    fallback = Path("/tmp/talkin-data")
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 DATA_DIR = _select_persistent_data_dir()
 member_shop.SHOP_PATH = DATA_DIR / "shop_data.json"
@@ -805,24 +823,28 @@ def _json_has_real_data(path):
         return False
 
 def _migrate_legacy_state_files():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # DATA_DIR is selected by a write probe above. Keep migration best-effort:
+    # a read-only legacy directory must never prevent the bot from starting.
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(f"[DATA] Cannot create data directory {DATA_DIR}: {exc}", flush=True)
+        return
     for name in _STATE_FILE_NAMES:
         target = DATA_DIR / name
         legacy_candidates = [BASE_DIR / name, BASE_DIR / "data" / name]
-        # Copy only when the persistent copy is missing/empty. Existing data is
-        # never overwritten by a newer bot.py.
         if _json_has_real_data(target):
             continue
         for legacy in legacy_candidates:
-            if legacy.resolve() == target.resolve() or not legacy.is_file():
-                continue
             try:
+                if legacy.resolve() == target.resolve() or not legacy.is_file():
+                    continue
                 if legacy.stat().st_size <= 0:
                     continue
                 shutil.copy2(legacy, target)
                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[DATA] Migration skipped for {name}: {exc}", flush=True)
 
 _migrate_legacy_state_files()
 # Restore state from GitHub after the data directory and legacy migration are ready.
@@ -17204,8 +17226,15 @@ class TalkinBot:
         return True
 
     def _execute_mining_command_with_id(self, room, text, sender_name, user_id):
-        """Execute mining commands using numeric ID; keep display name for replies."""
-        if not str(user_id or "").strip().isdigit():
+        """Execute immediately with username identity; numeric Talkin ID is a fallback."""
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            # MiningStore uses a stable namespaced key until a native ID is
+            # available. This prevents commands from waiting on members_list.
+            normalized = _norm_user(sender_name)
+            if normalized:
+                user_id = "name:" + normalized
+        if not user_id:
             return False
         raw = str(text or "").strip()
         low = raw.casefold()
@@ -17340,8 +17369,6 @@ class TalkinBot:
             return True
 
         if is_dig:
-            self.send_room_text(room, f"⛏️ بدأ @{sender_name} التنقيب؛ النتيجة بعد لحظة...")
-            time.sleep(1.1)
             outcome = MINING_STORE.dig(user_id, sender_name)
             if not outcome.get("ok"):
                 if outcome.get("error") == "cooldown":
@@ -17498,10 +17525,16 @@ class TalkinBot:
             "توب الماس", "توب الالماس", "top diamonds", "top gems", "اغنى المنقبين",
         }
         if mining_low in mining_commands or re.fullmatch(r"(?:r|rdem)\s+.+", mining_raw, re.I):
-            user_id = _stored_user_id(sender_name, room)
-            if user_id:
-                return self._execute_mining_command_with_id(room, mining_raw, sender_name, user_id)
-            return self._request_mining_identity_lookup(room, sender_name, mining_raw)
+            # Username is the primary identity for command responsiveness.
+            # A saved/native numeric ID is used when the sender itself is only
+            # an ID or when no usable username was supplied; no roster wait.
+            normalized_sender = _norm_user(sender_name)
+            # Keep username as the primary key even after its numeric ID is
+            # learned, so early progress/inventory is not split across keys.
+            user_id = ("name:" + normalized_sender) if normalized_sender else (
+                str(sender_name).strip() if str(sender_name).strip().isdigit() else ""
+            )
+            return self._execute_mining_command_with_id(room, mining_raw, sender_name, user_id)
         if self._handle_bomb_wire(room, sender_name, raw):
             return True
         bomb = re.fullmatch(r"bom@([^@]+)(?:@(.+))?", raw.strip(), re.I)

@@ -108,9 +108,12 @@ def resolve_item_keys(value: str) -> tuple[str, ...] | None:
 
 def _valid_user_id(user_id: str) -> str:
     value = str(user_id or "").strip()
-    if not value.isdigit():
-        raise ValueError("a numeric Talkin user_id is required")
-    return value
+    # Native Talkin numeric IDs are preferred. When absent, bot.py passes a
+    # normalized "name:<username>" key so commands can run immediately instead
+    # of blocking on a room-members lookup.
+    if value.isdigit() or (value.startswith("name:") and len(value) > 5):
+        return value
+    raise ValueError("a numeric Talkin user_id or name:<username> key is required")
 
 
 class MiningStore:
