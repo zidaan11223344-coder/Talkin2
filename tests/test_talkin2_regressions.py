@@ -316,7 +316,7 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         bot.handle_room_event({"room_event": {1: "text", 2: "Alice", 6: "1", 13: "Hall"}})
         self.assertEqual(observed, ["ar", "ar"])
 
-    def test_auto_rejoin_keeps_retrying_after_ten_attempts_in_the_window(self):
+    def test_auto_rejoin_sends_one_join_then_waits_for_server_ack(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.connected_rooms = set()
         bot._pending_room_joins = {}
@@ -324,6 +324,7 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         bot.blocked_rooms = set()
         bot._auto_rejoin_lock = threading.Lock()
         bot._auto_rejoin_pending = set()
+        bot._auto_rejoin_waiting_ack = set()
         bot._auto_rejoin_state = {}
         bot._connection_generation = 1
         bot._room_bulk_lock = threading.RLock()
@@ -343,11 +344,54 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         ):
             for _ in range(12):
                 bot._schedule_auto_rejoin("Hall", delay=0)
-        self.assertEqual(len(attempts), 12)
-        self.assertEqual(len(delays), 12)
-        self.assertLessEqual(max(delays), 15.0)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(len(delays), 1)
+        self.assertLessEqual(delays[0], 15.0)
+        self.assertEqual(bot._auto_rejoin_waiting_ack, {"Hall"})
         state = next(iter(bot._auto_rejoin_state.values()))
-        self.assertEqual(len(state["attempts"]), 12)
+        self.assertEqual(len(state["attempts"]), 1)
+
+    def test_auto_rejoin_timeout_does_not_resend_join(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot._pending_room_joins = {"hall": {"room": "Hall", "requested_by": ""}}
+        bot._auto_rejoin_waiting_ack = {"hall"}
+        bot.connected_rooms = set()
+        bot.known_rooms = {"Hall"}
+        bot.blocked_rooms = set()
+        bot.log = lambda *_args: None
+        bot._schedule_auto_rejoin = lambda *_args, **_kwargs: self.fail("timeout must not resend room_join")
+        with patch.object(bot_module, "_save_persistent_rooms"):
+            bot._join_timeout("hall")
+        self.assertEqual(bot._auto_rejoin_waiting_ack, {"hall"})
+        self.assertEqual(bot.known_rooms, {"Hall"})
+
+    def test_server_join_ack_clears_one_request_wait_state(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.connected_rooms = set()
+        bot.known_rooms = set()
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot._blocked_room_reasons = {}
+        bot._auto_rejoin_pending = set()
+        bot._auto_rejoin_waiting_ack = {"Hall"}
+        bot._auto_rejoin_lock = threading.Lock()
+        bot._auto_rejoin_state = {"Hall": {"attempts": [1.0], "joined_at": 0.0}}
+        bot._pending_room_joins = {}
+        bot.room_users = {}
+        bot._master_online_rooms = set()
+        bot._room_entry_times = {}
+        bot._room_entry_users = {}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        bot.request_room_occupants = lambda *_args, **_kwargs: True
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "_save_persistent_rooms"):
+            bot._handle_room_event_impl({"room_event": {1: "you_joined", 13: "Hall"}})
+        self.assertIn("Hall", bot.connected_rooms)
+        self.assertEqual(bot._auto_rejoin_waiting_ack, set())
 
     def test_new_socket_clears_stale_room_join_acknowledgements(self):
         class Timer:
@@ -360,11 +404,13 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         bot.connected_rooms = {"Hall"}
         bot._pending_room_joins = {"hall": {"timer": timer}}
         bot._auto_rejoin_pending = {"hall"}
+        bot._auto_rejoin_waiting_ack = {"hall"}
         bot._auto_rejoin_lock = threading.Lock()
         bot._reset_room_connection_state()
         self.assertEqual(bot.connected_rooms, set())
         self.assertEqual(bot._pending_room_joins, {})
         self.assertEqual(bot._auto_rejoin_pending, set())
+        self.assertEqual(bot._auto_rejoin_waiting_ack, set())
         self.assertTrue(timer.cancelled)
 
 

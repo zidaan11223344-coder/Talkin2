@@ -7809,8 +7809,8 @@ class TalkinBot:
         if requester:
             self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
         else:
-            # A timeout during automatic recovery is not a user-requested exit.
-            # Keep the room tracked and schedule another bounded attempt.
+            # A missing acknowledgement is not a reason to send another join
+            # packet. Keep the room tracked and wait for server/socket recovery.
             self.known_rooms.add(room)
         _save_persistent_rooms(self.known_rooms)
         self.log("[ROOM] join confirmation timeout:", room)
@@ -7821,7 +7821,7 @@ class TalkinBot:
                 "انتهت مهلة التأكيد ولم يظهر اتصال البوت بها؛ تحقق من صلاحياته ثم أعد المحاولة.",
             )
         elif _norm_room(room) not in getattr(self, "blocked_rooms", set()):
-            self._schedule_auto_rejoin(room, delay=3.0)
+            self.log("[AUTO_REJOIN] no server acknowledgement; not resending join:", room)
 
     def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
         """Keep retrying a lost room indefinitely, with a capped backoff."""
@@ -7832,6 +7832,8 @@ class TalkinBot:
             return
         if room_key in getattr(self, "_intentional_leaves", set()):
             return
+        if not hasattr(self, "_auto_rejoin_waiting_ack"):
+            self._auto_rejoin_waiting_ack = set()
         pending_join = getattr(self, "_pending_room_joins", {}).get(room_key)
         if pending_join:
             started = float(pending_join.get("started") or 0)
@@ -7846,7 +7848,8 @@ class TalkinBot:
             self._auto_rejoin_state = {}
         now = time.monotonic()
         with self._auto_rejoin_lock:
-            if room_key in self._auto_rejoin_pending:
+            if room_key in self._auto_rejoin_pending or room_key in self._auto_rejoin_waiting_ack:
+                self.log(f"[AUTO_REJOIN] already sent one join request; waiting for server: {room}")
                 return
             state = self._auto_rejoin_state.setdefault(room_key, {"attempts": [], "joined_at": 0.0})
             if state.get("joined_at") and now - float(state["joined_at"]) >= 120.0:
@@ -7860,17 +7863,24 @@ class TalkinBot:
             delay = max(float(delay), min(15.0, 1.2 * (2 ** min(len(recent_attempts), 4))))
             generation = int(getattr(self, "_connection_generation", 0))
             self._auto_rejoin_pending.add(room_key)
+            self._auto_rejoin_waiting_ack.add(room_key)
         def _rejoin_worker():
             try:
                 time.sleep(delay)
                 if generation != int(getattr(self, "_connection_generation", 0)):
                     self.log(f"[AUTO_REJOIN] stale connection worker cancelled: {room}")
+                    with self._auto_rejoin_lock:
+                        self._auto_rejoin_waiting_ack.discard(room_key)
                     return
                 if any(_norm_room(r) == room_key for r in getattr(self, "connected_rooms", set())):
                     self.log(f"[AUTO_REJOIN] already connected; skip {room}")
+                    with self._auto_rejoin_lock:
+                        self._auto_rejoin_waiting_ack.discard(room_key)
                     return
                 if room_key in getattr(self, "_pending_room_joins", {}):
                     self.log(f"[AUTO_REJOIN] pending join already exists; skip {room}")
+                    with self._auto_rejoin_lock:
+                        self._auto_rejoin_waiting_ack.discard(room_key)
                     return
                 self.log(f"[AUTO_REJOIN] Attempting to rejoin {room}...")
                 with self._room_bulk_lock:
@@ -7880,6 +7890,8 @@ class TalkinBot:
                     self.join_room(room, force=True)
             except Exception as e:
                 self.log(f"[AUTO_REJOIN] Rejoin failed for {room}:", repr(e))
+                with self._auto_rejoin_lock:
+                    self._auto_rejoin_waiting_ack.discard(room_key)
             finally:
                 with self._auto_rejoin_lock:
                     self._auto_rejoin_pending.discard(room_key)
@@ -7920,6 +7932,7 @@ class TalkinBot:
                 except Exception:
                     pass
         if requested_by:
+            getattr(self, "_auto_rejoin_waiting_ack", set()).discard(room_norm)
             getattr(self, "_intentional_leaves", set()).discard(room_norm)
             self.blocked_rooms.discard(room_norm)
             getattr(self, "_blocked_room_reasons", {}).pop(room_norm, None)
@@ -21565,17 +21578,24 @@ class TalkinBot:
             rejoin_state = getattr(self, "_auto_rejoin_state", {}).get(rnorm)
             if rejoin_state is not None:
                 rejoin_state["joined_at"] = time.monotonic()
-                # A successful server acknowledgement ends the previous retry
-                # episode even if a room later drops the bot again soon.
+                # A server ACK ends this one-request wait cycle and permits a
+                # fresh recovery if the room drops the bot again later.
                 rejoin_state["attempts"] = []
             auto_pending = getattr(self, "_auto_rejoin_pending", None)
-            if auto_pending is not None:
+            auto_waiting_ack = getattr(self, "_auto_rejoin_waiting_ack", None)
+            if auto_pending is not None or auto_waiting_ack is not None:
                 lock = getattr(self, "_auto_rejoin_lock", None)
                 if lock is None:
-                    auto_pending.discard(rnorm)
+                    if auto_pending is not None:
+                        auto_pending.discard(rnorm)
+                    if auto_waiting_ack is not None:
+                        auto_waiting_ack.discard(rnorm)
                 else:
                     with lock:
-                        auto_pending.discard(rnorm)
+                        if auto_pending is not None:
+                            auto_pending.discard(rnorm)
+                        if auto_waiting_ack is not None:
+                            auto_waiting_ack.discard(rnorm)
             pending_join = self._pending_room_joins.pop(rnorm, None)
             if pending_join and pending_join.get("timer"):
                 pending_join["timer"].cancel()
@@ -21638,6 +21658,7 @@ class TalkinBot:
                             self.log("[ACK] stale join-failure ack failed:", exc)
                     return
                 reason_text = self._room_failure_message(room, event_type)
+                getattr(self, "_auto_rejoin_waiting_ack", set()).discard(blocked_room)
                 pending_join = self._pending_room_joins.pop(blocked_room, None)
                 if pending_join and pending_join.get("timer"):
                     pending_join["timer"].cancel()
@@ -22720,13 +22741,20 @@ class TalkinBot:
                     pass
         pending.clear()
         auto_pending = getattr(self, "_auto_rejoin_pending", None)
+        auto_waiting_ack = getattr(self, "_auto_rejoin_waiting_ack", None)
         lock = getattr(self, "_auto_rejoin_lock", None)
-        if auto_pending is not None:
+        if auto_pending is not None or auto_waiting_ack is not None:
             if lock is None:
-                auto_pending.clear()
+                if auto_pending is not None:
+                    auto_pending.clear()
+                if auto_waiting_ack is not None:
+                    auto_waiting_ack.clear()
             else:
                 with lock:
-                    auto_pending.clear()
+                    if auto_pending is not None:
+                        auto_pending.clear()
+                    if auto_waiting_ack is not None:
+                        auto_waiting_ack.clear()
 
     def on_close(self, ws, code, msg):
         # These are rooms connected to THIS WebSocket session. Once it closes,
