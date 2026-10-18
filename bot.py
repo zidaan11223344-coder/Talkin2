@@ -22146,46 +22146,9 @@ class TalkinBot:
         to = str(event.get(3, ""))
         body = str(event.get(6, ""))
         room = str(event.get(13) or self.room or "").strip()
-        # Talkin has several event layouts. For text messages field 2 may be
-        # the numeric account ID while field 22 (or, on older servers, field
-        # 17) contains the username. Commands must use the username now;
-        # waiting for members_list here made the bot appear unresponsive.
-        event_id_candidates = (
-            event.get(14), event.get("user_id"),
-            event.get(2) if str(event.get(2, "")).strip().isdigit() else "",
-        )
-        sender_id = next(
-            (str(value).strip() for value in event_id_candidates
-             if str(value or "").strip().isdigit()),
-            "",
-        )
-        # Field 2 can be an opaque Talkin account token, not only digits.
-        # Prefer the protocol's canonical username fields for every command;
-        # otherwise older commands can be attributed to that token and fail
-        # their normal username/verification lookup.
-        identity_candidates = (
-            event.get(22), event.get(17), event.get("username"), frm,
-        )
-        event_username = next(
-            (str(value).strip().lstrip("@") for value in identity_candidates
-             if str(value or "").strip() and not str(value).strip().isdigit()),
-            "",
-        )
-        if not sender_id and event_username:
-            sender_id = _stored_user_id(event_username, room)
-        if sender_id:
-            event_username = event_username or _stored_username_for_id(sender_id, room)
-        if event_username:
-            # The username is the command identity even before its numeric ID
-            # is known. Save the ID opportunistically whenever an event carries
-            # it, without making command processing wait for roster sync.
-            frm = event_username
-            if sender_id and _stored_user_id(event_username, room) != sender_id:
-                _remember_roster_async(room, [{
-                    "username": event_username,
-                    "user_id": sender_id,
-                    "role": str(event.get(8, event.get("role", "none")) or "none"),
-                }])
+        sender_id = _stored_user_id(frm, room) if frm else ""
+        if sender_id and frm.isdigit():
+            frm = _stored_username_for_id(sender_id, room) or frm
         if event_type == "text" and frm:
             self._last_message_identity = {
                 "user_id": sender_id,
@@ -22229,7 +22192,7 @@ class TalkinBot:
                     self.log(f"[MOD_EVENT] ignored ambiguous bot user_left after moderation of another account in {room}")
                     username = ""
         else:
-            username = event_username or event_user_22 or frm
+            username = event_user_22
         monitored_username = username or frm or str(event.get(17, "") or "").strip()
         self._report_monitored_event(room, event_type, monitored_username, body)
         # Some server builds return L@a/L@m/L@o as a RoomEvent text `User List:`.
