@@ -22282,7 +22282,14 @@ class TalkinBot:
             known_before = len(self.known_rooms)
             self.known_rooms.add(room)
             if len(self.known_rooms) != known_before:
-                _save_persistent_rooms(self.known_rooms)
+                # Local/GitHub persistence must never delay command routing.
+                snapshot = set(self.known_rooms)
+                threading.Thread(
+                    target=_save_persistent_rooms,
+                    args=(snapshot,),
+                    daemon=True,
+                    name="persist-room-list",
+                ).start()
         event_id = str(event.get(41, ""))
         if event_type in ("user_joined", "user_left"):
             username = event_user_17 or event_user_22
@@ -22302,7 +22309,14 @@ class TalkinBot:
         else:
             username = event_user_22 or event_user_17 or (frm if event_type == "text" else "")
         monitored_username = username or frm or str(event.get(17, "") or "").strip()
-        self._report_monitored_event(room, event_type, monitored_username, body)
+        if (_norm_user(monitored_username)
+                and _norm_user(monitored_username) in getattr(self, "monitored_users", set())):
+            threading.Thread(
+                target=self._report_monitored_event,
+                args=(room, event_type, monitored_username, body),
+                daemon=True,
+                name="monitor-event-report",
+            ).start()
         # Some server builds return L@a/L@m/L@o as a RoomEvent text `User List:`.
         # Consume that native response before ordinary room-command handling.
         if self._complete_pending_room_list_text(room, body):
@@ -22407,7 +22421,7 @@ class TalkinBot:
                         self.log("[NO-PHOTO] ban failed", repr(exc))
                     return
             self.room_users.setdefault(room, {})[username] = role or "none"
-            _remember_roster(room, [{"username": username, "role": role or "none"}])
+            _remember_roster_async(room, [{"username": username, "role": role or "none"}])
             if _norm_user(username) != _norm_user(BOT_ID):
                 self._schedule_room_id_sync(room)
             # Keep a separate history for .r. Only events received after the
@@ -23332,7 +23346,9 @@ class TalkinBot:
 
         Games, media, roster work, and persistence can take time. Keeping them
         on the single WebSocket worker makes later commands wait behind an
-        earlier event, so text events use a small bounded executor.
+        earlier event, so command text and ordinary text use separate bounded
+        executors. A burst of presence/chat traffic can no longer occupy every
+        worker needed by a command.
         """
         event = result.get("room_event") if isinstance(result, dict) else None
         is_text = (
@@ -23342,18 +23358,27 @@ class TalkinBot:
         )
         if not is_text:
             return self.handle_room_event(result)
-        executor = getattr(self, "_room_event_executor", None)
+        is_command = _looks_like_bot_command(str(event.get(6, "") or ""))
+        executor_name = "_room_command_executor" if is_command else "_room_event_executor"
+        lock_name = f"{executor_name}_lock"
+        executor = getattr(self, executor_name, None)
         if executor is None:
-            lock = getattr(self, "_room_event_executor_lock", None)
+            lock = getattr(self, lock_name, None)
             if lock is None:
-                lock = self._room_event_executor_lock = threading.Lock()
+                lock = threading.Lock()
+                setattr(self, lock_name, lock)
             with lock:
-                executor = getattr(self, "_room_event_executor", None)
+                executor = getattr(self, executor_name, None)
                 if executor is None:
-                    executor = self._room_event_executor = ThreadPoolExecutor(
-                        max_workers=max(2, int(os.getenv("ROOM_COMMAND_WORKERS", "4") or 4)),
+                    default_workers = "8" if is_command else "4"
+                    executor = ThreadPoolExecutor(
+                        max_workers=max(2, int(os.getenv(
+                            "ROOM_COMMAND_WORKERS" if is_command else "ROOM_EVENT_WORKERS",
+                            default_workers,
+                        ) or default_workers)),
                         thread_name_prefix="room-command",
                     )
+                    setattr(self, executor_name, executor)
         try:
             return executor.submit(self.handle_room_event, result)
         except Exception as exc:
