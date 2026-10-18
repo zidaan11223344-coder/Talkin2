@@ -509,15 +509,15 @@ BOT_MASTER = (os.getenv("BOT_MASTER") or os.getenv("MASTER_USERNAME") or "").str
 PRIMARY_BOT_ID = (os.getenv("PRIMARY_BOT_ID") or "").strip()
 INVITE_SENDER_NAME = os.getenv("INVITE_SENDER_NAME", "السفير").strip() or "السفير"
 GROUP_TO_JOIN = (os.getenv("GROUP_TO_JOIN") or os.getenv("FIRST_ROOM") or "").strip()
-# Startup room policy: normal deployments use only GROUP_TO_JOIN/FIRST_ROOM by
-# default so a large stale room history cannot block command readiness. Set
-# AUTO_JOIN_ALL_ROOMS=on when restoring every saved room is explicitly needed.
+# Startup room policy: restore every saved room once per WebSocket session by
+# default, preserving the established 38-room behavior. Set
+# AUTO_JOIN_ALL_ROOMS=off only when a deployment must use the first room.
 # MASTER_SERVICE deployments retain their separate no-room behavior.
 AUTO_JOIN_ALL_ROOMS = (
     os.getenv("AUTO_JOIN_ALL_ROOMS")
     or os.getenv("JOIN_ALL_ROOMS")
     or os.getenv("AUTO_JOIN_ROOMS")
-    or "off"
+    or "on"
 ).strip().casefold() in {"1", "true", "yes", "on", "enable", "enabled"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
@@ -23927,7 +23927,12 @@ class TalkinBot:
         # OFF = only the configured GROUP_TO_JOIN/FIRST_ROOM.
         # ON  = all rooms saved in tracked_rooms.json plus GROUP_TO_JOIN.
         # Manual `.دخول غرفي` is independent and always joins the saved list.
-        if MASTER_SERVICE_ENABLED:
+        restore_generation = getattr(self, "_room_restore_generation", None)
+        restore_already_scheduled = restore_generation == getattr(self, "_connection_generation", None)
+        if restore_already_scheduled:
+            self.log("[ROOM] saved-room restore already scheduled for this connection; skipping duplicate")
+            rooms_to_restore = set()
+        elif MASTER_SERVICE_ENABLED:
             rooms_to_restore = set()
         elif AUTO_JOIN_ALL_ROOMS:
             # tracked_rooms.json is the authoritative startup source. The
@@ -23942,6 +23947,7 @@ class TalkinBot:
         else:
             rooms_to_restore = {str(self.room).strip()} if self.room else set()
         if rooms_to_restore:
+            self._room_restore_generation = getattr(self, "_connection_generation", None)
             self._room_restore_candidates = {
                 _norm_room(room_name) for room_name in rooms_to_restore if _norm_room(room_name)
             }
