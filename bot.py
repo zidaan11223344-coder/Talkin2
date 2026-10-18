@@ -22151,8 +22151,10 @@ class TalkinBot:
         # 22 is the normal username field and field 17 is the older fallback.
         event_user_17 = str(event.get(17, "") or "").strip().lstrip("@")
         event_user_22 = str(event.get(22, "") or "").strip().lstrip("@")
-        command_username = event_user_22 or event_user_17 or (
-            frm.strip().lstrip("@") if frm.strip() and not frm.strip().isdigit() else ""
+        command_username = next(
+            (candidate for candidate in (event_user_22, event_user_17, frm.strip().lstrip("@"))
+             if candidate and not candidate.isdigit()),
+            "",
         )
         event_id_candidates = (
             event.get(14), event.get("user_id"),
@@ -23221,6 +23223,39 @@ class TalkinBot:
                 except Exception:
                     pass
 
+    def _dispatch_room_event(self, result):
+        """Process room text outside the transport worker.
+
+        Games, media, roster work, and persistence can take time. Keeping them
+        on the single WebSocket worker makes later commands wait behind an
+        earlier event, so text events use a small bounded executor.
+        """
+        event = result.get("room_event") if isinstance(result, dict) else None
+        is_text = (
+            isinstance(event, dict)
+            and str(event.get(1, "")) == "text"
+            and bool(event.get(6, ""))
+        )
+        if not is_text:
+            return self.handle_room_event(result)
+        executor = getattr(self, "_room_event_executor", None)
+        if executor is None:
+            lock = getattr(self, "_room_event_executor_lock", None)
+            if lock is None:
+                lock = self._room_event_executor_lock = threading.Lock()
+            with lock:
+                executor = getattr(self, "_room_event_executor", None)
+                if executor is None:
+                    executor = self._room_event_executor = ThreadPoolExecutor(
+                        max_workers=max(2, int(os.getenv("ROOM_COMMAND_WORKERS", "4") or 4)),
+                        thread_name_prefix="room-command",
+                    )
+        try:
+            return executor.submit(self.handle_room_event, result)
+        except Exception as exc:
+            self.log("[ROOM-COMMAND] async dispatch failed; processing inline:", repr(exc))
+            return self.handle_room_event(result)
+
     def on_message(self, ws, message):
         """Queue inbound frames so expensive decoding/commands never block recv()."""
         if isinstance(message, str):
@@ -23302,7 +23337,7 @@ class TalkinBot:
                     "uid": result.get("uid", ""),
                 })
             if "room_event" in result:
-                self.handle_room_event(result)
+                self._dispatch_room_event(result)
             if result.get("rooms"):
                 self._process_room_list(result.get("rooms"))
             if result.get("users") or result.get("room_admin"):
@@ -23382,7 +23417,7 @@ class TalkinBot:
                             connected = set()
                             self.connected_rooms = connected
                         connected.add(cm_room)
-                        self.handle_room_event({"room_event": {
+                        self._dispatch_room_event({"room_event": {
                             1: "text", 2: str(cm.get(3, "") or ""),
                             6: str(cm.get(5, "") or ""), 13: cm_room,
                             41: str(cm.get(41, "") or ""),
