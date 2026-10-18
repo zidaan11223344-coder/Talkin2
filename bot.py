@@ -22159,9 +22159,13 @@ class TalkinBot:
              if str(value or "").strip().isdigit()),
             "",
         )
+        # Keep the historical field-22/field-2 layouts first. Field 17 is a
+        # fallback only because some event types use it for a target/actor
+        # rather than the author of a text command.
         identity_candidates = (
-            event.get(22), event.get(17), event.get("username"),
+            event.get(22), event.get("username"),
             frm if not frm.strip().isdigit() else "",
+            event.get(17),
         )
         event_username = next(
             (str(value).strip().lstrip("@") for value in identity_candidates
@@ -22226,7 +22230,7 @@ class TalkinBot:
                     self.log(f"[MOD_EVENT] ignored ambiguous bot user_left after moderation of another account in {room}")
                     username = ""
         else:
-            username = event_user_22
+            username = event_username or event_user_22 or frm
         monitored_username = username or frm or str(event.get(17, "") or "").strip()
         self._report_monitored_event(room, event_type, monitored_username, body)
         # Some server builds return L@a/L@m/L@o as a RoomEvent text `User List:`.
