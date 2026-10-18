@@ -3091,7 +3091,16 @@ def _format_saved_accounts(title, data, empty_text):
     return "\n".join(lines)
 
 
+_ROSTER_PERSIST_LOCK = threading.RLock()
+
+
 def _remember_roster(room, users):
+    """Merge roster identities atomically so concurrent background saves cannot overwrite each other."""
+    with _ROSTER_PERSIST_LOCK:
+        return _remember_roster_impl(room, users)
+
+
+def _remember_roster_impl(room, users):
     room = _norm_room(room)
     if not room:
         return
@@ -3164,9 +3173,16 @@ def _remember_roster_async(room, users):
     snapshot = [dict(user) for user in (users or []) if isinstance(user, dict)]
     if not snapshot:
         return False
+    def persist():
+        try:
+            _remember_roster(room, snapshot)
+        except Exception as exc:
+            # Background exceptions otherwise only appear as an unstructured
+            # thread traceback and can be missed by deployment log filters.
+            print(f"[ROSTER] background identity save failed: {exc!r}", flush=True)
+
     worker = threading.Thread(
-        target=_remember_roster,
-        args=(room, snapshot),
+        target=persist,
         name="persist-member-identity",
         daemon=True,
     )
