@@ -2794,6 +2794,19 @@ def _is_publish_command(text):
     return bool(re.fullmatch(r"(?:بوست|انشر|post|publish)(?:@.*)?", value, re.I | re.S))
 
 
+def _looks_like_media_command(text):
+    """Identify music/media commands so slow downloads cannot occupy chat workers."""
+    value = _normalize_game_command_text(str(text or "").strip()).casefold()
+    if not value:
+        return False
+    # Match only command prefixes, not ordinary conversation mentioning music.
+    return bool(re.match(
+        r"^(?:\.تشغيل|تشغيل|شغل|شغّل|play|music|song|\.play|\.music|\.song)(?:\s|@|$)",
+        value,
+        re.I,
+    ))
+
+
 def _looks_like_priority_command(text):
     """Return True for latency-sensitive game, gift, and publish commands."""
     value = str(text or "").strip()
@@ -23439,10 +23452,15 @@ class TalkinBot:
         if not is_text:
             return self.handle_room_event(result)
         body = str(event.get(6, "") or "")
+        is_media = _looks_like_media_command(body)
         is_priority = _looks_like_priority_command(body)
         is_command = _looks_like_bot_command(body)
+        # Music searches/downloads can take many seconds (or longer when a
+        # provider fails). Give them an isolated, deliberately small pool so
+        # repeated music requests cannot consume workers used for chat commands.
         executor_name = (
-            "_room_priority_executor" if is_priority
+            "_room_media_executor" if is_media
+            else "_room_priority_executor" if is_priority
             else "_room_command_executor" if is_command
             else "_room_event_executor"
         )
@@ -23456,7 +23474,10 @@ class TalkinBot:
             with lock:
                 executor = getattr(self, executor_name, None)
                 if executor is None:
-                    if is_priority:
+                    if is_media:
+                        default_workers = "2"
+                        env_name = "ROOM_MEDIA_WORKERS"
+                    elif is_priority:
                         default_workers = "12"
                         env_name = "ROOM_PRIORITY_WORKERS"
                     elif is_command:
@@ -23470,7 +23491,11 @@ class TalkinBot:
                             env_name,
                             default_workers,
                         ) or default_workers)),
-                        thread_name_prefix="room-priority" if is_priority else "room-command",
+                        thread_name_prefix=(
+                            "room-media" if is_media else
+                            "room-priority" if is_priority else
+                            "room-command" if is_command else "room-event"
+                        ),
                     )
                     setattr(self, executor_name, executor)
         try:
