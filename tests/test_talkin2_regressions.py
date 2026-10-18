@@ -606,7 +606,7 @@ class RawWebSocketTransportRegressions(unittest.TestCase):
         bot.log = lambda *_args: None
         self.assertFalse(bot._send_reconnect_notice("socket closed"))
 
-    def test_recv_drops_inbound_payload_over_1008_without_closing_socket(self):
+    def test_recv_drops_inbound_payload_over_configured_inbound_limit_without_closing_socket(self):
         class FakeSocket:
             def __init__(self, payload):
                 self.payload = payload
@@ -624,7 +624,7 @@ class RawWebSocketTransportRegressions(unittest.TestCase):
         ws._recvbuf = bytearray()
         ws.timeout = 1
         ws.permessage_deflate = False
-        with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
+        with patch.dict(bot_module.os.environ, {"WS_MAX_INBOUND_BYTES": "1008"}):
             kind, details = ws.recv()
         self.assertEqual(kind, "oversize")
         self.assertEqual(details["size"], 1009)

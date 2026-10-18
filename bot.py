@@ -1112,6 +1112,20 @@ def _ws_payload_limit():
     return max(1, min(1008, configured))
 
 
+def _ws_inbound_limit():
+    """Return a memory-safety limit for inbound frames.
+
+    The 1008-byte restriction applies to packets sent by the bot. The server
+    legitimately sends larger occupant/roster frames, so inbound traffic must
+    use a separate safety limit instead of being silently discarded.
+    """
+    try:
+        configured = int(os.getenv("WS_MAX_INBOUND_BYTES", str(8 * 1024 * 1024)))
+    except (TypeError, ValueError):
+        configured = 8 * 1024 * 1024
+    return max(1008, min(16 * 1024 * 1024, configured))
+
+
 def _is_normal_ws_close_reason(reason):
     """Return True for ordinary peer/TCP closes that should reconnect quietly."""
     value = str(reason or "").casefold()
@@ -1588,7 +1602,7 @@ class RawWebSocket:
         # Consume the complete frame to keep the stream synchronized, then
         # drop it locally. Never send a close frame or tear down the socket for
         # an oversized inbound packet.
-        max_bytes = _ws_payload_limit()
+        max_bytes = _ws_inbound_limit()
         if opcode in (0x1, 0x2, 0x0) and len(data) > max_bytes:
             return ("oversize", {"size": len(data), "limit": max_bytes})
         if opcode == 0x8:
@@ -7609,6 +7623,9 @@ class TalkinBot:
                     params["offset"] = self._telegram_update_offset
                 data = self._telegram_api("getUpdates", **params)
                 if not data or not data.get("ok"):
+                    if isinstance(data, dict) and data.get("error_code") == 409:
+                        self.log("[TELEGRAM] polling stopped: another instance owns getUpdates")
+                        return
                     time.sleep(TELEGRAM_POLL_SECONDS)
                     continue
                 for update in data.get("result", []) or []:
@@ -23357,7 +23374,12 @@ class TalkinBot:
             if isinstance(message, str):
                 self.log("[WS] unexpected text frame received")
                 return
-            self._process_message(ws, message)
+            # Do not run roster decoding, room joins, or command handlers in
+            # the WebSocket callback. Talkin1 receives directly, but Talkin2
+            # performs considerably more work per frame; a bounded executor
+            # keeps recv() responsive without reintroducing the old priority
+            # queue that could delay commands for minutes.
+            return self._dispatch_incoming_message(ws, message)
         except Exception as exc:
             self.last_error = str(exc)
             self.log("[WS] incoming frame failed:", repr(exc))
