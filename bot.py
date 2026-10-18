@@ -23329,40 +23329,22 @@ class TalkinBot:
             return self.handle_room_event(result)
 
     def on_message(self, ws, message):
-        """Queue inbound frames so expensive decoding/commands never block recv()."""
-        if isinstance(message, str):
-            return
+        """Decode and dispatch each frame immediately, like Talkin1.
+
+        Talkin1 does not put inbound frames behind a priority queue. That queue
+        could leave a valid command waiting behind stale presence/stream frames
+        on busy rooms, which is exactly the delay users observed. Expensive
+        room text work still uses the background room executor below, while the
+        receive path itself stays direct and predictable.
+        """
         try:
-            # One shallow protobuf pass is enough to prioritize chat/room text
-            # above low-value roster/stream traffic. The full decode happens
-            # once, inside the worker.
-            top = decode_message(message)
-            priority = 2
-            if 9 in top or 10 in top:
-                priority = 0
-            elif 8 in top:
-                priority = 1
-            with self._event_queue_lock:
-                self._event_queue_seq += 1
-                seq = self._event_queue_seq
-            try:
-                self._event_queue.put_nowait((priority, seq, ws, bytes(message)))
-            except queue.Full:
-                # Never let a burst of presence/stream frames freeze command
-                # reception. If the queue is full, make one immediate worker
-                # pass for command-bearing frames; otherwise drop the oldest
-                # low-priority pressure rather than blocking the socket.
-                if priority == 0:
-                    try:
-                        self._dispatch_incoming_message(ws, bytes(message))
-                    except Exception as exc:
-                        self.log("[EVENT-WORKER] urgent frame failed:", repr(exc))
-                else:
-                    if ROOM_EVENT_DEBUG:
-                        self.log("[EVENT-QUEUE] dropped low-priority frame; queue full")
+            if isinstance(message, str):
+                self.log("[WS] unexpected text frame received")
+                return
+            self._process_message(ws, message)
         except Exception as exc:
             self.last_error = str(exc)
-            self.log("[EVENT-QUEUE] enqueue failed:", repr(exc))
+            self.log("[WS] incoming frame failed:", repr(exc))
 
     def _process_message(self, ws, message):
         try:
