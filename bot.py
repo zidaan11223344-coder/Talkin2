@@ -19310,6 +19310,14 @@ class TalkinBot:
                 return False
             if room_key in pending_lists:
                 return False
+            max_pending = max(1, int(os.getenv("MAX_BACKGROUND_ID_SYNC", "2") or 2))
+            active_syncs = sum(
+                1 for item in pending_lists.values()
+                if isinstance(item, dict) and item.get("code") == "id_sync"
+            )
+            if active_syncs >= max_pending:
+                self.log("[ROSTER] ID sync deferred; active sync limit reached:", room)
+                return False
             request_id = secrets.token_urlsafe(15)[:20]
             pending_lists[room_key] = {
                 "room": room, "code": "id_sync", "request_type": "members_list",
@@ -22701,11 +22709,9 @@ class TalkinBot:
             # delay the user's entry confirmation.
             if requester:
                 self.send_private_text(requester, f"✅ البوت داخل الغرفة: {room}")
-            if room:
-                try:
-                    self.request_room_occupants(room)
-                except Exception as exc:
-                    self.log("[ROOM] occupants refresh after join failed:", repr(exc))
+            # Do not request a full occupants list for every room during a
+            # bulk restore. That floods the WebSocket and starves commands;
+            # IDs are collected gradually from message events/background sync.
         elif event_type in (
             "room_full", "room_unauthorized", "room_wrong_password",
             "room_needs_captcha", "room_needs_password", "room_membership_required",
