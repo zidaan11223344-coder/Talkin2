@@ -1396,13 +1396,15 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             next_level = bot_module._game_welcome("player", "North")
         self.assertIn("🏅 مستوى الألعاب: 2", next_level)
 
-    def test_join_welcome_uses_game_level_for_every_member_including_vip(self):
+    def test_join_welcome_does_not_duplicate_vip_for_member_with_game_level(self):
         with patch.object(bot_module, "_is_vip_user", side_effect=lambda name: name == "vip"):
-            with patch.object(bot_module, "_game_stats_data", return_value={}):
+            with patch.object(bot_module, "_game_stats_data", return_value={
+                "vip": {"username": "vip", "games": {"star": {"plays": 18}}}
+            }):
                 regular_welcome = bot_module._join_welcome_message("regular", "North")
                 vip_welcome = bot_module._join_welcome_message("vip", "North")
             self.assertIn("🏅 مستوى الألعاب: 1", regular_welcome)
-            self.assertIn("عضو Vip", vip_welcome)
+            self.assertNotIn("عضو Vip", vip_welcome)
             self.assertIn("🏅 مستوى الألعاب: 1", vip_welcome)
 
     def test_join_welcome_uses_game_level_at_50_games(self):

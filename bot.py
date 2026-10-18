@@ -4106,7 +4106,10 @@ def _join_welcome_message_with_identity(username, room, custom_welcome_enabled=T
     _level, _label, plays = _game_level_info(username)
     is_vip = _is_vip_user(username) and not _is_master_name(username)
     prefix = ""
-    if plays < 50 and is_vip:
+    # A member with recorded gameplay gets exactly one welcome: the level
+    # welcome. Do not prepend the VIP welcome to it; this used to produce two
+    # contradictory greetings for the same join event.
+    if plays <= 0 and is_vip:
         prefix = f"👑 عضو Vip\n👤 {username}\n🏠 الغرفة: {room}"
     elif (custom_welcome_enabled and not is_vip
           and isinstance(custom_welcome, dict) and custom_welcome.get("message")):
