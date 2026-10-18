@@ -7046,7 +7046,7 @@ class TalkinBot:
         # Realtime transport must never execute heavy command/event logic on
         # the WebSocket reader thread. A single ordered worker keeps command
         # order intact while allowing recv() to continue immediately.
-        self._event_queue = queue.PriorityQueue(maxsize=max(200, int(os.getenv("EVENT_QUEUE_MAX", "1000"))))
+        self._event_queue = queue.PriorityQueue(maxsize=max(500, int(os.getenv("EVENT_QUEUE_MAX", "2500"))))
         self._event_queue_seq = 0
         self._event_queue_lock = threading.Lock()
         self._event_worker = threading.Thread(
@@ -23378,15 +23378,20 @@ class TalkinBot:
         return True
 
     def _event_worker_loop(self):
+        """Process queued WebSocket frames in priority order.
+
+        Room-text handlers are dispatched to their own executors by
+        _dispatch_room_event(), so this worker should only do protocol decode
+        and state updates. Keeping one ordered frame consumer avoids races in
+        join acknowledgements, roster responses and pending-request state.
+        """
         while not self.stop_event.is_set():
             try:
                 _priority, _seq, ws, message = self._event_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             try:
-                # Keep the socket worker free: private and room commands can
-                # invoke games, media, roster sync, or network-backed work.
-                self._dispatch_incoming_message(ws, message)
+                self._process_message(ws, message)
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log("[EVENT-WORKER] processing failed:", repr(exc))
@@ -23475,27 +23480,43 @@ class TalkinBot:
             return self.handle_room_event(result)
 
     def on_message(self, ws, message):
-        """Decode and dispatch each frame immediately, like Talkin1.
+        """Quickly enqueue incoming frames, prioritizing likely chat commands.
 
-        Talkin1 does not put inbound frames behind a priority queue. That queue
-        could leave a valid command waiting behind stale presence/stream frames
-        on busy rooms, which is exactly the delay users observed. Expensive
-        room text work still uses the background room executor below, while the
-        receive path itself stays direct and predictable.
+        The WebSocket callback does only a shallow protobuf decode and queue
+        insertion. Full decoding and protocol handling happen on the worker;
+        room text itself is dispatched to separate command/event pools.
         """
+        if isinstance(message, str):
+            return
         try:
-            if isinstance(message, str):
-                self.log("[WS] unexpected text frame received")
-                return
-            # Do not run roster decoding, room joins, or command handlers in
-            # the WebSocket callback. Talkin1 receives directly, but Talkin2
-            # performs considerably more work per frame; a bounded executor
-            # keeps recv() responsive without reintroducing the old priority
-            # queue that could delay commands for minutes.
-            return self._dispatch_incoming_message(ws, message)
+            raw = bytes(message)
+            top = decode_message(raw)
+            # These protobuf fields have historically identified room/private
+            # message frames in TalkinChat. Prioritize them over roster noise.
+            priority = 2
+            if 9 in top or 10 in top:
+                priority = 0
+            elif 8 in top:
+                priority = 1
+            with self._event_queue_lock:
+                self._event_queue_seq += 1
+                seq = self._event_queue_seq
+            try:
+                self._event_queue.put_nowait((priority, seq, ws, raw))
+            except queue.Full:
+                # Never block the socket reader behind a full queue. Preserve
+                # urgent chat frames as a last resort; discard lower-value
+                # background frames and log only when event debugging is on.
+                if priority == 0:
+                    try:
+                        self._process_message(ws, raw)
+                    except Exception as exc:
+                        self.log("[EVENT-QUEUE] urgent frame failed:", repr(exc))
+                elif ROOM_EVENT_DEBUG:
+                    self.log("[EVENT-QUEUE] dropped low-priority frame; queue full")
         except Exception as exc:
             self.last_error = str(exc)
-            self.log("[WS] incoming frame failed:", repr(exc))
+            self.log("[EVENT-QUEUE] enqueue failed:", repr(exc))
 
     def _process_message(self, ws, message):
         try:
