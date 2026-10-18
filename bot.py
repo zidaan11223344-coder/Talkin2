@@ -2794,6 +2794,32 @@ def _is_publish_command(text):
     return bool(re.fullmatch(r"(?:بوست|انشر|post|publish)(?:@.*)?", value, re.I | re.S))
 
 
+def _looks_like_priority_command(text):
+    """Return True for latency-sensitive game, gift, and publish commands."""
+    value = str(text or "").strip()
+    low = _normalize_game_command_text(value).casefold()
+    if not low:
+        return False
+    if _is_publish_command(value):
+        return True
+    if re.fullmatch(r"(?:sa|sav|هدايا|gifts|gv)(?:@.*)?", value, re.I | re.S):
+        return True
+    if re.fullmatch(r"[0-9٠-٩]{1,2}", value):
+        # Numeric replies are commonly the next step in a game/gift menu.
+        return True
+    game_names = {
+        str(item).casefold().replace("ة", "ه")
+        for item in (*GAME_COMMANDS, *GAME_COMMANDS.values())
+    }
+    normalized = low.replace("ة", "ه")
+    return any(
+        normalized == name
+        or normalized.startswith(name + "@")
+        or normalized.startswith(name + " ")
+        for name in game_names
+    )
+
+
 def _publish_description(text):
     """Return the description part of a publish command without losing @/newlines."""
     value = str(text or "").strip()
@@ -3616,11 +3642,11 @@ def _game_stats_data():
 
 
 GAME_LEVEL_CATEGORIES = (
-    ("النجوم الفضية", "🥈", (
+    ("النجوم الفضية", "✩", (
         "مبتدئ", "لاعب ناشئ", "مقاتل", "برونزي", "فضي",
         "ذهبي", "محترف", "خبير", "أسطورة", "أسطورة فضية",
     )),
-    ("النجوم الذهبية", "🌟", (
+    ("النجوم الذهبية", "⭐", (
         "ذهبي مبتدئ", "محارب ذهبي", "ذهبي محترف", "ذهبي متألق", "ذهبي نادر",
         "أمير الذهب", "فارس الذهب", "قائد الذهب", "أسطورة الذهب", "ملك الذهب",
     )),
@@ -3628,19 +3654,19 @@ GAME_LEVEL_CATEGORIES = (
         "ماسي مبتدئ", "ماسي متألق", "ماسي محترف", "فارس الماس", "الماسي النادر",
         "أمير الماس", "قائد الماس", "أسطورة الماس", "إمبراطور الماس الأزرق", "ملك الماس الأزرق",
     )),
-    ("الماس البرونزي", "🟤", (
+    ("الماس البرونزي", "🔶", (
         "برونزي نادر", "فارس البرونز", "برونزي محترف", "البرونزي المتألق", "سيد البرونز",
         "أمير البرونز", "قائد البرونز", "أسطورة البرونز", "إمبراطور البرونز", "ملك الماس البرونزي",
     )),
-    ("الماس الأحمر", "❤️", (
+    ("الماس الأحمر", "♦️", (
         "أحمر نادر", "محارب الماس الأحمر", "أحمر محترف", "فارس الماس الأحمر", "أمير الماس الأحمر",
         "قائد الماس الأحمر", "أسطورة الماس الأحمر", "سيد الماس الأحمر", "إمبراطور الماس الأحمر", "ملك الماس الأحمر",
     )),
-    ("الماس الأسود", "🖤", (
+    ("الماس الأسود", "◆", (
         "أسود نادر", "محارب أسود", "متألق أسود", "محترف أسود", "فارس أسود",
         "أمير الأسود", "سيد الأسود", "أسطورة الأسود", "إمبراطور الأسود", "ملك الماس الأسود",
     )),
-    ("الماس البنفسجي", "💜", (
+    ("الماس البنفسجي", "🟣💎", (
         "بنفسجي نادر", "محارب بنفسجي", "متألق بنفسجي", "محترف بنفسجي", "فارس بنفسجي",
         "أمير البنفسج", "سيد البنفسج", "أسطورة البنفسج", "إمبراطور البنفسج", "ملك الماس البنفسجي",
     )),
@@ -3659,6 +3685,7 @@ GAME_LEVEL_FUTURE_CATEGORIES = (
         "أمير المجرات", "أسطورة المجرات", "إمبراطور الكون", "عرش المجرات", "سيّد المجرات",
     )),
 )
+GAME_LEVEL_FUTURE_SYMBOLS = ("🔷", "🔶", "🟣", "🟢", "🟠", "⚫", "⚪")
 GAME_LEVEL_FUTURE_TITLES = (
     "مستكشف", "مبتدئ", "متألق", "محترف", "فارس", "نادر", "أمير", "قائد", "أسطورة", "إمبراطور",
 )
@@ -23358,8 +23385,14 @@ class TalkinBot:
         )
         if not is_text:
             return self.handle_room_event(result)
-        is_command = _looks_like_bot_command(str(event.get(6, "") or ""))
-        executor_name = "_room_command_executor" if is_command else "_room_event_executor"
+        body = str(event.get(6, "") or "")
+        is_priority = _looks_like_priority_command(body)
+        is_command = _looks_like_bot_command(body)
+        executor_name = (
+            "_room_priority_executor" if is_priority
+            else "_room_command_executor" if is_command
+            else "_room_event_executor"
+        )
         lock_name = f"{executor_name}_lock"
         executor = getattr(self, executor_name, None)
         if executor is None:
@@ -23370,13 +23403,21 @@ class TalkinBot:
             with lock:
                 executor = getattr(self, executor_name, None)
                 if executor is None:
-                    default_workers = "8" if is_command else "4"
+                    if is_priority:
+                        default_workers = "12"
+                        env_name = "ROOM_PRIORITY_WORKERS"
+                    elif is_command:
+                        default_workers = "8"
+                        env_name = "ROOM_COMMAND_WORKERS"
+                    else:
+                        default_workers = "4"
+                        env_name = "ROOM_EVENT_WORKERS"
                     executor = ThreadPoolExecutor(
                         max_workers=max(2, int(os.getenv(
-                            "ROOM_COMMAND_WORKERS" if is_command else "ROOM_EVENT_WORKERS",
+                            env_name,
                             default_workers,
                         ) or default_workers)),
-                        thread_name_prefix="room-command",
+                        thread_name_prefix="room-priority" if is_priority else "room-command",
                     )
                     setattr(self, executor_name, executor)
         try:

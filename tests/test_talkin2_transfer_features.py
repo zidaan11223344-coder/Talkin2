@@ -27,12 +27,12 @@ def test_levels_command_shows_ten_complete_tiers_with_requested_symbols_and_ns()
     assert "📚 مستويات تقدم الألعاب" in first_page
     assert "كل مستوى يحتاج 500 لعبة" in first_page
     assert "المستوى الفضي" in first_page
-    assert "🥈" * 10 in first_page
+    assert "✩" * 10 in first_page
     assert "مستوى 1: مبتدئ" in first_page
     assert "مستوى 10: أسطورة فضية" in first_page
     level_lines = [line for line in first_page.splitlines() if line.startswith("مستوى ")]
     assert len(level_lines) == 10
-    assert all(not any(symbol in line for symbol in ("🥈", "⭐", "🌟", "💎", "🟤", "❤️", "🖤", "💜", "👑")) for line in level_lines)
+    assert all(not any(symbol in line for symbol in ("✩", "⭐", "💎", "🔶", "♦️", "◆", "🟣", "👑")) for line in level_lines)
 
     result_key = ("room_message", "North", "Player")
     pages = bot._result_pages[result_key]["pages"]
@@ -42,16 +42,16 @@ def test_levels_command_shows_ten_complete_tiers_with_requested_symbols_and_ns()
     next_text = bot_module.as_text(bot_module.decode_message(packets[0])[5][0])
     assert next_text.startswith("📄 القائمة 2/10")
     assert "المستوى الذهبي" in next_text
-    assert "🌟" * 10 in next_text
+    assert "⭐" * 10 in next_text
     assert "مستوى 1: ذهبي مبتدئ" in next_text
-    assert all(not line.startswith(("🥈", "⭐", "🌟", "💎", "🟤", "❤️", "🖤", "💜", "👑"))
+    assert all(not line.startswith(("✩", "⭐", "💎", "🔶", "♦️", "◆", "🟣", "👑"))
                for line in next_text.splitlines() if line.startswith("مستوى "))
 
     categories = [line for page in pages for line in page.splitlines() if line.startswith("المستوى ")]
     assert len(categories) == 10
     assert len(set(categories)) == 10
-    assert "❤️" in pages[4]
-    assert "♦️" not in pages[4]
+    assert "♦️" in pages[4]
+    assert "❤️" not in pages[4]
     assert "المستوى الماسي الخالد" in pages[8]
     assert "تاج الخلود" in pages[8]
     assert "المستوى الماسي الكوني" in pages[9]
