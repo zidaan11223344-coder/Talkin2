@@ -22159,13 +22159,12 @@ class TalkinBot:
              if str(value or "").strip().isdigit()),
             "",
         )
-        # Keep the historical field-22/field-2 layouts first. Field 17 is a
-        # fallback only because some event types use it for a target/actor
-        # rather than the author of a text command.
+        # Field 2 can be an opaque Talkin account token, not only digits.
+        # Prefer the protocol's canonical username fields for every command;
+        # otherwise older commands can be attributed to that token and fail
+        # their normal username/verification lookup.
         identity_candidates = (
-            event.get(22), event.get("username"),
-            frm if not frm.strip().isdigit() else "",
-            event.get(17),
+            event.get(22), event.get(17), event.get("username"), frm,
         )
         event_username = next(
             (str(value).strip().lstrip("@") for value in identity_candidates
