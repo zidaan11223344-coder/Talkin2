@@ -3153,6 +3153,20 @@ def _remember_roster_impl(room, users):
     if not isinstance(current, dict):
         current = {}
     now = int(time.time())
+    # Build lookup indexes once. Scanning the whole roster for every member
+    # made a large room response O(n²), monopolizing a worker and delaying
+    # game commands for tens of seconds.
+    by_id = {}
+    by_name = {}
+    for old_key, old_value in list(current.items()):
+        if not isinstance(old_value, dict):
+            continue
+        old_name = str(old_value.get("username") or old_key).strip().lstrip("@")
+        old_id = str(old_value.get("user_id") or (old_key if str(old_key).isdigit() else "")).strip()
+        if old_id.isdigit():
+            by_id.setdefault(old_id, []).append(str(old_key))
+        if _norm_user(old_name):
+            by_name[_norm_user(old_name)] = str(old_key)
     for user in users or []:
         if not isinstance(user, dict):
             continue
@@ -3163,31 +3177,21 @@ def _remember_roster_impl(room, users):
         if not user_id.isdigit():
             user_id = ""
         normalized_name = _norm_user(username)
-        existing_key = ""
+        existing_key = (by_id.get(user_id, [""])[0] if user_id else "") or by_name.get(normalized_name, "")
         existing_id = ""
         aliases = []
-        for old_key, old_value in list(current.items()):
-            if not isinstance(old_value, dict):
-                continue
-            old_name = str(old_value.get("username") or old_key).strip().lstrip("@")
-            old_id = str(old_value.get("user_id") or (old_key if str(old_key).isdigit() else "")).strip()
-            if (user_id and old_id == user_id) or (not user_id and normalized_name == _norm_user(old_name)):
-                existing_key, existing_id = str(old_key), old_id
-                old_aliases = old_value.get("aliases", [])
-                if isinstance(old_aliases, list):
-                    aliases.extend(str(alias).strip().lstrip("@") for alias in old_aliases if str(alias).strip())
-                if _norm_user(old_name) != normalized_name:
-                    aliases.append(old_name)
-                if user_id and old_id == user_id:
-                    break
+        old_value = current.get(existing_key)
+        if isinstance(old_value, dict):
+            old_name = str(old_value.get("username") or existing_key).strip().lstrip("@")
+            existing_id = str(old_value.get("user_id") or (existing_key if str(existing_key).isdigit() else "")).strip()
+            old_aliases = old_value.get("aliases", [])
+            if isinstance(old_aliases, list):
+                aliases.extend(str(alias).strip().lstrip("@") for alias in old_aliases if str(alias).strip())
+            if _norm_user(old_name) != normalized_name:
+                aliases.append(old_name)
         if user_id:
-            for old_key, old_value in list(current.items()):
-                if not isinstance(old_value, dict):
-                    continue
-                old_id = str(old_value.get("user_id") or (old_key if str(old_key).isdigit() else "")).strip()
-                old_name = str(old_value.get("username") or old_key).strip().lstrip("@")
-                if old_id == user_id or (not old_id and normalized_name == _norm_user(old_name)):
-                    current.pop(old_key, None)
+            for old_key in by_id.get(user_id, []):
+                current.pop(old_key, None)
             storage_key = user_id
         else:
             user_id = existing_id if existing_id.isdigit() else ""
@@ -3205,6 +3209,9 @@ def _remember_roster_impl(room, users):
             "is_present": user.get("is_present", user.get("online")),
             "last_seen": now,
         }
+        by_name[normalized_name] = storage_key
+        if user_id:
+            by_id[user_id] = [storage_key]
     rosters[room] = current
     _save_persistent_rosters(rosters)
 
