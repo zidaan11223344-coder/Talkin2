@@ -51,7 +51,7 @@ except Exception:
 from dotenv import dotenv_values, load_dotenv
 from cricket_integration import CricketIntegration
 import shop as member_shop
-from treasure_mining import DIAMOND_KEYS, ITEMS as MINING_ITEMS, MiningStore, resolve_item_keys
+from treasure_mining import DIAMOND_KEYS, ITEMS as MINING_ITEMS, MiningStore, format_cooldown, resolve_item_keys
 # Public defaults live in the tracked project settings file. Empty values are
 # ignored so required secrets must come from Railway Variables, while an
 # explicitly injected Railway value always wins over the repository defaults.
@@ -3248,7 +3248,7 @@ def _looks_like_bot_command(text):
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
     )
     prefixes = prefixes + (
-        "bl@", "+ds@", "رهان ", "مضاربه ", "استثمار ", "حظي ",
+        "فحص الماس", "فحص الالماس", "مستويات", "bl@", "+ds@", "رهان ", "مضاربه ", "استثمار ", "حظي ",
         "ذهب ", "الذهب ", "فضة ", "الفضة ", "فضه ", "الفضه ",
         "نفط ", "النفط ", "أرض ", "ارض ", "الأرض ", "الارض ",
         "gold ", "silver ", "oil ", "land ",
@@ -4700,7 +4700,7 @@ def _points_threshold_top_message(threshold, label, *, english=False, limit=POIN
     return "\n".join(lines)
 
 
-def _safe_text_pages_from_items(packet_type, route_fields, heading_lines, item_lines, *, max_items_per_page=None, language="ar"):
+def _safe_text_pages_from_items(packet_type, route_fields, heading_lines, item_lines, *, max_items_per_page=None, language="ar", marker_first=False):
     """Build numbered list pages whose complete protobuf packets fit the WS limit."""
     limit = _ws_payload_limit()
     english = str(language or "ar").casefold() == "en"
@@ -4708,11 +4708,11 @@ def _safe_text_pages_from_items(packet_type, route_fields, heading_lines, item_l
     next_footer = "\n\n📌 Type ns for the next list." if english else "\n\n📌 اكتب ns للقائمة التالية."
 
     def render(items, page_no, total):
-        return "\n".join([
-            *[str(line) for line in heading_lines],
-            f"{marker} {page_no}/{total}",
-            *items,
-        ])
+        marker_line = f"{marker} {page_no}/{total}"
+        headings = [str(line) for line in heading_lines]
+        if marker_first:
+            return "\n".join([marker_line, *headings, *items])
+        return "\n".join([*headings, marker_line, *items])
 
     def packet_size(text):
         fields = dict(route_fields or {})
@@ -5287,14 +5287,14 @@ def _default_help_sections():
             '📋 أوامر الإدارة — 3 | التوثيق وVIP\n━━━━━━━━━━━━\nvi@اسم — توثيق مستخدم\nuns@اسم — سحب التوثيق\nسحب التوثيق@اسم — سحب التوثيق\nإزالة توثيق@اسم — سحب التوثيق\nتوثيق الكل — توثيق كل الأعضاء\nvi — عدد الموثقين\nvip@اسم — منح VIP\nunvip@اسم — سحب VIP\nvip — عدد أعضاء VIP\nmvip@اسم — إضافة ماستر توثيق\numvip@اسم — سحب ماستر توثيق\nl@mvip — عرض ماسترات التوثيق',
             '📋 أوامر الإدارة — 4 | التوثيق والحماية\n━━━━━━━━━━━━\nتشغيل التوثيق — تشغيل نظام التوثيق\nإيقاف التوثيق — إيقاف نظام التوثيق\nحماية@اسم_الغرفة — قائمة الحماية الخاصة بالماستر\nتشغيل/إيقاف الحماية — إعداد عام للغرفة\nحالة الحماية — عرض الحالة\nحمايه البوت — حماية داخلية للبوت\nالمحظورين — المحظورون داخل البوت',
             '📋 أوامر الإدارة — 5 | الفلتر والنشر\n━━━━━━━━━━━━\nmf@on — تشغيل فلتر الكلمات\nmf@off — إيقاف فلتر الكلمات\n+mf@كلمة — إضافة كلمة للفلتر\n-mf@كلمة — حذف كلمة من الفلتر\nl@mf — عرض كلمات الفلتر\nclear@mf — مسح كلمات الفلتر\nl@mfb — عرض المحظورين بسبب الفلتر\nl@mbp — عرض الممنوعين من النشر\nmbp@اسم — فك منع النشر\namf@اسم — استثناء مستخدم من حظر الفلتر',
-            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nغرفي / myrooms — الغرف المتصلة\nدخول الكل / دخولكل / .دخول غرفي — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم / is@اسم — البحث عن مستخدم\nl@a / l@m / l@o / l@b — قوائم الرتب',
+            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nفحص الماس — منح ألماسة اختبارية متغيرة النوع وصورتها في الغرفة\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nغرفي / myrooms — الغرف المتصلة\nدخول الكل / دخولكل / .دخول غرفي — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم / is@اسم — البحث عن مستخدم\nl@a / l@m / l@o / l@b — قوائم الرتب',
         ],
         2: [
             '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال: .sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
             '❤️ التفاعلات والصور والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي أو صورتك — بحث آمن عن صورة مناسبة لاسمك\n.صوره اسم_المستخدم — بحث آمن عن صورة المستخدم\nشبيه@اسم — بحث آمن عن الشبيه\nشبيهك@اسم — بحث آمن عن شبيهك\n\n📌 النتائج العامة من الإنترنت، مع تفعيل SafeSearch ومنع البحث عن الصور المخلة.',
         ],
         3: [
-            '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📌 اكتب ns للقائمة التالية',
+            '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📚 مستويات — عرض فئات ومستويات التقدم\n📌 اكتب ns للقائمة التالية',
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
@@ -7710,6 +7710,16 @@ class TalkinBot:
         master = str(BOT_MASTER or "").strip()
         if not master or _norm_user(master) == _norm_user(BOT_ID):
             return False
+        room_key = _norm_room(room)
+        notice_times = getattr(self, "_room_departure_notice_times", None)
+        if not isinstance(notice_times, dict):
+            notice_times = self._room_departure_notice_times = {}
+        now = time.monotonic()
+        last_notice = notice_times.get(room_key)
+        if last_notice is not None and now - float(last_notice) < 300.0:
+            self.log(f"[ROOM_DEPARTURE_NOTICE] repeated notice suppressed for {room}")
+            return False
+        notice_times[room_key] = now
         event = event if isinstance(event, dict) else {}
         reason = ""
         for field in ("reason", "detail", "message", "description", "cause", "status_reason"):
@@ -7724,7 +7734,7 @@ class TalkinBot:
             else:
                 reason = f"الخادم أرسل حدث {event_type} دون سبب تفصيلي."
         message = (
-            "⚠️ رصد البوت انقطاعه عن الغرفة؛ سيواصل محاولة العودة تلقائيًا حتى يؤكد الخادم دخوله."
+            "⚠️ رصد البوت خروجه من الغرفة؛ سيحاول العودة تلقائيًا، وإذا تكرر الخروج سريعًا فسيوقف المحاولات لتجنب الدوران."
             f"\n📍 الغرفة: {str(room or 'غير معروفة')[:120]}"
             f"\n🧾 السبب المسجل: {reason}"
         )
@@ -8148,13 +8158,18 @@ class TalkinBot:
             self.log("[AUTO_REJOIN] no server acknowledgement; not resending join:", room)
 
     def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
-        """Keep retrying a lost room indefinitely, with a capped backoff."""
+        """Rejoin a dropped room, but pause after repeated rapid server removals."""
         if not room:
             return
         room_key = _norm_room(room)
         if room_key in getattr(self, "blocked_rooms", set()):
             return
         if room_key in getattr(self, "_intentional_leaves", set()):
+            return
+        if not hasattr(self, "_auto_rejoin_paused"):
+            self._auto_rejoin_paused = set()
+        if room_key in self._auto_rejoin_paused:
+            self.log(f"[AUTO_REJOIN] paused after repeated rapid exits; manual join required: {room}")
             return
         if not hasattr(self, "_auto_rejoin_waiting_ack"):
             self._auto_rejoin_waiting_ack = set()
@@ -8171,23 +8186,51 @@ class TalkinBot:
         if not hasattr(self, "_auto_rejoin_state"):
             self._auto_rejoin_state = {}
         now = time.monotonic()
+        pause_reason = False
         with self._auto_rejoin_lock:
             if room_key in self._auto_rejoin_pending or room_key in self._auto_rejoin_waiting_ack:
                 self.log(f"[AUTO_REJOIN] already sent one join request; waiting for server: {room}")
                 return
-            state = self._auto_rejoin_state.setdefault(room_key, {"attempts": [], "joined_at": 0.0})
-            if state.get("joined_at") and now - float(state["joined_at"]) >= 120.0:
-                state["attempts"] = []
-            recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
-            state["attempts"] = recent_attempts + [now]
-            # Never permanently give up after repeated transient disconnects.
-            # A confirmed join resets the retry history below; cap the backoff
-            # at 15 seconds so room-specific server drops do not leave the bot
-            # absent for minutes while still avoiding a rapid join flood.
-            delay = max(float(delay), min(15.0, 1.2 * (2 ** min(len(recent_attempts), 4))))
-            generation = int(getattr(self, "_connection_generation", 0))
-            self._auto_rejoin_pending.add(room_key)
-            self._auto_rejoin_waiting_ack.add(room_key)
+            state = self._auto_rejoin_state.setdefault(
+                room_key, {"attempts": [], "joined_at": 0.0, "rapid_losses": 0}
+            )
+            joined_at = float(state.get("joined_at", 0.0) or 0.0)
+            if joined_at:
+                joined_duration = max(0.0, now - joined_at)
+                if joined_duration < 120.0:
+                    state["rapid_losses"] = int(state.get("rapid_losses", 0) or 0) + 1
+                else:
+                    state["rapid_losses"] = 0
+                    state["attempts"] = []
+                state["joined_at"] = 0.0
+            if int(state.get("rapid_losses", 0) or 0) >= 3:
+                self._auto_rejoin_paused.add(room_key)
+                state["paused_at"] = now
+                pause_reason = True
+            if pause_reason:
+                self._auto_rejoin_waiting_ack.discard(room_key)
+                self._auto_rejoin_pending.discard(room_key)
+            else:
+                recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
+                state["attempts"] = recent_attempts + [now]
+                delay = max(float(delay), min(15.0, 1.2 * (2 ** min(len(recent_attempts), 4))))
+                generation = int(getattr(self, "_connection_generation", 0))
+                self._auto_rejoin_pending.add(room_key)
+                self._auto_rejoin_waiting_ack.add(room_key)
+        if pause_reason:
+            message = (
+                "⛔ أوقفت إعادة الدخول التلقائية لتجنب حلقة دخول وخروج متكررة."
+                f"\n📍 الغرفة: {str(room)[:120]}"
+                "\nتحقق من عضوية البوت وصلاحياته، ثم أرسل دخول@اسم_الغرفة واختر اللغة لإعادة المحاولة يدوياً."
+            )
+            self.log(f"[AUTO_REJOIN] circuit breaker paused {room} after 3 rapid confirmed exits")
+            master = str(BOT_MASTER or "").strip()
+            if master and _norm_user(master) != _norm_user(BOT_ID):
+                try:
+                    self.send_private_text(master, message)
+                except Exception as exc:
+                    self.log("[AUTO_REJOIN] pause notice failed:", repr(exc))
+            return
         def _rejoin_worker():
             try:
                 time.sleep(delay)
@@ -8258,6 +8301,10 @@ class TalkinBot:
         if requested_by:
             getattr(self, "_auto_rejoin_waiting_ack", set()).discard(room_norm)
             getattr(self, "_intentional_leaves", set()).discard(room_norm)
+            getattr(self, "_auto_rejoin_paused", set()).discard(room_norm)
+            rejoin_state = getattr(self, "_auto_rejoin_state", {}).get(room_norm)
+            if isinstance(rejoin_state, dict):
+                rejoin_state.update({"rapid_losses": 0, "joined_at": 0.0, "attempts": []})
             self.blocked_rooms.discard(room_norm)
             getattr(self, "_blocked_room_reasons", {}).pop(room_norm, None)
             getattr(self, "_blocked_room_notices", set()).discard(room_norm)
@@ -17142,12 +17189,44 @@ class TalkinBot:
         inventory_commands = {"sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag"}
         top_commands = {"توب الماس", "توب الالماس", "top diamonds", "top gems", "أغنى المنقبين", "اغنى المنقبين"}
         redeem_match = re.fullmatch(r"(?:r|rdem)\s+(.+)", raw, re.I)
+        is_diamond_test = low in {"فحص الماس", "فحص الالماس"}
         is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining"}
         is_store = low in store_commands
         is_inventory = low in inventory_commands
         is_top = low in top_commands
-        if not (is_store or is_inventory or is_top or redeem_match or is_dig):
+        if not (is_store or is_inventory or is_top or redeem_match or is_dig or is_diamond_test):
             return False
+
+        if is_diamond_test:
+            if not _is_master_name(sender_name):
+                self.send_room_text(room, "🔒 هذا الأمر مخصص للماستر فقط.")
+                return True
+            if not room:
+                self.send_private_text(sender_name, "📌 أرسل أمر فحص الماس داخل الغرفة ليظهر الرد والصورة فيها.")
+                return True
+            result = MINING_STORE.give_test_diamond(user_id, sender_name)
+            item = result.get("item") or {}
+            self.send_room_text(
+                room,
+                f"💎 فحص الألماس — {sender_name}\n"
+                f"{item.get('icon', '💎')} أُضيفت {item.get('name', 'ألماسة')} إلى مخزونك.\n"
+                f"🛒 قيمة الاستبدال: {int(item.get('price', 0) or 0):,} نقطة للقطعة.",
+            )
+            image_path = ASSETS_DIR / "treasures" / str(item.get("image", ""))
+            if not image_path.is_file():
+                self.send_room_text(room, "⚠️ أُضيفت الألماسة لكن صورتها غير موجودة في مجلد assets/treasures.")
+                return True
+            image_url = self._game_public_image(image_path, route="assets/treasures")
+            if not image_url:
+                self.send_room_text(room, "⚠️ أُضيفت الألماسة لكن تعذر تجهيز رابط صورتها.")
+                return True
+            try:
+                if self.send_room_media(room, image_url, "image") is False:
+                    self.send_room_text(room, "⚠️ أُضيفت الألماسة لكن تعذر إرسال صورتها.")
+            except Exception as exc:
+                self.log("[MINING] diamond test image send failed:", repr(exc))
+                self.send_room_text(room, "⚠️ أُضيفت الألماسة لكن تعذر إرسال صورتها.")
+            return True
 
         settled = self._resume_pending_mining_redemption(room, sender_name, user_id)
         if settled is False:
@@ -17241,9 +17320,7 @@ class TalkinBot:
             if not outcome.get("ok"):
                 if outcome.get("error") == "cooldown":
                     remaining = int(outcome.get("remaining", 0) or 0)
-                    hours, remainder = divmod(remaining, 3600)
-                    minutes = (remainder + 59) // 60
-                    self.send_room_text(room, f"⌛ @{sender_name} يمكنك التنقيب مرة كل ساعتين. تبقّى {hours} ساعة و{minutes} دقيقة.")
+                    self.send_room_text(room, f"⌛ {sender_name} يمكنك التنقيب مرة كل 30 ثانية. تبقّى {format_cooldown(remaining)}.")
                 elif outcome.get("error") == "pending_redemption":
                     self.send_room_text(room, "⌛ لديك استبدال كنوز ينتظر التسوية؛ استخدم Rdem مرة أخرى بعد قليل.")
                 return True
@@ -17253,12 +17330,13 @@ class TalkinBot:
                 self.log("[MINING] game stats update failed:", repr(exc))
             item = outcome.get("item")
             if not item:
-                self.send_room_text(room, f"🪨 لم يعثر @{sender_name} على شيء هذه المرة. حظًا أوفر بعد ساعتين.")
+                self.send_room_text(room, f"🪨 {sender_name} لم يعثر على شيء هذه المرة. حظًا أوفر في التنقيب القادم.")
                 return True
             self.send_room_text(
                 room,
-                f"🎉 عثر @{sender_name} على {item['icon']} {item['name']}!\n"
-                "🎒 أُضيف الكنز إلى مخزونك.",
+                f"🎉 {sender_name} عثرت على:\n{item['icon']} {item['name']}\n"
+                "🎒 أُضيف إلى مخزونك.\n"
+                f"🛒 قيمة الاستبدال: {int(item['price']):,} نقطة للقطعة.",
             )
             image_path = ASSETS_DIR / "treasures" / item.get("image", "")
             if image_path.is_file():
@@ -17388,6 +17466,7 @@ class TalkinBot:
         mining_low = mining_raw.casefold().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
         mining_commands = {
             "الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining",
+            "فحص الماس", "فحص الالماس",
             "sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag",
             "متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures",
             "توب الماس", "توب الالماس", "top diamonds", "top gems", "اغنى المنقبين",
@@ -17730,6 +17809,37 @@ class TalkinBot:
         # master-only management gate below.
         _body_text = str(body or "").strip()
         _body_low = _body_text.casefold()
+        if _body_low == "مستويات":
+            item_lines = []
+            tier_titles = {
+                "النجوم الفضية": "المستوى الفضي",
+                "النجوم الذهبية": "المستوى الذهبي",
+                "الماس الأزرق": "المستوى الماسي الأزرق",
+                "الماس البرونزي": "المستوى الماسي البرونزي",
+                "الماس الأحمر": "المستوى الماسي الأحمر",
+                "الماس الأسود": "المستوى الماسي الأسود",
+                "الماس البنفسجي": "المستوى الماسي البنفسجي",
+                "الماس الملكي": "المستوى الماسي الملكي",
+            }
+            for tier_index in range(len(GAME_LEVEL_CATEGORIES) + 1):
+                tier_start = tier_index * 5000
+                _category_index, _level_number, category, _title, symbol, _plays = _game_level_details_from_plays(tier_start)
+                tier_title = tier_titles.get(category, f"المستوى {category}")
+                item_lines.extend((tier_title, f"{symbol} {category}"))
+                for level_in_tier in range(1, 11):
+                    plays = tier_start + (level_in_tier - 1) * 500
+                    _category_index, _level_number, _category, title, level_symbol, _plays = _game_level_details_from_plays(plays)
+                    item_lines.append(f"{level_in_tier}: {level_symbol * level_in_tier} — {title}")
+            headings = ["📚 مستويات تقدم الألعاب", "كل مستوى يحتاج 500 لعبة"]
+            packet_type = "chat_message" if is_private else "room_message"
+            route_fields = {"to": str(sender or "")} if is_private else {"room": str(room or "")}
+            pages = _safe_text_pages_from_items(
+                packet_type, route_fields, headings, item_lines,
+                max_items_per_page=12,
+                language="ar", marker_first=True,
+            )
+            self._send_paginated_text_pages(sender, room, packet_type, pages, route_fields, language="ar")
+            return True
         # ID lookup is intentionally public: run it before the master-only
         # management gate so any member can retrieve their own server ID.
         if re.fullmatch(r"(?:ايدي|أيدي|id)(?:@(.+))?", _body_text, re.I):

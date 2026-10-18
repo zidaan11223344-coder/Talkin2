@@ -1,21 +1,51 @@
 import json
 import threading
 
-from treasure_mining import COOLDOWN_SECONDS, DIAMOND_KEYS, ITEMS, MiningStore, resolve_item_keys
+from treasure_mining import (
+    COOLDOWN_SECONDS,
+    DAILY_DIAMOND_SPAWNS,
+    DAY_SECONDS,
+    DIAMOND_KEYS,
+    ITEMS,
+    MiningStore,
+    resolve_item_keys,
+)
 
 
-def build_store(path, outcomes):
+def build_store(path, outcomes, diamonds=(), spawn_times=None):
     queue = list(outcomes)
+    diamond_queue = list(diamonds)
 
     def choose():
         return queue.pop(0) if queue else None
 
-    return MiningStore(path, chooser=choose)
+    def choose_diamond():
+        return diamond_queue.pop(0) if diamond_queue else DIAMOND_KEYS[0]
+
+    if spawn_times is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "version": 1,
+                "players": {},
+                "diamond_schedule": {
+                    "cycle_end": max(spawn_times or [0]) + DAY_SECONDS,
+                    "times": sorted(spawn_times),
+                },
+            }),
+            encoding="utf-8",
+        )
+    return MiningStore(
+        path,
+        chooser=choose,
+        diamond_chooser=choose_diamond,
+        schedule_chooser=lambda start: [start + DAY_SECONDS] * DAILY_DIAMOND_SPAWNS,
+    )
 
 
-def test_dig_is_keyed_by_numeric_user_id_and_cooldown_persists(tmp_path):
+def test_dig_is_keyed_by_numeric_user_id_and_30_second_cooldown_persists(tmp_path):
     path = tmp_path / "mining_game.json"
-    store = build_store(path, ["diamond_blue", None])
+    store = build_store(path, [None], diamonds=["diamond_blue"], spawn_times=[10_000])
 
     first = store.dig("3456782", "Ahmed", now=10_000)
     assert first["ok"] is True
@@ -24,12 +54,11 @@ def test_dig_is_keyed_by_numeric_user_id_and_cooldown_persists(tmp_path):
     assert store.inventory("3456782")["inventory"]["diamond_blue"] == 1
 
     # A changed display name still resolves to the same numeric-ID record.
-    blocked = store.dig("3456782", "أحمد الجديد", now=10_000 + 3600)
+    blocked = store.dig("3456782", "أحمد الجديد", now=10_020)
     assert blocked["error"] == "cooldown"
-    assert blocked["remaining"] == 3600
+    assert blocked["remaining"] == 10
     assert store.inventory("3456782")["username"] == "Ahmed"
 
-    # The next attempt is accepted exactly when the two-hour boundary is met.
     second = store.dig("3456782", "أحمد الجديد", now=10_000 + COOLDOWN_SECONDS)
     assert second["ok"] is True
     assert second["item_key"] is None
@@ -71,7 +100,9 @@ def test_two_concurrent_attempts_commit_only_one_mine(tmp_path):
 
 def test_redemption_reservation_is_persisted_before_credit_and_restorable(tmp_path):
     path = tmp_path / "mining_game.json"
-    store = build_store(path, ["copper", "diamond_royal"])
+    store = build_store(
+        path, ["copper"], diamonds=["diamond_royal"], spawn_times=[40_030]
+    )
     store.dig("300", "Miner", now=40_000)
     store.dig("300", "Miner", now=40_000 + COOLDOWN_SECONDS)
 
@@ -93,7 +124,12 @@ def test_redemption_reservation_is_persisted_before_credit_and_restorable(tmp_pa
 
 def test_inventory_persistence_and_diamond_leaderboard(tmp_path):
     path = tmp_path / "mining_game.json"
-    store = build_store(path, ["diamond_clear", "diamond_blue", "iron"])
+    store = build_store(
+        path,
+        ["iron"],
+        diamonds=["diamond_clear", "diamond_blue"],
+        spawn_times=[50_000, 50_000 + COOLDOWN_SECONDS],
+    )
     store.dig("9", "First", now=50_000)
     store.dig("9", "First", now=50_000 + COOLDOWN_SECONDS)
     store.dig("12", "Second", now=50_000)
@@ -104,6 +140,42 @@ def test_inventory_persistence_and_diamond_leaderboard(tmp_path):
     assert restarted.leaderboard(10)[0]["diamonds_found"] == 2
 
 
+def test_each_daily_spawn_is_claimed_by_only_the_first_miner(tmp_path):
+    path = tmp_path / "mining_game.json"
+    start = 70_000
+    store = MiningStore(
+        path,
+        chooser=lambda: "copper",
+        diamond_chooser=lambda: "diamond_red",
+        schedule_chooser=lambda moment: [moment + index * 100 for index in range(1, DAILY_DIAMOND_SPAWNS + 1)],
+    )
+    before_spawn = store.dig("101", "First", now=start)
+    assert before_spawn["item_key"] == "copper"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert len(state["diamond_schedule"]["times"]) == 15
+    assert state["diamond_schedule"]["times"] == sorted(state["diamond_schedule"]["times"])
+
+    first_after_spawn = store.dig("101", "First", now=start + 100)
+    another_miner = store.dig("202", "Second", now=start + 100)
+    assert first_after_spawn["item_key"] == "diamond_red"
+    assert another_miner["item_key"] == "copper"
+    assert store.inventory("101")["diamonds_found"] == 1
+    assert store.inventory("202")["diamonds_found"] == 0
+
+
+def test_master_test_diamond_rotates_and_is_saved_to_inventory(tmp_path):
+    store = MiningStore(tmp_path / "mining_game.json")
+    first = store.give_test_diamond("88", "Master")
+    second = store.give_test_diamond("88", "Master")
+
+    assert first["item_key"] == DIAMOND_KEYS[0]
+    assert second["item_key"] == DIAMOND_KEYS[1]
+    inventory = store.inventory("88")["inventory"]
+    assert inventory[DIAMOND_KEYS[0]] == 1
+    assert inventory[DIAMOND_KEYS[1]] == 1
+    assert store.inventory("88")["diamonds_found"] == 2
+
+
 def test_item_aliases_cover_redeem_commands():
     assert resolve_item_keys("الماس") == DIAMOND_KEYS
     assert resolve_item_keys("R نحاس") is None
@@ -111,9 +183,11 @@ def test_item_aliases_cover_redeem_commands():
     assert resolve_item_keys("royal diamond") == ("diamond_royal",)
 
 
-def test_outcome_distribution_is_complete_and_normalized():
+def test_outcome_distribution_is_complete_and_daily_diamonds_are_configured():
     from treasure_mining import OUTCOME_KEYS, OUTCOME_WEIGHTS
 
     assert sum(OUTCOME_WEIGHTS) == 10_000
     assert len(OUTCOME_KEYS) == len(OUTCOME_WEIGHTS)
     assert len(DIAMOND_KEYS) == 6
+    assert COOLDOWN_SECONDS == 30
+    assert DAILY_DIAMOND_SPAWNS == 15

@@ -2,16 +2,21 @@ import copy
 from pathlib import Path
 
 import bot as bot_module
-from treasure_mining import MiningStore
+from treasure_mining import DAY_SECONDS, MiningStore
 
 
 def test_mining_commands_use_stable_id_and_redeem_inventory_idempotently(tmp_path, monkeypatch):
-    state = {"version": 1, "players": {}}
+    state = {
+        "version": 1,
+        "players": {},
+        "diamond_schedule": {"cycle_end": 1_000.0 + DAY_SECONDS, "times": [1_000.0]},
+    }
     store = MiningStore(
         tmp_path / "mining_game.json",
-        load_json=lambda _path, default: copy.deepcopy(state if state["players"] else default),
+        load_json=lambda _path, default: copy.deepcopy(state),
         save_json=lambda _path, data: state.update(copy.deepcopy(data)),
-        chooser=lambda: "diamond_blue",
+        chooser=lambda: None,
+        diamond_chooser=lambda: "diamond_blue",
         clock=lambda: 1_000.0,
     )
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -36,7 +41,7 @@ def test_mining_commands_use_stable_id_and_redeem_inventory_idempotently(tmp_pat
 
     assert bot._execute_mining_command_with_id("Hall", "الماس", "Ahmed", "3456782")
     assert state["players"]["3456782"]["inventory"]["diamond_blue"] == 1
-    assert any("@Ahmed" in text and "ID:" not in text for _room, text in sent)
+    assert any("Ahmed عثرت على:" in text and "قيمة الاستبدال: 1,000,000 نقطة" in text for _room, text in sent)
     assert media == [("Hall", "https://assets.example/assets/treasures/diamond_blue.jpg", "image")]
 
     sent.clear()

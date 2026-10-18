@@ -16,7 +16,9 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-COOLDOWN_SECONDS = 2 * 60 * 60
+COOLDOWN_SECONDS = 30
+DAY_SECONDS = 24 * 60 * 60
+DAILY_DIAMOND_SPAWNS = 15
 
 # Price values are centralized so the point economy can be adjusted without
 # changing the mining, inventory, or redemption algorithms.
@@ -60,7 +62,7 @@ ITEMS = {
 }
 DIAMOND_KEYS = tuple(key for key, item in ITEMS.items() if item["kind"] == "diamond")
 
-# Weights sum to 10,000. A failed dig still consumes the two-hour cooldown.
+# Weights sum to 10,000. A failed dig still consumes the 30-second cooldown.
 OUTCOME_KEYS = (
     None,
     "copper", "iron", "ruby", "diamond_clear", "diamond_blue",
@@ -121,12 +123,16 @@ class MiningStore:
         save_json: Callable | None = None,
         *,
         chooser: Callable[[], str | None] | None = None,
+        diamond_chooser: Callable[[], str] | None = None,
+        schedule_chooser: Callable[[float], list[float]] | None = None,
         clock: Callable[[], float] = time.time,
     ):
         self.path = Path(path)
         self.load_json = load_json or self._load_file
         self.save_json = save_json or self._save_file
         self.chooser = chooser or self._random_outcome
+        self.diamond_chooser = diamond_chooser or self._random_diamond_outcome
+        self.schedule_chooser = schedule_chooser or self._random_diamond_spawns
         self.clock = clock
         self.lock = threading.RLock()
 
@@ -157,7 +163,13 @@ class MiningStore:
         players = raw.get("players")
         if not isinstance(players, dict):
             players = {}
-        return {"version": 1, "players": players}
+        schedule = raw.get("diamond_schedule")
+        return {
+            "version": 1,
+            "players": players,
+            "diamond_schedule": schedule if isinstance(schedule, dict) else None,
+            "test_diamond_index": raw.get("test_diamond_index", 0),
+        }
 
     def _save_state(self, data: dict) -> None:
         self.save_json(self.path, data)
@@ -180,7 +192,42 @@ class MiningStore:
 
     @staticmethod
     def _random_outcome() -> str | None:
-        return random.choices(OUTCOME_KEYS, weights=OUTCOME_WEIGHTS, k=1)[0]
+        ordinary = [
+            (key, weight)
+            for key, weight in zip(OUTCOME_KEYS, OUTCOME_WEIGHTS)
+            if key is None or key not in DIAMOND_KEYS
+        ]
+        return random.choices([key for key, _weight in ordinary], weights=[weight for _key, weight in ordinary], k=1)[0]
+
+    @staticmethod
+    def _random_diamond_outcome() -> str:
+        weights = [OUTCOME_WEIGHTS[OUTCOME_KEYS.index(key)] for key in DIAMOND_KEYS]
+        return random.choices(DIAMOND_KEYS, weights=weights, k=1)[0]
+
+    @staticmethod
+    def _random_diamond_spawns(start: float) -> list[float]:
+        return sorted(random.uniform(start, start + DAY_SECONDS) for _ in range(DAILY_DIAMOND_SPAWNS))
+
+    def _diamond_schedule(self, state: dict, now: float) -> dict:
+        schedule = state.get("diamond_schedule")
+        if not isinstance(schedule, dict) or not isinstance(schedule.get("times"), list):
+            cycle_end = now + DAY_SECONDS
+            times = self.schedule_chooser(now)
+        else:
+            try:
+                cycle_end = float(schedule.get("cycle_end", 0) or 0)
+                times = [float(value) for value in schedule.get("times", [])]
+            except (TypeError, ValueError):
+                cycle_end, times = 0.0, []
+            if cycle_end <= 0:
+                cycle_end = now + DAY_SECONDS
+                times = self.schedule_chooser(now)
+            while now >= cycle_end:
+                times = self.schedule_chooser(cycle_end)
+                cycle_end += DAY_SECONDS
+        schedule = {"cycle_end": cycle_end, "times": sorted(times)}
+        state["diamond_schedule"] = schedule
+        return schedule
 
     def dig(self, user_id: str, username: str, *, now: float | None = None) -> dict:
         """Commit one attempt and any found item before returning its result."""
@@ -199,9 +246,16 @@ class MiningStore:
             if remaining:
                 return {"ok": False, "error": "cooldown", "remaining": remaining}
 
-            item_key = self.chooser()
-            if item_key not in ITEMS:
-                item_key = None
+            schedule = self._diamond_schedule(state, moment)
+            if schedule["times"] and schedule["times"][0] <= moment:
+                schedule["times"].pop(0)
+                item_key = self.diamond_chooser()
+                if item_key not in DIAMOND_KEYS:
+                    item_key = self._random_diamond_outcome()
+            else:
+                item_key = self.chooser()
+                if item_key not in ITEMS or item_key in DIAMOND_KEYS:
+                    item_key = None
             player["last_mine_at"] = moment
             player["mines_count"] = max(0, int(player.get("mines_count", 0) or 0)) + 1
             player["inventory"] = player.get("inventory", {})
@@ -228,6 +282,28 @@ class MiningStore:
                 "item": copy.deepcopy(ITEMS[item_key]) if item_key else None,
                 "diamonds_found": int(player.get("diamonds_found", 0) or 0),
                 "cooldown_until": moment + COOLDOWN_SECONDS,
+            }
+
+    def give_test_diamond(self, user_id: str, username: str = "") -> dict:
+        """Grant the next diamond type to the master for room-image testing."""
+        uid = _valid_user_id(user_id)
+        with self.lock:
+            state = self._load_state()
+            try:
+                index = int(state.get("test_diamond_index", 0) or 0) % len(DIAMOND_KEYS)
+            except (TypeError, ValueError):
+                index = 0
+            item_key = DIAMOND_KEYS[index]
+            player = self._player(state, uid, username)
+            player["inventory"][item_key] += 1
+            player["diamonds_found"] = max(0, int(player.get("diamonds_found", 0) or 0)) + 1
+            state["test_diamond_index"] = (index + 1) % len(DIAMOND_KEYS)
+            self._save_state(state)
+            return {
+                "ok": True,
+                "item_key": item_key,
+                "item": copy.deepcopy(ITEMS[item_key]),
+                "diamonds_found": player["diamonds_found"],
             }
 
     def inventory(self, user_id: str, username: str = "") -> dict:
@@ -351,3 +427,17 @@ class MiningStore:
             player.pop("pending_redemption", None)
             self._save_state(state)
             return True
+
+
+def format_cooldown(seconds: int | float) -> str:
+    """Format a remaining cooldown compactly in Arabic."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours} ساعة و{minutes} دقيقة"
+    if minutes and seconds:
+        return f"{minutes} دقيقة و{seconds} ثانية"
+    if minutes:
+        return f"{minutes} دقيقة"
+    return f"{seconds} ثانية"
