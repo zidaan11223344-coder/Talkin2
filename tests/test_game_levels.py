@@ -7,12 +7,12 @@ import bot as bot_module
 @pytest.mark.parametrize(
     "plays, category, level, label, symbol",
     [
-        (0, "النجوم الفضية", 1, "مبتدئ", "⭐"),
-        (499, "النجوم الفضية", 1, "مبتدئ", "⭐"),
-        (500, "النجوم الفضية", 2, "لاعب ناشئ", "⭐"),
-        (2_500, "النجوم الفضية", 6, "ذهبي", "⭐"),
-        (4_500, "النجوم الفضية", 10, "أسطورة فضية", "⭐"),
-        (4_999, "النجوم الفضية", 10, "أسطورة فضية", "⭐"),
+        (0, "النجوم الفضية", 1, "مبتدئ", "🥈"),
+        (499, "النجوم الفضية", 1, "مبتدئ", "🥈"),
+        (500, "النجوم الفضية", 2, "لاعب ناشئ", "🥈"),
+        (2_500, "النجوم الفضية", 6, "ذهبي", "🥈"),
+        (4_500, "النجوم الفضية", 10, "أسطورة فضية", "🥈"),
+        (4_999, "النجوم الفضية", 10, "أسطورة فضية", "🥈"),
         (5_000, "النجوم الذهبية", 1, "ذهبي مبتدئ", "🌟"),
         (7_000, "النجوم الذهبية", 5, "ذهبي نادر", "🌟"),
         (9_500, "النجوم الذهبية", 10, "ملك الذهب", "🌟"),
@@ -55,3 +55,14 @@ def test_welcome_symbol_count_matches_level():
         assert symbol == expected_symbol
         assert welcome.endswith(expected_symbol * count)
         assert f"🏅 مستوى الألعاب: {count}" in welcome
+
+
+def test_all_game_level_titles_are_unique():
+    titles = [
+        title
+        for _category, _symbol, category_titles in (
+            bot_module.GAME_LEVEL_CATEGORIES + bot_module.GAME_LEVEL_FUTURE_CATEGORIES
+        )
+        for title in category_titles
+    ]
+    assert len(titles) == len(set(titles))
