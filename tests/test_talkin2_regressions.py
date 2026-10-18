@@ -395,6 +395,55 @@ class ProtectionAuthorizationRegressions(unittest.TestCase):
                 self.assertFalse(bot_module._load_moderation_config()[0])
 
 
+class RuntimeCleanupRegressions(unittest.TestCase):
+    def test_cleanup_worker_runs_once_then_waits_one_hour(self):
+        class StopAfterWait:
+            def __init__(self):
+                self.waited = []
+
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                self.waited.append(seconds)
+                return True
+
+        stop = StopAfterWait()
+        with patch.object(bot_module, "CLEANUP_INTERVAL_SECONDS", 3600), patch.object(
+            bot_module, "_cleanup_runtime_files"
+        ) as cleanup:
+            bot_module._runtime_cleanup_worker(stop_event=stop)
+        cleanup.assert_called_once_with(bot=None)
+        self.assertEqual(stop.waited, [3600])
+
+    def test_cleanup_removes_old_generated_files_but_preserves_persistent_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            data_dir = base / "bot_data"
+            generated = base / "generated_music"
+            data_dir.mkdir()
+            generated.mkdir()
+            state = data_dir / "member_state.json"
+            state.write_text('{"balance": 12}', encoding="utf-8")
+            temporary = generated / "old_track.mp3"
+            temporary.write_bytes(b"old")
+            old = time.time() - 7200
+            os.utime(temporary, (old, old))
+            with patch.object(bot_module, "BASE_DIR", base), patch.object(
+                bot_module, "DATA_DIR", data_dir
+            ), patch.object(bot_module, "CLEANUP_MAX_AGE_SECONDS", 3600), patch.object(
+                bot_module, "CLEANUP_GENERATED_ENABLED", True
+            ), patch.object(bot_module, "CLEANUP_AUDIO_ENABLED", False), patch.object(
+                bot_module, "CLEANUP_CACHE_ENABLED", False
+            ), patch.object(bot_module, "CLEANUP_TMP_ENABLED", False), patch.object(
+                bot_module, "CLEANUP_LOG_ENABLED", False
+            ):
+                result = bot_module._cleanup_runtime_files()
+            self.assertFalse(temporary.exists())
+            self.assertTrue(state.exists())
+            self.assertEqual(result["files"], 1)
+
+
 class RoomExclusionRegressions(unittest.TestCase):
     def test_unauthorized_room_is_persisted_skipped_and_only_manual_join_clears_it(self):
         class NoOpTimer:
