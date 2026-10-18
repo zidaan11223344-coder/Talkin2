@@ -387,6 +387,7 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
         bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
         bot.request_room_occupants = lambda *_args, **_kwargs: True
+        bot.send_room_text = lambda *_args, **_kwargs: True
         bot.log = lambda *_args: None
         with patch.object(bot_module, "_save_persistent_rooms"):
             bot._handle_room_event_impl({"room_event": {1: "you_joined", 13: "Hall"}})

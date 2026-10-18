@@ -22680,6 +22680,7 @@ class TalkinBot:
             self._blocked_room_notices.discard(rnorm)
             if room:
                 self.known_rooms.add(room)
+                self.send_room_text(room, "انا جيت ادري اشتقتولي😚😚😚😚")
                 _save_persistent_rooms(self.known_rooms)
             requester = str((pending_join or {}).get("requested_by", "") or "").strip()
             # Confirm immediately when the server ACK arrives. Roster loading
