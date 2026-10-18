@@ -7822,8 +7822,10 @@ class TalkinBot:
             recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
             state["attempts"] = recent_attempts + [now]
             # Never permanently give up after repeated transient disconnects.
-            # Cap retries at one every five minutes to avoid flooding the server.
-            delay = max(float(delay), min(300.0, 1.2 * (2 ** min(len(recent_attempts), 8))))
+            # A confirmed join resets the retry history below; cap the backoff
+            # at 15 seconds so room-specific server drops do not leave the bot
+            # absent for minutes while still avoiding a rapid join flood.
+            delay = max(float(delay), min(15.0, 1.2 * (2 ** min(len(recent_attempts), 4))))
             generation = int(getattr(self, "_connection_generation", 0))
             self._auto_rejoin_pending.add(room_key)
         def _rejoin_worker():
@@ -21527,6 +21529,9 @@ class TalkinBot:
             rejoin_state = getattr(self, "_auto_rejoin_state", {}).get(rnorm)
             if rejoin_state is not None:
                 rejoin_state["joined_at"] = time.monotonic()
+                # A successful server acknowledgement ends the previous retry
+                # episode even if a room later drops the bot again soon.
+                rejoin_state["attempts"] = []
             auto_pending = getattr(self, "_auto_rejoin_pending", None)
             if auto_pending is not None:
                 lock = getattr(self, "_auto_rejoin_lock", None)

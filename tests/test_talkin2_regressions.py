@@ -329,6 +329,7 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         bot._room_bulk_lock = threading.RLock()
         bot.log = lambda *_args: None
         attempts = []
+        delays = []
         bot.join_room = lambda room, **kwargs: attempts.append((room, kwargs)) or True
 
         class ImmediateThread:
@@ -338,11 +339,13 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
                 self.target()
 
         with patch.object(bot_module.threading, "Thread", ImmediateThread), patch.object(
-            bot_module.time, "sleep", lambda *_args: None
+            bot_module.time, "sleep", lambda delay: delays.append(delay)
         ):
             for _ in range(12):
                 bot._schedule_auto_rejoin("Hall", delay=0)
         self.assertEqual(len(attempts), 12)
+        self.assertEqual(len(delays), 12)
+        self.assertLessEqual(max(delays), 15.0)
         state = next(iter(bot._auto_rejoin_state.values()))
         self.assertEqual(len(state["attempts"]), 12)
 
