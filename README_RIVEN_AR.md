@@ -22,10 +22,10 @@ RIVEN_DATABASE_KIND=mysql
 # اختياري فقط إذا أعطاك Riven رابط اتصال جاهزاً:
 RIVEN_DATABASE_URL=
 GITHUB_SYNC=1
-GITHUB_REPO=zidaan11223344-coder/Talkin4
+GITHUB_REPO=zidaan11223344-coder/Talkin-ID-Data
 GITHUB_BRANCH=main
 GITHUB_DATA_DIR=bot_data
-GITHUB_TOKEN=<توكن GitHub بصلاحية الكتابة إلى Talkin4>
+GITHUB_TOKEN=<REDACTED_IN_ARCHIVE>
 DATABASE_BACKUP_INTERVAL_SECONDS=21600
 GITHUB_JSON_MIRROR=0
 ```
@@ -41,7 +41,7 @@ GITHUB_JSON_MIRROR=0
 - يحتفظ بملفات JSON محلياً كـCache وخطة احتياط.
 - عند إعادة التشغيل، يستعيد البيانات من PostgreSQL قبل تشغيل البوت.
 - لا يرفع كل تغيير إلى GitHub عند تفعيل PostgreSQL.
-- ينشئ نسخة JSON مجمعة إلى مجلد `bot_data` في Talkin4 كل 6 ساعات افتراضياً.
+- ينشئ نسخة JSON مجمعة إلى مجلد `bot_data` في Talkin-ID-Data كل 6 ساعات افتراضياً.
 - يمكن تنفيذ النسخ فوراً من أمر الماستر:
 
 ```text
@@ -52,7 +52,7 @@ GITHUB_JSON_MIRROR=0
 
 1. أنشئ قاعدة PostgreSQL باسم `talkin_bot_db` في Riven.
 2. انسخ `Host` إلى `RIVEN_DB_HOST`، و`Port` إلى `RIVEN_DB_PORT`، و`Database` إلى `RIVEN_DATABASE_NAME`، و`Username` إلى `RIVEN_DB_USER`، و`Password` إلى `RIVEN_DB_PASSWORD` داخل `.env`.
-3. أضف `GITHUB_TOKEN` بصلاحية الكتابة إلى مستودع Talkin4 الخاص داخل `.env`.
+3. أضف `GITHUB_TOKEN` بصلاحية الكتابة إلى مستودع Talkin-ID-Data الخاص داخل `.env`.
 4. أعد تشغيل الخدمة.
 5. ابحث في سجل التشغيل عن:
 
@@ -64,7 +64,7 @@ GITHUB_JSON_MIRROR=0
 
 ## ملاحظات أمان
 
-- اجعل مستودع Talkin4 خاصاً؛ النسخ قد تحتوي على نقاط وأسماء مستخدمين وإعدادات حظر.
+- اجعل مستودع Talkin-ID-Data خاصاً؛ النسخ قد تحتوي على نقاط وأسماء مستخدمين وإعدادات حظر.
 - لا ترفع ملف `.env` إلى GitHub؛ أضفه إلى `.gitignore` إن لم يكن موجوداً.
 - لا تضع رابط قاعدة البيانات أو توكن GitHub داخل أي ملف يتم رفعه إلى المستودع.
 - لا تغيّر `GITHUB_JSON_MIRROR` إلى `1` إلا إذا أردت مرآة GitHub مع كل حفظ؛ القيمة `0` هي الأفضل لتقليل الحمل.
@@ -72,7 +72,7 @@ GITHUB_JSON_MIRROR=0
 
 ## لعبة الكركيت
 
-تم دمج لعبة الكركيت داخل `Talkin2` مع نفس طبقة حفظ الحالة. أضف هذه المتغيرات إلى خدمة RavenHost:
+تم دمج لعبة الكركيت داخل `Talkin-ID` مع نفس طبقة حفظ الحالة. أضف هذه المتغيرات إلى خدمة RavenHost:
 
 ```text
 BOT_DATA_DIR=/data/talkin2

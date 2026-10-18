@@ -35,28 +35,13 @@ def _save(data: dict) -> None:
     os.replace(tmp, SHOP_PATH)
 
 
-def _user_keys(username: str, user_id: str = "", aliases=()) -> list[str]:
-    keys = []
-    uid = str(user_id or "").strip()
-    if uid.isdigit():
-        keys.append(f"id:{uid}")
-    if isinstance(aliases, str):
-        aliases = (aliases,)
-    for value in (username, *(aliases or ())):
-        key = str(value or "").strip().lstrip("@").casefold()
-        if key and key not in keys:
-            keys.append(key)
-    return keys
-
-
-def purchase(username: str, item_id: int, room: str = "", *, user_id: str = "", aliases=()) -> tuple[bool, str]:
+def purchase(username: str, item_id: int, room: str = "") -> tuple[bool, str]:
     """Return a durable entitlement record; caller debits points transactionally."""
     item = ITEMS.get(int(item_id))
     if not item:
         return False, "❌ رقم العنصر غير موجود. أرسل متجر لعرض العناصر."
     now = time.time()
-    user_keys = _user_keys(username, user_id, aliases)
-    user_key = user_keys[0] if user_id and str(user_id).strip().isdigit() else (user_keys[0] if user_keys else "")
+    user_key = str(username or "").strip().lstrip("@").casefold()
     room_key = str(room or "").strip().casefold()
     if not user_key:
         return False, "❌ تعذر تحديد حساب المشتري."
@@ -64,25 +49,13 @@ def purchase(username: str, item_id: int, room: str = "", *, user_id: str = "", 
     subject = room_key if bucket == "rooms" else user_key
     with SHOP_LOCK:
         data = _load()
-        bucket_data = data.setdefault(bucket, {})
-        current = bucket_data.get(subject)
-        if current is None and bucket == "users":
-            old_key = next((key for key in user_keys[1:] if key in bucket_data), "")
-            if old_key:
-                current = bucket_data.pop(old_key)
-                bucket_data[subject] = current
-        if not isinstance(current, dict):
-            current = {}
-            bucket_data[subject] = current
+        current = data.setdefault(bucket, {}).setdefault(subject, {})
         kind = item["kind"]
         old = current.get(kind)
         if item["seconds"] and isinstance(old, dict) and float(old.get("expires_at", 0) or 0) > now:
             return False, "⏳ لديك هذا العنصر فعال بالفعل؛ لا يمكن تكديس المدة."
         if item["seconds"]:
-            current[kind] = {
-                "expires_at": now + int(item["seconds"]), "buyer": username,
-                "user_id": str(user_id or ""), "room": room,
-            }
+            current[kind] = {"expires_at": now + int(item["seconds"]), "buyer": username, "room": room}
         else:
             owned = set(current.get("unlocks", []))
             if kind in owned:
@@ -93,38 +66,29 @@ def purchase(username: str, item_id: int, room: str = "", *, user_id: str = "", 
     return True, ""
 
 
-def active(kind: str, *, username: str = "", room: str = "", user_id: str = "", aliases=()) -> bool:
+def active(kind: str, *, username: str = "", room: str = "") -> bool:
     now = time.time()
-    keys = _user_keys(username, user_id, aliases)
-    key = keys[0] if user_id and str(user_id).strip().isdigit() else (keys[0] if keys else "")
+    key = str(username or "").strip().lstrip("@").casefold()
     rkey = str(room or "").strip().casefold()
     with SHOP_LOCK:
         data = _load()
         if kind in {"room_bomb", "room_roster"}:
             entry = (data.get("rooms") or {}).get(rkey, {}).get(kind, {})
         else:
-            users = data.get("users") or {}
-            user = next((users[candidate] for candidate in keys if isinstance(users.get(candidate), dict)), {})
-            entry = user.get(kind, {})
+            entry = (data.get("users") or {}).get(key, {}).get(kind, {})
         if kind in {"custom_welcome", "image_welcome"}:
-            return kind in (user.get("unlocks") or [])
+            return kind in ((data.get("users") or {}).get(key, {}).get("unlocks") or [])
         return isinstance(entry, dict) and float(entry.get("expires_at", 0) or 0) > now
 
 
-def remaining(kind: str, *, username: str = "", room: str = "", user_id: str = "", aliases=()) -> int:
-    keys = _user_keys(username, user_id, aliases)
-    key = keys[0] if user_id and str(user_id).strip().isdigit() else (keys[0] if keys else "")
+def remaining(kind: str, *, username: str = "", room: str = "") -> int:
+    key = str(username or "").strip().lstrip("@").casefold()
     rkey = str(room or "").strip().casefold()
     with SHOP_LOCK:
         data = _load()
         bucket = "rooms" if kind.startswith("room_") else "users"
         subject = rkey if bucket == "rooms" else key
-        bucket_data = data.get(bucket) or {}
-        if bucket == "users":
-            user = next((bucket_data[candidate] for candidate in keys if isinstance(bucket_data.get(candidate), dict)), {})
-            row = user.get(kind) or {}
-        else:
-            row = (bucket_data.get(subject) or {}).get(kind) or {}
+        row = ((data.get(bucket) or {}).get(subject) or {}).get(kind) or {}
         return max(0, int(float(row.get("expires_at", 0) or 0) - time.time()))
 
 

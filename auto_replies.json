@@ -1,4 +1,6 @@
 {
-  "enabled": true,
-  "replies": {}
+  "auto_replies_enabled": true,
+  "auto_replies": {},
+  "departure_farewell_enabled": true,
+  "departure_replies": {}
 }
