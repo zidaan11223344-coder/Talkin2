@@ -23664,7 +23664,28 @@ class TalkinBot:
             and bool(event.get(6, ""))
         )
         if not is_text:
-            return self.handle_room_event(result)
+            # Presence/member/system room events can arrive in large bursts when
+            # the bot joins several rooms. Some handlers perform storage work or
+            # send follow-up queries; running them on the sole protocol worker
+            # delays decoding subsequent chat commands across every room.
+            # Route them through the shared per-room ordered event queue instead.
+            executor_name = "_room_event_executor"
+            lock_name = "_room_event_executor_lock"
+            executor = getattr(self, executor_name, None)
+            if executor is None:
+                lock = getattr(self, lock_name, None)
+                if lock is None:
+                    lock = threading.Lock()
+                    setattr(self, lock_name, lock)
+                with lock:
+                    executor = getattr(self, executor_name, None)
+                    if executor is None:
+                        executor = ThreadPoolExecutor(
+                            max_workers=max(2, int(os.getenv("ROOM_EVENT_WORKERS", "8") or 8)),
+                            thread_name_prefix="room-event",
+                        )
+                        setattr(self, executor_name, executor)
+            return self._enqueue_room_event_serially(result, executor)
         body = str(event.get(6, "") or "")
         is_media = _looks_like_media_command(body)
         is_priority = _looks_like_priority_command(body)
