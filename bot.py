@@ -523,7 +523,7 @@ AUTO_JOIN_ALL_ROOMS = (
 # automatic joins; commands that truly need a numeric ID still request it on demand.
 BACKGROUND_ID_SYNC_ON_JOIN = os.getenv("BACKGROUND_ID_SYNC_ON_JOIN", "0").strip().casefold() in {"1", "true", "yes", "on"}
 # Automatic roster rebuilding is paused by default: usernames drive normal gameplay; IDs are fetched only on demand.
-ROSTER_BACKGROUND_SYNC_ENABLED = os.getenv("ROSTER_BACKGROUND_SYNC_ENABLED", "1").strip().casefold() in {"1", "true", "yes", "on"}
+ROSTER_BACKGROUND_SYNC_ENABLED = os.getenv("ROSTER_BACKGROUND_SYNC_ENABLED", "0").strip().casefold() in {"1", "true", "yes", "on"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -22640,9 +22640,11 @@ class TalkinBot:
                 # Start a fresh history for this bot entry/re-entry. Members
                 # who were already in the room are NOT part of .r.
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
-                # Do not request a roster during room entry. A single delayed,
-                # low-rate worker rebuilds IDs after room restoration settles.
-                self._start_low_priority_roster_sync()
+                # Never start a members_list sweep from a room-entry event.
+                # The same WebSocket carries chat/game traffic, so even a
+                # paced sweep can delay messages while many rooms reconnect.
+                # IDs continue to be learned from message events and explicit
+                # on-demand ID/mining lookups in the background.
 
         elif event_type == "user_left" and username:
             self.room_users.get(room, {}).pop(username, None)
