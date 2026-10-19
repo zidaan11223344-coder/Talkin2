@@ -3163,6 +3163,10 @@ def _format_saved_accounts(title, data, empty_text):
 _ROSTER_PERSIST_LOCK = threading.RLock()
 _ROSTER_ASYNC_STATE_LOCK = threading.Lock()
 _ROSTER_ASYNC_LAST = {}
+_ROSTER_ASYNC_PENDING = {}
+_ROSTER_ASYNC_QUEUED = set()
+_ROSTER_ASYNC_QUEUE = queue.Queue(maxsize=256)
+_ROSTER_ASYNC_WORKER_STARTED = False
 
 
 def _remember_roster(room, users):
@@ -3247,14 +3251,19 @@ def _remember_roster_impl(room, users):
 
 
 def _remember_roster_async(room, users):
-    """Persist newly observed username/ID pairs without blocking commands."""
+    """Queue username/ID persistence without creating a thread per event.
+
+    Room events can arrive in bursts, especially after ``members_list``.  A
+    thread per burst caused scheduler/JSON-write pressure and competed with
+    game workers.  Keep one bounded worker, coalesce pending updates by room,
+    and let the event/command threads return immediately.
+    """
+    global _ROSTER_ASYNC_WORKER_STARTED
     snapshot = [dict(user) for user in (users or []) if isinstance(user, dict)]
     if not snapshot:
         return False
-    # Room text events can repeat the same sender identity for every game
-    # command. Do not start a JSON write thread for each message; that thread
-    # storm competes with game workers even though the identity is unchanged.
     now = time.monotonic()
+    accepted = False
     for user in snapshot:
         username = _norm_user(user.get("username"))
         user_id = str(user.get("user_id") or "").strip()
@@ -3264,24 +3273,63 @@ def _remember_roster_async(room, users):
             if previous and previous[0] == user_id and now - previous[1] < 60.0:
                 continue
             _ROSTER_ASYNC_LAST[key] = (user_id, now)
-        break
-    else:
+            accepted = True
+    if not accepted:
         return False
-    def persist():
-        try:
-            _remember_roster(room, snapshot)
-        except Exception as exc:
-            # Background exceptions otherwise only appear as an unstructured
-            # thread traceback and can be missed by deployment log filters.
-            print(f"[ROSTER] background identity save failed: {exc!r}", flush=True)
 
-    worker = threading.Thread(
-        target=persist,
-        name="persist-member-identity",
-        daemon=True,
-    )
-    worker.start()
+    room_key = _norm_room(room)
+    with _ROSTER_ASYNC_STATE_LOCK:
+        pending = _ROSTER_ASYNC_PENDING.setdefault(room_key, {})
+        for user in snapshot:
+            username = str(user.get("username") or "").strip()
+            if username:
+                pending[_norm_user(username)] = user
+        should_queue = room_key not in _ROSTER_ASYNC_QUEUED
+        if should_queue:
+            _ROSTER_ASYNC_QUEUED.add(room_key)
+    if should_queue:
+        try:
+            _ROSTER_ASYNC_QUEUE.put_nowait(room_key)
+        except queue.Full:
+            # Never make a command wait for persistence. The coalesced update
+            # remains in memory and will be retried by the next roster event.
+            with _ROSTER_ASYNC_STATE_LOCK:
+                _ROSTER_ASYNC_QUEUED.discard(room_key)
+            return False
+
+    if not _ROSTER_ASYNC_WORKER_STARTED:
+        with _ROSTER_ASYNC_STATE_LOCK:
+            if not _ROSTER_ASYNC_WORKER_STARTED:
+                _ROSTER_ASYNC_WORKER_STARTED = True
+                threading.Thread(
+                    target=_roster_async_worker,
+                    name="persist-member-identity",
+                    daemon=True,
+                ).start()
     return True
+
+def _roster_async_worker():
+    """Single low-contention writer for all background roster updates."""
+    while True:
+        room_key = _ROSTER_ASYNC_QUEUE.get()
+        try:
+            with _ROSTER_ASYNC_STATE_LOCK:
+                batch = _ROSTER_ASYNC_PENDING.pop(room_key, {})
+            if batch:
+                _remember_roster(room_key, list(batch.values()))
+        except Exception as exc:
+            print(f"[ROSTER] background identity save failed: {exc!r}", flush=True)
+        finally:
+            with _ROSTER_ASYNC_STATE_LOCK:
+                _ROSTER_ASYNC_QUEUED.discard(room_key)
+                # A new update may have arrived while this room was writing.
+                if room_key in _ROSTER_ASYNC_PENDING:
+                    _ROSTER_ASYNC_QUEUED.add(room_key)
+                    try:
+                        _ROSTER_ASYNC_QUEUE.put_nowait(room_key)
+                    except queue.Full:
+                        _ROSTER_ASYNC_QUEUED.discard(room_key)
+            _ROSTER_ASYNC_QUEUE.task_done()
 
 
 def _game_control_data():
@@ -19295,8 +19343,11 @@ class TalkinBot:
                     username = str(user.get("username") or "").strip()
                     if username:
                         self.room_users.setdefault(room, {})[username] = str(user.get("role") or "none")
-                _remember_roster(room, clean)
-                self.log(f"[ROSTER] saved {len(clean)} member IDs for {_norm_room(room)} in background")
+                # Keep the response worker focused on routing follow-ups. The
+                # potentially large JSON merge/write is coalesced by the one
+                # low-priority roster writer and never runs here.
+                _remember_roster_async(room, clean)
+                self.log(f"[ROSTER] queued {len(clean)} member IDs for {_norm_room(room)} background sync")
             for followup in followups or []:
                 if not isinstance(followup, dict):
                     continue
@@ -22632,9 +22683,13 @@ class TalkinBot:
                 # Start a fresh history for this bot entry/re-entry. Members
                 # who were already in the room are NOT part of .r.
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
-                # Do not request a roster during room entry. A single delayed,
-                # low-rate worker rebuilds IDs after room restoration settles.
-                self._start_low_priority_roster_sync()
+                # Do not request a roster during room entry unless explicitly
+                # enabled. ID rebuilding is intentionally opt-in because a
+                # full members_list can be expensive in busy/large rooms.
+                # When enabled it runs in the delayed, serialized background
+                # worker and never blocks the event or command path.
+                if BACKGROUND_ID_SYNC_ON_JOIN:
+                    self._start_low_priority_roster_sync()
 
         elif event_type == "user_left" and username:
             self.room_users.get(room, {}).pop(username, None)
