@@ -251,3 +251,13 @@ def test_stored_user_id_looks_up_case_insensitively_across_rooms():
 def test_canonical_message_username_prefers_username_over_numeric_transport_id():
     assert bot_module._canonical_message_username("3456782", "Ahmed", "opaque-token") == "Ahmed"
     assert bot_module._canonical_message_username("3456782", "") == ""
+
+
+def test_lightweight_room_command_uses_direct_event_path():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    calls = []
+    bot.handle_room_event = lambda result: calls.append(result) or True
+    result = {"room_event": {1: "text", 6: "ns", 13: "Hall"}}
+    assert bot._dispatch_room_event(result) is True
+    assert calls == [result]
+    assert not hasattr(bot, "_room_command_executor")

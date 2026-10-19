@@ -2835,6 +2835,26 @@ def _looks_like_priority_command(text):
         for name in game_names
     )
 
+def _is_fast_room_command(text):
+    """Identify commands safe to run inline on the event worker.
+
+    The original fast bot handled ordinary commands directly after decoding a
+    frame. Keep that low-latency path for games, navigation, and short admin
+    actions, while routing operations that wait for another server response or
+    perform media/network work to their background executors.
+    """
+    value = str(text or "").strip()
+    low = value.casefold()
+    if not value or _looks_like_media_command(value):
+        return False
+    if re.match(r"^(?:la@|l@[amobx*]|is@|inv(?:msg)?@|رساله@|رسالة@)", low, re.I):
+        return False
+    if re.match(r"^(?:دخول@|خروج(?:\s|$)|leave(?:\s|$)|exit(?:\s|$))", low, re.I):
+        return False
+    if low in {"inv", "دعوات", "invite", "l@all", "l@*", "l@x"}:
+        return False
+    return _is_ns_command(value) or _looks_like_priority_command(value) or _looks_like_bot_command(value)
+
 
 def _publish_description(text):
     """Return the description part of a publish command without losing @/newlines."""
@@ -23590,6 +23610,12 @@ class TalkinBot:
         is_media = _looks_like_media_command(body)
         is_priority = _looks_like_priority_command(body)
         is_command = _looks_like_bot_command(body)
+        # Fast path copied from the reference bot: short commands are handled
+        # immediately after the frame is decoded, avoiding a second executor
+        # hand-off and its scheduling latency. Slow operations remain isolated
+        # below so music, roster queries, and room joins cannot block commands.
+        if _is_fast_room_command(body):
+            return self.handle_room_event(result)
         # Music searches/downloads can take many seconds (or longer when a
         # provider fails). Give them an isolated, deliberately small pool so
         # repeated music requests cannot consume workers used for chat commands.
