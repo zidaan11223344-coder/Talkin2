@@ -4860,13 +4860,12 @@ def _money_game_win_text(game, username, language="ar"):
     name = str(username or "").strip().lstrip("@")
     amount = "1b" if game == "billion" else "1m"
     stars = "⭐" * 9
+    symbol = "💎" if game == "billion" else "🏦"
     if language == "en":
         title = "billion" if game == "billion" else "million"
-        return (f"🏆✨ Congratulations! You got the {title}! ✨🏆\n\n"
-                f"✅ {name}\n💰 Prize: +{amount} points\n🎉 Congrats, champ!\n{stars}")
-    title = "المليار" if game == "billion" else "المليون"
-    return (f"🏆✨ مبروك! تم الحصول على {title} ✨🏆\n\n"
-            f"✅ {name}\n💰 مبلغ الفوز: +{amount} نقطة\n🎉 مبروك يا بطل!\n{stars}")
+        return f"{symbol} @{name} got {title}: +{amount} {symbol}"
+    title = "مليار" if game == "billion" else "مليون"
+    return f"{symbol} @{name} تم الحصول على {title}: +{amount} {symbol}"
 
 
 def _money_game_short_win_text(game, username, language="ar"):
@@ -4876,10 +4875,10 @@ def _money_game_short_win_text(game, username, language="ar"):
     title = ("billion" if game == "billion" else "million") if language == "en" else (
         "المليار" if game == "billion" else "المليون"
     )
-    decoration = "💵💸" if game == "billion" else "🟩🟨🏆"
+    symbol = "💎" if game == "billion" else "🏦"
     if language == "en":
-        return f"{decoration}✨ @{name} won the {title}! ✨{decoration}"
-    return f"{decoration}✨ حصل @{name} على {title}! ✨{decoration}"
+        return f"{symbol} @{name} won {title} {symbol}"
+    return f"{symbol} @{name} حصل على {title} {symbol}"
 
 
 DEFAULT_REPLY_MESSAGES = {
@@ -16271,15 +16270,15 @@ class TalkinBot:
             return True
         english = self._configured_room_language(room) == "en"
         if english:
-            self.send_room_text(room, f"🏦✨ Million Bank ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the prize...\n━━━━━━━━━━━━━━")
+            self.send_room_text(room, f"🏦 {sender_name}\n🏦 Searching for million 🏦")
         else:
-            self.send_room_text(room, f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن الجائزة...\n━━━━━━━━━━━━━━")
+            self.send_room_text(room, f"🏦 {sender_name}\n🏦 جاري البحث عن مليون 🏦")
         won = _money_game_roll("million")
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
         if not won:
-            loss_text = (f"🏦 Million Bank\n━━━━━━━━━━━━━━\n❌ {sender_name}, no luck this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
-                         if english else f"🏦 بنك مليون\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحالفه الحظ هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
+            loss_text = (f"🏦 {sender_name}\n🏦 No million this time 🏦"
+                         if english else f"🏦 {sender_name}\n🏦 لم يتم الحصول على مليون 🏦")
             # محاولة الحصول على المليون تبقى داخل الغرفة التي أُرسلت منها.
             self.send_room_text(room, loss_text)
             return True
@@ -17837,9 +17836,9 @@ class TalkinBot:
                 return True
             english = self._configured_room_language(room) == "en"
             if english:
-                self.send_room_text(room, f"🎰✨ Billion game ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the billion...\n━━━━━━━━━━━━━━")
+                self.send_room_text(room, f"💎 {sender_name}\n💎 Searching for billion 💎")
             else:
-                self.send_room_text(room, f"🎰✨ لعبة المليار ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن مليار...\n━━━━━━━━━━━━━━")
+                self.send_room_text(room, f"💎 {sender_name}\n💎 جاري البحث عن مليار 💎")
             won = _money_game_roll("billion")
             reward = 1000000000 if won else 0
             _record_game(sender_name, "billion", reward, 0)
@@ -17872,8 +17871,8 @@ class TalkinBot:
                     before_each_room=announce_winner_text,
                 )
             else:
-                loss_text = (f"🎰🍀 Billion game\n━━━━━━━━━━━━━━\n❌ {sender_name} did not get the billion this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
-                             if english else f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحصل على المليار هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
+                loss_text = (f"💎 {sender_name}\n💎 No billion this time 💎"
+                             if english else f"💎 {sender_name}\n💎 لم يتم الحصول على مليار 💎")
                 self.send_room_text(room, loss_text)
             return True
         if game_low in ("حظ","الحظ","luck"):
@@ -22707,13 +22706,11 @@ class TalkinBot:
                 # Start a fresh history for this bot entry/re-entry. Members
                 # who were already in the room are NOT part of .r.
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
-                # Do not request a roster during room entry unless explicitly
-                # enabled. ID rebuilding is intentionally opt-in because a
-                # full members_list can be expensive in busy/large rooms.
-                # When enabled it runs in the delayed, serialized background
-                # worker and never blocks the event or command path.
-                if BACKGROUND_ID_SYNC_ON_JOIN:
-                    self._start_low_priority_roster_sync()
+                # Never synchronize the full member roster automatically on
+                # room entry/re-entry. This avoids repeated expensive requests
+                # during startup/redeploy or when joining several rooms.
+                # Existing saved IDs are reused; targeted/on-demand lookups
+                # remain available to commands that genuinely need an ID.
 
         elif event_type == "user_left" and username:
             self.room_users.get(room, {}).pop(username, None)
