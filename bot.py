@@ -3044,18 +3044,30 @@ def _stored_user_aliases(username, preferred_room=""):
 
 
 def _user_identity_key(username, preferred_room=""):
-    # Commands and game state are keyed by the name received in the message.
-    # A native numeric ID is deliberately only a fallback when the transport
-    # supplies no usable username; never make a command wait for roster data.
+    # Username is the primary identity for commands, points, and games.
+    # Numeric IDs are retained as reference metadata for future features only.
     raw = str(username or "").strip().lstrip("@")
-    if raw and not raw.isdigit():
-        return _norm_user(raw)
-    user_id = _stored_user_id(raw, preferred_room)
-    return f"id:{user_id}" if user_id else _norm_user(raw)
+    return _norm_user(raw)
 
 
 def _save_persistent_rosters(rosters):
     _save_local_json(ROOM_USERS_FILE, {"version": 1, "rooms": rosters})
+
+
+def _reset_room_rosters_for_fresh_id_build():
+    """Replace only the saved room-member roster so IDs are rebuilt this run.
+
+    Game points, verification, gifts, and all other data files are untouched.
+    This runs after startup restore, so the old GitHub snapshot is replaced too.
+    """
+    try:
+        with _ROSTER_PERSIST_LOCK:
+            _save_persistent_rosters({})
+        print("[ROSTER] cleared room_users.json; rebuilding member IDs gradually in background", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[ROSTER] could not reset room_users.json: {exc!r}", flush=True)
+        return False
 
 def _persistent_roster_users(room):
     data = _persistent_rosters()
@@ -3195,7 +3207,9 @@ def _remember_roster_impl(room, users):
         if not user_id.isdigit():
             user_id = ""
         normalized_name = _norm_user(username)
-        existing_key = (by_id.get(user_id, [""])[0] if user_id else "") or by_name.get(normalized_name, "")
+        # Username is the canonical roster key. Numeric ID is saved as a
+        # secondary reference, never used to merge two different usernames.
+        existing_key = by_name.get(normalized_name, "")
         existing_id = ""
         aliases = []
         old_value = current.get(existing_key)
@@ -3207,13 +3221,11 @@ def _remember_roster_impl(room, users):
                 aliases.extend(str(alias).strip().lstrip("@") for alias in old_aliases if str(alias).strip())
             if _norm_user(old_name) != normalized_name:
                 aliases.append(old_name)
-        if user_id:
-            for old_key in by_id.get(user_id, []):
-                current.pop(old_key, None)
-            storage_key = user_id
-        else:
+        if not user_id:
             user_id = existing_id if existing_id.isdigit() else ""
-            storage_key = existing_key or normalized_name
+        storage_key = normalized_name
+        if existing_key and existing_key != storage_key:
+            current.pop(existing_key, None)
         aliases = list(dict.fromkeys(
             alias for alias in aliases
             if alias and _norm_user(alias) != normalized_name
@@ -3814,20 +3826,8 @@ def _game_record_matches(data, username):
         stored_name = candidate.get("username") or key
         if _game_name_key(stored_name) == wanted:
             matches.append((str(key), candidate))
-    if matches:
-        return matches
-    # Only consult the saved/native ID when the current username has no direct
-    # record. This preserves old renamed accounts without slowing normal games.
-    wanted_id = _stored_user_id(username)
-    if not wanted_id:
-        return []
-    for key, candidate in data.items():
-        if not isinstance(candidate, dict):
-            continue
-        stored_name = candidate.get("username") or key
-        stored_id = str(candidate.get("user_id") or _stored_user_id(stored_name) or "").strip()
-        if stored_id == wanted_id:
-            matches.append((str(key), candidate))
+    # Username is authoritative. IDs are stored for future reference only and
+    # must not merge separate username records or change current game identity.
     return matches
 
 
@@ -3881,9 +3881,6 @@ def _coalesce_game_records(data, username):
     if not merged:
         return _user_identity_key(username), {}
     stable_key = _user_identity_key(username)
-    if stable_key.startswith("id:"):
-        merged["user_id"] = stable_key.split(":", 1)[1]
-        key = stable_key
     data[key] = merged
     wanted_keys = {record_key for record_key, _item in _game_record_matches(data, username)}
     for duplicate_key in wanted_keys - {key}:
@@ -3903,8 +3900,7 @@ def _game_aggregate_map(data):
         if not isinstance(item, dict):
             continue
         name = str(item.get("username") or key).strip().lstrip("@")
-        user_id = str(item.get("user_id") or _stored_user_id(name) or "").strip()
-        canonical = f"id:{user_id}" if user_id.isdigit() else _game_name_key(name)
+        canonical = _game_name_key(name)
         if not canonical:
             continue
         games = item.get("games") if isinstance(item.get("games"), dict) else {}
@@ -3965,8 +3961,7 @@ def _dedupe_persisted_game_files():
             if not isinstance(item, dict):
                 continue
             username = str(item.get("username") or key).strip().lstrip("@")
-            user_id = str(item.get("user_id") or _stored_user_id(username) or "").strip()
-            canonical = f"id:{user_id}" if user_id.isdigit() else _game_name_key(username)
+            canonical = _game_name_key(username)
             if not canonical:
                 continue
             current = merged_players.get(canonical)
@@ -7120,6 +7115,9 @@ class TalkinBot:
         self._pending_room_lists = {}
         self._room_id_sync_lock = threading.RLock()
         self._room_id_sync_last = {}
+        self._room_id_sync_worker_started = False
+        self._room_id_sync_worker_lock = threading.Lock()
+        self._room_id_sync_seen = set()
         self._pending_presence = {}
         # Live profile photos learned from Talkin UserItem field 3.
         # username(casefold) -> public photo URL.
@@ -18485,7 +18483,7 @@ class TalkinBot:
             # Startup restore must not wait for one ACK per room. The reader
             # remains free to process all ACKs/events while joins are sent at
             # a small gateway-safe pace.
-            gap=max(0.08, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.15") or 0.15))
+            gap=max(0.20, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.45") or 0.45))
         else:
             gap=max(0.8, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
         timeout=max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20") or 20))
@@ -18882,6 +18880,9 @@ class TalkinBot:
                 pass
 
         if pending.get("code") == "id_sync":
+            # Only mark the room complete after a real server response. If the
+            # request times out, the paced worker can retry it later.
+            self._room_id_sync_seen.add(_norm_room(source_room))
             users = self._extract_room_list_users(result)
             followups = pending.get("mine_followups", [])
             if users or followups:
@@ -19335,6 +19336,69 @@ class TalkinBot:
                 self._pending_room_lists.pop(room_key, None)
             self.log("[ROSTER] background member-ID request failed:", repr(exc))
 
+    def _start_low_priority_roster_sync(self):
+        """Start one delayed roster worker; it never runs on the command thread."""
+        lock = getattr(self, "_room_id_sync_worker_lock", None)
+        if lock is None:
+            lock = self._room_id_sync_worker_lock = threading.Lock()
+        with lock:
+            if getattr(self, "_room_id_sync_worker_started", False):
+                return False
+            self._room_id_sync_worker_started = True
+        threading.Thread(
+            target=self._low_priority_roster_sync_loop,
+            name="low-priority-room-id-sync",
+            daemon=True,
+        ).start()
+        return True
+
+    def _low_priority_roster_sync_loop(self):
+        """Rebuild room IDs slowly, yielding to normal commands and games."""
+        # Let bulk room restoration and initial game traffic settle first.
+        if self.stop_event.wait(max(20.0, float(os.getenv("ROSTER_SYNC_START_DELAY_SECONDS", "30") or 30))):
+            return
+        while not self.stop_event.is_set():
+            try:
+                if not getattr(self, "ws", None) or not getattr(self, "connected_rooms", None):
+                    if self.stop_event.wait(5.0):
+                        return
+                    continue
+                rooms = sorted(
+                    list(getattr(self, "connected_rooms", set()) or []),
+                    key=_norm_room,
+                )
+                target = next((room for room in rooms
+                               if _norm_room(room) and _norm_room(room) not in self._room_id_sync_seen), None)
+                if not target:
+                    # New rooms may be joined later; check occasionally without
+                    # polling or creating repeated worker threads.
+                    if self.stop_event.wait(20.0):
+                        return
+                    continue
+                room_key = _norm_room(target)
+                pending = getattr(self, "_pending_room_lists", {})
+                # Don't compete with explicit member/admin list or ID requests.
+                if any(isinstance(item, dict) for item in pending.values()):
+                    if self.stop_event.wait(4.0):
+                        return
+                    continue
+                if self._schedule_room_id_sync(target):
+                    # One in-flight roster request at a time. The timeout handler
+                    # releases it if the server never responds.
+                    while not self.stop_event.is_set() and room_key in getattr(self, "_pending_room_lists", {}):
+                        if self.stop_event.wait(1.0):
+                            return
+                    # Give games/chat a quiet window before the next room request.
+                    if self.stop_event.wait(max(5.0, float(os.getenv("ROSTER_SYNC_GAP_SECONDS", "10") or 10))):
+                        return
+                else:
+                    if self.stop_event.wait(5.0):
+                        return
+            except Exception as exc:
+                self.log("[ROSTER] low-priority worker error:", repr(exc))
+                if self.stop_event.wait(8.0):
+                    return
+
     def _schedule_room_id_sync(self, room):
         """Refresh numeric member identities off the event/command thread."""
         room = str(room or "").strip()
@@ -19354,7 +19418,9 @@ class TalkinBot:
                 return False
             if room_key in pending_lists:
                 return False
-            max_pending = max(1, int(os.getenv("MAX_BACKGROUND_ID_SYNC", "2") or 2))
+            # Keep roster traffic strictly serialized so it cannot crowd the
+            # WebSocket command/game traffic with concurrent members_list calls.
+            max_pending = 1
             active_syncs = sum(
                 1 for item in pending_lists.values()
                 if isinstance(item, dict) and item.get("code") == "id_sync"
@@ -22514,10 +22580,9 @@ class TalkinBot:
                     return
             self.room_users.setdefault(room, {})[username] = role or "none"
             _remember_roster_async(room, [{"username": username, "role": role or "none"}])
-            # Do not start a members_list request for every person who enters.
-            # This traffic was multiplying roster requests across all restored rooms.
-            if BACKGROUND_ID_SYNC_ON_JOIN and _norm_user(username) != _norm_user(BOT_ID):
-                self._schedule_room_id_sync(room)
+            # Member-ID refresh is handled by one paced background worker.
+            # Never request members_list from a user_joined event: it competes
+            # with game/chat commands in busy rooms.
             # Keep a separate history for .r. Only events received after the
             # bot's own you_joined/you_rejoined timestamp are recorded.
             entry_room = _norm_room(room)
@@ -22563,9 +22628,9 @@ class TalkinBot:
                 # Start a fresh history for this bot entry/re-entry. Members
                 # who were already in the room are NOT part of .r.
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
-                # Sync once when the bot itself enters a room so ID-dependent
-                # commands can use the cache, without syncing for every user join.
-                self._schedule_room_id_sync(room)
+                # Do not request a roster during room entry. A single delayed,
+                # low-rate worker rebuilds IDs after room restoration settles.
+                self._start_low_priority_roster_sync()
 
         elif event_type == "user_left" and username:
             self.room_users.get(room, {}).pop(username, None)
@@ -24262,6 +24327,9 @@ class TalkinBot:
                 "Missing required deployment variables: " + ", ".join(missing) + ". "
                 "Add them to Railway Variables (not the source code) and redeploy."
             )
+        # User requested a fresh ID roster on each process start. Only the
+        # member roster is reset; points, games, verification, gifts, and rooms remain.
+        _reset_room_rosters_for_fresh_id_build()
         if TELEGRAM_BOT_TOKEN and TELEGRAM_POLL_ENABLED:
             threading.Thread(target=self._telegram_poll_loop, name="telegram-poll", daemon=True).start()
         elif TELEGRAM_BOT_TOKEN:
