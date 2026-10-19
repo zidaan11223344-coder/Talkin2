@@ -521,7 +521,7 @@ AUTO_JOIN_ALL_ROOMS = (
 ).strip().casefold() in {"1", "true", "yes", "on", "enable", "enabled"}
 # Background member-ID sync is expensive on busy rooms. Keep it opt-in during
 # automatic joins; commands that truly need a numeric ID still request it on demand.
-BACKGROUND_ID_SYNC_ON_JOIN = os.getenv("BACKGROUND_ID_SYNC_ON_JOIN", "0").strip().casefold() in {"1", "true", "yes", "on"}
+BACKGROUND_ID_SYNC_ON_JOIN = False  # Permanently disabled: never fetch room members automatically on entry.
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -24418,9 +24418,9 @@ class TalkinBot:
                 "Missing required deployment variables: " + ", ".join(missing) + ". "
                 "Add them to Railway Variables (not the source code) and redeploy."
             )
-        # User requested a fresh ID roster on each process start. Only the
-        # member roster is reset; points, games, verification, gifts, and rooms remain.
-        _reset_room_rosters_for_fresh_id_build()
+        # Preserve room_users.json restored from the GitHub backup repository.
+        # Never clear or rebuild the saved roster automatically at startup or room entry;
+        # member-ID lookups remain available only to explicit commands that need them.
         if TELEGRAM_BOT_TOKEN and TELEGRAM_POLL_ENABLED:
             threading.Thread(target=self._telegram_poll_loop, name="telegram-poll", daemon=True).start()
         elif TELEGRAM_BOT_TOKEN:
