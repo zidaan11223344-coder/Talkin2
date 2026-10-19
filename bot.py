@@ -18485,7 +18485,7 @@ class TalkinBot:
             # Startup restore must not wait for one ACK per room. The reader
             # remains free to process all ACKs/events while joins are sent at
             # a small gateway-safe pace.
-            gap=max(0.08, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.45") or 0.45))
+            gap=max(0.08, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.15") or 0.15))
         else:
             gap=max(0.8, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
         timeout=max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20") or 20))
@@ -22563,9 +22563,9 @@ class TalkinBot:
                 # Start a fresh history for this bot entry/re-entry. Members
                 # who were already in the room are NOT part of .r.
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
-                # Roster IDs are loaded only when needed unless explicitly enabled.
-                if BACKGROUND_ID_SYNC_ON_JOIN:
-                    self._schedule_room_id_sync(room)
+                # Sync once when the bot itself enters a room so ID-dependent
+                # commands can use the cache, without syncing for every user join.
+                self._schedule_room_id_sync(room)
 
         elif event_type == "user_left" and username:
             self.room_users.get(room, {}).pop(username, None)
