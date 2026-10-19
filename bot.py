@@ -522,8 +522,8 @@ AUTO_JOIN_ALL_ROOMS = (
 # Background member-ID sync is expensive on busy rooms. Keep it opt-in during
 # automatic joins; commands that truly need a numeric ID still request it on demand.
 BACKGROUND_ID_SYNC_ON_JOIN = os.getenv("BACKGROUND_ID_SYNC_ON_JOIN", "0").strip().casefold() in {"1", "true", "yes", "on"}
-# Roster IDs are refreshed in a low-rate background worker; normal commands always take priority.
-ROSTER_BACKGROUND_SYNC_ENABLED = os.getenv("ROSTER_BACKGROUND_SYNC_ENABLED", "1").strip().casefold() in {"1", "true", "yes", "on"}
+# Automatic roster rebuilding is paused by default: usernames drive normal gameplay; IDs are fetched only on demand.
+ROSTER_BACKGROUND_SYNC_ENABLED = os.getenv("ROSTER_BACKGROUND_SYNC_ENABLED", "0").strip().casefold() in {"1", "true", "yes", "on"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -19362,7 +19362,7 @@ class TalkinBot:
     def _low_priority_roster_sync_loop(self):
         """Rebuild room IDs slowly, yielding to normal commands and games."""
         # Let bulk room restoration and initial game traffic settle first.
-        if self.stop_event.wait(max(60.0, float(os.getenv("ROSTER_SYNC_START_DELAY_SECONDS", "90") or 90))):
+        if self.stop_event.wait(max(20.0, float(os.getenv("ROSTER_SYNC_START_DELAY_SECONDS", "30") or 30))):
             return
         while not self.stop_event.is_set():
             try:
@@ -19383,25 +19383,10 @@ class TalkinBot:
                         return
                     continue
                 room_key = _norm_room(target)
-                # Do not start background roster traffic while command/game workers
-                # have queued work. The roster is useful metadata, never a reason
-                # to delay game commands, publishing, or room messages.
-                priority_executor = getattr(self, "_room_priority_executor", None)
-                command_busy = False
-                for worker_pool in (priority_executor,):
-                    try:
-                        if worker_pool is not None and worker_pool._work_queue.qsize() > 0:
-                            command_busy = True
-                    except Exception:
-                        pass
-                if command_busy:
-                    if self.stop_event.wait(10.0):
-                        return
-                    continue
                 pending = getattr(self, "_pending_room_lists", {})
                 # Don't compete with explicit member/admin list or ID requests.
                 if any(isinstance(item, dict) for item in pending.values()):
-                    if self.stop_event.wait(5.0):
+                    if self.stop_event.wait(4.0):
                         return
                     continue
                 if self._schedule_room_id_sync(target):
@@ -19410,9 +19395,8 @@ class TalkinBot:
                     while not self.stop_event.is_set() and room_key in getattr(self, "_pending_room_lists", {}):
                         if self.stop_event.wait(1.0):
                             return
-                    # Only one room roster request per minute by default. This is
-                    # intentionally slower than command traffic and runs off-thread.
-                    if self.stop_event.wait(max(60.0, float(os.getenv("ROSTER_SYNC_GAP_SECONDS", "60") or 60))):
+                    # Give games/chat a quiet window before the next room request.
+                    if self.stop_event.wait(max(5.0, float(os.getenv("ROSTER_SYNC_GAP_SECONDS", "10") or 10))):
                         return
                 else:
                     if self.stop_event.wait(5.0):
@@ -19458,7 +19442,7 @@ class TalkinBot:
             }
             last[room_key] = now
             self._room_id_sync_last = last
-            timer = threading.Timer(12.0, self._room_list_response_timeout, args=(room_key, request_id))
+            timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
             timer.daemon = True
             pending_lists[room_key]["timer"] = timer
             timer.start()
