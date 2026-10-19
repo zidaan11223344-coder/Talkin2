@@ -246,3 +246,8 @@ def test_stored_user_id_looks_up_case_insensitively_across_rooms():
         "rooms": {"hall": {"ahmed": {"username": "Ahmed", "user_id": "3456782"}}},
     }):
         assert bot_module._stored_user_id("@AHMED", "Hall") == "3456782"
+
+
+def test_canonical_message_username_prefers_username_over_numeric_transport_id():
+    assert bot_module._canonical_message_username("3456782", "Ahmed", "opaque-token") == "Ahmed"
+    assert bot_module._canonical_message_username("3456782", "") == ""

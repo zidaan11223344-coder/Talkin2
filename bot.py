@@ -2870,6 +2870,14 @@ def _norm_user(name):
     value = unicodedata.normalize("NFKC", str(name or "")).strip().lstrip("@").casefold()
     return re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", value)
 
+def _canonical_message_username(*values):
+    """Return the first real Talkin username, ignoring numeric IDs/tokens."""
+    for value in values:
+        candidate = str(value or "").strip().lstrip("@")
+        if candidate and not candidate.isdigit():
+            return candidate
+    return ""
+
 def _norm_room(name):
     return str(name or "").strip()
 
@@ -22446,11 +22454,7 @@ class TalkinBot:
         # 22 is the normal username field and field 17 is the older fallback.
         event_user_17 = str(event.get(17, "") or "").strip().lstrip("@")
         event_user_22 = str(event.get(22, "") or "").strip().lstrip("@")
-        command_username = next(
-            (candidate for candidate in (event_user_22, event_user_17, frm.strip().lstrip("@"))
-             if candidate and not candidate.isdigit()),
-            "",
-        )
+        command_username = _canonical_message_username(event_user_22, event_user_17, frm)
         event_id_candidates = (
             event.get(14), event.get("user_id"),
             frm if frm.strip().isdigit() else "",
@@ -23556,7 +23560,7 @@ class TalkinBot:
                 executor = getattr(self, "_incoming_executor", None)
                 if executor is None:
                     executor = self._incoming_executor = ThreadPoolExecutor(
-                        max_workers=max(2, int(os.getenv("INCOMING_COMMAND_WORKERS", "6") or 6)),
+                        max_workers=max(2, int(os.getenv("INCOMING_COMMAND_WORKERS", "16") or 16)),
                         thread_name_prefix="incoming-command",
                     )
         try:
@@ -23609,13 +23613,13 @@ class TalkinBot:
                         default_workers = "2"
                         env_name = "ROOM_MEDIA_WORKERS"
                     elif is_priority:
-                        default_workers = "12"
+                        default_workers = "32"
                         env_name = "ROOM_PRIORITY_WORKERS"
                     elif is_command:
-                        default_workers = "8"
+                        default_workers = "32"
                         env_name = "ROOM_COMMAND_WORKERS"
                     else:
-                        default_workers = "4"
+                        default_workers = "8"
                         env_name = "ROOM_EVENT_WORKERS"
                     executor = ThreadPoolExecutor(
                         max_workers=max(2, int(os.getenv(
@@ -23809,9 +23813,14 @@ class TalkinBot:
                 try:
                     frm = str(cm.get(3, "") or "").strip()
                     body = str(cm.get(5, "") or "").strip()
-                    private_username = str(
+                    private_username = _canonical_message_username(
                         cm.get(22, "") or cm.get("username", "") or cm.get("sender", "") or ""
-                    ).strip()
+                    , cm.get(17, ""), frm)
+                    if private_username:
+                        # ChatMessage field 3 is sometimes a numeric ID or an
+                        # opaque token. Use the canonical username for every
+                        # command and response, not only verification checks.
+                        frm = private_username
                     if body:
                         self._remember_inflight_command(self.room, body, frm, is_private=True)
                     media_url = next(
