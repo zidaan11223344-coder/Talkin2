@@ -3165,6 +3165,9 @@ def _format_saved_accounts(title, data, empty_text):
 _ROSTER_PERSIST_LOCK = threading.RLock()
 _ROSTER_ASYNC_STATE_LOCK = threading.Lock()
 _ROSTER_ASYNC_LAST = {}
+_ROSTER_ID_RATE_LOCK = threading.Lock()
+_ROSTER_ID_RATE_STARTED = time.monotonic()
+_ROSTER_ID_RATE_COUNT = 0
 
 
 def _remember_roster(room, users):
@@ -3250,9 +3253,27 @@ def _remember_roster_impl(room, users):
 
 def _remember_roster_async(room, users):
     """Persist newly observed username/ID pairs without blocking commands."""
+    global _ROSTER_ID_RATE_STARTED, _ROSTER_ID_RATE_COUNT
     snapshot = [dict(user) for user in (users or []) if isinstance(user, dict)]
     if not snapshot:
         return False
+    # Never perform a room-wide ID sync. Only IDs already present in incoming
+    # events may be persisted, with a hard budget of ten new IDs per hour.
+    # This keeps identity collection practically invisible to chat/game traffic.
+    numeric_snapshot = [user for user in snapshot if str(user.get("user_id") or "").strip().isdigit()]
+    if numeric_snapshot:
+        with _ROSTER_ID_RATE_LOCK:
+            now_rate = time.monotonic()
+            if now_rate - _ROSTER_ID_RATE_STARTED >= 3600.0:
+                _ROSTER_ID_RATE_STARTED = now_rate
+                _ROSTER_ID_RATE_COUNT = 0
+            available = max(0, 10 - _ROSTER_ID_RATE_COUNT)
+            if not available:
+                return False
+            numeric_snapshot = numeric_snapshot[:available]
+            _ROSTER_ID_RATE_COUNT += len(numeric_snapshot)
+            snapshot = [user for user in snapshot if not str(user.get("user_id") or "").strip().isdigit()]
+            snapshot.extend(numeric_snapshot)
     # Room text events can repeat the same sender identity for every game
     # command. Do not start a JSON write thread for each message; that thread
     # storm competes with game workers even though the identity is unchanged.
@@ -19411,6 +19432,10 @@ class TalkinBot:
 
     def _schedule_room_id_sync(self, room):
         """Refresh numeric member identities off the event/command thread."""
+        # Automatic room-wide members_list requests are deliberately disabled.
+        # Username routing works without them, and explicit user ID lookups
+        # still use their own on-demand path.
+        return False
         room = str(room or "").strip()
         room_key = _norm_room(room)
         if not room or not room_key or getattr(self, "ws", None) is None:
