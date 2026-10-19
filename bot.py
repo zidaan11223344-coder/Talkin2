@@ -522,8 +522,8 @@ AUTO_JOIN_ALL_ROOMS = (
 # Background member-ID sync is expensive on busy rooms. Keep it opt-in during
 # automatic joins; commands that truly need a numeric ID still request it on demand.
 BACKGROUND_ID_SYNC_ON_JOIN = os.getenv("BACKGROUND_ID_SYNC_ON_JOIN", "0").strip().casefold() in {"1", "true", "yes", "on"}
-# Automatic roster rebuilding is paused by default: usernames drive normal gameplay; IDs are fetched only on demand.
-ROSTER_BACKGROUND_SYNC_ENABLED = os.getenv("ROSTER_BACKGROUND_SYNC_ENABLED", "0").strip().casefold() in {"1", "true", "yes", "on"}
+# Roster IDs are refreshed in a low-rate background worker; normal commands always take priority.
+ROSTER_BACKGROUND_SYNC_ENABLED = os.getenv("ROSTER_BACKGROUND_SYNC_ENABLED", "1").strip().casefold() in {"1", "true", "yes", "on"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -3165,9 +3165,6 @@ def _format_saved_accounts(title, data, empty_text):
 _ROSTER_PERSIST_LOCK = threading.RLock()
 _ROSTER_ASYNC_STATE_LOCK = threading.Lock()
 _ROSTER_ASYNC_LAST = {}
-_ROSTER_ID_RATE_LOCK = threading.Lock()
-_ROSTER_ID_RATE_STARTED = time.monotonic()
-_ROSTER_ID_RATE_COUNT = 0
 
 
 def _remember_roster(room, users):
@@ -3212,7 +3209,9 @@ def _remember_roster_impl(room, users):
         if not user_id.isdigit():
             user_id = ""
         normalized_name = _norm_user(username)
-        existing_key = (by_id.get(user_id, [""])[0] if user_id else "") or by_name.get(normalized_name, "")
+        # Username is the canonical roster key. Numeric ID is saved as a
+        # secondary reference, never used to merge two different usernames.
+        existing_key = by_name.get(normalized_name, "")
         existing_id = ""
         aliases = []
         old_value = current.get(existing_key)
@@ -3224,13 +3223,11 @@ def _remember_roster_impl(room, users):
                 aliases.extend(str(alias).strip().lstrip("@") for alias in old_aliases if str(alias).strip())
             if _norm_user(old_name) != normalized_name:
                 aliases.append(old_name)
-        if user_id:
-            for old_key in by_id.get(user_id, []):
-                current.pop(old_key, None)
-            storage_key = user_id
-        else:
+        if not user_id:
             user_id = existing_id if existing_id.isdigit() else ""
-            storage_key = existing_key or normalized_name
+        storage_key = normalized_name
+        if existing_key and existing_key != storage_key:
+            current.pop(existing_key, None)
         aliases = list(dict.fromkeys(
             alias for alias in aliases
             if alias and _norm_user(alias) != normalized_name
@@ -3253,27 +3250,9 @@ def _remember_roster_impl(room, users):
 
 def _remember_roster_async(room, users):
     """Persist newly observed username/ID pairs without blocking commands."""
-    global _ROSTER_ID_RATE_STARTED, _ROSTER_ID_RATE_COUNT
     snapshot = [dict(user) for user in (users or []) if isinstance(user, dict)]
     if not snapshot:
         return False
-    # Never perform a room-wide ID sync. Only IDs already present in incoming
-    # events may be persisted, with a hard budget of ten new IDs per hour.
-    # This keeps identity collection practically invisible to chat/game traffic.
-    numeric_snapshot = [user for user in snapshot if str(user.get("user_id") or "").strip().isdigit()]
-    if numeric_snapshot:
-        with _ROSTER_ID_RATE_LOCK:
-            now_rate = time.monotonic()
-            if now_rate - _ROSTER_ID_RATE_STARTED >= 3600.0:
-                _ROSTER_ID_RATE_STARTED = now_rate
-                _ROSTER_ID_RATE_COUNT = 0
-            available = max(0, 10 - _ROSTER_ID_RATE_COUNT)
-            if not available:
-                return False
-            numeric_snapshot = numeric_snapshot[:available]
-            _ROSTER_ID_RATE_COUNT += len(numeric_snapshot)
-            snapshot = [user for user in snapshot if not str(user.get("user_id") or "").strip().isdigit()]
-            snapshot.extend(numeric_snapshot)
     # Room text events can repeat the same sender identity for every game
     # command. Do not start a JSON write thread for each message; that thread
     # storm competes with game workers even though the identity is unchanged.
@@ -19382,16 +19361,13 @@ class TalkinBot:
 
     def _low_priority_roster_sync_loop(self):
         """Rebuild room IDs slowly, yielding to normal commands and games."""
-        stop_event = getattr(self, "stop_event", None)
-        if stop_event is None:
-            return
         # Let bulk room restoration and initial game traffic settle first.
-        if stop_event.wait(max(20.0, float(os.getenv("ROSTER_SYNC_START_DELAY_SECONDS", "30") or 30))):
+        if self.stop_event.wait(max(60.0, float(os.getenv("ROSTER_SYNC_START_DELAY_SECONDS", "90") or 90))):
             return
-        while not stop_event.is_set():
+        while not self.stop_event.is_set():
             try:
                 if not getattr(self, "ws", None) or not getattr(self, "connected_rooms", None):
-                    if stop_event.wait(5.0):
+                    if self.stop_event.wait(5.0):
                         return
                     continue
                 rooms = sorted(
@@ -19403,39 +19379,51 @@ class TalkinBot:
                 if not target:
                     # New rooms may be joined later; check occasionally without
                     # polling or creating repeated worker threads.
-                    if stop_event.wait(20.0):
+                    if self.stop_event.wait(20.0):
                         return
                     continue
                 room_key = _norm_room(target)
+                # Do not start background roster traffic while command/game workers
+                # have queued work. The roster is useful metadata, never a reason
+                # to delay game commands, publishing, or room messages.
+                priority_executor = getattr(self, "_room_priority_executor", None)
+                command_busy = False
+                for worker_pool in (priority_executor,):
+                    try:
+                        if worker_pool is not None and worker_pool._work_queue.qsize() > 0:
+                            command_busy = True
+                    except Exception:
+                        pass
+                if command_busy:
+                    if self.stop_event.wait(10.0):
+                        return
+                    continue
                 pending = getattr(self, "_pending_room_lists", {})
                 # Don't compete with explicit member/admin list or ID requests.
                 if any(isinstance(item, dict) for item in pending.values()):
-                    if stop_event.wait(4.0):
+                    if self.stop_event.wait(5.0):
                         return
                     continue
                 if self._schedule_room_id_sync(target):
                     # One in-flight roster request at a time. The timeout handler
                     # releases it if the server never responds.
-                    while not stop_event.is_set() and room_key in getattr(self, "_pending_room_lists", {}):
-                        if stop_event.wait(1.0):
+                    while not self.stop_event.is_set() and room_key in getattr(self, "_pending_room_lists", {}):
+                        if self.stop_event.wait(1.0):
                             return
-                    # Give games/chat a quiet window before the next room request.
-                    if stop_event.wait(max(5.0, float(os.getenv("ROSTER_SYNC_GAP_SECONDS", "10") or 10))):
+                    # Only one room roster request per minute by default. This is
+                    # intentionally slower than command traffic and runs off-thread.
+                    if self.stop_event.wait(max(60.0, float(os.getenv("ROSTER_SYNC_GAP_SECONDS", "60") or 60))):
                         return
                 else:
-                    if stop_event.wait(5.0):
+                    if self.stop_event.wait(5.0):
                         return
             except Exception as exc:
                 self.log("[ROSTER] low-priority worker error:", repr(exc))
-                if stop_event.wait(8.0):
+                if self.stop_event.wait(8.0):
                     return
 
     def _schedule_room_id_sync(self, room):
         """Refresh numeric member identities off the event/command thread."""
-        # Automatic room-wide members_list requests are deliberately disabled.
-        # Username routing works without them, and explicit user ID lookups
-        # still use their own on-demand path.
-        return False
         room = str(room or "").strip()
         room_key = _norm_room(room)
         if not room or not room_key or getattr(self, "ws", None) is None:
@@ -19449,8 +19437,6 @@ class TalkinBot:
         with lock:
             now = time.time()
             last = getattr(self, "_room_id_sync_last", {})
-            if room_key in getattr(self, "_room_id_sync_seen", set()):
-                return False
             if now - float(last.get(room_key, 0) or 0) < 60:
                 return False
             if room_key in pending_lists:
@@ -19472,7 +19458,7 @@ class TalkinBot:
             }
             last[room_key] = now
             self._room_id_sync_last = last
-            timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
+            timer = threading.Timer(12.0, self._room_list_response_timeout, args=(room_key, request_id))
             timer.daemon = True
             pending_lists[room_key]["timer"] = timer
             timer.start()
@@ -22665,11 +22651,9 @@ class TalkinBot:
                 # Start a fresh history for this bot entry/re-entry. Members
                 # who were already in the room are NOT part of .r.
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
-                # Never start a members_list sweep from a room-entry event.
-                # The same WebSocket carries chat/game traffic, so even a
-                # paced sweep can delay messages while many rooms reconnect.
-                # IDs continue to be learned from message events and explicit
-                # on-demand ID/mining lookups in the background.
+                # Do not request a roster during room entry. A single delayed,
+                # low-rate worker rebuilds IDs after room restoration settles.
+                self._start_low_priority_roster_sync()
 
         elif event_type == "user_left" and username:
             self.room_users.get(room, {}).pop(username, None)
