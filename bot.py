@@ -7136,6 +7136,12 @@ class TalkinBot:
         self._event_queue = queue.PriorityQueue(maxsize=max(500, int(os.getenv("EVENT_QUEUE_MAX", "2500"))))
         self._event_queue_seq = 0
         self._event_queue_lock = threading.Lock()
+        # Room text is queued per room and executed in order. This keeps the
+        # transport worker free while preventing game turns and menu replies
+        # in the same room from racing each other.
+        self._room_serial_lock = threading.Lock()
+        self._room_serial_queues = {}
+        self._room_serial_running = set()
         self._event_worker = threading.Thread(
             target=self._event_worker_loop, name="ws-event-worker", daemon=True
         )
@@ -23589,6 +23595,59 @@ class TalkinBot:
             self.log("[EVENT-DISPATCH] async submit failed; processing inline:", repr(exc))
             return self._process_message(ws, message)
 
+    def _room_serial_start_next(self, room_key):
+        """Submit the next queued text event for a room without blocking a worker."""
+        with self._room_serial_lock:
+            pending = self._room_serial_queues.get(room_key, [])
+            if not pending:
+                self._room_serial_running.discard(room_key)
+                self._room_serial_queues.pop(room_key, None)
+                return
+            executor, result = pending[0]
+        try:
+            future = executor.submit(self.handle_room_event, result)
+        except Exception as exc:
+            self.log("[ROOM-COMMAND] async dispatch failed:", repr(exc))
+            self._room_serial_done(room_key, None)
+            return
+        future.add_done_callback(lambda completed, key=room_key: self._room_serial_done(key, completed))
+
+    def _room_serial_done(self, room_key, future):
+        """Advance a room's serial queue after its current event finishes."""
+        if future is not None:
+            try:
+                error = future.exception()
+                if error is not None:
+                    self.log("[ROOM-COMMAND] handler failed:", repr(error))
+            except Exception:
+                pass
+        with self._room_serial_lock:
+            pending = self._room_serial_queues.get(room_key, [])
+            if pending:
+                pending.pop(0)
+            has_more = bool(pending)
+            if not has_more:
+                self._room_serial_queues.pop(room_key, None)
+                self._room_serial_running.discard(room_key)
+        if has_more:
+            self._room_serial_start_next(room_key)
+
+    def _enqueue_room_event_serially(self, result, executor):
+        """Keep events ordered within each room while allowing rooms to run concurrently."""
+        event = result.get("room_event", {}) if isinstance(result, dict) else {}
+        room_key = str(event.get(13) or event.get(2) or result.get("room") or "__unknown_room__").strip()
+        if not room_key:
+            room_key = "__unknown_room__"
+        should_start = False
+        with self._room_serial_lock:
+            self._room_serial_queues.setdefault(room_key, []).append((executor, result))
+            if room_key not in self._room_serial_running:
+                self._room_serial_running.add(room_key)
+                should_start = True
+        if should_start:
+            self._room_serial_start_next(room_key)
+        return True
+
     def _dispatch_room_event(self, result):
         """Process room text outside the transport worker.
 
@@ -23610,12 +23669,10 @@ class TalkinBot:
         is_media = _looks_like_media_command(body)
         is_priority = _looks_like_priority_command(body)
         is_command = _looks_like_bot_command(body)
-        # Fast path copied from the reference bot: short commands are handled
-        # immediately after the frame is decoded, avoiding a second executor
-        # hand-off and its scheduling latency. Slow operations remain isolated
-        # below so music, roster queries, and room joins cannot block commands.
-        if _is_fast_room_command(body):
-            return self.handle_room_event(result)
+        # Do not execute text commands inline on the single protocol worker.
+        # Even a command classified as "fast" can touch storage, send network
+        # requests, or wait on a lock; running it inline stalls every incoming
+        # frame. All text events are dispatched below, with per-room ordering.
         # Music searches/downloads can take many seconds (or longer when a
         # provider fails). Give them an isolated, deliberately small pool so
         # repeated music requests cannot consume workers used for chat commands.
@@ -23659,11 +23716,7 @@ class TalkinBot:
                         ),
                     )
                     setattr(self, executor_name, executor)
-        try:
-            return executor.submit(self.handle_room_event, result)
-        except Exception as exc:
-            self.log("[ROOM-COMMAND] async dispatch failed; processing inline:", repr(exc))
-            return self.handle_room_event(result)
+        return self._enqueue_room_event_serially(result, executor)
 
     def on_message(self, ws, message):
         """Quickly enqueue incoming frames, prioritizing likely chat commands.
@@ -23694,10 +23747,13 @@ class TalkinBot:
                 # urgent chat frames as a last resort; discard lower-value
                 # background frames and log only when event debugging is on.
                 if priority == 0:
+                    # Keep the socket callback non-blocking even during bursts.
+                    # The fallback executor is used only when the ordered queue
+                    # is saturated, so urgent chat frames are not processed inline.
                     try:
-                        self._process_message(ws, raw)
+                        self._dispatch_incoming_message(ws, raw)
                     except Exception as exc:
-                        self.log("[EVENT-QUEUE] urgent frame failed:", repr(exc))
+                        self.log("[EVENT-QUEUE] urgent frame dispatch failed:", repr(exc))
                 elif ROOM_EVENT_DEBUG:
                     self.log("[EVENT-QUEUE] dropped low-priority frame; queue full")
         except Exception as exc:
