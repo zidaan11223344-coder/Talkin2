@@ -27,6 +27,7 @@ import io
 import sys
 import inspect
 import gc
+from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, unquote, urlencode, quote
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -49,6 +50,8 @@ except Exception:
     pymysql = None
 from dotenv import dotenv_values, load_dotenv
 from cricket_integration import CricketIntegration
+import shop as member_shop
+from treasure_mining import DIAMOND_KEYS, ITEMS as MINING_ITEMS, MiningStore, format_cooldown, resolve_item_keys
 # Public defaults live in the tracked project settings file. Empty values are
 # ignored so required secrets must come from Railway Variables, while an
 # explicitly injected Railway value always wins over the repository defaults.
@@ -288,8 +291,9 @@ _SOCIAL_HUNT_PHOTO_LOCK = threading.Lock()
 # الألعاب وصورها معطلة بناءً على إعداد البوت المطلوب؛ لا تُرسل صور ألعاب.
 GAME_IMAGE_FILES = {
     "bet": "game_bet.jpg",
-    "billion": "game_billion.jpg",
-    "بنك مليون": "game_million_bank.jpg",
+    "billion": "game_billion_prize.jpg",
+    "million": "game_million_prize.jpg",
+    "بنك مليون": "game_million_prize.jpg",
     "duel": "game_duel.jpg",
     "luck": "game_luck.jpg",
     "investment": "game_investment.jpg",
@@ -335,6 +339,8 @@ GAME_COMMANDS = {
     "shoot": "شوت", "shot": "شوت",
     "lightning": "برق", "ruby": "ياقوت", "crash": "صدام", "detector": "كاشف", "guess who": "كاشف",
     "steal": "اسرق", "rob": "اسرق", "lookalike": "شبيه", "twin": "شبيه",
+    "mining": "الماس", "mine": "الماس", "dig": "الماس", "diamond mining": "الماس",
+    "احفر": "الماس", "تنقيب": "الماس", "نقب": "الماس",
 }
 MILLION_BANK_COOLDOWN_SECONDS = 60.0
 try:
@@ -346,6 +352,7 @@ MONEY_GAME_OPEN_WIN_CHANCE_PERCENT = 30
 MONEY_GAME_WIN_CHANCE_PERCENT = MONEY_GAME_DEFAULT_WIN_CHANCE_PERCENT
 MONEY_GAME_WIN_GAP_LOSSES = 1
 _MONEY_GAME_WIN_LOCK = threading.RLock()
+_MONEY_GAME_WIN_HISTORY_LOCK = threading.RLock()
 
 try:
     STOCK_MARKET_INTERVAL_SECONDS = max(60.0, float(os.getenv("STOCK_MARKET_INTERVAL_SECONDS", "600") or 600))
@@ -502,8 +509,9 @@ BOT_MASTER = (os.getenv("BOT_MASTER") or os.getenv("MASTER_USERNAME") or "").str
 PRIMARY_BOT_ID = (os.getenv("PRIMARY_BOT_ID") or "").strip()
 INVITE_SENDER_NAME = os.getenv("INVITE_SENDER_NAME", "السفير").strip() or "السفير"
 GROUP_TO_JOIN = (os.getenv("GROUP_TO_JOIN") or os.getenv("FIRST_ROOM") or "").strip()
-# Startup room policy: normal bot deployments restore every room saved in
-# tracked_rooms.json plus GROUP_TO_JOIN after each connection/reconnection.
+# Startup room policy: restore every saved room once per WebSocket session by
+# default, preserving the established 38-room behavior. Set
+# AUTO_JOIN_ALL_ROOMS=off only when a deployment must use the first room.
 # MASTER_SERVICE deployments retain their separate no-room behavior.
 AUTO_JOIN_ALL_ROOMS = (
     os.getenv("AUTO_JOIN_ALL_ROOMS")
@@ -511,6 +519,9 @@ AUTO_JOIN_ALL_ROOMS = (
     or os.getenv("AUTO_JOIN_ROOMS")
     or "on"
 ).strip().casefold() in {"1", "true", "yes", "on", "enable", "enabled"}
+# Background member-ID sync is expensive on busy rooms. Keep it opt-in during
+# automatic joins; commands that truly need a numeric ID still request it on demand.
+BACKGROUND_ID_SYNC_ON_JOIN = os.getenv("BACKGROUND_ID_SYNC_ON_JOIN", "0").strip().casefold() in {"1", "true", "yes", "on"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -679,23 +690,42 @@ def _stop_master_process():
 # bot state across deployments. When no volume is mounted, the code falls back
 # to a local data/ directory beside bot.py and migrates any old JSON files there.
 def _select_persistent_data_dir():
+    """Choose a writable data directory; immutable app roots are common on PaaS."""
     configured = (os.getenv("BOT_DATA_DIR") or os.getenv("PERSISTENT_DATA_DIR") or "").strip()
     candidates = []
     if configured:
         candidates.append(Path(configured).expanduser())
-    candidates.append(BASE_DIR / "data")
+    # Common mounted-volume locations first, then writable home/temp locations.
+    candidates.extend([
+        Path("/data"),
+        Path("/var/data"),
+        Path.home() / ".talkin-data",
+        Path("/tmp/talkin-data"),
+        BASE_DIR / "data",
+    ])
+    seen = set()
     for candidate in candidates:
         try:
+            candidate = candidate.resolve()
+            if str(candidate) in seen:
+                continue
+            seen.add(str(candidate))
             candidate.mkdir(parents=True, exist_ok=True)
-            probe = candidate / ".write_test"
+            probe = candidate / f".write_test_{os.getpid()}"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
             return candidate
         except Exception:
             continue
-    return BASE_DIR / "data"
+    # Last-resort writable location lets the bot start even without a mounted
+    # persistent volume. Configure BOT_DATA_DIR to a platform volume to retain
+    # data across restarts/redeploys.
+    fallback = Path("/tmp/talkin-data")
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 DATA_DIR = _select_persistent_data_dir()
+member_shop.SHOP_PATH = DATA_DIR / "shop_data.json"
 
 # Telegram diagnostics: only the bot token is required. The first incoming
 # Telegram message is used to learn and persist the chat_id automatically.
@@ -732,6 +762,7 @@ PUBLISHED_FILE = DATA_DIR / "published_posts.json"
 MEDIA_STATS_FILE = DATA_DIR / "media_stats.json"
 GAME_STATS_FILE = DATA_DIR / "game_stats.json"
 GAME_LEVELS_FILE = DATA_DIR / "game_levels.json"
+MINING_FILE = DATA_DIR / "mining_game.json"
 GAME_STATS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_stats.duplicates-backup.json"
 GAME_LEVELS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_levels.duplicates-backup.json"
 GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
@@ -763,6 +794,7 @@ FILTER_BANS_FILE = DATA_DIR / "filter_bans.json"
 BOT_BANS_FILE = DATA_DIR / "bot_bans.json"
 LAST_BOT_BANS_FILE = DATA_DIR / "last_bot_bans.json"
 MONEY_GAME_WIN_STATE_FILE = DATA_DIR / "money_game_win_state.json"
+MONEY_GAME_WIN_HISTORY_FILE = DATA_DIR / "money_game_winners.json"
 MONEY_GAME_SETTINGS_FILE = DATA_DIR / "money_game_settings.json"
 PUBLISH_BANS_FILE = DATA_DIR / "publish_bans.json"
 PROTECTION_FILE = DATA_DIR / "room_protection.json"
@@ -777,8 +809,8 @@ _STATE_FILE_NAMES = (
     "masters.json", "vip_users.json", "verified_users.json", "points.json",
     "messages.json", "published_posts.json", "media_stats.json", "game_stats.json", "game_levels.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
-    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "money_game_win_state.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
-    "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "backup_manifest.json",
+    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "money_game_win_state.json", "money_game_winners.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json", "mining_game.json",
+    "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "shop_data.json", "backup_manifest.json",
 )
 
 def _json_has_real_data(path):
@@ -795,24 +827,28 @@ def _json_has_real_data(path):
         return False
 
 def _migrate_legacy_state_files():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # DATA_DIR is selected by a write probe above. Keep migration best-effort:
+    # a read-only legacy directory must never prevent the bot from starting.
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(f"[DATA] Cannot create data directory {DATA_DIR}: {exc}", flush=True)
+        return
     for name in _STATE_FILE_NAMES:
         target = DATA_DIR / name
         legacy_candidates = [BASE_DIR / name, BASE_DIR / "data" / name]
-        # Copy only when the persistent copy is missing/empty. Existing data is
-        # never overwritten by a newer bot.py.
         if _json_has_real_data(target):
             continue
         for legacy in legacy_candidates:
-            if legacy.resolve() == target.resolve() or not legacy.is_file():
-                continue
             try:
+                if legacy.resolve() == target.resolve() or not legacy.is_file():
+                    continue
                 if legacy.stat().st_size <= 0:
                     continue
                 shutil.copy2(legacy, target)
                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[DATA] Migration skipped for {name}: {exc}", flush=True)
 
 _migrate_legacy_state_files()
 # Restore state from GitHub after the data directory and legacy migration are ready.
@@ -920,6 +956,8 @@ QUIET_MODE = os.getenv("QUIET_MODE", "1").strip() == "1"
 # Room chat is high-volume and must never be copied into the host/runtime log.
 # Keep this opt-in for short, controlled debugging only.
 LOG_ROOM_MESSAGES = os.getenv("LOG_ROOM_MESSAGES", "0").strip() == "1"
+# Successful per-file backup messages are noisy; errors always remain visible.
+LOG_GITHUB_SYNC_SUCCESS = os.getenv("LOG_GITHUB_SYNC_SUCCESS", "0").strip() == "1"
 # Runtime room-event diagnostics are disabled by default. Set ROOM_EVENT_DEBUG=1 only while debugging.
 ROOM_EVENT_DEBUG = os.getenv("ROOM_EVENT_DEBUG", "0").strip() == "1"
 
@@ -1076,6 +1114,20 @@ def _ws_payload_limit():
     except (TypeError, ValueError):
         configured = 1008
     return max(1, min(1008, configured))
+
+
+def _ws_inbound_limit():
+    """Return a memory-safety limit for inbound frames.
+
+    The 1008-byte restriction applies to packets sent by the bot. The server
+    legitimately sends larger occupant/roster frames, so inbound traffic must
+    use a separate safety limit instead of being silently discarded.
+    """
+    try:
+        configured = int(os.getenv("WS_MAX_INBOUND_BYTES", str(8 * 1024 * 1024)))
+    except (TypeError, ValueError):
+        configured = 8 * 1024 * 1024
+    return max(1008, min(16 * 1024 * 1024, configured))
 
 
 def _is_normal_ws_close_reason(reason):
@@ -1554,7 +1606,7 @@ class RawWebSocket:
         # Consume the complete frame to keep the stream synchronized, then
         # drop it locally. Never send a close frame or tear down the socket for
         # an oversized inbound packet.
-        max_bytes = _ws_payload_limit()
+        max_bytes = _ws_inbound_limit()
         if opcode in (0x1, 0x2, 0x0) and len(data) > max_bytes:
             return ("oversize", {"size": len(data), "limit": max_bytes})
         if opcode == 0x8:
@@ -1780,6 +1832,9 @@ _STATE_DB_CONDITION = threading.Condition()
 _STATE_DB_PENDING = {}
 _STATE_DB_WORKER_STARTED = False
 _STATE_DB_HAS_DATA = False
+_STATE_DB_INFLIGHT = 0
+_STATE_DB_LAST_SYNC_AT = 0.0
+_STATE_DB_LAST_SYNC_ERROR = ""
 
 class PersistentStateDatabase:
     """JSON state store for one row per local bot state file."""
@@ -1926,6 +1981,10 @@ def _save_local_json(path, data, *, persist_state_db=True):
     if github_save:
         github_save(path, data)
 
+
+MINING_STORE = MiningStore(MINING_FILE, _load_local_json, _save_local_json)
+
+
 def _set_money_game_open(game_name, enabled):
     """Persist the master switch that raises a money game to 30% wins."""
     game_name = str(game_name or "").strip().lower()
@@ -1970,6 +2029,108 @@ def _money_game_roll(game_name):
         _save_local_json(MONEY_GAME_WIN_STATE_FILE, state)
         return won
 
+
+def _record_money_game_winner(game_name, username, at=None):
+    """Persist a rolling 30-day jackpot history, without recording losing plays."""
+    game_name = str(game_name or "").strip().lower()
+    username = str(username or "").strip().lstrip("@")
+    if game_name not in {"million", "billion"} or not username:
+        return False
+    timestamp = int(time.time() if at is None else at)
+    cutoff = timestamp - 30 * 24 * 60 * 60
+    with _MONEY_GAME_WIN_HISTORY_LOCK:
+        history = _load_local_json(MONEY_GAME_WIN_HISTORY_FILE, {})
+        if not isinstance(history, dict):
+            history = {}
+        for game in ("million", "billion"):
+            records = history.get(game, [])
+            if not isinstance(records, list):
+                records = []
+            retained = []
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    record_time = int(record.get("at", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if record_time >= cutoff:
+                    retained.append(record)
+            history[game] = retained
+        canonical = _game_name_key(username)
+        records = history[game_name]
+        if not any(
+            _game_name_key(record.get("username", "")) == canonical
+            and int(record.get("at", 0) or 0) == timestamp
+            for record in records
+        ):
+            records.append({"username": username, "at": timestamp})
+        _save_local_json(MONEY_GAME_WIN_HISTORY_FILE, history)
+    return True
+
+
+def _money_game_winner_rows(game_name, now=None, limit=15):
+    """Return top jackpot winners from the last 30 days, ranked by win count."""
+    game_name = str(game_name or "").strip().lower()
+    if game_name not in {"million", "billion"}:
+        return []
+    current_time = int(time.time() if now is None else now)
+    cutoff = current_time - 30 * 24 * 60 * 60
+    with _MONEY_GAME_WIN_HISTORY_LOCK:
+        history = _load_local_json(MONEY_GAME_WIN_HISTORY_FILE, {})
+        records = history.get(game_name, []) if isinstance(history, dict) else []
+        if not isinstance(records, list):
+            return []
+        winners = {}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            username = str(record.get("username") or "").strip().lstrip("@")
+            try:
+                won_at = int(record.get("at", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not username or not cutoff <= won_at <= current_time:
+                continue
+            key = _game_name_key(username)
+            if not key:
+                continue
+            row = winners.setdefault(key, {"username": username, "wins": 0, "last_at": won_at})
+            row["wins"] += 1
+            row["last_at"] = max(int(row["last_at"]), won_at)
+            row["username"] = _preferred_display_name(row["username"], username)
+    ranked = sorted(
+        winners.values(),
+        key=lambda row: (-int(row["wins"]), -int(row["last_at"]), _norm_user(row["username"])),
+    )
+    return ranked[:max(1, int(limit or 15))]
+
+
+def _money_game_winners_message(game_name, english=False):
+    game_name = str(game_name or "").strip().lower()
+    rows = _money_game_winner_rows(game_name, limit=15)
+    arabic_label = "المليار" if game_name == "billion" else "المليون"
+    english_label = "Billion" if game_name == "billion" else "Million"
+    if english:
+        lines = [f"🏆 Top {english_label} Game Winners — Last 30 Days", "━━━━━━━━━━━━"]
+        if not rows:
+            lines.append("No winners recorded in the last 30 days.")
+        else:
+            lines.extend(
+                f"{rank}. @{row['username']} — {row['wins']} {'win' if row['wins'] == 1 else 'wins'}"
+                for rank, row in enumerate(rows, 1)
+            )
+    else:
+        lines = [f"🏆 توب الفائزين بلعبة {arabic_label} — آخر 30 يومًا", "━━━━━━━━━━━━"]
+        if not rows:
+            lines.append("لا توجد جوائز مسجلة خلال آخر 30 يومًا.")
+        else:
+            lines.extend(
+                f"{rank}. @{row['username']} — {row['wins']} فوز"
+                for rank, row in enumerate(rows, 1)
+            )
+    return "\n".join(lines)
+
 # GitHub-backed persistent state. Runtime stays in Talkin1; durable state is
 # backed up to Talkin4 asynchronously so message handling is not blocked by
 # GitHub network requests. Set GITHUB_TOKEN in the hosting environment.
@@ -1992,6 +2153,8 @@ _GITHUB_PENDING_CONDITION = threading.Condition()
 _GITHUB_INFLIGHT = 0
 _GITHUB_WORKER_STARTED = False
 _GITHUB_BACKUP_REQUESTS = []
+_GITHUB_LAST_SYNC_AT = 0.0
+_GITHUB_LAST_SYNC_ERROR = ""
 
 def _queue_local_json_save(path, data):
     """Queue a local JSON snapshot for background persistence.
@@ -2183,7 +2346,8 @@ def _github_put_file(local_path, data, sha=None):
                     )
 
         r.raise_for_status()
-        print(f"[GITHUB] saved {name}", flush=True)
+        if LOG_GITHUB_SYNC_SUCCESS:
+            print(f"[GITHUB] saved {name}", flush=True)
         return True
     except Exception as exc:
         print(f"[GITHUB] write failed for {name}: {exc}", flush=True)
@@ -2332,8 +2496,9 @@ def _merge_points_snapshots(authoritative, secondary):
     return {"version": 2, "accounts": merged, "transfer_history": history[-1000:]}
 
 def _restore_or_seed_postgres_state():
-    global _STATE_DB_HAS_DATA
+    global _STATE_DB_HAS_DATA, _STATE_DB_LAST_SYNC_AT, _STATE_DB_LAST_SYNC_ERROR
     if not _STATE_DB_ENABLED or not _STATE_DB: return
+    had_error = False
     names=set(_STATE_FILE_NAMES) | {x.name for x in DATA_DIR.glob("*.json")}
     for name in sorted(names):
         path=DATA_DIR/name
@@ -2348,9 +2513,16 @@ def _restore_or_seed_postgres_state():
                         name, remote,
                         lambda current: (_merge_points_snapshots(current, local), None),
                     )
-                _save_local_json(path, remote)
-            elif _state_has_data(local): _STATE_DB.save(name, local)
-        except Exception as exc: print(f"[STATE-DB] startup state failed for {name}: {exc}", flush=True)
+                _save_local_json(path, remote, persist_state_db=False)
+            elif _state_has_data(local) and not _STATE_DB.save(name, local):
+                raise RuntimeError(f"database seed returned false for {name}")
+        except Exception as exc:
+            had_error = True
+            _STATE_DB_LAST_SYNC_ERROR = str(exc)[:240]
+            print(f"[STATE-DB] startup state failed for {name}: {exc}", flush=True)
+    if not had_error:
+        _STATE_DB_LAST_SYNC_AT = time.time()
+        _STATE_DB_LAST_SYNC_ERROR = ""
 
 if _STATE_DB_ENABLED:
     try:
@@ -2466,15 +2638,33 @@ def _request_github_full_backup(bot, sender):
 
 
 def _state_db_worker():
+    global _STATE_DB_INFLIGHT, _STATE_DB_LAST_SYNC_AT, _STATE_DB_LAST_SYNC_ERROR
     while True:
         with _STATE_DB_CONDITION:
             while not _STATE_DB_PENDING: _STATE_DB_CONDITION.wait()
             _STATE_DB_CONDITION.wait(timeout=0.15)
             pending=dict(_STATE_DB_PENDING); _STATE_DB_PENDING.clear()
+            _STATE_DB_INFLIGHT += len(pending)
+        retry_needed = False
         for path,data in pending.items():
             try:
-                if _STATE_DB: _STATE_DB.save(Path(path).name, data)
-            except Exception as exc: print(f"[STATE-DB] background save failed: {exc}", flush=True)
+                if not _STATE_DB or not _STATE_DB.save(Path(path).name, data):
+                    raise RuntimeError("database save returned false")
+                with _STATE_DB_CONDITION:
+                    _STATE_DB_LAST_SYNC_AT = time.time()
+                    _STATE_DB_LAST_SYNC_ERROR = ""
+            except Exception as exc:
+                retry_needed = True
+                with _STATE_DB_CONDITION:
+                    _STATE_DB_LAST_SYNC_ERROR = str(exc)[:240]
+                    _STATE_DB_PENDING.setdefault(path, data)
+                print(f"[STATE-DB] background save failed: {exc}", flush=True)
+            finally:
+                with _STATE_DB_CONDITION:
+                    _STATE_DB_INFLIGHT = max(0, _STATE_DB_INFLIGHT - 1)
+                    _STATE_DB_CONDITION.notify_all()
+        if retry_needed:
+            time.sleep(max(5.0, float(os.getenv("STATE_DB_RETRY_SECONDS", "30") or 30)))
 
 def _database_backup_worker():
     interval=max(900.0,float(os.getenv("DATABASE_BACKUP_INTERVAL_SECONDS","21600") or 21600))
@@ -2485,7 +2675,7 @@ def _database_backup_worker():
             except Exception as exc: print("[BACKUP] periodic backup failed:", repr(exc), flush=True)
 
 def _github_sync_worker():
-    global _GITHUB_INFLIGHT
+    global _GITHUB_INFLIGHT, _GITHUB_LAST_SYNC_AT, _GITHUB_LAST_SYNC_ERROR
     while True:
         with _GITHUB_PENDING_CONDITION:
             while not _GITHUB_PENDING:
@@ -2496,6 +2686,7 @@ def _github_sync_worker():
             _GITHUB_PENDING.clear()
             _GITHUB_INFLIGHT += 1
         backup_ok = True
+        failed_paths = []
         try:
             for path in pending:
                 try:
@@ -2505,12 +2696,21 @@ def _github_sync_worker():
                     with _GITHUB_SYNC_LOCK:
                         if not _github_put_file(path, data):
                             backup_ok = False
+                            failed_paths.append(path)
                 except Exception as exc:
                     backup_ok = False
+                    failed_paths.append(path)
                     print(f"[GITHUB] background sync failed for {Path(path).name}: {exc}", flush=True)
         finally:
             with _GITHUB_PENDING_CONDITION:
                 _GITHUB_INFLIGHT = max(0, _GITHUB_INFLIGHT - 1)
+                for failed_path in failed_paths:
+                    _GITHUB_PENDING.setdefault(failed_path, None)
+                if backup_ok:
+                    _GITHUB_LAST_SYNC_AT = time.time()
+                    _GITHUB_LAST_SYNC_ERROR = ""
+                else:
+                    _GITHUB_LAST_SYNC_ERROR = "رفع ملف أو أكثر لم ينجح"
                 _GITHUB_PENDING_CONDITION.notify_all()
         with _GITHUB_PENDING_CONDITION:
             requests_to_notify = list(_GITHUB_BACKUP_REQUESTS)
@@ -2525,6 +2725,45 @@ def _github_sync_worker():
                 bot.send_private_text(sender, notice)
             except Exception as exc:
                 print(f"[GITHUB] backup completion notice failed: {exc}", flush=True)
+        if not backup_ok:
+            time.sleep(max(5.0, float(os.getenv("GITHUB_SYNC_RETRY_SECONDS", "30") or 30)))
+
+
+def _database_sync_status_text():
+    """Describe local/remote copy synchronization from in-memory worker state only."""
+    with _STATE_DB_CONDITION:
+        state_pending = len(_STATE_DB_PENDING)
+        state_inflight = int(_STATE_DB_INFLIGHT or 0)
+        state_last_at = float(_STATE_DB_LAST_SYNC_AT or 0)
+        state_error = str(_STATE_DB_LAST_SYNC_ERROR or "")
+    with _GITHUB_PENDING_CONDITION:
+        github_pending = len(_GITHUB_PENDING)
+        github_inflight = int(_GITHUB_INFLIGHT or 0)
+        github_last_at = float(_GITHUB_LAST_SYNC_AT or 0)
+        github_error = str(_GITHUB_LAST_SYNC_ERROR or "")
+
+    def status_line(configured, pending, inflight, last_at, error):
+        if not configured:
+            return "⚪ غير مفعّل / Disabled"
+        if pending or inflight:
+            return f"🟡 غير متزامن / Pending — معلّق: {pending}، جارٍ: {inflight}"
+        if error:
+            return f"🔴 غير متزامن / Error — {error[:140]}"
+        if last_at:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_at))
+            return f"🟢 متزامن / In sync — آخر نجاح / last success: {timestamp}"
+        return "🟠 غير مؤكد / Not verified yet"
+
+    state_enabled = bool(_STATE_DB_ENABLED and _STATE_DB is not None)
+    github_enabled = bool(GITHUB_SYNC_ENABLED)
+    return (
+        "🗄️ حالة مزامنة النسخ / Database copy synchronization\n"
+        "• ملفات الحالة المحلية / Local JSON: 🟢 تعمل / Active\n"
+        f"• قاعدة البيانات الدائمة ({RIVEN_DATABASE_KIND.upper()}) / Persistent DB: "
+        f"{status_line(state_enabled, state_pending, state_inflight, state_last_at, state_error)}\n"
+        f"• نسخة GitHub (Talkin4) / GitHub backup: "
+        f"{status_line(github_enabled, github_pending, github_inflight, github_last_at, github_error)}"
+    )
 
 
 if not _LOCAL_BG_WORKER_STARTED:
@@ -2556,6 +2795,45 @@ def _is_publish_command(text):
     """Recognize Arabic and English image-publication commands."""
     value = str(text or "").strip()
     return bool(re.fullmatch(r"(?:بوست|انشر|post|publish)(?:@.*)?", value, re.I | re.S))
+
+
+def _looks_like_media_command(text):
+    """Identify music/media commands so slow downloads cannot occupy chat workers."""
+    value = _normalize_game_command_text(str(text or "").strip()).casefold()
+    if not value:
+        return False
+    # Match only command prefixes, not ordinary conversation mentioning music.
+    return bool(re.match(
+        r"^(?:\.تشغيل|تشغيل|شغل|شغّل|play|music|song|\.play|\.music|\.song)(?:\s|@|$)",
+        value,
+        re.I,
+    ))
+
+
+def _looks_like_priority_command(text):
+    """Return True for latency-sensitive game, gift, and publish commands."""
+    value = str(text or "").strip()
+    low = _normalize_game_command_text(value).casefold()
+    if not low:
+        return False
+    if _is_publish_command(value):
+        return True
+    if re.fullmatch(r"(?:sa|sav|هدايا|gifts|gv)(?:@.*)?", value, re.I | re.S):
+        return True
+    if re.fullmatch(r"[0-9٠-٩]{1,2}", value):
+        # Numeric replies are commonly the next step in a game/gift menu.
+        return True
+    game_names = {
+        str(item).casefold().replace("ة", "ه")
+        for item in (*GAME_COMMANDS, *GAME_COMMANDS.values())
+    }
+    normalized = low.replace("ة", "ه")
+    return any(
+        normalized == name
+        or normalized.startswith(name + "@")
+        or normalized.startswith(name + " ")
+        for name in game_names
+    )
 
 
 def _publish_description(text):
@@ -2623,6 +2901,158 @@ def _save_persistent_blocked_rooms(rooms):
 def _persistent_rosters():
     data = _load_local_json(ROOM_USERS_FILE, {})
     return data if isinstance(data, dict) else {}
+
+
+_IDENTITY_CONTEXT = threading.local()
+
+
+def _set_identity_context(username, room):
+    previous = getattr(_IDENTITY_CONTEXT, "value", None)
+    _IDENTITY_CONTEXT.value = (_norm_user(username), str(room or "").strip())
+    return previous
+
+
+def _restore_identity_context(previous):
+    if previous is None:
+        try:
+            del _IDENTITY_CONTEXT.value
+        except AttributeError:
+            pass
+    else:
+        _IDENTITY_CONTEXT.value = previous
+
+
+def _identity_contextual(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        room = kwargs.get("room", args[0] if args else "")
+        sender = kwargs.get(
+            "sender", kwargs.get("sender_name", args[2] if len(args) > 2 else "")
+        )
+        previous = _set_identity_context(sender, room)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            _restore_identity_context(previous)
+    return wrapped
+
+
+def _stored_user_id(username, preferred_room=""):
+    """Return a numeric Talkin user_id already learned from native room data."""
+    raw = str(username or "").strip().lstrip("@")
+    if raw.isdigit():
+        return raw
+    wanted = _norm_user(raw)
+    if not wanted:
+        return ""
+    if not preferred_room:
+        current = getattr(_IDENTITY_CONTEXT, "value", None)
+        if isinstance(current, tuple) and len(current) == 2 and current[0] == wanted:
+            preferred_room = current[1]
+    data = _persistent_rosters()
+    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+    if not isinstance(rooms, dict):
+        return ""
+    room_names = list(rooms)
+    preferred = _norm_room(preferred_room)
+    room_names.sort(key=lambda name: 0 if preferred and _norm_room(name) == preferred else 1)
+    exact_matches = []
+    decorated_matches = []
+    wanted_decorated = _game_name_key(raw)
+    for room_name in room_names:
+        roster = rooms.get(room_name)
+        if not isinstance(roster, dict):
+            continue
+        for key, value in roster.items():
+            if not isinstance(value, dict):
+                continue
+            saved_name = str(value.get("username") or key).strip().lstrip("@")
+            user_id = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
+            aliases = value.get("aliases", []) if isinstance(value.get("aliases"), list) else []
+            if not user_id.isdigit():
+                continue
+            if _norm_user(saved_name) == wanted or any(_norm_user(alias) == wanted for alias in aliases):
+                exact_matches.append((room_name, user_id))
+            elif wanted_decorated and (
+                    _game_name_key(saved_name) == wanted_decorated
+                    or any(_game_name_key(alias) == wanted_decorated for alias in aliases)):
+                decorated_matches.append((room_name, user_id))
+
+    def unique_match(matches):
+        preferred_matches = [user_id for room_name, user_id in matches
+                             if preferred and _norm_room(room_name) == preferred]
+        candidates = preferred_matches or [user_id for _room_name, user_id in matches]
+        unique = set(candidates)
+        return next(iter(unique)) if len(unique) == 1 else ""
+
+    return unique_match(exact_matches) or unique_match(decorated_matches)
+
+
+def _stored_username_for_id(user_id, preferred_room=""):
+    """Resolve a stable numeric ID back to the latest known display name."""
+    wanted = str(user_id or "").strip()
+    if not wanted.isdigit():
+        return ""
+    data = _persistent_rosters()
+    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+    if not isinstance(rooms, dict):
+        return ""
+    room_names = list(rooms)
+    preferred = _norm_room(preferred_room)
+    room_names.sort(key=lambda name: 0 if preferred and _norm_room(name) == preferred else 1)
+    for room_name in room_names:
+        roster = rooms.get(room_name)
+        if not isinstance(roster, dict):
+            continue
+        for key, value in roster.items():
+            if not isinstance(value, dict):
+                continue
+            saved_id = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
+            if saved_id == wanted:
+                return str(value.get("username") or "").strip().lstrip("@")
+    return ""
+
+
+def _stored_user_aliases(username, preferred_room=""):
+    """Return the current and historical display names mapped to one user ID."""
+    raw = str(username or "").strip().lstrip("@")
+    user_id = _stored_user_id(raw, preferred_room)
+    if not user_id:
+        return [raw] if raw else []
+    data = _persistent_rosters()
+    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+    aliases = {}
+    if isinstance(rooms, dict):
+        for roster in rooms.values():
+            if not isinstance(roster, dict):
+                continue
+            for key, value in roster.items():
+                if not isinstance(value, dict):
+                    continue
+                saved_id = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
+                if saved_id != user_id:
+                    continue
+                name = str(value.get("username") or "").strip().lstrip("@")
+                if name:
+                    aliases.setdefault(_norm_user(name), name)
+                for alias in value.get("aliases", []) if isinstance(value.get("aliases"), list) else []:
+                    alias = str(alias or "").strip().lstrip("@")
+                    if alias:
+                        aliases.setdefault(_norm_user(alias), alias)
+    aliases.setdefault(_norm_user(raw), raw)
+    return list(aliases.values())
+
+
+def _user_identity_key(username, preferred_room=""):
+    # Commands and game state are keyed by the name received in the message.
+    # A native numeric ID is deliberately only a fallback when the transport
+    # supplies no usable username; never make a command wait for roster data.
+    raw = str(username or "").strip().lstrip("@")
+    if raw and not raw.isdigit():
+        return _norm_user(raw)
+    user_id = _stored_user_id(raw, preferred_room)
+    return f"id:{user_id}" if user_id else _norm_user(raw)
+
 
 def _save_persistent_rosters(rosters):
     _save_local_json(ROOM_USERS_FILE, {"version": 1, "rooms": rosters})
@@ -2718,7 +3148,18 @@ def _format_saved_accounts(title, data, empty_text):
     return "\n".join(lines)
 
 
+_ROSTER_PERSIST_LOCK = threading.RLock()
+_ROSTER_ASYNC_STATE_LOCK = threading.Lock()
+_ROSTER_ASYNC_LAST = {}
+
+
 def _remember_roster(room, users):
+    """Merge roster identities atomically so concurrent background saves cannot overwrite each other."""
+    with _ROSTER_PERSIST_LOCK:
+        return _remember_roster_impl(room, users)
+
+
+def _remember_roster_impl(room, users):
     room = _norm_room(room)
     if not room:
         return
@@ -2730,22 +3171,105 @@ def _remember_roster(room, users):
     if not isinstance(current, dict):
         current = {}
     now = int(time.time())
+    # Build lookup indexes once. Scanning the whole roster for every member
+    # made a large room response O(n²), monopolizing a worker and delaying
+    # game commands for tens of seconds.
+    by_id = {}
+    by_name = {}
+    for old_key, old_value in list(current.items()):
+        if not isinstance(old_value, dict):
+            continue
+        old_name = str(old_value.get("username") or old_key).strip().lstrip("@")
+        old_id = str(old_value.get("user_id") or (old_key if str(old_key).isdigit() else "")).strip()
+        if old_id.isdigit():
+            by_id.setdefault(old_id, []).append(str(old_key))
+        if _norm_user(old_name):
+            by_name[_norm_user(old_name)] = str(old_key)
     for user in users or []:
         if not isinstance(user, dict):
             continue
         username = str(user.get("username") or "").strip()
         if not username or _norm_user(username) == _norm_user(BOT_ID):
             continue
-        current[_norm_user(username)] = {
+        user_id = str(user.get("user_id") or "").strip()
+        if not user_id.isdigit():
+            user_id = ""
+        normalized_name = _norm_user(username)
+        existing_key = (by_id.get(user_id, [""])[0] if user_id else "") or by_name.get(normalized_name, "")
+        existing_id = ""
+        aliases = []
+        old_value = current.get(existing_key)
+        if isinstance(old_value, dict):
+            old_name = str(old_value.get("username") or existing_key).strip().lstrip("@")
+            existing_id = str(old_value.get("user_id") or (existing_key if str(existing_key).isdigit() else "")).strip()
+            old_aliases = old_value.get("aliases", [])
+            if isinstance(old_aliases, list):
+                aliases.extend(str(alias).strip().lstrip("@") for alias in old_aliases if str(alias).strip())
+            if _norm_user(old_name) != normalized_name:
+                aliases.append(old_name)
+        if user_id:
+            for old_key in by_id.get(user_id, []):
+                current.pop(old_key, None)
+            storage_key = user_id
+        else:
+            user_id = existing_id if existing_id.isdigit() else ""
+            storage_key = existing_key or normalized_name
+        aliases = list(dict.fromkeys(
+            alias for alias in aliases
+            if alias and _norm_user(alias) != normalized_name
+        ))
+        current[storage_key] = {
             "username": username,
+            "aliases": aliases,
             "role": str(user.get("role") or "none").strip().lower() or "none",
-            "user_id": str(user.get("user_id") or ""),
+            "user_id": user_id,
             "online": user.get("online", user.get("is_present")),
             "is_present": user.get("is_present", user.get("online")),
             "last_seen": now,
         }
+        by_name[normalized_name] = storage_key
+        if user_id:
+            by_id[user_id] = [storage_key]
     rosters[room] = current
     _save_persistent_rosters(rosters)
+
+
+def _remember_roster_async(room, users):
+    """Persist newly observed username/ID pairs without blocking commands."""
+    snapshot = [dict(user) for user in (users or []) if isinstance(user, dict)]
+    if not snapshot:
+        return False
+    # Room text events can repeat the same sender identity for every game
+    # command. Do not start a JSON write thread for each message; that thread
+    # storm competes with game workers even though the identity is unchanged.
+    now = time.monotonic()
+    for user in snapshot:
+        username = _norm_user(user.get("username"))
+        user_id = str(user.get("user_id") or "").strip()
+        key = (_norm_room(room), username)
+        with _ROSTER_ASYNC_STATE_LOCK:
+            previous = _ROSTER_ASYNC_LAST.get(key)
+            if previous and previous[0] == user_id and now - previous[1] < 60.0:
+                continue
+            _ROSTER_ASYNC_LAST[key] = (user_id, now)
+        break
+    else:
+        return False
+    def persist():
+        try:
+            _remember_roster(room, snapshot)
+        except Exception as exc:
+            # Background exceptions otherwise only appear as an unstructured
+            # thread traceback and can be missed by deployment log filters.
+            print(f"[ROSTER] background identity save failed: {exc!r}", flush=True)
+
+    worker = threading.Thread(
+        target=persist,
+        name="persist-member-identity",
+        daemon=True,
+    )
+    worker.start()
+    return True
 
 
 def _game_control_data():
@@ -2796,12 +3320,13 @@ def _master_list():
 
 def _is_master_name(name):
     n = _norm_user(name)
-    configured = {
-        _norm_user(BOT_MASTER),
-        _norm_user(os.getenv("MASTER_ID", "").strip()),
-    }
+    configured_names = [BOT_MASTER, os.getenv("MASTER_ID", "").strip(), *_master_list()]
+    configured = {_norm_user(value) for value in configured_names}
     configured.discard("")
-    return bool(n and (n in configured or n in {_norm_user(x) for x in _master_list()}))
+    candidate_id = _stored_user_id(name)
+    configured_ids = {_stored_user_id(value) for value in configured_names}
+    configured_ids.discard("")
+    return bool(n and (n in configured or (candidate_id and candidate_id in configured_ids)))
 
 def _is_configured_master_account(name):
     """Return only whether *name* is the master configured by deployment vars.
@@ -2811,14 +3336,18 @@ def _is_configured_master_account(name):
     the actual configured BOT_MASTER/MASTER_USERNAME/MASTER_ID account.
     """
     candidate = _norm_user(name)
-    configured = {
+    configured_names = [
         _norm_user(BOT_MASTER),
         _norm_user(os.getenv("BOT_MASTER", "").strip()),
         _norm_user(os.getenv("MASTER_USERNAME", "").strip()),
         _norm_user(os.getenv("MASTER_ID", "").strip()),
-    }
+    ]
+    configured = set(configured_names)
     configured.discard("")
-    return bool(candidate and candidate in configured)
+    candidate_id = _stored_user_id(name)
+    configured_ids = {_stored_user_id(value) for value in configured_names}
+    configured_ids.discard("")
+    return bool(candidate and (candidate in configured or (candidate_id and candidate_id in configured_ids)))
 def _mvip_master_list():
     data = _load_local_json(MVIP_MASTERS_FILE, [])
     return data if isinstance(data, list) else []
@@ -2854,27 +3383,35 @@ def _looks_like_bot_command(text):
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "ملياري", "مليارات", "مليوني", "ملايين", "هدايا", "gifts", "gv", "sher@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "ملياري", "مليارات", "مليوني", "ملايين", "هدايا", "gifts", "gv", "sher@", "sby", "متجر", "shop", "store", "story", "la@", "ترحيب@", "ايدي", "أيدي", "id@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
         "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
     )
     prefixes = prefixes + (
-        "bl@", "+ds@", "رهان ", "مضاربه ", "استثمار ", "حظي ",
+        "فحص الماس", "فحص الالماس", "مستويات", "bl@", "+ds@", "رهان ", "مضاربه ", "استثمار ", "حظي ",
         "ذهب ", "الذهب ", "فضة ", "الفضة ", "فضه ", "الفضه ",
         "نفط ", "النفط ", "أرض ", "ارض ", "الأرض ", "الارض ",
         "gold ", "silver ", "oil ", "land ",
         "سجل التحويل", "سجل تحويلاتي", "سجل المليار", "سجل مليار", "سجل المليون", "سجل مليون",
         "transfer history", "transfer log", "billion record", "billion history", "million record", "million history",
-        "top b", "topb", "top m", "topm",
+        "top b", "topb", "top m", "topm", "room message@", "rooms message@", "room broadcast@",
+        "حالة قاعدة البيانات", "حاله قاعده البيانات",
+        "حالة النسخ", "database status", "database sync status", "db status", "dbsync",
     )
     normalized_low = low.replace("ة", "ه")
     normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
     normalized_games = {str(x).casefold().replace("ة", "ه") for x in (*GAME_COMMANDS, *GAME_COMMANDS.values())}
+    redeem_match = re.fullmatch(r"(?:r|rdem)\s+(.+)", low, re.I)
+    if redeem_match:
+        selection = redeem_match.group(1).strip()
+        selection = re.sub(r"\s+\d+$", "", selection)
+        if resolve_item_keys(selection):
+            return True
     return (
         low.startswith(prefixes)
         or normalized_low.startswith(normalized_prefixes)
-        or low in ("help", "مساعدة", "games", "game", "bom", "vi", "vip")
+        or low in ("help", "مساعدة", "games", "game", "bom", "vi", "vip", "id", "sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag", "متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures", "توب الماس", "توب الألماس", "top diamonds", "top gems", "اغنى المنقبين")
         or normalized_low in ("مساعده", "games", "game")
         or low in {x.casefold() for x in GAME_COMMANDS}
         or normalized_low in normalized_games
@@ -2960,7 +3497,7 @@ def _vip_data():
 
 def _saved_identity_groups(data):
     """Build account identity groups once; exclude audit metadata from identities."""
-    identity_fields = {"username", "user_name", "name", "display_name", "nickname", "nick", "account", "user"}
+    identity_fields = {"username", "user_name", "name", "display_name", "nickname", "nick", "account", "user", "user_id"}
     container_fields = {"users", "records", "accounts", "verified_users", "vip_users", "data", "list", "items", "entries", "members"}
     metadata_fields = {
         "verified_by", "granted_by", "approved_by", "created_at", "updated_at", "timestamp",
@@ -3039,6 +3576,11 @@ def _saved_identity_groups_match(groups, name):
     if not target:
         return False
     if any(_norm_user(candidate) == target for group in groups for candidate in group):
+        return True
+    target_id = _stored_user_id(name)
+    if target_id and any(
+            _stored_user_id(candidate) == target_id
+            for group in groups for candidate in group):
         return True
     canonical = _verification_name_key(name)
     if not canonical:
@@ -3140,20 +3682,75 @@ def _game_stats_data():
         return _GAME_STATS_CACHE
 
 
-# العتبات السابقة محفوظة حتى لا تتغير مستويات اللاعبين الحاليين.
-GAME_LEVELS = (
-    (0, "لاعب جديد"),
-    (21, "لاعب نشيط"),
-    (50, "لاعب محترف"),
-    (150, "أسطورة الألعاب"),
-    (500, "ملك الألعاب"),
-    (1000, "سيد الألعاب"),
-    (2000, "إمبراطور الألعاب"),
-    (5000, "بطل الألعاب"),
-    (10000, "نجم الألعاب"),
-    (20000, "أسطورة الأساطير"),
+GAME_LEVEL_CATEGORIES = (
+    ("النجوم الفضية", "✩", (
+        "مبتدئ", "لاعب ناشئ", "مقاتل", "برونزي", "فضي",
+        "ذهبي", "محترف", "خبير", "أسطورة", "أسطورة فضية",
+    )),
+    ("النجوم الذهبية", "⭐", (
+        "ذهبي مبتدئ", "محارب ذهبي", "ذهبي محترف", "ذهبي متألق", "ذهبي نادر",
+        "أمير الذهب", "فارس الذهب", "قائد الذهب", "أسطورة الذهب", "ملك الذهب",
+    )),
+    ("الماس الأزرق", "💎", (
+        "ماسي مبتدئ", "ماسي متألق", "ماسي محترف", "فارس الماس", "الماسي النادر",
+        "أمير الماس", "قائد الماس", "أسطورة الماس", "إمبراطور الماس الأزرق", "ملك الماس الأزرق",
+    )),
+    ("الماس البرونزي", "🔶", (
+        "برونزي نادر", "فارس البرونز", "برونزي محترف", "البرونزي المتألق", "سيد البرونز",
+        "أمير البرونز", "قائد البرونز", "أسطورة البرونز", "إمبراطور البرونز", "ملك الماس البرونزي",
+    )),
+    ("الماس الأحمر", "♦️", (
+        "أحمر نادر", "محارب الماس الأحمر", "أحمر محترف", "فارس الماس الأحمر", "أمير الماس الأحمر",
+        "قائد الماس الأحمر", "أسطورة الماس الأحمر", "سيد الماس الأحمر", "إمبراطور الماس الأحمر", "ملك الماس الأحمر",
+    )),
+    ("الماس الأسود", "◆", (
+        "أسود نادر", "محارب أسود", "متألق أسود", "محترف أسود", "فارس أسود",
+        "أمير الأسود", "سيد الأسود", "أسطورة الأسود", "إمبراطور الأسود", "ملك الماس الأسود",
+    )),
+    ("الماس البنفسجي", "🟣💎", (
+        "بنفسجي نادر", "محارب بنفسجي", "متألق بنفسجي", "محترف بنفسجي", "فارس بنفسجي",
+        "أمير البنفسج", "سيد البنفسج", "أسطورة البنفسج", "إمبراطور البنفسج", "ملك الماس البنفسجي",
+    )),
+    ("الماس الملكي", "👑", (
+        "ملكي نادر", "محارب ملكي", "متألق ملكي", "محترف ملكي", "فارس ملكي",
+        "أمير ملكي", "سيد الملك", "أسطورة ملكية", "إمبراطور الماس", "تاج الملوك الأبدي",
+    )),
 )
-
+GAME_LEVEL_FUTURE_CATEGORIES = (
+    ("الماس الخالد", "💠", (
+        "بداية الخلود", "حارس الخلود", "نبض الخلود", "فارس الخلود", "سيد الخلود",
+        "أمير الخلود", "أسطورة الخلود", "إمبراطور الخلود", "عرش الخلود", "تاج الخلود",
+    )),
+    ("الماس الكوني", "🔷", (
+        "بداية الكون", "حارس النجوم", "سائر المجرات", "فارس المجرة", "سيد الكون",
+        "أمير المجرات", "أسطورة المجرات", "إمبراطور الكون", "عرش المجرات", "سيّد المجرات",
+    )),
+)
+GAME_LEVEL_FUTURE_SYMBOLS = ("🔷", "🔶", "🟣", "🟢", "🟠", "⚫", "⚪")
+GAME_LEVEL_FUTURE_TITLES = (
+    "مستكشف", "مبتدئ", "متألق", "محترف", "فارس", "نادر", "أمير", "قائد", "أسطورة", "إمبراطور",
+)
+def _game_level_details_from_plays(plays):
+    try:
+        plays = max(0, int(plays or 0))
+    except (TypeError, ValueError):
+        plays = 0
+    category_index = plays // 5000
+    level_number = (plays % 5000) // 500 + 1
+    if category_index < len(GAME_LEVEL_CATEGORIES):
+        category_name, symbol, titles = GAME_LEVEL_CATEGORIES[category_index]
+        label = titles[level_number - 1]
+    else:
+        future_index = category_index - len(GAME_LEVEL_CATEGORIES)
+        if future_index < len(GAME_LEVEL_FUTURE_CATEGORIES):
+            category_name, symbol, titles = GAME_LEVEL_FUTURE_CATEGORIES[future_index]
+            label = titles[level_number - 1]
+        else:
+            dynamic_index = future_index - len(GAME_LEVEL_FUTURE_CATEGORIES) + 1
+            category_name = f"الماس الكوني {dynamic_index}"
+            symbol = GAME_LEVEL_FUTURE_CATEGORIES[-1][1]
+            label = f"{GAME_LEVEL_FUTURE_TITLES[level_number - 1]} {category_name}"
+    return category_index, level_number, category_name, label, symbol, plays
 def _game_name_key(name):
     """Compare decorated usernames without changing their displayed form."""
     raw = unicodedata.normalize("NFKC", str(name or "")).strip().lstrip("@")
@@ -3210,9 +3807,28 @@ def _game_record_matches(data, username):
     if not isinstance(data, dict):
         return []
     wanted = _game_name_key(username)
-    return [(str(key), candidate) for key, candidate in data.items()
-            if isinstance(candidate, dict)
-            and _game_name_key(candidate.get("username") or key) == wanted]
+    matches = []
+    for key, candidate in data.items():
+        if not isinstance(candidate, dict):
+            continue
+        stored_name = candidate.get("username") or key
+        if _game_name_key(stored_name) == wanted:
+            matches.append((str(key), candidate))
+    if matches:
+        return matches
+    # Only consult the saved/native ID when the current username has no direct
+    # record. This preserves old renamed accounts without slowing normal games.
+    wanted_id = _stored_user_id(username)
+    if not wanted_id:
+        return []
+    for key, candidate in data.items():
+        if not isinstance(candidate, dict):
+            continue
+        stored_name = candidate.get("username") or key
+        stored_id = str(candidate.get("user_id") or _stored_user_id(stored_name) or "").strip()
+        if stored_id == wanted_id:
+            matches.append((str(key), candidate))
+    return matches
 
 
 def _merged_game_item(data, username):
@@ -3224,8 +3840,11 @@ def _merged_game_item(data, username):
     """
     exact_key = _norm_user(username)
     matches = _game_record_matches(data, username)
+    # A normal username match is complete; only legacy/renamed records need
+    # the compatibility ID lookup performed by _game_record_matches.
+    wanted_id = _stored_user_id(username) if not matches else ""
     if not matches:
-        return exact_key, {}
+        return _user_identity_key(username), {}
     # Prefer an exact non-empty key for the canonical record; otherwise keep
     # the record with the richest history and preserve its displayed username.
     canonical_key, canonical = next(
@@ -3251,6 +3870,8 @@ def _merged_game_item(data, username):
                     int(values.get(field, 0) or 0),
                 )
     merged["games"] = merged_games
+    if wanted_id:
+        merged["user_id"] = wanted_id
     return canonical_key, merged
 
 
@@ -3258,7 +3879,11 @@ def _coalesce_game_records(data, username):
     """Merge equivalent records in-place without inflating duplicate counters."""
     key, merged = _merged_game_item(data, username)
     if not merged:
-        return _norm_user(username), {}
+        return _user_identity_key(username), {}
+    stable_key = _user_identity_key(username)
+    if stable_key.startswith("id:"):
+        merged["user_id"] = stable_key.split(":", 1)[1]
+        key = stable_key
     data[key] = merged
     wanted_keys = {record_key for record_key, _item in _game_record_matches(data, username)}
     for duplicate_key in wanted_keys - {key}:
@@ -3278,7 +3903,8 @@ def _game_aggregate_map(data):
         if not isinstance(item, dict):
             continue
         name = str(item.get("username") or key).strip().lstrip("@")
-        canonical = _game_name_key(name)
+        user_id = str(item.get("user_id") or _stored_user_id(name) or "").strip()
+        canonical = f"id:{user_id}" if user_id.isdigit() else _game_name_key(name)
         if not canonical:
             continue
         games = item.get("games") if isinstance(item.get("games"), dict) else {}
@@ -3339,7 +3965,8 @@ def _dedupe_persisted_game_files():
             if not isinstance(item, dict):
                 continue
             username = str(item.get("username") or key).strip().lstrip("@")
-            canonical = _game_name_key(username)
+            user_id = str(item.get("user_id") or _stored_user_id(username) or "").strip()
+            canonical = f"id:{user_id}" if user_id.isdigit() else _game_name_key(username)
             if not canonical:
                 continue
             current = merged_players.get(canonical)
@@ -3357,11 +3984,10 @@ def _game_level_from_item(item):
     games = item.get("games", {}) if isinstance(item, dict) else {}
     plays = sum(int((value or {}).get("plays", 0) or 0)
                 for value in games.values()) if isinstance(games, dict) else 0
-    level_number, label = 1, GAME_LEVELS[0][1]
-    for number, (threshold, current_label) in enumerate(GAME_LEVELS, 1):
-        if plays >= threshold:
-            level_number, label = number, current_label
-    return level_number, label, plays
+    category_index, level_number, _category, label, _symbol, plays = _game_level_details_from_plays(plays)
+    # Keep a monotonically increasing rank for existing global game boards,
+    # even though the displayed level resets to 1 at every new category.
+    return category_index * 10 + level_number, label, plays
 
 
 def _game_level_info(username):
@@ -3376,16 +4002,14 @@ def _game_level_info(username):
             wanted = _game_name_key(username)
             item = next((candidate for key, candidate in players.items()
                          if isinstance(candidate, dict)
-                         and _game_name_key(candidate.get("username") or key) == wanted), {})
+                         and (_game_name_key(candidate.get("username") or key) == wanted
+                              or (_stored_user_id(username) and str(candidate.get("user_id") or _stored_user_id(candidate.get("username") or key) or "") == _stored_user_id(username)))), {})
     games = item.get("games", {}) if isinstance(item, dict) else {}
     if isinstance(games, dict):
         plays = sum(int((value or {}).get("plays", 0) or 0) for value in games.values())
     else:
         plays = int(item.get("plays", 0) or 0) if isinstance(item, dict) else 0
-    level_number, label = 1, GAME_LEVELS[0][1]
-    for number, (threshold, current_label) in enumerate(GAME_LEVELS, 1):
-        if plays >= threshold:
-            level_number, label = number, current_label
+    _category_index, level_number, _category, label, _symbol, plays = _game_level_details_from_plays(plays)
     return level_number, label, plays
 
 
@@ -3398,7 +4022,7 @@ def _game_star_rank(username):
             rows.append((level, plays, canonical, name))
     rows.sort(key=lambda row: (-row[0], -row[1], row[2]))
     for rank, row in enumerate(rows[:15], 1):
-        if row[2] == _game_name_key(username):
+        if row[2] == _user_identity_key(username):
             return rank
     return None
 
@@ -3450,6 +4074,7 @@ def _save_game_levels_snapshot():
             username = str(item.get("username") or canonical).strip().lstrip("@")
             players[canonical] = {
                 "username": username,
+                "user_id": str(item.get("user_id") or _stored_user_id(username) or ""),
                 "level": level,
                 "label": label,
                 "plays": plays,
@@ -3481,42 +4106,52 @@ def _schedule_game_levels_snapshot():
 
 
 def _game_welcome(username, room):
-    level, label, plays = _game_level_info(username)
-    if plays < 50:
-        return (f"🎮 دخل @{username}\n"
-                f"🏠 الغرفة: {room}\n"
-                f"🎯 جولاتك: {plays}")
-    star_line = f"\n⭐ ترتيب النجوم\n       {'⭐' * level}"
-    return (f"🎮 دخل @{username}\n"
-            f"{label}\n"
+    previous = _set_identity_context(username, room)
+    try:
+        return _game_welcome_with_identity(username, room)
+    finally:
+        _restore_identity_context(previous)
+
+
+def _game_welcome_with_identity(username, room):
+    _level, _label, plays = _game_level_info(username)
+    _category_index, level, category, label, symbol, plays = _game_level_details_from_plays(plays)
+    return (f"🎮 يا هلا بعودة اللاعب @{username}\n"
             f"🏠 الغرفة: {room}\n"
+            f"🏅 الفئة: {category}\n"
+            f"🎖️ اللقب: {label}\n"
             f"🏅 مستوى الألعاب: {level}\n"
-                f"🎯 جولاتك: {plays}{star_line}")
+            f"🎯 عدد الألعاب: {plays}\n"
+            f"{symbol * level}")
 
 
 def _join_welcome_message(username, room, custom_welcome_enabled=True, custom_welcome=None):
-    """Build the automatic join welcome without mixing VIP and game levels."""
+    previous = _set_identity_context(username, room)
+    try:
+        return _join_welcome_message_with_identity(
+            username, room, custom_welcome_enabled, custom_welcome,
+        )
+    finally:
+        _restore_identity_context(previous)
+
+
+def _join_welcome_message_with_identity(username, room, custom_welcome_enabled=True, custom_welcome=None):
+    """Build the same data-driven level welcome for every joining account."""
     _level, _label, plays = _game_level_info(username)
-    is_vip = _is_vip_user(username)
-    if plays < 50:
-        if not is_vip:
-            return None
-        custom_welcome = {"message": "👑 عضو Vip\n👤 {username}\n🏠 الغرفة: {room}"}
-    elif not custom_welcome_enabled:
-        custom_welcome = None
-    if plays >= 50:
-        level_welcome = _game_welcome(username, room)
-        if (isinstance(custom_welcome, dict) and custom_welcome.get("message")
-                and not is_vip):
-            level_welcome = (str(custom_welcome["message"])
-                             .replace("{username}", username)
-                             .replace("{room}", room) + "\n\n" + level_welcome)
-        return level_welcome
-    if isinstance(custom_welcome, dict) and custom_welcome.get("message"):
-        return (str(custom_welcome["message"])
-                .replace("{username}", username)
-                .replace("{room}", room))
-    return None
+    is_vip = _is_vip_user(username) and not _is_master_name(username)
+    prefix = ""
+    # A member with recorded gameplay gets exactly one welcome: the level
+    # welcome. Do not prepend the VIP welcome to it; this used to produce two
+    # contradictory greetings for the same join event.
+    if plays <= 0 and is_vip:
+        prefix = f"👑 عضو Vip\n👤 {username}\n🏠 الغرفة: {room}"
+    elif (custom_welcome_enabled and not is_vip
+          and isinstance(custom_welcome, dict) and custom_welcome.get("message")):
+        prefix = (str(custom_welcome["message"])
+                  .replace("{username}", username)
+                  .replace("{room}", room))
+    level_welcome = _game_welcome(username, room)
+    return f"{prefix}\n\n{level_welcome}" if prefix else level_welcome
 
 
 def _record_game(username, game_key, points_delta=0, stake=0):
@@ -3525,7 +4160,7 @@ def _record_game(username, game_key, points_delta=0, stake=0):
         return
     with _GAME_STATE_LOCK:
         data = _game_stats_data()
-        canonical_key = _game_name_key(username)
+        canonical_key = _user_identity_key(username)
         if _GAME_STATS_MIGRATION_DONE and canonical_key in data and isinstance(data[canonical_key], dict):
             existing_key, item = canonical_key, data[canonical_key]
         else:
@@ -3533,6 +4168,8 @@ def _record_game(username, game_key, points_delta=0, stake=0):
         key = existing_key or key
         item = item if isinstance(item, dict) else {}
         item.setdefault("username", str(username).strip().lstrip("@"))
+        # Native IDs are background metadata; never read room_users.json while
+        # processing a live game command.
         games = item.get("games") if isinstance(item.get("games"), dict) else {}
         g = games.get(game_key, {"plays": 0, "points": 0, "staked": 0})
         g["plays"] = int(g.get("plays", 0) or 0) + 1
@@ -3551,7 +4188,7 @@ def _restore_game_play_count(username, count, *, increment=False):
     amount = max(0, int(count))
     with _GAME_STATE_LOCK:
         data = _game_stats_data()
-        canonical_key = _game_name_key(username)
+        canonical_key = _user_identity_key(username)
         if _GAME_STATS_MIGRATION_DONE and canonical_key in data and isinstance(data[canonical_key], dict):
             key, item = canonical_key, data[canonical_key]
         else:
@@ -3559,6 +4196,9 @@ def _restore_game_play_count(username, count, *, increment=False):
         key = key or _norm_user(username)
         item = item if isinstance(item, dict) else {}
         item.setdefault("username", str(username).strip().lstrip("@"))
+        user_id = _stored_user_id(username)
+        if user_id:
+            item["user_id"] = user_id
         games = item.get("games") if isinstance(item.get("games"), dict) else {}
         current = sum(int((value or {}).get("plays", 0) or 0) for value in games.values())
         target = current + amount if increment else amount
@@ -3672,6 +4312,19 @@ def _points_account_candidates(data, username, *, exact_only=False):
             exact.append((str(key), item))
     if exact or exact_only:
         return exact
+    # ID lookup is a compatibility fallback for renamed/legacy accounts only.
+    wanted_id = _stored_user_id(username)
+    if wanted_id:
+        by_id = []
+        for key, item in data.items():
+            if not isinstance(item, dict):
+                continue
+            saved_name = item.get("username") or key
+            saved_id = str(item.get("user_id") or _stored_user_id(saved_name) or "").strip()
+            if saved_id == wanted_id:
+                by_id.append((str(key), item))
+        if by_id:
+            return by_id
     canonical = _game_name_key(username)
     if not canonical:
         return []
@@ -3765,12 +4418,15 @@ def _add_points(username, amount):
         else:
             if amount < 0:
                 raise PointsInsufficientError("No saved points account for this player")
-            key = _norm_user(display_name)
+            key = _user_identity_key(display_name)
             item = {"username": display_name, "points": 0}
         old_balance = _points_balance(item)
         if amount < 0 and old_balance < -amount:
             raise PointsInsufficientError("Insufficient points for this game debit")
         item["username"] = _preferred_display_name(item.get("username"), display_name)
+        user_id = _stored_user_id(display_name)
+        if user_id:
+            item["user_id"] = user_id
         item["points"] = old_balance + amount
         accounts[key] = item
         return item["points"], True
@@ -3783,7 +4439,7 @@ def _add_points(username, amount):
         raise PointsPersistenceError("Could not persist points mutation") from exc
 
 
-def _apply_points_delta_once(username, delta, transaction_id, reason):
+def _apply_points_delta_once(username, delta, transaction_id, reason, *, stock_market_investment=None):
     """Atomically apply one idempotent game debit/credit and audit it."""
     try:
         delta = int(delta)
@@ -3794,16 +4450,29 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
     if not _norm_user(display_name) or not txid or delta == 0:
         return {"ok": False, "error": "invalid_transaction"}
 
+    has_stock_metadata = (
+        isinstance(stock_market_investment, dict)
+        and txid == f"stock-market-debit:{stock_market_investment.get('id') or ''}"
+    )
+
     def update(accounts, history):
-        if any(isinstance(row, dict) and str(row.get("id") or "") == txid for row in history):
+        existing_transaction = next(
+            (row for row in history if isinstance(row, dict) and str(row.get("id") or "") == txid),
+            None,
+        )
+        if existing_transaction is not None:
             existing = _resolve_points_account(accounts, display_name)
-            return {"ok": True, "already_applied": True,
-                    "balance": _points_balance(existing[1]) if existing else 0}, False
+            result = {"ok": True, "already_applied": True,
+                      "balance": _points_balance(existing[1]) if existing else 0}
+            if has_stock_metadata and not isinstance(existing_transaction.get("stock_market_investment"), dict):
+                existing_transaction["stock_market_investment"] = copy.deepcopy(stock_market_investment)
+                return result, True
+            return result, False
         resolved = _resolve_points_account(accounts, display_name)
         if not resolved:
             if delta < 0:
                 return {"ok": False, "error": "target_not_found"}, False
-            key = _norm_user(display_name)
+            key = _user_identity_key(display_name)
             item = {"username": display_name, "points": 0}
         else:
             key, saved = resolved
@@ -3813,10 +4482,13 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
             return {"ok": False, "error": "insufficient", "balance": old_balance}, False
         new_balance = old_balance + delta
         item["username"] = _preferred_display_name(item.get("username"), display_name)
+        user_id = _stored_user_id(display_name)
+        if user_id:
+            item["user_id"] = user_id
         item["points"] = new_balance
         accounts[key] = item
         positive = delta > 0
-        history.append({
+        entry = {
             "id": txid, "timestamp": int(time.time()),
             "sender": (
                 "wager_refund" if positive and str(reason or "").casefold().startswith("refund expired")
@@ -3828,7 +4500,10 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
             "amount": abs(delta), "sender_balance_after": None if positive else new_balance,
             "recipient_balance_after": new_balance if positive else None,
             "reason": str(reason or "stock_market"),
-        })
+        }
+        if has_stock_metadata:
+            entry["stock_market_investment"] = copy.deepcopy(stock_market_investment)
+        history.append(entry)
         del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
         return {"ok": True, "already_applied": False, "balance": new_balance}, True
 
@@ -3861,6 +4536,9 @@ def _deduct_points(username, amount, *, actor=""):
             return {"ok": False, "error": "insufficient", "balance": balance}, False
         item = dict(saved_item)
         item["points"] = balance - amount
+        user_id = _stored_user_id(target_name)
+        if user_id:
+            item["user_id"] = user_id
         accounts[key] = item
         history.append({
             "id": uuid.uuid4().hex,
@@ -3902,7 +4580,7 @@ def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_s
         source = _resolve_points_account(accounts, sender_name, exact_only=not allow_alias_source)
         destination = _resolve_points_account(accounts, target_name, exact_only=require_exact_target)
         if not destination and create_target_if_missing and _norm_user(target_name):
-            destination = (_norm_user(target_name), {"username": target_name, "points": 0})
+            destination = (_user_identity_key(target_name), {"username": target_name, "points": 0})
         if not destination:
             return {"ok": False, "error": "target_not_found"}, False
         if not source:
@@ -3921,6 +4599,12 @@ def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_s
         target_item["points"] = target_balance + amount
         source_item["username"] = str(source_item.get("username") or sender_name)
         target_item["username"] = str(target_item.get("username") or target_name)
+        source_id = _stored_user_id(sender_name)
+        target_id = _stored_user_id(target_name)
+        if source_id:
+            source_item["user_id"] = source_id
+        if target_id:
+            target_item["user_id"] = target_id
         accounts[source_key] = source_item
         accounts[target_key] = target_item
         entry = {
@@ -4114,6 +4798,19 @@ def _money_game_win_text(game, username, language="ar"):
             f"✅ {name}\n💰 مبلغ الفوز: +{amount} نقطة\n🎉 مبروك يا بطل!\n{stars}")
 
 
+def _money_game_short_win_text(game, username, language="ar"):
+    """Compact winner notice for rooms other than the game origin."""
+    game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
+    name = str(username or "").strip().lstrip("@")
+    title = ("billion" if game == "billion" else "million") if language == "en" else (
+        "المليار" if game == "billion" else "المليون"
+    )
+    decoration = "💵💸" if game == "billion" else "🟩🟨🏆"
+    if language == "en":
+        return f"{decoration}✨ @{name} won the {title}! ✨{decoration}"
+    return f"{decoration}✨ حصل @{name} على {title}! ✨{decoration}"
+
+
 DEFAULT_REPLY_MESSAGES = {
     "master_silent": "",
     "master_denied": "",
@@ -4168,6 +4865,62 @@ def _points_threshold_top_message(threshold, label, *, english=False, limit=POIN
     if not rows:
         lines.append("No qualifying players yet." if english else "لا يوجد لاعبون وصلوا لهذا الرصيد بعد.")
     return "\n".join(lines)
+
+
+def _safe_text_pages_from_items(packet_type, route_fields, heading_lines, item_lines, *, max_items_per_page=None, language="ar", marker_first=False):
+    """Build numbered list pages whose complete protobuf packets fit the WS limit."""
+    limit = _ws_payload_limit()
+    english = str(language or "ar").casefold() == "en"
+    marker = "📄 List" if english else "📄 القائمة"
+    next_footer = "\n\n📌 Type ns for the next list." if english else "\n\n📌 اكتب ns للقائمة التالية."
+
+    def render(items, page_no, total):
+        marker_line = f"{marker} {page_no}/{total}"
+        headings = [str(line) for line in heading_lines]
+        if marker_first:
+            return "\n".join([marker_line, *headings, *items])
+        return "\n".join([*headings, marker_line, *items])
+
+    def packet_size(text):
+        fields = dict(route_fields or {})
+        fields.update({"type_": "text", "body": text})
+        return len(encode_query(packet_type, **fields))
+
+    def fits(items):
+        # The largest plausible marker plus the longer continuation footer
+        # reserves enough bytes for the final page number and navigation.
+        probe = render(items, "999999", "999999") + next_footer
+        return packet_size(probe) <= limit
+
+    def shorten_line(line):
+        if fits([line]):
+            return line
+        low, high = 0, len(line)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = line[:middle].rstrip() + "…"
+            if fits([candidate]):
+                low = middle
+            else:
+                high = middle - 1
+        return line[:low].rstrip() + "…"
+
+    item_pages = []
+    current = []
+    for raw_item in item_lines:
+        item = str(raw_item)
+        count_full = max_items_per_page and len(current) >= int(max_items_per_page)
+        if current and (count_full or not fits(current + [item])):
+            item_pages.append(current)
+            current = []
+        if not fits(current + [item]):
+            item = shorten_line(item)
+        current.append(item)
+    if current or not item_pages:
+        item_pages.append(current)
+
+    total = len(item_pages)
+    return [render(page, page_no, total) for page_no, page in enumerate(item_pages, 1)]
 
 
 def _points_rank(username):
@@ -4297,8 +5050,11 @@ def _load_moderation_config():
             words = sorted(BANNED_WORDS)
 
     words = [str(w).strip() for w in words if _valid_filter_word(w)]
+    # Legacy enabled state has no record of who enabled it. Keep it off once,
+    # then preserve future choices made through the restricted master command.
+    authorized_state = bool(mf_data.get("_creator_master_only_v1"))
     raw_enabled = mf_data.get("enabled", moderation_data.get("enabled", AUTO_BAN_WORDS))
-    enabled = bool(raw_enabled) if isinstance(raw_enabled, (bool, int)) else AUTO_BAN_WORDS
+    enabled = (bool(raw_enabled) if isinstance(raw_enabled, (bool, int)) else AUTO_BAN_WORDS) if authorized_state else False
 
     # Ensure the dedicated file exists immediately so filter data is visibly
     # stored separately from the main moderation settings.
@@ -4316,7 +5072,10 @@ def _save_mf_config(enabled, words):
         if key and key not in seen:
             seen.add(key)
             clean.append(word)
-    _save_local_json(MF_FILE, {"enabled": bool(enabled), "words": clean})
+    _save_local_json(MF_FILE, {
+        "enabled": bool(enabled), "words": clean,
+        "_creator_master_only_v1": True,
+    })
     return clean
 
 
@@ -4423,7 +5182,18 @@ def _publish_ban_rows():
 
 def _room_protection_data():
     data=_load_local_json(PROTECTION_FILE,{})
-    return data if isinstance(data,dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    if not data.get("_creator_master_only_v1"):
+        rooms = data.get("rooms", {})
+        if isinstance(rooms, dict):
+            for cfg in rooms.values():
+                if isinstance(cfg, dict):
+                    for key in ("swear", "flood", "joinleave", "no_photo"):
+                        cfg[key] = False
+        data["_creator_master_only_v1"] = True
+        _save_local_json(PROTECTION_FILE, data)
+    return data
 
 def _room_protection_cfg(room):
     data=_room_protection_data(); rooms=data.get("rooms",{}) if isinstance(data.get("rooms"),dict) else {}
@@ -4453,7 +5223,17 @@ def _save_moderation_config(enabled, words):
 
 def _room_moderation_data():
     data = _load_local_json(MODERATION_FILE, {})
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    if not data.get("_room_protection_creator_master_only_v1"):
+        rooms = data.get("rooms", {})
+        if isinstance(rooms, dict):
+            for cfg in rooms.values():
+                if isinstance(cfg, dict):
+                    cfg["enabled"] = False
+        data["_room_protection_creator_master_only_v1"] = True
+        _save_local_json(MODERATION_FILE, data)
+    return data
 
 def _room_moderation_config(room):
     data = _room_moderation_data()
@@ -4484,6 +5264,10 @@ def _bot_protection_data():
     data = _load_local_json(MODERATION_FILE, {})
     if not isinstance(data, dict):
         data = {}
+    if not data.get("_bot_protection_master_only_v1"):
+        data["bot_protection_enabled"] = False
+        data["_bot_protection_master_only_v1"] = True
+        _save_local_json(MODERATION_FILE, data)
     blocked = data.get("bot_blocked_users", [])
     if not isinstance(blocked, list):
         blocked = []
@@ -4494,11 +5278,12 @@ def _bot_blocked_users():
     return set(_bot_protection_data().get("bot_blocked_users", []))
 
 def _bot_protection_enabled():
-    return bool(_bot_protection_data().get("bot_protection_enabled", True))
+    return bool(_bot_protection_data().get("bot_protection_enabled", False))
 
 def _save_bot_protection_enabled(enabled):
     data = _bot_protection_data()
     data["bot_protection_enabled"] = bool(enabled)
+    data["_bot_protection_master_only_v1"] = True
     _save_local_json(MODERATION_FILE, data)
     return bool(enabled)
 
@@ -4669,19 +5454,19 @@ def _default_help_sections():
             '📋 أوامر الإدارة — 3 | التوثيق وVIP\n━━━━━━━━━━━━\nvi@اسم — توثيق مستخدم\nuns@اسم — سحب التوثيق\nسحب التوثيق@اسم — سحب التوثيق\nإزالة توثيق@اسم — سحب التوثيق\nتوثيق الكل — توثيق كل الأعضاء\nvi — عدد الموثقين\nvip@اسم — منح VIP\nunvip@اسم — سحب VIP\nvip — عدد أعضاء VIP\nmvip@اسم — إضافة ماستر توثيق\numvip@اسم — سحب ماستر توثيق\nl@mvip — عرض ماسترات التوثيق',
             '📋 أوامر الإدارة — 4 | التوثيق والحماية\n━━━━━━━━━━━━\nتشغيل التوثيق — تشغيل نظام التوثيق\nإيقاف التوثيق — إيقاف نظام التوثيق\nحماية@اسم_الغرفة — قائمة الحماية الخاصة بالماستر\nتشغيل/إيقاف الحماية — إعداد عام للغرفة\nحالة الحماية — عرض الحالة\nحمايه البوت — حماية داخلية للبوت\nالمحظورين — المحظورون داخل البوت',
             '📋 أوامر الإدارة — 5 | الفلتر والنشر\n━━━━━━━━━━━━\nmf@on — تشغيل فلتر الكلمات\nmf@off — إيقاف فلتر الكلمات\n+mf@كلمة — إضافة كلمة للفلتر\n-mf@كلمة — حذف كلمة من الفلتر\nl@mf — عرض كلمات الفلتر\nclear@mf — مسح كلمات الفلتر\nl@mfb — عرض المحظورين بسبب الفلتر\nl@mbp — عرض الممنوعين من النشر\nmbp@اسم — فك منع النشر\namf@اسم — استثناء مستخدم من حظر الفلتر',
-            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nغرفي / myrooms — الغرف المتصلة\nدخول الكل / دخولكل / .دخول غرفي — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم / is@اسم — البحث عن مستخدم\nl@a / l@m / l@o / l@b — قوائم الرتب',
+            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nفحص الماس — منح ألماسة اختبارية متغيرة النوع وصورتها في الغرفة\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nغرفي / myrooms — الغرف المتصلة\nدخول الكل / دخولكل / .دخول غرفي — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم / is@اسم — البحث عن مستخدم\nl@a / l@m / l@o / l@b — قوائم الرتب',
         ],
         2: [
             '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال: .sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
             '❤️ التفاعلات والصور والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي أو صورتك — بحث آمن عن صورة مناسبة لاسمك\n.صوره اسم_المستخدم — بحث آمن عن صورة المستخدم\nشبيه@اسم — بحث آمن عن الشبيه\nشبيهك@اسم — بحث آمن عن شبيهك\n\n📌 النتائج العامة من الإنترنت، مع تفعيل SafeSearch ومنع البحث عن الصور المخلة.',
         ],
         3: [
-            '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📌 اكتب ns للقائمة التالية',
+            '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📚 مستويات — عرض فئات ومستويات التقدم\n📌 اكتب ns للقائمة التالية',
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
             '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — بعد دقيقة؛ ربح أو خسارة 1–20%. بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
-            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
+            '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 1,000,000,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا (حتى 30 هدية في القائمة)\ngifts / gv — قائمة الهدايا؛ اكتب ns للتالي\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
@@ -5516,6 +6301,9 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url="", language
     """
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow غير مثبت")
+    if str(game_key) in {"million", "billion", "بنك مليون"}:
+        money_key = "million" if str(game_key) in {"million", "بنك مليون"} else "billion"
+        return render_money_game_winner_card(money_key, winner_name, winner_photo_url, language)
     source_name = GAME_IMAGE_FILES.get(game_key) or GAME_IMAGE_FILES.get("billion")
     source = ASSETS_DIR / source_name
     if not source.is_file():
@@ -5629,6 +6417,74 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url="", language
             image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
             if out.stat().st_size <= 300 * 1024:
                 break
+    return out
+
+
+def render_money_game_winner_card(game_key, winner_name, winner_photo_url="", language="ar"):
+    """Render the million/billion artwork with one shared, low-profile winner bar."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبت")
+    game_key = "million" if str(game_key).casefold() in {"million", "بنك مليون"} else "billion"
+    source_name = GAME_IMAGE_FILES.get(game_key)
+    source = ASSETS_DIR / source_name if source_name else None
+    if not source or not source.is_file():
+        raise FileNotFoundError(f"صورة الجائزة غير موجودة: {source}")
+
+    image = Image.open(source).convert("RGBA")
+    target_w = 1100
+    target_h = max(1, round(target_w * image.height / image.width))
+    image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    w, h = image.size
+    gold = (244, 196, 92, 255)
+    panel = (3, 28, 31, 235)
+    panel_box = (int(w * .07), int(h * .785), int(w * .93), int(h * .94))
+    draw.rounded_rectangle(
+        panel_box, radius=max(20, int(w * .025)), fill=panel,
+        outline=gold, width=max(3, int(w * .004)),
+    )
+
+    avatar_size = min(max(96, int(h * .075)), panel_box[3] - panel_box[1] - 28)
+    avatar = _load_sender_avatar(winner_photo_url, avatar_size)
+    margin = max(20, int(w * .035))
+    if avatar is not None:
+        # Arabic is right-to-left: keep the small winner photo on the right,
+        # beside the winner's name inside the same bottom rectangle.
+        avatar_x = panel_box[2] - margin - avatar_size
+        avatar_y = panel_box[1] + (panel_box[3] - panel_box[1] - avatar_size) // 2
+        overlay.alpha_composite(avatar, (int(avatar_x), int(avatar_y)))
+        text_left = panel_box[0] + margin
+        text_right = avatar_x - max(18, int(w * .025))
+    else:
+        text_left = panel_box[0] + margin
+        text_right = panel_box[2] - margin
+
+    english = str(language or "ar").casefold().startswith("en")
+    title = ("Million winner" if game_key == "million" else "Billion winner") if english else (
+        "الفائز بالمليون" if game_key == "million" else "الفائز بالمليار"
+    )
+    text_center = ((text_left + text_right) / 2, panel_box[1] + (panel_box[3] - panel_box[1]) * .34)
+    _draw_centered(draw, text_center, "🏆 " + title, max(28, int(h * .038)),
+                   (255, 224, 145, 255), max(80, text_right - text_left))
+    name_center = ((text_left + text_right) / 2, panel_box[1] + (panel_box[3] - panel_box[1]) * .70)
+    _draw_name_centered(draw, name_center, "@" + str(winner_name or ""), max(34, int(h * .044)),
+                        (255, 255, 255, 255), max(80, text_right - text_left))
+
+    image = Image.alpha_composite(image, overlay).convert("RGB")
+    out_dir = BASE_DIR / "generated_games"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        old = sorted((x for x in out_dir.iterdir() if x.is_file()), key=lambda x: x.stat().st_mtime, reverse=True)
+        for fp in old[29:]:
+            fp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    out = out_dir / f"{game_key}_winner_{uuid.uuid4().hex}.jpg"
+    for quality in (92, 88, 84, 80, 76):
+        image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+        if out.stat().st_size <= 300 * 1024:
+            break
     return out
 
 def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
@@ -6124,6 +6980,19 @@ class _MediaHandler(SimpleHTTPRequestHandler):
         return target
 
     def _ctype(self,target):
+        try:
+            with open(target, "rb") as image_file:
+                signature = image_file.read(16)
+            if signature.startswith(b"\x89PNG\r\n\x1a\n"):
+                return "image/png"
+            if signature.startswith(b"\xff\xd8\xff"):
+                return "image/jpeg"
+            if signature.startswith((b"GIF87a", b"GIF89a")):
+                return "image/gif"
+            if signature.startswith(b"RIFF") and signature[8:12] == b"WEBP":
+                return "image/webp"
+        except OSError:
+            pass
         ctype,_=mimetypes.guess_type(str(target))
         return ctype or {
             ".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".webp":"image/webp",".gif":"image/gif",
@@ -6193,7 +7062,7 @@ class TalkinBot:
         # Realtime transport must never execute heavy command/event logic on
         # the WebSocket reader thread. A single ordered worker keeps command
         # order intact while allowing recv() to continue immediately.
-        self._event_queue = queue.PriorityQueue(maxsize=max(200, int(os.getenv("EVENT_QUEUE_MAX", "1000"))))
+        self._event_queue = queue.PriorityQueue(maxsize=max(500, int(os.getenv("EVENT_QUEUE_MAX", "2500"))))
         self._event_queue_seq = 0
         self._event_queue_lock = threading.Lock()
         self._event_worker = threading.Thread(
@@ -6249,6 +7118,8 @@ class TalkinBot:
         self._pending_inv_role_check = {}
         # Private list requests waiting for the native occupants_list response.
         self._pending_room_lists = {}
+        self._room_id_sync_lock = threading.RLock()
+        self._room_id_sync_last = {}
         self._pending_presence = {}
         # Live profile photos learned from Talkin UserItem field 3.
         # username(casefold) -> public photo URL.
@@ -6445,6 +7316,8 @@ class TalkinBot:
             row for row in saved_stock_rows
             if isinstance(row, dict) and row.get("id") and row.get("username")
         ] if isinstance(saved_stock_rows, list) else []
+        self._recover_stock_market_investments_from_points_history()
+        self._migrate_legacy_stock_market_investments()
         # Global wager queues, crop timers, and fruit-match state.
         self.wager_waiting = {}
         # Global fixed-prize PvP queues: one open challenge per game name.
@@ -6822,6 +7695,9 @@ class TalkinBot:
                     params["offset"] = self._telegram_update_offset
                 data = self._telegram_api("getUpdates", **params)
                 if not data or not data.get("ok"):
+                    if isinstance(data, dict) and data.get("error_code") == 409:
+                        self.log("[TELEGRAM] polling stopped: another instance owns getUpdates")
+                        return
                     time.sleep(TELEGRAM_POLL_SECONDS)
                     continue
                 for update in data.get("result", []) or []:
@@ -6998,6 +7874,48 @@ class TalkinBot:
             r"\1\2[محذوف]", text,
         )
         return text[:1200]
+
+    def _send_master_room_departure_notice(self, room, event_type, event=None, role=""):
+        """Send the master a concise server-reported reason for an unexpected room exit."""
+        master = str(BOT_MASTER or "").strip()
+        if not master or _norm_user(master) == _norm_user(BOT_ID):
+            return False
+        room_key = _norm_room(room)
+        notice_times = getattr(self, "_room_departure_notice_times", None)
+        if not isinstance(notice_times, dict):
+            notice_times = self._room_departure_notice_times = {}
+        now = time.monotonic()
+        last_notice = notice_times.get(room_key)
+        if last_notice is not None and now - float(last_notice) < 300.0:
+            self.log(f"[ROOM_DEPARTURE_NOTICE] repeated notice suppressed for {room}")
+            return False
+        notice_times[room_key] = now
+        event = event if isinstance(event, dict) else {}
+        reason = ""
+        for field in ("reason", "detail", "message", "description", "cause", "status_reason"):
+            value = event.get(field)
+            if isinstance(value, str) and value.strip():
+                reason = self._redact_connection_secrets(value.strip())[:350]
+                break
+        if not reason:
+            role = str(role or event.get(31, "") or event.get("role", "")).strip().lower()
+            if event_type == "role_changed" and role:
+                reason = f"غيّر الخادم دور البوت إلى {role} (إزالة أو حظر من الغرفة)."
+            else:
+                reason = f"الخادم أرسل حدث {event_type} دون سبب تفصيلي."
+        message = (
+            "⚠️ رصد البوت خروجه من الغرفة؛ سيحاول العودة تلقائيًا، وإذا تكرر الخروج سريعًا فسيوقف المحاولات لتجنب الدوران."
+            f"\n📍 الغرفة: {str(room or 'غير معروفة')[:120]}"
+            f"\n🧾 السبب المسجل: {reason}"
+        )
+        actor = str(event.get(22, "") or "").strip()
+        if actor and _norm_user(actor) != _norm_user(BOT_ID):
+            message += f"\n📎 حساب آخر مذكور في الحدث: @{actor[:120]}"
+        try:
+            return bool(self.send_private_text(master, message))
+        except Exception as exc:
+            self.log("[ROOM_DEPARTURE_NOTICE] master DM failed:", repr(exc))
+            return False
 
     def _send_reconnect_notice(self, reason, command=None):
         """Deliver a sanitized connection-recovery diagnostic to both channels."""
@@ -7324,7 +8242,8 @@ class TalkinBot:
                     return
                 try:
                     ws.send_control(0x9, b"talkin-heartbeat")
-                    self.log("[WS] heartbeat ping sent")
+                    if DEBUG and not QUIET_MODE:
+                        self.log("[WS] heartbeat ping sent")
                 except Exception as exc:
                     self.log("[WS] heartbeat failed:", repr(exc))
                     return
@@ -7388,10 +8307,15 @@ class TalkinBot:
             self.known_rooms.add(room)
             _save_persistent_rooms(self.known_rooms)
             if requester:
-                self.send_private_text(requester, f"✅ تم دخول البوت إلى الغرفة: {room}")
+                self.send_private_text(requester, f"✅ البوت داخل الغرفة: {room}")
             return
-        self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
+        if requester:
+            self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
+        else:
+            # A missing acknowledgement is not a reason to send another join
+            # packet. Keep the room tracked and wait for server/socket recovery.
+            self.known_rooms.add(room)
         _save_persistent_rooms(self.known_rooms)
         self.log("[ROOM] join confirmation timeout:", room)
         if requester:
@@ -7400,9 +8324,11 @@ class TalkinBot:
                 f"❌ لم يتم دخول البوت إلى الغرفة: {room}. "
                 "انتهت مهلة التأكيد ولم يظهر اتصال البوت بها؛ تحقق من صلاحياته ثم أعد المحاولة.",
             )
+        elif _norm_room(room) not in getattr(self, "blocked_rooms", set()):
+            self.log("[AUTO_REJOIN] no server acknowledgement; not resending join:", room)
 
     def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
-        """Rejoin after a departure with bounded attempts and exponential backoff."""
+        """Rejoin a dropped room, but pause after repeated rapid server removals."""
         if not room:
             return
         room_key = _norm_room(room)
@@ -7410,6 +8336,13 @@ class TalkinBot:
             return
         if room_key in getattr(self, "_intentional_leaves", set()):
             return
+        if not hasattr(self, "_auto_rejoin_paused"):
+            self._auto_rejoin_paused = set()
+        if room_key in self._auto_rejoin_paused:
+            self.log(f"[AUTO_REJOIN] paused after repeated rapid exits; manual join required: {room}")
+            return
+        if not hasattr(self, "_auto_rejoin_waiting_ack"):
+            self._auto_rejoin_waiting_ack = set()
         pending_join = getattr(self, "_pending_room_joins", {}).get(room_key)
         if pending_join:
             started = float(pending_join.get("started") or 0)
@@ -7423,32 +8356,68 @@ class TalkinBot:
         if not hasattr(self, "_auto_rejoin_state"):
             self._auto_rejoin_state = {}
         now = time.monotonic()
+        pause_reason = False
         with self._auto_rejoin_lock:
-            if room_key in self._auto_rejoin_pending:
+            if room_key in self._auto_rejoin_pending or room_key in self._auto_rejoin_waiting_ack:
+                self.log(f"[AUTO_REJOIN] already sent one join request; waiting for server: {room}")
                 return
-            state = self._auto_rejoin_state.setdefault(room_key, {"attempts": [], "joined_at": 0.0})
-            if state.get("joined_at") and now - float(state["joined_at"]) >= 120.0:
-                state["attempts"] = []
-            recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
-            if len(recent_attempts) >= 5:
-                state["attempts"] = recent_attempts
-                self.log(f"[AUTO_REJOIN] stopping after 5 attempts in 15 minutes: {room}")
-                return
-            state["attempts"] = recent_attempts + [now]
-            delay = max(float(delay), min(60.0, 1.2 * (2 ** len(recent_attempts))))
-            generation = int(getattr(self, "_connection_generation", 0))
-            self._auto_rejoin_pending.add(room_key)
+            state = self._auto_rejoin_state.setdefault(
+                room_key, {"attempts": [], "joined_at": 0.0, "rapid_losses": 0}
+            )
+            joined_at = float(state.get("joined_at", 0.0) or 0.0)
+            if joined_at:
+                joined_duration = max(0.0, now - joined_at)
+                if joined_duration < 120.0:
+                    state["rapid_losses"] = int(state.get("rapid_losses", 0) or 0) + 1
+                else:
+                    state["rapid_losses"] = 0
+                    state["attempts"] = []
+                state["joined_at"] = 0.0
+            if int(state.get("rapid_losses", 0) or 0) >= 3:
+                self._auto_rejoin_paused.add(room_key)
+                state["paused_at"] = now
+                pause_reason = True
+            if pause_reason:
+                self._auto_rejoin_waiting_ack.discard(room_key)
+                self._auto_rejoin_pending.discard(room_key)
+            else:
+                recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
+                state["attempts"] = recent_attempts + [now]
+                delay = max(float(delay), min(15.0, 1.2 * (2 ** min(len(recent_attempts), 4))))
+                generation = int(getattr(self, "_connection_generation", 0))
+                self._auto_rejoin_pending.add(room_key)
+                self._auto_rejoin_waiting_ack.add(room_key)
+        if pause_reason:
+            message = (
+                "⛔ أوقفت إعادة الدخول التلقائية لتجنب حلقة دخول وخروج متكررة."
+                f"\n📍 الغرفة: {str(room)[:120]}"
+                "\nتحقق من عضوية البوت وصلاحياته، ثم أرسل دخول@اسم_الغرفة واختر اللغة لإعادة المحاولة يدوياً."
+            )
+            self.log(f"[AUTO_REJOIN] circuit breaker paused {room} after 3 rapid confirmed exits")
+            master = str(BOT_MASTER or "").strip()
+            if master and _norm_user(master) != _norm_user(BOT_ID):
+                try:
+                    self.send_private_text(master, message)
+                except Exception as exc:
+                    self.log("[AUTO_REJOIN] pause notice failed:", repr(exc))
+            return
         def _rejoin_worker():
             try:
                 time.sleep(delay)
                 if generation != int(getattr(self, "_connection_generation", 0)):
                     self.log(f"[AUTO_REJOIN] stale connection worker cancelled: {room}")
+                    with self._auto_rejoin_lock:
+                        self._auto_rejoin_waiting_ack.discard(room_key)
                     return
                 if any(_norm_room(r) == room_key for r in getattr(self, "connected_rooms", set())):
                     self.log(f"[AUTO_REJOIN] already connected; skip {room}")
+                    with self._auto_rejoin_lock:
+                        self._auto_rejoin_waiting_ack.discard(room_key)
                     return
                 if room_key in getattr(self, "_pending_room_joins", {}):
                     self.log(f"[AUTO_REJOIN] pending join already exists; skip {room}")
+                    with self._auto_rejoin_lock:
+                        self._auto_rejoin_waiting_ack.discard(room_key)
                     return
                 self.log(f"[AUTO_REJOIN] Attempting to rejoin {room}...")
                 with self._room_bulk_lock:
@@ -7458,6 +8427,8 @@ class TalkinBot:
                     self.join_room(room, force=True)
             except Exception as e:
                 self.log(f"[AUTO_REJOIN] Rejoin failed for {room}:", repr(e))
+                with self._auto_rejoin_lock:
+                    self._auto_rejoin_waiting_ack.discard(room_key)
             finally:
                 with self._auto_rejoin_lock:
                     self._auto_rejoin_pending.discard(room_key)
@@ -7498,7 +8469,12 @@ class TalkinBot:
                 except Exception:
                     pass
         if requested_by:
+            getattr(self, "_auto_rejoin_waiting_ack", set()).discard(room_norm)
             getattr(self, "_intentional_leaves", set()).discard(room_norm)
+            getattr(self, "_auto_rejoin_paused", set()).discard(room_norm)
+            rejoin_state = getattr(self, "_auto_rejoin_state", {}).get(room_norm)
+            if isinstance(rejoin_state, dict):
+                rejoin_state.update({"rapid_losses": 0, "joined_at": 0.0, "attempts": []})
             self.blocked_rooms.discard(room_norm)
             getattr(self, "_blocked_room_reasons", {}).pop(room_norm, None)
             getattr(self, "_blocked_room_notices", set()).discard(room_norm)
@@ -7902,21 +8878,54 @@ class TalkinBot:
         )
         return sorted(rooms)
 
-    def broadcast_all_rooms(self, text: str):
+    def broadcast_all_rooms(self, text: str, *, return_details=False):
         """Send a room-wide announcement serially without disturbing joins."""
-        sent = 0
+        sent = failed = 0
         rooms=self._active_rooms()
         delay=max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
         with self._room_bulk_lock:
             for index, target_room in enumerate(rooms):
                 try:
-                    self.send_room_text(target_room, text)
-                    sent += 1
+                    result = self.send_room_text(target_room, text)
+                    if result is False:
+                        failed += 1
+                    else:
+                        sent += 1
                 except Exception as exc:
+                    failed += 1
                     self.log("[BROADCAST] failed", target_room, repr(exc))
                 if index+1 < len(rooms):
                     time.sleep(delay)
-        return sent
+        return {"sent": sent, "failed": failed, "total": len(rooms)} if return_details else sent
+
+    def _broadcast_room_message_worker(self, sender, text, english=False):
+        """Run slow all-room message delivery away from the WebSocket reader."""
+        try:
+            result = self.broadcast_all_rooms(text, return_details=True)
+            sent = int(result.get("sent", 0) or 0) if isinstance(result, dict) else int(result or 0)
+            failed = int(result.get("failed", 0) or 0) if isinstance(result, dict) else 0
+            total = int(result.get("total", sent + failed) or 0) if isinstance(result, dict) else sent
+            notice = (
+                f"✅ Background room message finished: delivered to {sent} rooms; {failed}/{total} failed."
+                if english and sent else
+                f"❌ Failed to send the message to rooms (0/{total})."
+                if english else
+                f"✅ اكتمل إرسال الرسالة بالخلفية: وصلت إلى {sent} غرفة، وفشل {failed} من {total}."
+                if sent else f"❌ فشل إرسال الرسالة إلى الغرف (0/{total})."
+            )
+            if sender:
+                self.send_private_text(sender, notice)
+        except Exception as exc:
+            self.log("[BROADCAST] background worker failed:", repr(exc))
+            if sender:
+                try:
+                    self.send_private_text(
+                        sender,
+                        "❌ Failed to broadcast the message; check the Railway logs."
+                        if english else "❌ فشل إرسال الرسالة إلى الغرف؛ راجع سجل Railway."
+                    )
+                except Exception:
+                    pass
 
     def broadcast_game_rooms(self, text: str, first_room: str = ""):
         """Quickly announce a game, delivering to its initiating room first."""
@@ -8334,7 +9343,8 @@ class TalkinBot:
             _save_local_json(DATA_DIR / "last_action.json", action)
         except Exception as exc:
             self.log("[UNDO] save last action failed:", repr(exc))
-        self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
+        if LOG_ROOM_MESSAGES:
+            self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
 
     def _cleanup_memory_state(self):
         """Prune bounded runtime caches and force Python GC without touching persistent data."""
@@ -8734,6 +9744,40 @@ class TalkinBot:
             return False
         return self._send_text_packets("chat_message", text, to=username)
 
+    def _deliver_user_private_message(self, sender, target, message_text, english=False):
+        """Deliver a user message privately and confirm only to its sender."""
+        sender_name = str(sender or "").strip().lstrip("@")
+        target_name = str(target or "").strip().lstrip("@")
+        text = str(message_text or "").strip()
+        if not sender_name or not target_name or not text:
+            return False
+        payload = (
+            f"📩 You have a message from {sender_name}\n\n{text}"
+            if english else f"📩 لديك رسالة من {sender_name}\n\n{text}"
+        )
+        try:
+            delivered = self.send_private_text(target_name, payload) is not False
+        except Exception as exc:
+            delivered = False
+            self.log("[DIRECT-MESSAGE] failed", target_name, repr(exc))
+        notice = (
+            f"✅ Message sent to @{target_name}." if english else f"✅ تم إرسال الرسالة إلى @{target_name} بنجاح."
+        ) if delivered else (
+            f"❌ Failed to send the message to @{target_name}." if english else f"❌ فشل إرسال الرسالة إلى @{target_name}."
+        )
+        reply_state = getattr(self, "_master_reply_local", None)
+        old_rerouting = getattr(reply_state, "rerouting", False) if reply_state else False
+        try:
+            if reply_state:
+                reply_state.rerouting = True
+            self.send_private_text(sender_name, notice)
+        except Exception as exc:
+            self.log("[DIRECT-MESSAGE] sender confirmation failed", repr(exc))
+        finally:
+            if reply_state:
+                reply_state.rerouting = old_rerouting
+        return delivered
+
     def send_private_media(self, username: str, media_url: str, media_type: str, duration: int = 0):
         """Send media to a private chat using the same Query media fields as rooms.
 
@@ -8963,7 +10007,7 @@ class TalkinBot:
                 lk_ws = getattr(self, f"_livekit_ws_{room}", None)
                 socket_healthy = bool(lk_ws and getattr(lk_ws, "sock", None))
                 self.log(f"[STREAM_VERIFY] فحص جاهزية البث في {room}: audio_sent={audio_sent}, livekit_active={lk_active}, socket_ok={socket_healthy}")
-                
+
                 # دورة إدارة تشغيل الأغنية في خيط مستقل لضمان استمرار البث حتى انتهاء الملف
                 # وتوقف الصوت بأمان دون مغادرة البوت أو إغلاق LiveKit
                 def _playback_lifecycle(target_room, r_id, s_id, track_len):
@@ -10514,10 +11558,10 @@ class TalkinBot:
         occupants response populates ``bot_room_roles`` after joining, so this
         check stays local and does not add a roster request to every command.
         """
-        role = self._bot_room_role(room)
+        role = re.sub(r"[\s-]+", "_", self._bot_room_role(room).casefold().strip())
         return role in {
-            "owner", "creator", "room_owner", "room_creator", "host",
-            "مالك", "اونر", "أونر", "صانع", "صانع_الغرفة",
+            "owner", "creator", "room_owner", "room_creator", "roomowner", "roomcreator", "host",
+            "مالك", "مالك_الغرفة", "اونر", "أونر", "صانع", "صانع_الغرفة", "صانع_الغرفه",
         }
 
     def _inv_bot_owner_allowed(self, room):
@@ -11856,14 +12900,27 @@ class TalkinBot:
             self.send_room_text(room, "❌ اكتب: .sa اسم الأغنية")
             return True
         if live_stream and not self._bot_is_room_owner(room):
-            role = self._bot_room_role(room) or "غير معروفة"
-            self.send_room_text(
-                room,
-                "⚠️ لم يتم تشغيل البث.\n"
-                "👑 يجب أن تكون رتبة البوت Owner في الغرفة قبل تشغيل البث.\n"
-                f"📌 الرتبة الحالية: {role}"
-            )
-            return True
+            role = self._bot_room_role(room)
+            role_key = re.sub(r"[\s-]+", "_", role.casefold().strip())
+            unknown_roles = {"", "none", "unknown", "غير_معروفة", "غير_معروف"}
+            if role_key not in unknown_roles:
+                if self._effective_room_language(room) == "en":
+                    notice = (
+                        "⚠️ Stream not started.\n"
+                        "👑 The bot must be an Owner of the room to start a broadcast.\n"
+                        f"📌 Current role: {role}"
+                    )
+                else:
+                    notice = (
+                        "⚠️ لم يتم تشغيل البث.\n"
+                        "👑 يجب أن تكون رتبة البوت Owner في الغرفة قبل تشغيل البث.\n"
+                        f"📌 الرتبة الحالية: {role}"
+                    )
+                self.send_room_text(room, notice)
+                return True
+            # The role cache can be empty after reconnect even when the server
+            # recognizes the bot as Owner. Let Talkin authorize the request.
+            self.log("[STREAM] room role unknown; relying on server authorization:", room)
         now = time.time()
         last = self.music_last.get(requester, 0)
         if now - last < MUSIC_COOLDOWN:
@@ -12480,21 +13537,52 @@ class TalkinBot:
         if winner_name and game_key:
             self._send_game_winner_card(game_key, winner_name, target_rooms or [room])
 
-    def _send_game_winner_card(self, game_key, winner_name, target_rooms, send_delay=0.0):
+    def _send_game_winner_card(
+        self, game_key, winner_name, target_rooms, send_delay=0.0, before_each_room=None
+    ):
         """Render the existing game artwork and send it safely room-by-room.
 
         ``send_delay`` is used by multi-room game broadcasts to avoid a burst
         of media packets that can trigger the TalkinChat server to close the
         WebSocket. Existing callers keep the original zero-delay behaviour.
+        ``before_each_room`` can send the matching text immediately before
+        that room's image; if the image is unavailable, text is still sent.
         """
+        rooms = []
+        seen = set()
+        for room in (target_rooms or []):
+            room = str(room or "").strip()
+            key = room.casefold()
+            if room and key not in seen:
+                seen.add(key)
+                rooms.append(room)
+
+        announced = set()
+
+        def announce_room(room):
+            key = room.casefold()
+            if before_each_room is None or key in announced:
+                return
+            announced.add(key)
+            try:
+                before_each_room(room)
+            except Exception as exc:
+                self.log("[GAME] winner text room send failed:", room, repr(exc))
+
+        def announce_remaining_rooms():
+            for room in rooms:
+                announce_room(room)
+
         base = _public_base_url()
         if not base:
             self.log("[GAME] winner card skipped: public media URL is not configured")
+            announce_remaining_rooms()
             return False
         filename = GAME_IMAGE_FILES.get(game_key)
         image = ASSETS_DIR / filename if filename else None
         if not image or not image.is_file():
             self.log("[GAME] winner card skipped: no artwork", game_key)
+            announce_remaining_rooms()
             return False
         try:
             if game_key == "اسرق_فشل":
@@ -12510,22 +13598,16 @@ class TalkinBot:
                 winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
                 if not winner_photo:
                     winner_photo = self._lookup_profile_photo(winner_name)
-                language = self._effective_room_language(target_rooms[0]) if game_key == "hunt_dragon" and target_rooms else "ar"
+                language = self._effective_room_language(target_rooms[0]) if target_rooms else "ar"
                 card = render_game_winner_card(game_key, winner_name, winner_photo, language=language)
                 url = f"{base}/games/{card.name}"
             self._verify_public_media_url(url, "image")
-            rooms = []
-            seen = set()
-            for r in (target_rooms or []):
-                r = str(r or "").strip()
-                k = r.casefold()
-                if r and k not in seen:
-                    seen.add(k); rooms.append(r)
             for index, r in enumerate(rooms):
                 # Send sequentially. A short pause is important for an image
                 # broadcast: the server may close the realtime socket when
                 # several room-media packets arrive back-to-back.
                 try:
+                    announce_room(r)
                     self.send_room_media(r, url, "image")
                 except Exception as exc:
                     self.log("[GAME] winner card room send failed:", r, repr(exc))
@@ -12535,6 +13617,7 @@ class TalkinBot:
             return bool(rooms)
         except Exception as exc:
             self.log("[GAME] winner card send failed:", game_key, repr(exc))
+            announce_remaining_rooms()
             return False
 
     def game_help(self, room, sender=None):
@@ -13138,6 +14221,15 @@ class TalkinBot:
             return True
         if _norm_user(target) == _norm_user(sender):
             self.send_room_text(source_room, "❌ You cannot target yourself." if english else "❌ لا يمكنك اختيار نفسك هدفًا للقنبلة.")
+            return True
+        if member_shop.active(
+                "user_bomb", username=target,
+                user_id=_stored_user_id(target, room),
+                aliases=_stored_user_aliases(target, room)):
+            self.send_room_text(source_room, f"🛡️ @{target} محمي من القنابل حالياً.")
+            return True
+        if member_shop.active("room_bomb", room=destination):
+            self.send_room_text(source_room, f"🏰 الغرفة {destination} محمية من القنابل حالياً.")
             return True
         active_rooms = {_norm_room(r): str(r).strip() for r in self._active_rooms() if str(r).strip()}
         if _norm_room(destination) not in active_rooms:
@@ -13771,6 +14863,152 @@ class TalkinBot:
             snapshot = [dict(row) for row in self.stock_investments if isinstance(row, dict)]
         _save_local_json(STOCK_MARKET_FILE, {"version": 1, "investments": snapshot})
 
+    def _recover_stock_market_investments_from_points_history(self):
+        """Rebuild debit intents if async Talkin4 sync missed the separate market file."""
+        try:
+            _points_data()
+            with _GAME_STATE_LOCK:
+                transactions = copy.deepcopy(_POINTS_TRANSFER_CACHE or [])
+        except Exception as exc:
+            self.log("[STOCK] point journal recovery read failed:", repr(exc))
+            return 0
+
+        transaction_ids = {
+            str(row.get("id") or "") for row in transactions if isinstance(row, dict)
+        }
+        with self._stock_market_lock:
+            existing_ids = {
+                str(row.get("id") or "") for row in self.stock_investments if isinstance(row, dict)
+            }
+            settled_ids = {
+                str(row.get("id") or "")
+                for row in getattr(self, "stock_market_history", []) if isinstance(row, dict)
+            }
+            recovered = []
+            for transaction in transactions:
+                if not isinstance(transaction, dict):
+                    continue
+                transaction_id = str(transaction.get("id") or "")
+                if not transaction_id.startswith("stock-market-debit:"):
+                    continue
+                metadata = transaction.get("stock_market_investment")
+                if not isinstance(metadata, dict):
+                    continue
+                investment_id = str(metadata.get("id") or "")
+                username = str(metadata.get("username") or "").strip().lstrip("@")
+                try:
+                    amount = int(metadata.get("amount", 0) or 0)
+                    asset = int(metadata.get("asset", 0) or 0)
+                    started_at = float(metadata.get("started_at", 0) or 0)
+                    due_at = float(metadata.get("due_at", 0) or 0)
+                    transaction_amount = int(transaction.get("amount", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (
+                    not investment_id
+                    or transaction_id != f"stock-market-debit:{investment_id}"
+                    or investment_id in existing_ids
+                    or investment_id in settled_ids
+                    or f"stock-market-payout:{investment_id}" in transaction_ids
+                    or not username
+                    or _norm_user(transaction.get("sender")) != _norm_user(username)
+                    or amount <= 0
+                    or transaction_amount != amount
+                    or asset not in STOCK_MARKET_ASSETS
+                    or due_at <= 0
+                ):
+                    continue
+                recovered_row = {
+                    "id": investment_id,
+                    "event_id": metadata.get("event_id"),
+                    "username": username,
+                    "room": str(metadata.get("room") or ""),
+                    "asset": asset,
+                    "amount": amount,
+                    "started_at": started_at,
+                    "due_at": due_at,
+                    "status": "pending_debit",
+                }
+                recovered.append(recovered_row)
+                existing_ids.add(investment_id)
+            if recovered:
+                self.stock_investments.extend(recovered)
+
+        if recovered:
+            try:
+                self._save_stock_investments()
+            except Exception as exc:
+                self.log("[STOCK] recovered investment save failed:", repr(exc))
+            self.log(f"[STOCK] recovered {len(recovered)} unresolved investment(s) from point history")
+        return len(recovered)
+
+    def _migrate_legacy_stock_market_investments(self):
+        """Undo entry-time debits on unresolved legacy rows before deferred settlement."""
+        try:
+            _points_data()
+            with _GAME_STATE_LOCK:
+                transaction_ids = {
+                    str(row.get("id") or "") for row in (_POINTS_TRANSFER_CACHE or [])
+                    if isinstance(row, dict)
+                }
+        except Exception as exc:
+            self.log("[STOCK] legacy investment migration journal read failed:", repr(exc))
+            return 0
+
+        changed = 0
+        with self._stock_market_lock:
+            for row in self.stock_investments:
+                if not isinstance(row, dict) or row.get("balance_mode") == "deferred":
+                    continue
+                status = str(row.get("status") or "pending_debit")
+                if status not in {"pending_debit", "active", "paying"}:
+                    continue
+                investment_id = str(row.get("id") or "")
+                username = str(row.get("username") or "").strip().lstrip("@")
+                try:
+                    amount = int(row.get("amount", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not investment_id or not username or amount <= 0:
+                    continue
+
+                # Completed old payouts must stay on the legacy idempotent path.
+                debit_id = f"stock-market-debit:{investment_id}"
+                if (f"stock-market-payout:{investment_id}" in transaction_ids
+                        or f"stock-market-settlement:{investment_id}" in transaction_ids):
+                    continue
+                was_debited = debit_id in transaction_ids
+                if status in {"active", "paying"} and not was_debited:
+                    # An active legacy row means the old code had already
+                    # applied its debit. If its journal entry is absent (for
+                    # example, an unsynchronized backup snapshot), do not risk
+                    # crediting the principal twice; retain legacy settlement.
+                    continue
+                if was_debited:
+                    refund = _apply_points_delta_once(
+                        username, amount, f"stock-market-migration-refund:{investment_id}",
+                        "stock market migration: return legacy reserved principal",
+                    )
+                    if not refund.get("ok"):
+                        self.log("[STOCK] legacy reservation refund failed; keeping old state:",
+                                 investment_id, refund.get("error"))
+                        continue
+                    transaction_ids.add(f"stock-market-migration-refund:{investment_id}")
+
+                row["balance_mode"] = "deferred"
+                row["status"] = "paying" if status == "paying" else "pending_settlement"
+                row["migrated_from_entry_debit"] = bool(was_debited)
+                changed += 1
+
+        if changed:
+            try:
+                self._save_stock_investments()
+            except Exception as exc:
+                self.log("[STOCK] legacy investment migration save failed:", repr(exc))
+                return 0
+            self.log(f"[STOCK] migrated {changed} unresolved legacy investment(s) to deferred settlement")
+        return changed
+
     def _record_stock_market_history(self, result):
         """Persist one completed investment exactly once for the user's بورصتي log."""
         if not isinstance(result, dict) or not result.get("id") or not result.get("username"):
@@ -13825,7 +15063,7 @@ class TalkinBot:
             amount = int(row.get("amount", 0) or 0)
             status = str(row.get("status") or "settled")
             room_name = _transfer_log_safe_field(row.get("room"), 36)
-            if status in {"pending_debit", "active", "paying"}:
+            if status in {"pending_debit", "active", "paying", "pending_settlement"}:
                 line = (f"{when} | {asset.get('icon', '📈')} {asset_name} | {_fmt_points(amount)} | "
                         f"{'Pending settlement' if english else 'قيد التسوية'} | {room_name}")
             else:
@@ -13965,6 +15203,8 @@ class TalkinBot:
         previous_cooldown = None
         previous_cooldown_present = False
         cooldown_remaining = 0.0
+        insufficient_balance = False
+        available_balance = 0
         with self._stock_market_lock:
             cooldowns = getattr(self, "_stock_market_user_cooldowns", {})
             if not isinstance(cooldowns, dict):
@@ -13989,24 +15229,43 @@ class TalkinBot:
                 if closed:
                     investment = None
                 else:
-                    previous_cooldown_present = user_key in cooldowns
-                    previous_cooldown = cooldowns.get(user_key)
-                    cooldowns[user_key] = now
-                    self._stock_market_user_cooldowns = cooldowns
-                    investment = {
-                        "id": uuid.uuid4().hex,
-                        "event_id": round_id,
-                        "username": str(sender).strip().lstrip("@"),
-                        "room": str(room or ""),
-                        "asset": asset,
-                        "amount": amount,
-                        "started_at": now,
-                        "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
-                        "status": "pending_debit",
-                    }
-                    self.stock_investments.append(investment)
-                    # A player may invest repeatedly during the same market round;
-                    # the two-minute cooldown is the only per-player restriction.
+                    committed = 0
+                    for pending_row in self.stock_investments:
+                        if not (
+                            isinstance(pending_row, dict)
+                            and pending_row.get("balance_mode") == "deferred"
+                            and _norm_user(pending_row.get("username")) == user_key
+                            and str(pending_row.get("status") or "") in {"pending_settlement", "paying"}
+                        ):
+                            continue
+                        try:
+                            committed += max(0, int(pending_row.get("amount", 0) or 0))
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                    available_balance = max(0, int(_get_points(sender) or 0) - committed)
+                    if available_balance < amount:
+                        insufficient_balance = True
+                        investment = None
+                    else:
+                        previous_cooldown_present = user_key in cooldowns
+                        previous_cooldown = cooldowns.get(user_key)
+                        cooldowns[user_key] = now
+                        self._stock_market_user_cooldowns = cooldowns
+                        investment = {
+                            "id": uuid.uuid4().hex,
+                            "event_id": round_id,
+                            "username": str(sender).strip().lstrip("@"),
+                            "room": str(room or ""),
+                            "asset": asset,
+                            "amount": amount,
+                            "started_at": now,
+                            "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
+                            "status": "pending_settlement",
+                            "balance_mode": "deferred",
+                        }
+                        self.stock_investments.append(investment)
+                        # The principal is not moved now. Pending stakes only
+                        # reduce this user's available balance for new entries.
         if cooldown_remaining > 0:
             seconds = max(1, int(cooldown_remaining + 0.999))
             text = (
@@ -14018,6 +15277,14 @@ class TalkinBot:
             return True
         if closed:
             self.send_room_text(room, "⌛ انتهت جولة البورصة؛ انتظر الإعلان التالي أو اكتب بورصة لبدء جولة." if language != "en" else "⌛ This market round has closed. Wait for the next announcement or type stock to start a round.")
+            return True
+        if insufficient_balance:
+            text = (
+                f"❌ رصيدك المتاح لا يكفي. المتاح بعد احتساب استثماراتك المعلقة: {_fmt_points(available_balance)} نقطة."
+                if language != "en" else
+                f"❌ Not enough available points. Available after pending investments: {_fmt_points(available_balance)} points."
+            )
+            self.send_room_text(room, text)
             return True
         if investment is None:
             self.send_room_text(room, "⚠️ استثمرت مرة واحدة في هذه الجولة؛ انتظر النتيجة أو الجولة التالية." if language != "en" else "⚠️ You already invested in this round. Wait for the result or next round.")
@@ -14037,46 +15304,11 @@ class TalkinBot:
             self.log("[STOCK] could not save pending investment:", repr(exc))
             self.send_room_text(room, "❌ تعذر حفظ الاستثمار، لم يُخصم أي رصيد." if language != "en" else "❌ The investment could not be saved; no points were deducted.")
             return True
-        debit = _apply_points_delta_once(
-            sender, -amount, f"stock-market-debit:{investment['id']}",
-            f"stock market investment in {STOCK_MARKET_ASSETS[asset]['en']}",
-        )
-        if not debit.get("ok"):
-            with self._stock_market_lock:
-                self.stock_investments = [row for row in self.stock_investments if row.get("id") != investment["id"]]
-                self._stock_market_seen.discard((str(round_id), _norm_user(sender)))
-                cooldowns = getattr(self, "_stock_market_user_cooldowns", {})
-                if isinstance(cooldowns, dict) and cooldowns.get(user_key) == now:
-                    if previous_cooldown_present:
-                        cooldowns[user_key] = previous_cooldown
-                    else:
-                        cooldowns.pop(user_key, None)
-            try:
-                self._save_stock_investments()
-            except Exception as exc:
-                self.log("[STOCK] failed to remove rejected investment:", repr(exc))
-            if debit.get("error") == "insufficient":
-                text = f"❌ رصيدك لا يكفي لاستثمار {_fmt_points(amount)} نقطة." if language != "en" else f"❌ You do not have enough points to invest {_fmt_points(amount)}."
-            else:
-                text = "❌ تعذر خصم مبلغ الاستثمار بأمان؛ لم تُعتمد العملية." if language != "en" else "❌ The investment debit could not be committed safely."
-            self.send_room_text(room, text)
-            return True
-        with self._stock_market_lock:
-            for row in self.stock_investments:
-                if row.get("id") == investment["id"]:
-                    row["status"] = "active"
-                    break
-        try:
-            self._save_stock_investments()
-        except Exception as exc:
-            # The durable pending_debit record is recoverable because the debit
-            # itself has a stable transaction id and cannot be applied twice.
-            self.log("[STOCK] active state save deferred; recovery will reconcile:", repr(exc))
         data = STOCK_MARKET_ASSETS[asset]
         if language == "en":
-            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss.\n⏳ You can invest again in 2 minutes."
+            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss.\n💳 Points change only after the result.\n⏳ You can invest again in 2 minutes."
         else:
-            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة.\n⏳ يمكنك الاستثمار مجدداً بعد دقيقتين."
+            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة.\n💳 لا يتغير رصيدك إلا بعد ظهور النتيجة.\n⏳ يمكنك الاستثمار مجدداً بعد دقيقتين."
         self.send_room_text(room, text)
         return True
 
@@ -14130,10 +15362,13 @@ class TalkinBot:
             if not investment_id or not username or amount <= 0 or asset not in STOCK_MARKET_ASSETS:
                 continue
             status = str(row.get("status") or "pending_debit")
+            # Legacy rows were debited when accepted. New deferred rows never
+            # touch points until the final profit/loss is known.
             if status == "pending_debit":
                 debit = _apply_points_delta_once(
                     username, -amount, f"stock-market-debit:{investment_id}",
                     f"stock market investment in {STOCK_MARKET_ASSETS[asset]['en']}",
+                    stock_market_investment=row,
                 )
                 if not debit.get("ok"):
                     if debit.get("error") == "persistence_failed":
@@ -14194,18 +15429,22 @@ class TalkinBot:
                 self.log("[STOCK] payout state save failed; retrying:", repr(exc))
                 continue
             payout = max(0, amount - change) if outcome == "loss" else amount + change
-            credit = _apply_points_delta_once(
-                username, payout, f"stock-market-payout:{investment_id}",
+            deferred_balance = str(row.get("balance_mode") or "") == "deferred"
+            settlement_delta = (change if outcome == "profit" else -change) if deferred_balance else payout
+            transaction_prefix = "stock-market-settlement" if deferred_balance else "stock-market-payout"
+            settlement = _apply_points_delta_once(
+                username, settlement_delta, f"{transaction_prefix}:{investment_id}",
                 f"stock market {outcome} {change_percent}% settlement",
             )
-            if not credit.get("ok"):
-                self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, credit.get("error"))
+            if not settlement.get("ok"):
+                self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, settlement.get("error"))
                 continue
-            net_change = payout - amount
+            net_change = settlement_delta if deferred_balance else payout - amount
             history_row = dict(row)
             history_row.update({
                 "status": "settled", "payout": payout, "net_change": net_change,
-                "balance_after": int(credit.get("balance", 0) or 0), "settled_at": now,
+                "balance_change": settlement_delta,
+                "balance_after": int(settlement.get("balance", 0) or 0), "settled_at": now,
             })
             if not self._record_stock_market_history(history_row):
                 # Keep the paying row so the idempotent credit and history write
@@ -14223,7 +15462,7 @@ class TalkinBot:
                     f"📈 Your stock-market result — {result_label}\n👤 Investor: @{display_user}\n"
                     f"{data['icon']} {data['en']} | Invested: {_fmt_points(amount)} points\n"
                     f"📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
-                    f"💳 Balance: {_fmt_points(credit['balance'])}"
+                    f"💳 Balance: {_fmt_points(settlement['balance'])}"
                 )
             else:
                 result_label = "الخسارة" if outcome == "loss" else "الربح"
@@ -14231,7 +15470,7 @@ class TalkinBot:
                     f"📈 نتيجتك في البورصة — {result_label}\n👤 المستثمر: @{display_user}\n"
                     f"{data['icon']} {data['ar']} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
                     f"📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
-                    f"💳 الرصيد: {_fmt_points(credit['balance'])}"
+                    f"💳 الرصيد: {_fmt_points(settlement['balance'])}"
                 )
             try:
                 self._broadcast_stock_market_result(
@@ -14537,6 +15776,12 @@ class TalkinBot:
         target = m.group(1).strip().lstrip("@").strip()
         if not target:
             self.send_room_text(room, "❌ الصيغة: شبيه@اسم_المستخدم")
+            return True
+        if member_shop.active(
+                "user_search", username=target,
+                user_id=_stored_user_id(target, room),
+                aliases=_stored_user_aliases(target, room)):
+            self.send_room_text(room, f"🕵️ @{target} فعّل حماية البحث عن النك.")
             return True
         # Avoid several expensive web searches by the same user at once.
         # Also remember a small rolling set of the last images used for this
@@ -14965,6 +16210,7 @@ class TalkinBot:
             self.send_room_text(room, loss_text)
             return True
         self._game_award(sender_name, reward)
+        _record_money_game_winner("million", sender_name)
         winner_photo = self.user_photos.get(_norm_user(sender_name), "") or self._lookup_profile_photo(sender_name)
 
         # IMPORTANT: for the bank-win broadcast use only rooms confirmed as
@@ -14979,19 +16225,19 @@ class TalkinBot:
         if not target_rooms:
             target_rooms = [preferred_room]
 
-        # Do not burst all room packets at once. The short pacing keeps the
-        # realtime connection alive while preserving the existing all-room
-        # winner announcement and image behaviour.
-        for index, target_room in enumerate(target_rooms):
-            try:
-                language = self._configured_room_language(target_room)
-                self.send_room_text(target_room, _money_game_win_text("million", sender_name, language))
-            except Exception as exc:
-                self.log("[GAME] bank winner text send failed:", target_room, repr(exc))
-            if index + 1 < len(target_rooms):
-                time.sleep(0.05)
+        def announce_winner_text(target_room):
+            language = self._configured_room_language(target_room)
+            announcement = (
+                _money_game_win_text("million", sender_name, language)
+                if _norm_room(target_room) == _norm_room(room)
+                else _money_game_short_win_text("million", sender_name, language)
+            )
+            self.send_room_text(target_room, announcement)
 
-        self._send_game_winner_card("بنك مليون", sender_name, target_rooms, send_delay=0.35)
+        self._send_game_winner_card(
+            "million", sender_name, target_rooms, send_delay=0.35,
+            before_each_room=announce_winner_text,
+        )
         return True
 
     def _handle_pending_bot_choice(self, room, text, sender_name):
@@ -15070,6 +16316,7 @@ class TalkinBot:
                 return False
         response_language = self._capture_room_response_language(room, text)
         def worker():
+            previous_identity = _set_identity_context(sender_name, room)
             try:
                 self.handle_game_command(room, text, sender_name)
             except Exception as exc:
@@ -15090,6 +16337,8 @@ class TalkinBot:
                     self.report_master_error("الألعاب", exc, room)
                 except Exception:
                     pass
+            finally:
+                _restore_identity_context(previous_identity)
         if not getattr(self, "_replaying_bot_action", False):
             self._remember_bot_action(room, text, sender_name, is_private=False)
         threading.Thread(
@@ -15502,7 +16751,7 @@ class TalkinBot:
             if final>=100:
                 photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender); win_img=self._render_snake_board(game,winner_name=sender)
                 new_points = _add_points(sender, self.SNAKE_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
+                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,"");
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.snake_games.pop(key,None)
@@ -15747,7 +16996,7 @@ class TalkinBot:
             if new>=58:
                 win_img=self._render_ludo_board(game,winner_name=sender); photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
                 new_points = _add_points(sender, self.LUDO_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
+                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,"");
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.ludo_games.pop(key,None); return True
@@ -16075,6 +17324,207 @@ class TalkinBot:
             self.send_room_text(room, f"✨ {command} @{sender}: {value}")
         return True
 
+    def _resume_pending_mining_redemption(self, room, sender_name, user_id):
+        pending = MINING_STORE.pending_redemption(user_id)
+        if not pending:
+            return None
+        transaction_id = f"mining-redemption:{pending.get('id') or ''}"
+        credited = _apply_points_delta_once(
+            sender_name, int(pending.get("points", 0) or 0),
+            transaction_id, "treasure mining redemption",
+        )
+        if not credited.get("ok"):
+            self.send_room_text(
+                room,
+                "⚠️ يوجد استبدال محفوظ ينتظر اعتماد النقاط. لم أخصم أو أضف شيئًا مرتين؛ أعد المحاولة لاحقًا.",
+            )
+            return False
+        MINING_STORE.complete_redemption(user_id, pending.get("id"))
+        self.send_room_text(
+            room,
+            f"✅ اكتملت تسوية استبدال الكنوز السابق لـ@{sender_name}: "
+            f"+{int(pending.get('points', 0) or 0):,} نقطة.",
+        )
+        return True
+
+    def _execute_mining_command_with_id(self, room, text, sender_name, user_id):
+        """Execute immediately with username identity; numeric Talkin ID is a fallback."""
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            # MiningStore uses a stable namespaced key until a native ID is
+            # available. This prevents commands from waiting on members_list.
+            normalized = _norm_user(sender_name)
+            if normalized:
+                user_id = "name:" + normalized
+        if not user_id:
+            return False
+        raw = str(text or "").strip()
+        low = raw.casefold()
+        low = low.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+        low = low.replace("ى", "ي")
+        store_commands = {"متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures"}
+        inventory_commands = {"sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag"}
+        top_commands = {"توب الماس", "توب الالماس", "top diamonds", "top gems", "أغنى المنقبين", "اغنى المنقبين"}
+        redeem_match = re.fullmatch(r"(?:r|rdem)\s+(.+)", raw, re.I)
+        is_diamond_test = low in {"فحص الماس", "فحص الالماس"}
+        is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining"}
+        is_store = low in store_commands
+        is_inventory = low in inventory_commands
+        is_top = low in top_commands
+        if not (is_store or is_inventory or is_top or redeem_match or is_dig or is_diamond_test):
+            return False
+
+        if is_diamond_test:
+            if not _is_master_name(sender_name):
+                self.send_room_text(room, "🔒 هذا الأمر مخصص للماستر فقط.")
+                return True
+            if not room:
+                self.send_private_text(sender_name, "📌 أرسل أمر فحص الماس داخل الغرفة ليظهر الرد والصورة فيها.")
+                return True
+            result = MINING_STORE.give_test_diamond(user_id, sender_name)
+            item = result.get("item") or {}
+            self.send_room_text(
+                room,
+                f"💎 فحص الألماس — {sender_name}\n"
+                f"{item.get('icon', '💎')} أُضيفت {item.get('name', 'ألماسة')} إلى مخزونك.\n"
+                f"🛒 قيمة الاستبدال: {int(item.get('price', 0) or 0):,} نقطة للقطعة.",
+            )
+            image_path = ASSETS_DIR / "treasures" / str(item.get("image", ""))
+            if not image_path.is_file():
+                self.send_room_text(room, "⚠️ أُضيفت الألماسة لكن صورتها غير موجودة في مجلد assets/treasures.")
+                return True
+            image_url = self._game_public_image(image_path, route="assets/treasures")
+            if not image_url:
+                self.send_room_text(room, "⚠️ أُضيفت الألماسة لكن تعذر تجهيز رابط صورتها.")
+                return True
+            try:
+                if self.send_room_media(room, image_url, "image") is False:
+                    self.send_room_text(room, "⚠️ أُضيفت الألماسة لكن تعذر إرسال صورتها.")
+            except Exception as exc:
+                self.log("[MINING] diamond test image send failed:", repr(exc))
+                self.send_room_text(room, "⚠️ أُضيفت الألماسة لكن تعذر إرسال صورتها.")
+            return True
+
+        settled = self._resume_pending_mining_redemption(room, sender_name, user_id)
+        if settled is False:
+            return True
+
+        if is_store:
+            lines = ["⛏️ متجر الكنوز — الأسعار بالنقاط"]
+            lines.extend(
+                f"{item['icon']} {item['name']}: {item['price']:,} نقطة"
+                for item in MINING_ITEMS.values()
+            )
+            lines.extend(("للتنقيب: احفر", "للمخزون: sv", "للاستبدال: Rdem اسم_الكنز [العدد]"))
+            self.send_room_text(room, "\n".join(lines))
+            return True
+
+        if is_inventory:
+            inventory = MINING_STORE.inventory(user_id, sender_name)
+            lines = [f"🎒 مخزون @{sender_name}"]
+            owned = False
+            for key, item in MINING_ITEMS.items():
+                count = int(inventory["inventory"].get(key, 0) or 0)
+                if count:
+                    owned = True
+                    lines.append(f"{item['icon']} {item['name']}: {count}")
+            if not owned:
+                lines.append("لا توجد كنوز بعد؛ جرّب أمر احفر.")
+            lines.append(f"💎 إجمالي الألماس الذي عثرت عليه: {inventory['diamonds_found']}")
+            self.send_room_text(room, "\n".join(lines))
+            return True
+
+        if is_top:
+            rows = MINING_STORE.leaderboard(10)
+            if not rows:
+                self.send_room_text(room, "💎 توب المنقبين\nلا توجد اكتشافات ألماس بعد.")
+                return True
+            lines = ["💎 توب المنقبين"]
+            for place, row in enumerate(rows, 1):
+                mark = {1: "🥇", 2: "🥈", 3: "🥉"}.get(place, f"{place}.")
+                lines.append(f"{mark} @{row['username']} — {row['diamonds_found']} ألماسة")
+            self.send_room_text(room, "\n".join(lines))
+            return True
+
+        if redeem_match:
+            selection = redeem_match.group(1).strip()
+            selection = selection.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+            quantity = None
+            quantity_match = re.fullmatch(r"(.+?)\s+(\d+)", selection)
+            if quantity_match:
+                selection = quantity_match.group(1).strip()
+                quantity = int(quantity_match.group(2))
+            item_keys = resolve_item_keys(selection)
+            if not item_keys:
+                self.send_room_text(room, "❌ اسم الكنز غير معروف. اكتب متجر الكنوز لمعرفة الأسماء والأسعار.")
+                return True
+            reserved = MINING_STORE.reserve_redemption(
+                user_id, sender_name, item_keys, quantity,
+            )
+            if not reserved.get("ok"):
+                errors = {
+                    "empty_inventory": "📭 لا تملك من هذا الكنز شيئًا لاستبداله.",
+                    "insufficient_items": f"❌ الكمية غير متوفرة؛ المتاح {reserved.get('available', 0)}.",
+                    "invalid_quantity": "❌ اكتب كمية موجبة صحيحة.",
+                    "pending_redemption": "⌛ يجري اعتماد استبدال محفوظ؛ أعد المحاولة بعد لحظات.",
+                }
+                self.send_room_text(room, errors.get(reserved.get("error"), "❌ تعذر تنفيذ الاستبدال."))
+                return True
+            pending = reserved["pending"]
+            credited = _apply_points_delta_once(
+                sender_name, pending["points"],
+                f"mining-redemption:{pending['id']}", "treasure mining redemption",
+            )
+            if not credited.get("ok"):
+                self.send_room_text(room, "⚠️ حُجزت الكنوز للاستبدال بأمان، لكن تعذر اعتماد النقاط الآن. أعد Rdem لاحقًا؛ لن تُخصم الكنوز مرتين.")
+                return True
+            MINING_STORE.complete_redemption(user_id, pending["id"])
+            item_names = ", ".join(
+                f"{MINING_ITEMS[key]['icon']} {MINING_ITEMS[key]['name']} ×{count}"
+                for key, count in pending["items"].items()
+            )
+            self.send_room_text(
+                room,
+                f"✅ تم استبدال {item_names} لـ@{sender_name}\n"
+                f"💰 أضيف إلى رصيدك {pending['points']:,} نقطة.",
+            )
+            return True
+
+        if is_dig:
+            outcome = MINING_STORE.dig(user_id, sender_name)
+            if not outcome.get("ok"):
+                if outcome.get("error") == "cooldown":
+                    remaining = int(outcome.get("remaining", 0) or 0)
+                    self.send_room_text(room, f"⌛ {sender_name} يمكنك التنقيب مرة كل 30 ثانية. تبقّى {format_cooldown(remaining)}.")
+                elif outcome.get("error") == "pending_redemption":
+                    self.send_room_text(room, "⌛ لديك استبدال كنوز ينتظر التسوية؛ استخدم Rdem مرة أخرى بعد قليل.")
+                return True
+            try:
+                _record_game(sender_name, "treasure_mining", 0, 0)
+            except Exception as exc:
+                self.log("[MINING] game stats update failed:", repr(exc))
+            item = outcome.get("item")
+            if not item:
+                self.send_room_text(room, f"🪨 {sender_name} لم يعثر على شيء هذه المرة. حظًا أوفر في التنقيب القادم.")
+                return True
+            self.send_room_text(
+                room,
+                f"🎉 {sender_name} عثرت على:\n{item['icon']} {item['name']}\n"
+                "🎒 أُضيف إلى مخزونك.\n"
+                f"🛒 قيمة الاستبدال: {int(item['price']):,} نقطة للقطعة.",
+            )
+            image_path = ASSETS_DIR / "treasures" / item.get("image", "")
+            if image_path.is_file():
+                image_url = self._game_public_image(image_path, route="assets/treasures")
+                if image_url:
+                    try:
+                        self.send_room_media(room, image_url, "image")
+                    except Exception as exc:
+                        self.log("[MINING] treasure image send failed:", repr(exc))
+            return True
+        return False
+
+    @_identity_contextual
     def handle_game_command(self, room, text, sender_name):
         stock_order = _parse_stock_market_order(text)
         raw=_normalize_game_command_text(text)
@@ -16187,6 +17637,26 @@ class TalkinBot:
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
+        mining_raw = raw.strip()
+        mining_low = mining_raw.casefold().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
+        mining_commands = {
+            "الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining",
+            "فحص الماس", "فحص الالماس",
+            "sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag",
+            "متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures",
+            "توب الماس", "توب الالماس", "top diamonds", "top gems", "اغنى المنقبين",
+        }
+        if mining_low in mining_commands or re.fullmatch(r"(?:r|rdem)\s+.+", mining_raw, re.I):
+            # Username is the primary identity for command responsiveness.
+            # A saved/native numeric ID is used when the sender itself is only
+            # an ID or when no usable username was supplied; no roster wait.
+            normalized_sender = _norm_user(sender_name)
+            # Keep username as the primary key even after its numeric ID is
+            # learned, so early progress/inventory is not split across keys.
+            user_id = ("name:" + normalized_sender) if normalized_sender else (
+                str(sender_name).strip() if str(sender_name).strip().isdigit() else ""
+            )
+            return self._execute_mining_command_with_id(room, mining_raw, sender_name, user_id)
         if self._handle_bomb_wire(room, sender_name, raw):
             return True
         bomb = re.fullmatch(r"bom@([^@]+)(?:@(.+))?", raw.strip(), re.I)
@@ -16302,6 +17772,7 @@ class TalkinBot:
 
             if won:
                 self._game_award(sender_name, reward)
+                _record_money_game_winner("billion", sender_name)
                 # Prefer the latest live profile URL; DB lookup is only a fallback.
                 winner_key = _norm_user(sender_name)
                 winner_photo = self.user_photos.get(winner_key, "")
@@ -16313,25 +17784,19 @@ class TalkinBot:
                     target_room for target_room in target_rooms
                     if _norm_room(target_room) != _norm_room(room)
                 ]
-                for index, target_room in enumerate(target_rooms):
+                def announce_winner_text(target_room):
                     language = self._configured_room_language(target_room)
-                    self.send_room_text(target_room, _money_game_win_text("billion", sender_name, language))
-                    if index + 1 < len(target_rooms):
-                        time.sleep(0.05)
+                    announcement = (
+                        _money_game_win_text("billion", sender_name, language)
+                        if _norm_room(target_room) == _norm_room(room)
+                        else _money_game_short_win_text("billion", sender_name, language)
+                    )
+                    self.send_room_text(target_room, announcement)
 
-                try:
-                    base = _public_base_url()
-                    if not base:
-                        raise RuntimeError("PUBLIC_BASE_URL أو RAILWAY_PUBLIC_DOMAIN غير مضبوط")
-                    card = render_billion_card(sender_name, winner_photo)
-                    url = f"{base}/billion/{card.name}"
-                    self._verify_public_media_url(url, "image")
-                    # Publish the same generated winner card to every active room.
-                    for target_room in target_rooms:
-                        self.send_room_media(target_room, url, "image")
-                    self.log("[GAME] billion winner card sent", sender_name, len(target_rooms))
-                except Exception as exc:
-                    self.log("[GAME] billion winner card failed:", repr(exc))
+                self._send_game_winner_card(
+                    "billion", sender_name, target_rooms, send_delay=0.35,
+                    before_each_room=announce_winner_text,
+                )
             else:
                 loss_text = (f"🎰🍀 Billion game\n━━━━━━━━━━━━━━\n❌ {sender_name} did not get the billion this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
                              if english else f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحصل على المليار هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
@@ -16514,6 +17979,7 @@ class TalkinBot:
     def _send_help(self, room=None, private_to=None, page=1, game_part=1):
         self._send_help_section(room=room, private_to=private_to, page=page, part=game_part)
 
+    @_identity_contextual
     def _handle_management_command(self, room, body, sender, is_private=False):
         # Management commands are accepted only from the master. Keep normal
         # response routing enabled so the master receives the result privately
@@ -16524,6 +17990,47 @@ class TalkinBot:
         # master-only management gate below.
         _body_text = str(body or "").strip()
         _body_low = _body_text.casefold()
+        if _body_low == "مستويات":
+            item_lines = []
+            tier_titles = {
+                "النجوم الفضية": "المستوى الفضي",
+                "النجوم الذهبية": "المستوى الذهبي",
+                "الماس الأزرق": "المستوى الماسي الأزرق",
+                "الماس البرونزي": "المستوى الماسي البرونزي",
+                "الماس الأحمر": "المستوى الماسي الأحمر",
+                "الماس الأسود": "المستوى الماسي الأسود",
+                "الماس البنفسجي": "المستوى الماسي البنفسجي",
+                "الماس الملكي": "المستوى الماسي الملكي",
+                "الماس الخالد": "المستوى الماسي الخالد",
+                "الماس الكوني": "المستوى الماسي الكوني",
+            }
+            category_count = len(GAME_LEVEL_CATEGORIES) + len(GAME_LEVEL_FUTURE_CATEGORIES)
+            for tier_index in range(category_count):
+                tier_start = tier_index * 5000
+                _category_index, _level_number, category, _title, symbol, _plays = _game_level_details_from_plays(tier_start)
+                tier_title = tier_titles.get(category, f"المستوى {category}")
+                item_lines.extend((tier_title, symbol * 10))
+                for level_in_tier in range(1, 11):
+                    plays = tier_start + (level_in_tier - 1) * 500
+                    _category_index, _level_number, _category, title, _level_symbol, _plays = _game_level_details_from_plays(plays)
+                    item_lines.append(f"مستوى {level_in_tier}: {title}")
+            headings = ["📚 مستويات تقدم الألعاب", "كل مستوى يحتاج 500 لعبة"]
+            packet_type = "chat_message" if is_private else "room_message"
+            route_fields = {"to": str(sender or "")} if is_private else {"room": str(room or "")}
+            pages = _safe_text_pages_from_items(
+                packet_type, route_fields, headings, item_lines,
+                max_items_per_page=12,
+                language="ar", marker_first=True,
+            )
+            self._send_paginated_text_pages(sender, room, packet_type, pages, route_fields, language="ar")
+            return True
+        # ID lookup is intentionally public: run it before the master-only
+        # management gate so any member can retrieve their own server ID.
+        if re.fullmatch(r"(?:ايدي|أيدي|id)(?:@(.+))?", _body_text, re.I):
+            return self._room_list_commands(room, _body_text, sender, is_private)
+        # Live room presence is also a public utility, not a management action.
+        if re.fullmatch(r"la@.+", _body_text, re.I):
+            return self._room_list_commands(room, _body_text, sender, is_private)
         # أمر استعلام تواجد المستخدم is@اسم أو is اسم
         m_is = re.fullmatch(r"(?:is@|is\s+@?)([^\s@]+)", _body_text, re.I)
         if m_is:
@@ -16626,32 +18133,45 @@ class TalkinBot:
             # Room lists are keyed by room and requester too, so one user's
             # ns command cannot advance another user's pending roster.
             result_key_user = str(sender or "")
-            result_key = ("chat_message" if is_private else "room_message", result_key_room, result_key_user)
+            result_packet_type = "chat_message" if is_private else "room_message"
+            result_key = (result_packet_type, "" if is_private else result_key_room, result_key_user)
             result_state = result_pages.get(result_key)
             if not result_state:
-                # l@sr is often issued from a room but replies privately to
-                # the master.  Accept Ns from that private chat as well as
-                # from the original command context.
+                # Talkin can provide a display alias in one event and the
+                # canonical username in another. Match the same route+room.
+                wanted = _norm_user(sender)
                 for candidate_key, candidate_state in reversed(list(result_pages.items())):
-                    if (candidate_key[0] == "chat_message"
-                            and candidate_key[2] == str(sender or "")):
+                    if (isinstance(candidate_key, tuple) and len(candidate_key) == 3
+                            and candidate_key[0] == result_packet_type
+                            and candidate_key[1] == ("" if is_private else result_key_room)
+                            and _norm_user(candidate_key[2]) == wanted):
+                        result_key, result_state = candidate_key, candidate_state
+                        break
+            if not result_state and not is_private:
+                # Some room commands deliberately answer in DM.
+                wanted = _norm_user(sender)
+                for candidate_key, candidate_state in reversed(list(result_pages.items())):
+                    if (isinstance(candidate_key, tuple) and len(candidate_key) == 3
+                            and candidate_key[0] == "chat_message"
+                            and _norm_user(candidate_key[2]) == wanted):
                         result_key, result_state = candidate_key, candidate_state
                         break
             if result_state:
                 pages = result_state.get("pages") or []
                 part = int(result_state.get("part", 1) or 1)
+                result_english = str(result_state.get("language") or "ar").casefold() == "en"
                 if part < len(pages):
                     part += 1
                     result_state["part"] = part
                     chunk = pages[part - 1]
                     if part < len(pages):
-                        chunk += "\n\n📌 للقائمة التالية اكتب Ns"
+                        chunk += "\n\n📌 Type ns for the next list." if result_english else "\n\n📌 للقائمة التالية اكتب ns"
                     else:
-                        chunk += "\n\n✅ انتهت القوائم."
+                        chunk += "\n\n✅ End of list." if result_english else "\n\n✅ انتهت القوائم."
                     payload = dict(result_state.get("kwargs") or {})
                     payload["type_"] = "text"
                     payload["body"] = chunk
-                    self.send_query(encode_query("chat_message" if is_private else "room_message", **payload))
+                    self.send_query(encode_query(result_key[0], **payload))
                 else:
                     result_pages.pop(result_key, None)
                     msg = "✅ انتهت القوائم.\n📌 أرسل الأمر من جديد لعرض النتائج من البداية."
@@ -16762,6 +18282,11 @@ class TalkinBot:
         public_top_command = str(body or "").strip().casefold() in {
             "توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top", "ملياري", "مليارات", "مليوني", "ملايين"
         }
+        public_shop_command = bool(
+            str(body or "").strip().casefold() in {"متجر", "shop", "store", "story", "ترحيب_صورة", "welcome_image"}
+            or re.fullmatch(r"sby\s+[1-6]", str(body or "").strip(), re.I)
+            or re.fullmatch(r"ترحيب@.+", str(body or "").strip(), re.S)
+        )
         is_game_cmd = str(body or "").strip().casefold() in ("تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب")
         is_creator_cmd = bool(re.match(r"^[+-]?صانع(?:ي| الغرفة| الغرفه)?(?:@.+)?$", str(body or "").strip(), re.I))
         pending_protection_choice = bool(
@@ -16816,6 +18341,7 @@ class TalkinBot:
             return True
         if (not _is_master_name(sender)
                 and not public_top_command
+                and not public_shop_command
                 and not (verification_manager_command and _is_mvip_master(sender))
                 and not (is_publish and _is_verified_user(sender))
                 and not (points_transfer_command and _is_verified_user(sender))
@@ -16959,7 +18485,7 @@ class TalkinBot:
             # Startup restore must not wait for one ACK per room. The reader
             # remains free to process all ACKs/events while joins are sent at
             # a small gateway-safe pace.
-            gap=max(0.08, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.15") or 0.15))
+            gap=max(0.08, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.45") or 0.45))
         else:
             gap=max(0.8, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
         timeout=max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20") or 20))
@@ -16981,14 +18507,37 @@ class TalkinBot:
                         self._record_room_sync_result(sync_id, target, True, "موجودة ومتصل بها البوت")
                     continue
                 if sender and key in getattr(self, "_room_restore_candidates", set()):
-                    try:
-                        self.send_private_text(sender, f"✅ البوت موجود داخل الغرفة: {target}")
-                    except Exception as exc:
-                        self.log("[ROOM] restored-room notice failed:", target, repr(exc))
-                    skipped += 1
-                    if sync_id:
-                        self._record_room_sync_result(sync_id, target, True, "تمت استعادتها عند تشغيل البوت")
-                    continue
+                    # A restore candidate is only a queued join, never proof of
+                    # membership. Wait for the pending server acknowledgement;
+                    # do not tell the requester the bot is present prematurely.
+                    pending_joins = getattr(self, "_pending_room_joins", {})
+                    if key in pending_joins:
+                        deadline = time.time() + timeout + 1.0
+                        while time.time() < deadline:
+                            if any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set())):
+                                break
+                            if key not in pending_joins:
+                                break
+                            time.sleep(0.25)
+                    if any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set())):
+                        try:
+                            self.send_private_text(sender, f"✅ البوت داخل الغرفة: {target}")
+                        except Exception as exc:
+                            self.log("[ROOM] confirmed restore notice failed:", target, repr(exc))
+                        skipped += 1
+                        if sync_id:
+                            self._record_room_sync_result(sync_id, target, True, "أكد الخادم وجود البوت في الغرفة")
+                        continue
+                    if key in getattr(self, "_pending_room_joins", {}):
+                        try:
+                            self.send_private_text(sender, f"⏳ طلب دخول البوت إلى {target} ما زال بانتظار تأكيد الخادم؛ لم أؤكد وجوده بعد.")
+                        except Exception:
+                            pass
+                        skipped += 1
+                        if sync_id:
+                            self._record_room_sync_result(sync_id, target, False, "طلب الدخول ما زال بانتظار تأكيد الخادم")
+                        continue
+                    getattr(self, "_room_restore_candidates", set()).discard(key)
                 try:
                     if self.join_room(target, force=bool(fast_restore), requested_by=sender):
                         sent += 1
@@ -17288,10 +18837,20 @@ class TalkinBot:
             "o": "👑 قائمة الأونرات",
             "b": "🚫 قائمة المحظورين",
         }.get(label, "📋 قائمة الغرفة")
-        self._send_room_list(
-            room, f"{title} — {room}", names,
-            "📭 لم تصل أسماء فعلية من السيرفر.", sender=pending.get("sender")
-        )
+        if pending.get("code") == "la":
+            title = f"🟢 المتواجدون الآن في {pending.get('room') or room}"
+            if pending.get("private_response"):
+                self._send_private_list(pending.get("sender"), title, names, "📭 لا يوجد متواجدون الآن.")
+            else:
+                self._send_room_list(
+                    pending.get("response_room") or room, title, names,
+                    "📭 لا يوجد متواجدون الآن.", sender=pending.get("sender")
+                )
+        else:
+            self._send_room_list(
+                room, f"{title} — {room}", names,
+                "📭 لم تصل أسماء فعلية من السيرفر.", sender=pending.get("sender")
+            )
 
         try:
             self.send_private_text(
@@ -17315,6 +18874,34 @@ class TalkinBot:
         pending = self._pending_room_lists.pop(_norm_room(source_room), None)
         if not isinstance(pending, dict):
             return False
+        response_timer = pending.get("timer")
+        if response_timer:
+            try:
+                response_timer.cancel()
+            except Exception:
+                pass
+
+        if pending.get("code") == "id_sync":
+            users = self._extract_room_list_users(result)
+            followups = pending.get("mine_followups", [])
+            if users or followups:
+                threading.Thread(
+                    target=self._store_room_ids_background,
+                    args=(source_room, users, followups),
+                    name="room-id-roster-save",
+                    daemon=True,
+                ).start()
+            return True
+
+        if pending.get("code") == "mine_uid":
+            users = self._extract_room_list_users(result)
+            threading.Thread(
+                target=self._store_room_ids_background,
+                args=(source_room, users, pending.get("mine_followups", [])),
+                name="mining-user-id-resolve",
+                daemon=True,
+            ).start()
+            return True
 
         # INV roster collection: each category is fetched separately. The
         # response category is authoritative; then the next category is
@@ -17401,6 +18988,47 @@ class TalkinBot:
                         state.setdefault("results", []).append((pending.get("room"), user))
                     break
             return self._request_next_presence(pending.get("presence_token"))
+
+        if pending.get("code") == "uid":
+            users = self._extract_room_list_users(result)
+            if users:
+                _remember_roster(source_room, users)
+            wanted = _norm_user(pending.get("target"))
+            match = next((user for user in users
+                          if (_norm_user(user.get("username")) == wanted
+                              or _game_name_key(user.get("username")) == _game_name_key(pending.get("target"))
+                              or (str(pending.get("target") or "").strip().isdigit()
+                                  and str(user.get("user_id") or "").strip() == str(pending.get("target") or "").strip()))
+                          and str(user.get("user_id") or "").strip().isdigit()), None)
+            if match:
+                response = str(match.get("user_id")).strip()
+            else:
+                response = f"📭 لم يعثر الخادم على ID رقمي لـ @{pending.get('target')} في {source_room}."
+            if pending.get("private_response"):
+                self.send_private_text(pending.get("sender"), response)
+            else:
+                self.send_room_text(pending.get("response_room") or source_room, response)
+            return True
+
+        if pending.get("code") == "la":
+            users = self._extract_room_list_users(result)
+            if users:
+                _remember_roster(source_room, users)
+            names = []
+            seen = set()
+            for user in users:
+                name = str(user.get("username") or "").strip().lstrip("@")
+                key = _norm_user(name)
+                if name and key != _norm_user(BOT_ID) and key not in seen:
+                    seen.add(key)
+                    names.append({"username": name})
+            response_room = str(pending.get("response_room") or source_room)
+            title = f"🟢 المتواجدون الآن في {source_room}"
+            if pending.get("private_response"):
+                self._send_private_list(pending.get("sender"), title, names, "📭 لا يوجد متواجدون الآن.")
+            else:
+                self._send_room_list(response_room, title, names, "📭 لا يوجد متواجدون الآن.", sender=pending.get("sender"))
+            return True
 
         # L@a / L@m / L@o / L@b: the APK sends the actual roster in
         # ResultMessage.users[] (or the equivalent RoomAdmin wrapper).
@@ -17496,15 +19124,17 @@ class TalkinBot:
             return
         rows.sort(key=_norm_user)
         limit = max(240, int(os.getenv("WS_MAX_MESSAGE_BYTES", "1008")) - 120)
-        pages=[]; current=[f"{title} ({len(rows)}):"]
-        for index, name in enumerate(rows, 1):
-            line = f"{index}. @{name}"
+        pages=[]; current=[f"{title} ({len(rows)}):"]; page_items=0
+        for name in rows:
+            line = f"{page_items + 1}. @{name}"
             candidate = "\n".join(current + [line])
-            if len(candidate.encode("utf-8")) > limit and len(current) > 1:
+            if (page_items >= 30 or len(candidate.encode("utf-8")) > limit) and page_items > 0:
                 pages.append("\n".join(current))
-                current=[f"{title} ({len(rows)}):", line]
-            else:
-                current.append(line)
+                current=[f"{title} ({len(rows)}):"]
+                page_items=0
+                line = f"{page_items + 1}. @{name}"
+            current.append(line)
+            page_items += 1
         if len(current) > 1:
             pages.append("\n".join(current))
 
@@ -17632,7 +19262,253 @@ class TalkinBot:
         self.send_query(encode_query("room_admin",type_=types[code],room=state["room"],to=BOT_ID,value="none",id_=rid))
         return True
 
+    def _room_list_response_timeout(self, room_key, request_id):
+        pending_lists = getattr(self, "_pending_room_lists", {})
+        pending = pending_lists.get(room_key)
+        if (not isinstance(pending, dict) or pending.get("code") not in {"la", "id_sync", "mine_uid"}
+                or str(pending.get("request_id") or "") != str(request_id or "")):
+            return False
+        pending_lists.pop(room_key, None)
+        if pending.get("code") in {"id_sync", "mine_uid"}:
+            for followup in pending.get("mine_followups", []) or []:
+                if isinstance(followup, dict):
+                    sender = str(followup.get("sender") or "").strip().lstrip("@")
+                    self.send_room_text(
+                        pending.get("room") or room_key,
+                        f"⌛ لم يصل رد الأعضاء لتحديد ID الخاص بـ@{sender}. أعد الأمر بعد ثوانٍ.",
+                    )
+            self.log("[ROSTER] background member-ID sync timed out:", pending.get("room") or room_key)
+            return True
+        notice = "⚠️ لم يصل رد المتواجدين من الخادم. تأكد أن البوت متصل بالغرفة ثم أعد la@اسم_الغرفة."
+        if pending.get("private_response"):
+            self.send_private_text(pending.get("sender"), notice)
+        else:
+            self.send_room_text(pending.get("response_room") or pending.get("room"), notice)
+        return True
+
+    def _store_room_ids_background(self, room, users, followups=()):
+        try:
+            clean = [user for user in users or [] if isinstance(user, dict)]
+            if clean:
+                for user in clean:
+                    username = str(user.get("username") or "").strip()
+                    if username:
+                        self.room_users.setdefault(room, {})[username] = str(user.get("role") or "none")
+                _remember_roster(room, clean)
+                self.log(f"[ROSTER] saved {len(clean)} member IDs for {_norm_room(room)} in background")
+            for followup in followups or []:
+                if not isinstance(followup, dict):
+                    continue
+                sender = str(followup.get("sender") or "").strip().lstrip("@")
+                wanted = _norm_user(sender)
+                match = next((user for user in clean
+                              if (_norm_user(user.get("username")) == wanted
+                                  or _game_name_key(user.get("username")) == _game_name_key(sender)
+                                  or (sender.isdigit() and str(user.get("user_id") or "").strip() == sender))
+                              and str(user.get("user_id") or "").strip().isdigit()), None)
+                if match:
+                    previous_identity = _set_identity_context(sender, room)
+                    try:
+                        self._execute_mining_command_with_id(
+                            room, str(followup.get("text") or ""), sender,
+                            str(match.get("user_id")).strip(),
+                        )
+                    finally:
+                        _restore_identity_context(previous_identity)
+                else:
+                    self.send_room_text(room, f"📭 لم يعثر الخادم على ID رقمي لـ@{sender} في {room}.")
+            return bool(clean)
+        except Exception as exc:
+            self.log("[ROSTER] background ID save failed:", repr(exc))
+            return False
+
+    def _send_room_id_sync_request(self, room, room_key, request_id):
+        try:
+            payload = encode_query(
+                "room_admin", type_="members_list", room=room, to=BOT_ID,
+                value="none", id_=request_id,
+            )
+            self.send_query(payload)
+        except Exception as exc:
+            pending = getattr(self, "_pending_room_lists", {}).get(room_key)
+            if isinstance(pending, dict) and str(pending.get("request_id") or "") == str(request_id):
+                self._pending_room_lists.pop(room_key, None)
+            self.log("[ROSTER] background member-ID request failed:", repr(exc))
+
+    def _schedule_room_id_sync(self, room):
+        """Refresh numeric member identities off the event/command thread."""
+        room = str(room or "").strip()
+        room_key = _norm_room(room)
+        if not room or not room_key or getattr(self, "ws", None) is None:
+            return False
+        lock = getattr(self, "_room_id_sync_lock", None)
+        if lock is None:
+            lock = self._room_id_sync_lock = threading.RLock()
+        pending_lists = getattr(self, "_pending_room_lists", None)
+        if not isinstance(pending_lists, dict):
+            pending_lists = self._pending_room_lists = {}
+        with lock:
+            now = time.time()
+            last = getattr(self, "_room_id_sync_last", {})
+            if now - float(last.get(room_key, 0) or 0) < 60:
+                return False
+            if room_key in pending_lists:
+                return False
+            max_pending = max(1, int(os.getenv("MAX_BACKGROUND_ID_SYNC", "2") or 2))
+            active_syncs = sum(
+                1 for item in pending_lists.values()
+                if isinstance(item, dict) and item.get("code") == "id_sync"
+            )
+            if active_syncs >= max_pending:
+                self.log("[ROSTER] ID sync deferred; active sync limit reached:", room)
+                return False
+            request_id = secrets.token_urlsafe(15)[:20]
+            pending_lists[room_key] = {
+                "room": room, "code": "id_sync", "request_type": "members_list",
+                "request_id": request_id, "requested_at": now,
+            }
+            last[room_key] = now
+            self._room_id_sync_last = last
+            timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
+            timer.daemon = True
+            pending_lists[room_key]["timer"] = timer
+            timer.start()
+        threading.Thread(
+            target=self._send_room_id_sync_request,
+            args=(room, room_key, request_id),
+            name="room-member-id-sync",
+            daemon=True,
+        ).start()
+        return True
+
+    def _request_mining_identity_lookup(self, room, sender, text):
+        """Queue a mining command until a background members_list returns IDs."""
+        room = str(room or "").strip()
+        room_key = _norm_room(room)
+        if not room_key:
+            self.send_room_text(room, "⚠️ نفّذ أمر التعدين داخل غرفة متصلة حتى أتمكن من جلب ID.")
+            return True
+        pending_lists = getattr(self, "_pending_room_lists", None)
+        if not isinstance(pending_lists, dict):
+            pending_lists = self._pending_room_lists = {}
+        followup = {"sender": str(sender or "").strip().lstrip("@"), "text": str(text or "")}
+        pending = pending_lists.get(room_key) if isinstance(pending_lists, dict) else None
+        if isinstance(pending, dict):
+            if pending.get("code") in {"id_sync", "mine_uid"}:
+                pending.setdefault("mine_followups", []).append(followup)
+                self.send_room_text(room, f"🔄 جارٍ تحديد حساب @{followup['sender']} عبر ID في الخلفية.")
+            else:
+                self.send_room_text(room, "⌛ هناك طلب أعضاء جارٍ لهذه الغرفة؛ أعد أمر التنقيب بعد اكتماله.")
+            return True
+        if not getattr(self, "ws", None):
+            self.send_room_text(room, "⚠️ لا أستطيع طلب ID الآن لأن اتصال الغرفة غير جاهز.")
+            return True
+        lock = getattr(self, "_room_id_sync_lock", None)
+        if lock is None:
+            lock = self._room_id_sync_lock = threading.RLock()
+        with lock:
+            if room_key in pending_lists:
+                return self._request_mining_identity_lookup(room, sender, text)
+            request_id = secrets.token_urlsafe(15)[:20]
+            pending = {
+                "room": room, "code": "mine_uid", "request_type": "members_list",
+                "request_id": request_id, "requested_at": time.time(),
+                "mine_followups": [followup],
+            }
+            pending_lists[room_key] = pending
+            timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
+            timer.daemon = True
+            pending["timer"] = timer
+            timer.start()
+        self.send_room_text(room, f"🔄 جارٍ تحديد حساب @{followup['sender']} عبر ID في الخلفية.")
+        threading.Thread(
+            target=self._send_room_id_sync_request,
+            args=(room, room_key, request_id),
+            name="mining-user-id-request",
+            daemon=True,
+        ).start()
+        return True
+
     def _room_list_commands(self, room, text, sender, is_private):
+        id_request = re.fullmatch(r"(?:ايدي|أيدي|id)(?:@(.+))?", str(text or "").strip(), re.I)
+        if id_request:
+            target = str(id_request.group(1) or sender or "").strip().lstrip("@")
+            if not target:
+                self.send_private_text(sender, "⚠️ تعذر تحديد اسم المستخدم. استخدم ايدي أو ايدي@اسم_المستخدم.")
+                return True
+            cached_id = _stored_user_id(target, room)
+            if cached_id:
+                response = cached_id
+                (self.send_private_text(sender, response) if is_private else self.send_room_text(room, response))
+                return True
+            connected = sorted(getattr(self, "connected_rooms", set()) or [], key=_norm_room)
+            query_room = str(room or getattr(self, "room", "") or (connected[0] if connected else "")).strip()
+            if not query_room or not getattr(self, "ws", None):
+                response = f"📭 لا يوجد ID محفوظ لـ @{target} بعد. نفّذ الأمر داخل غرفة متصل بها البوت."
+                (self.send_private_text(sender, response) if is_private else self.send_room_text(room, response))
+                return True
+            if _norm_room(query_room) in getattr(self, "_pending_room_lists", {}):
+                response = f"⏳ يوجد طلب قائمة آخر قيد التنفيذ في {query_room}؛ أعد المحاولة بعد قليل."
+                (self.send_private_text(sender, response) if is_private else self.send_room_text(room, response))
+                return True
+            try:
+                request_id = secrets.token_urlsafe(15)[:20]
+                self._pending_room_lists[_norm_room(query_room)] = {
+                    "room": query_room, "code": "uid", "sender": str(sender or "").strip(),
+                    "target": target, "request_type": "members_list", "request_id": request_id,
+                    "requested_at": time.time(), "private_response": bool(is_private),
+                    "response_room": str(room or query_room),
+                }
+                self.send_query(encode_query(
+                    "room_admin", type_="members_list", room=query_room,
+                    to=BOT_ID, value="none", id_=request_id,
+                ))
+            except Exception as exc:
+                self._pending_room_lists.pop(_norm_room(query_room), None)
+                self.log("[USER-ID] native lookup failed", repr(exc))
+                self.send_private_text(sender, "❌ تعذر طلب معرّف المستخدم من الخادم.")
+            return True
+
+        live_room = re.fullmatch(r"la@(.+)", str(text or "").strip(), re.I)
+        if live_room:
+            target_room = live_room.group(1).strip()
+            if not target_room:
+                (self.send_private_text(sender, "⚠️ اكتب اسم الغرفة بعد la@.") if is_private
+                 else self.send_room_text(room, "⚠️ اكتب اسم الغرفة بعد la@."))
+                return True
+            if member_shop.active("room_roster", room=target_room):
+                text = f"🌫️ قائمة المتواجدين في {target_room} مخفية بحماية المتجر."
+                (self.send_private_text(sender, text) if is_private else self.send_room_text(room, text))
+                return True
+            if not getattr(self, "ws", None):
+                text = "❌ يلزم اتصال مباشر بالخادم لجلب المتواجدين الآن."
+                (self.send_private_text(sender, text) if is_private else self.send_room_text(room, text))
+                return True
+            try:
+                request_id = secrets.token_urlsafe(15)[:20]
+                self._pending_room_lists[_norm_room(target_room)] = {
+                    "room": target_room, "code": "la", "sender": str(sender or "").strip(),
+                    "request_type": "occupants_list", "request_id": request_id,
+                    "requested_at": time.time(), "private_response": bool(is_private),
+                    "response_room": str(room or "").strip(),
+                }
+                self.send_query(encode_query(
+                    "room_admin", type_="occupants_list", room=target_room,
+                    to=BOT_ID, value="none", id_=request_id,
+                ))
+                timeout = max(5.0, float(os.getenv("ROOM_OCCUPANTS_TIMEOUT_SECONDS", "15")))
+                timer = threading.Timer(
+                    timeout, self._room_list_response_timeout,
+                    args=(_norm_room(target_room), request_id),
+                )
+                timer.daemon = True
+                timer.start()
+            except Exception as exc:
+                self._pending_room_lists.pop(_norm_room(target_room), None)
+                self.log("[ROOM-PRESENCE] la@ request failed", repr(exc))
+                text = "❌ تعذر طلب قائمة المتواجدين من الخادم."
+                (self.send_private_text(sender, text) if is_private else self.send_room_text(room, text))
+            return True
         match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
         if match:
             if not room:
@@ -17732,11 +19608,80 @@ class TalkinBot:
             return True
         return False
 
+    @_identity_contextual
     def _handle_management_command_impl(self, room, body, sender, is_private=False):
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
         if self._room_list_commands(room, text, sender, is_private):
+            return True
+
+        if low in {"متجر", "shop", "store", "story"}:
+            self.send_private_text(sender, member_shop.render_catalog())
+            return True
+        buy = re.fullmatch(r"sby\s+([1-6])", text, re.I)
+        if buy:
+            item_id = int(buy.group(1))
+            item = member_shop.ITEMS[item_id]
+            target_room = str(room or getattr(self, "room", "") or "").strip()
+            if item["kind"].startswith("room_") and not target_room:
+                self.send_private_text(sender, "⚠️ اشترِ حماية الغرفة من داخل الغرفة المطلوبة.")
+                return True
+            account = _resolve_points_account(_points_data(), sender)
+            balance = _points_balance(account[1]) if account else 0
+            if balance < int(item["cost"]):
+                self.send_private_text(sender, f"❌ رصيدك غير كافٍ. السعر {item['cost']:,} نقطة، رصيدك {balance:,}.")
+                return True
+            try:
+                _add_points(sender, -int(item["cost"]))
+            except (PointsInsufficientError, PointsPersistenceError):
+                self.send_private_text(sender, "❌ تعذر خصم النقاط؛ لم يتم الشراء.")
+                return True
+            success, error = member_shop.purchase(
+                sender, item_id, target_room,
+                user_id=_stored_user_id(sender, room),
+                aliases=_stored_user_aliases(sender, room),
+            )
+            if not success:
+                try:
+                    _add_points(sender, int(item["cost"]))
+                except Exception as exc:
+                    self.log("[SHOP] refund failed after rejected purchase", repr(exc))
+                self.send_private_text(sender, error)
+                return True
+            _github_sync_after_local_save(member_shop.SHOP_PATH, None)
+            if item["kind"] in {"custom_welcome", "image_welcome"}:
+                extra = "\nبعدها استخدم: ترحيب@النص" if item["kind"] == "custom_welcome" else "\nميزة الصورة مفعّلة للحساب، أرسل صورة الترحيب في الغرفة مع الأمر ترحيب_صورة."
+            else:
+                extra = "\n⏱️ تنتهي الحماية بعد ساعة."
+            self.send_private_text(sender, f"✅ تم شراء {item['icon']} {item['name']} مقابل {item['cost']:,} نقطة.{extra}")
+            return True
+        custom_welcome = re.fullmatch(r"ترحيب@(.+)", text, re.S)
+        if custom_welcome:
+            if not member_shop.active(
+                    "custom_welcome", username=sender,
+                    user_id=_stored_user_id(sender, room),
+                    aliases=_stored_user_aliases(sender, room)):
+                self.send_private_text(sender, "🔒 افتح ميزة الترحيب المخصص من المتجر أولاً: sby 5.")
+                return True
+            welcome = custom_welcome.group(1).strip()[:300]
+            if welcome:
+                self.custom_welcomes[_norm_user(sender)] = {"username": sender, "message": welcome}
+                self.custom_welcome_enabled = True
+                self._save_social_features()
+                self.send_private_text(sender, "✅ تم حفظ ترحيبك المخصص.")
+            return True
+        if low in {"ترحيب_صورة", "welcome_image"}:
+            if not member_shop.active(
+                    "image_welcome", username=sender,
+                    user_id=_stored_user_id(sender, room),
+                    aliases=_stored_user_aliases(sender, room)):
+                self.send_private_text(sender, "🔒 افتح ميزة الترحيب بصورة من المتجر أولاً: sby 6.")
+                return True
+            if not isinstance(getattr(self, "custom_welcome_image_pending", None), dict):
+                self.custom_welcome_image_pending = {}
+            self.custom_welcome_image_pending[_norm_user(sender)] = {"username": sender, "created_at": time.time()}
+            self.send_private_text(sender, "🖼️ أرسل صورة الترحيب الآن في الخاص أو أي غرفة خلال دقيقتين.")
             return True
 
         money_toggle_commands = {
@@ -17829,7 +19774,8 @@ class TalkinBot:
             if not target_room:
                 self.send_private_text(sender, "⚠️ لا توجد غرفة محددة لفحص الحماية.")
                 return True
-            if not (_is_master_name(sender) or _room_manager(self, target_room, sender)):
+            if not (_is_primary_master(sender) or _is_master_name(sender)
+                    or _is_room_creator(target_room, sender)):
                 return True
             pcfg = _room_protection_cfg(target_room)
             mcfg = _room_moderation_config(target_room)
@@ -17840,8 +19786,8 @@ class TalkinBot:
                     f"🛡️ Protection status — {target_room}\n"
                     f"• Room protection: {protection_state(mcfg.get('enabled'))}\n"
                     f"• Profanity filter: {protection_state(pcfg.get('swear'))}\n"
-                    f"• Repeated-message protection: {protection_state(pcfg.get('repeat'))}\n"
-                    f"• Join/leave protection: {protection_state(pcfg.get('flood'))}\n"
+                    f"• Repeated-message protection: {protection_state(pcfg.get('flood'))}\n"
+                    f"• Join/leave protection: {protection_state(pcfg.get('joinleave'))}\n"
                     f"• Repetition limit: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
                     f"• Internal bot protection: {protection_state(bot_prot)}"
                 )
@@ -17850,12 +19796,27 @@ class TalkinBot:
                     f"🛡️ حالة الحماية — {target_room}\n"
                     f"• حماية الغرفة: {'🟢 شغالة' if mcfg.get('enabled') else '🔴 متوقفة'}\n"
                     f"• فلتر الكلمات: {'🟢 شغال' if pcfg.get('swear') else '🔴 متوقف'}\n"
-                    f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('repeat') else '🔴 متوقفة'}\n"
-                    f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
+                    f"• حماية التكرار: {'🟢 شغالة' if pcfg.get('flood') else '🔴 متوقفة'}\n"
+                    f"• حماية الدخول/الخروج: {'🟢 شغالة' if pcfg.get('joinleave') else '🔴 متوقفة'}\n"
                     f"• حد التكرار: {int(mcfg.get('repeat_limit', pcfg.get('repeat_limit', 11)) or 11)}\n"
                     f"• حماية البوت الداخلية: {'🟢 شغالة' if bot_prot else '🔴 متوقفة'}"
                 )
             self.send_private_text(sender, status_text)
+            return True
+
+        if low in ("حالة قاعدة البيانات", "حاله قاعده البيانات", "حالة النسخ", "database status", "database sync status", "db status", "dbsync"):
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 أمر حالة مزامنة النسخ مخصص للماستر الأساسي فقط.")
+                return True
+            response_thread = getattr(self, "_master_reply_local", None)
+            old_rerouting = getattr(response_thread, "rerouting", False) if response_thread else False
+            try:
+                if response_thread:
+                    response_thread.rerouting = True
+                self.send_private_text(sender, _database_sync_status_text())
+            finally:
+                if response_thread:
+                    response_thread.rerouting = old_rerouting
             return True
 
         # Overall bot health/status for the master. This is diagnostic, not a
@@ -17885,7 +19846,10 @@ class TalkinBot:
             return True
 
         # Master-only room broadcast: رسالهغرف@النص / رسالةغرف@النص.
-        m_room_broadcast = re.fullmatch(r"(?:رسالهغرف|رسالةغرف|رساله\s+غرفه|رسالة\s+غرفه)@(.+)", text, re.I | re.S)
+        m_room_broadcast = re.fullmatch(
+            r"(?:رسالهغرف|رسالةغرف|رساله\s+غرفه|رسالة\s+غرفه|room\s+message|rooms\s+message|room\s+broadcast)@(.+)",
+            text, re.I | re.S,
+        )
         if m_room_broadcast:
             if not _is_primary_master(sender):
                 self.send_private_text(sender, "🔒 هذا الأمر مخصص للماستر الأساسي فقط.")
@@ -17894,8 +19858,39 @@ class TalkinBot:
             if not message_text:
                 self.send_private_text(sender, "❌ الصيغة: رساله غرفه@نص الرسالة")
                 return True
-            count=self.broadcast_all_rooms(message_text)
-            self.send_private_text(sender, f"📣 تم إرسال الرسالة إلى {count} غرفة.")
+            rooms = self._active_rooms()
+            if not rooms:
+                self.send_private_text(
+                    sender,
+                    "❌ No rooms are available for this broadcast."
+                    if text.casefold().startswith(("room", "rooms")) else "❌ لا توجد غرف لإرسال الرسالة إليها."
+                )
+                return True
+            english = text.casefold().startswith(("room", "rooms"))
+            if room:
+                try:
+                    english = english or self._effective_room_language(room) == "en"
+                except Exception:
+                    pass
+            try:
+                threading.Thread(
+                    target=self._broadcast_room_message_worker,
+                    args=(str(sender or ""), message_text, english),
+                    daemon=True,
+                    name="room-message-broadcast",
+                ).start()
+                self.send_private_text(
+                    sender,
+                    f"📨 Background broadcast started for {len(rooms)} rooms; you can keep using the bot."
+                    if english else f"📨 بدأ إرسال الرسالة بالخلفية إلى {len(rooms)} غرفة؛ يمكنك متابعة استخدام البوت."
+                )
+            except Exception as exc:
+                self.log("[BROADCAST] could not start background worker:", repr(exc))
+                self.send_private_text(
+                    sender,
+                    "❌ Could not start the room broadcast."
+                    if text.casefold().startswith(("room", "rooms")) else "❌ تعذر بدء إرسال الرسالة إلى الغرف."
+                )
             return True
 
         # Ordinary-user private message: رساله@اسم_المستخدم نص الرسالة
@@ -17903,20 +19898,21 @@ class TalkinBot:
         # The message itself is NEVER echoed to the room. The recipient gets
         # a private notification containing the sender, room and message,
         # while the requester gets a private success/failure result.
-        m_user_private = re.fullmatch(r"(?:رساله|رسالة)(?:@|\s+)@?([^\s@]+)\s+(.+)", text, re.I | re.S)
+        m_user_private = re.fullmatch(r"(?:رساله|رسالة|message)(?:@|\s+)@?([^\s@]+)\s+(.+)", text, re.I | re.S)
         if m_user_private:
             target = m_user_private.group(1).strip().lstrip("@")
             message_text = m_user_private.group(2).strip()
             if not target or not message_text:
                 return True
 
+            english = text.casefold().startswith("message")
             private_payload = (
-                f"📩 لديك رسالة خاصة من @{sender}\n"
-                f"🏠 الغرفة: {str(room or 'غير محددة').strip()}\n"
-                f"📝 نص الرسالة: {message_text}"
+                f"📩 You have a message from {str(sender or '').strip()}\n\n{message_text}"
+                if english else
+                f"📩 لديك رسالة من {str(sender or '').strip()}\n\n{message_text}"
             )
             try:
-                sent = bool(self.send_private_text(target, private_payload))
+                sent = self.send_private_text(target, private_payload) is not False
             except Exception as exc:
                 sent = False
                 self.log("[PRIVATE-MSG] failed", repr(exc))
@@ -17927,9 +19923,9 @@ class TalkinBot:
             try:
                 self._master_reply_local.rerouting = True
                 if sent:
-                    self.send_private_text(sender, f"✅ تم إرسال الرسالة إلى @{target} بنجاح.")
+                    self.send_private_text(sender, f"✅ Message sent to @{target}." if english else f"✅ تم إرسال الرسالة إلى @{target} بنجاح.")
                 else:
-                    self.send_private_text(sender, f"❌ فشل إرسال الرسالة إلى @{target}.")
+                    self.send_private_text(sender, f"❌ Failed to send the message to @{target}." if english else f"❌ فشل إرسال الرسالة إلى @{target}.")
             finally:
                 self._master_reply_local.rerouting = old_rerouting
             return True
@@ -17988,7 +19984,7 @@ class TalkinBot:
         protection_match = re.fullmatch(r"(?:حماية|حمايه|حماية الغرفة|حمايه الغرفه|protection|room protection)(?:@([^@]+)|\s+(.+))?", text, re.I)
         if protection_match:
             room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
-                                          or _room_manager(self, room, sender)))
+                                          or _is_room_creator(room, sender)))
             if not ((_is_primary_master(sender) and is_private) or room_manager):
                 if room and not is_private:
                     self.send_room_text(room, "🚫 قائمة الحماية لصانع الغرفة أو الماستر فقط.")
@@ -18030,7 +20026,7 @@ class TalkinBot:
         st=pending_protection.get(protection_key,{})
         if st.get("awaiting_number") and re.fullmatch(r"\d+",low):
             room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
-                                          or _room_manager(self, room, sender)))
+                                          or _is_room_creator(str(st.get("room") or room), sender)))
             if not ((is_private and _is_primary_master(sender)) or (not is_private and room_manager)):
                 return True
             try:
@@ -18050,7 +20046,7 @@ class TalkinBot:
         if protection_key in pending_protection and low.isdigit():
             st=pending_protection.get(protection_key,{})
             room_manager = bool(room and (_is_master_name(sender) or _is_primary_master(sender)
-                                          or _room_manager(self, room, sender)))
+                                          or _is_room_creator(str(st.get("room") or room), sender)))
             if not ((is_private and _is_primary_master(sender)) or (not is_private and room_manager)):
                 if is_private and _is_primary_master(sender):
                     self.send_private_text(sender, "🔒 أرسل رقم الخيار من خاص البوت أو داخل الغرفة بصفتك صانعاً.")
@@ -18106,7 +20102,7 @@ class TalkinBot:
 
         if low in ("تشغيل الحماية", "تشغيل الحمايه", "الحماية تشغيل", "الحمايه تشغيل", "enable protection", "enable room protection"):
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
-                                or _room_manager(self, room, sender)):
+                                or _is_room_creator(room, sender)):
                 return True
             cfg = _save_room_moderation(room, enabled=True)
             _save_room_protection(room, swear=True, flood=True)
@@ -18114,7 +20110,7 @@ class TalkinBot:
             return True
         if low in ("إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "الحماية إيقاف", "الحمايه ايقاف", "disable protection", "disable room protection"):
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
-                                or _room_manager(self, room, sender)):
+                                or _is_room_creator(room, sender)):
                 return True
             _save_room_moderation(room, enabled=False)
             _save_room_protection(room, swear=False, flood=False)
@@ -18123,7 +20119,7 @@ class TalkinBot:
         m_repeat = re.fullmatch(r"mr@(\d+)", text, re.I)
         if m_repeat:
             if not room or not (_is_master_name(sender) or _is_primary_master(sender)
-                                or _room_manager(self, room, sender)):
+                                or _is_room_creator(room, sender)):
                 return True
             limit = max(2, min(50, int(m_repeat.group(1))))
             _save_room_moderation(room, repeat_limit=limit)
@@ -18230,6 +20226,18 @@ class TalkinBot:
             result_key = (packet_type, "" if is_private else str(room or ""), str(sender or ""))
             result_pages = getattr(self, "_result_pages", {})
             result_state = result_pages.get(result_key)
+            if not isinstance(result_state, dict):
+                # Talkin can put a display alias in one event and the canonical
+                # username in another. Match the same route+room by identity.
+                wanted = _norm_user(sender)
+                for candidate_key, candidate_state in list(result_pages.items()):
+                    if (isinstance(candidate_key, tuple) and len(candidate_key) == 3
+                            and candidate_key[0] == packet_type
+                            and candidate_key[1] == ("" if is_private else str(room or ""))
+                            and _norm_user(candidate_key[2]) == wanted
+                            and isinstance(candidate_state, dict)):
+                        result_key, result_state = candidate_key, candidate_state
+                        break
             if not isinstance(result_state, dict) and not is_private:
                 # Some commands (including personal logs) deliberately answer
                 # in DM even when issued in a room. Let `ns` sent from that room
@@ -18393,20 +20401,28 @@ class TalkinBot:
                            f"🎟️ إجمالي الرهانات: {_fmt_points(stats['staked'])}")
             (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room, message)
             return True
-        balance_top_aliases = {
-            "ملياري": (1_000_000_000, "المليار"),
-            "مليارات": (1_000_000_000, "المليار"),
-            "مليوني": (1_000_000, "المليون"),
-            "ملايين": (1_000_000, "المليون"),
+        money_game_winner_aliases = {
+            "ملياري": "billion",
+            "مليارات": "billion",
+            "مليارت": "billion",
+            "مليوني": "million",
+            "ملايين": "million",
         }
-        if low in balance_top_aliases:
-            threshold, label = balance_top_aliases[low]
+        if low in money_game_winner_aliases:
+            game_name = money_game_winner_aliases[low]
             english = _detect_text_language(text) == "en"
-            message = _points_threshold_top_message(threshold, label, english=english)
-            if is_private:
-                self.send_private_text(sender, message)
-            else:
-                self.send_room_text(room, message)
+            message = _money_game_winners_message(game_name, english=english)
+            lines = message.splitlines()
+            packet_type = "chat_message" if is_private else "room_message"
+            route_fields = {"to": str(sender or "")} if is_private else {"room": str(room or "")}
+            pages = _safe_text_pages_from_items(
+                packet_type, route_fields, lines[:2], lines[2:],
+                language="en" if english else "ar",
+            )
+            self._send_paginated_text_pages(
+                sender, room, packet_type, pages, route_fields,
+                language="en" if english else "ar",
+            )
             return True
         game_top_aliases = {
             "توب المليار": ("billion", "المليار"), "توب مليار": ("billion", "المليار"),
@@ -18640,11 +20656,24 @@ class TalkinBot:
             if not saved_rooms:
                 self.send_private_text(sender, "📭 لا توجد غرف محفوظة في ملف الغرف.")
                 return True
+            bulk_lock = getattr(self, "_room_bulk_lock", None)
+            if bulk_lock is not None and not bulk_lock.acquire(blocking=False):
+                self.send_private_text(
+                    sender,
+                    "⏳ توجد عملية دخول غرف قيد التنفيذ حالياً؛ لن أبدأ عملية ثانية حتى لا يتوقف البوت.",
+                )
+                return True
+            if bulk_lock is not None:
+                bulk_lock.release()
             threading.Thread(
-                target=self._join_rooms_serially, args=(saved_rooms, sender),
+                target=self._join_rooms_serially, args=(saved_rooms, sender, True),
                 daemon=True, name="manual-join-my-rooms",
             ).start()
-            self.send_private_text(sender, f"⏳ جاري دخول غرفي ({len(saved_rooms)} غرفة) بالتتابع...")
+            self.send_private_text(
+                sender,
+                f"📨 أرسلت طلبات دخول {len(saved_rooms)} غرفة بسرعة. "
+                "لن أعتبر أي غرفة دخلتها إلا بعد تأكيد الخادم، وستظهر رسالة الدخول داخل كل غرفة.",
+            )
             return True
 
         # Bulk room join: enter every room currently saved in tracked_rooms.json.
@@ -18760,7 +20789,7 @@ class TalkinBot:
             self._save_blocked_rooms()
             _save_persistent_rooms(self.known_rooms)
             response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
-            
+
             # Accept immediately, but send one room_join at a time.
             if not hasattr(self, "room_languages"):
                 self.room_languages = {}
@@ -18776,7 +20805,7 @@ class TalkinBot:
                 self.send_room_text(response_room, confirm_msg)
             else:
                 self.send_private_text(sender, confirm_msg)
-                
+
             return True
         m_master_transfer = re.fullmatch(r"msb@([^@]+)@(\d+)", text, re.I)
         if m_master_transfer and is_private and _is_primary_master(sender):
@@ -18925,6 +20954,9 @@ class TalkinBot:
                 self.send_private_text(sender, f"✅ تم حذف @{target} من قائمة المحظورين.")
                 return True
         if low in ("حمايه البوت", "حماية البوت", "bot protection", "bot_protection"):
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 إعداد حماية البوت الداخلية للماستر الأساسي فقط.")
+                return True
             self._bot_protection_menu_state = _norm_user(sender)
             self.send_private_text(sender, "🛡️ حماية البوت\n1. تشغيل\n2. إيقاف\n3. عرض المحظورين\n4. حذف محظور\n\nأرسل رقم العملية.")
             return True
@@ -18939,9 +20971,9 @@ class TalkinBot:
             _save_bot_blocked_users(self.bot_blocked_users)
             self.send_private_text(sender, f"✅ تم فك الحظر الداخلي عن @{target}.")
             return True
-        # "غرفي" must include the complete restored catalog. connected_rooms
-        # can be temporarily smaller while the fast reconnect ACKs are still
-        # arriving, so use the persistent room file as well.
+        # "غرفي" must show only rooms confirmed by the server in this session.
+        # Saved rooms and room_users are restore/roster data, not proof that the
+        # current WebSocket session actually joined those rooms.
         if low in ("جلب غرف السيرفر", "جلب الغرف من السيرفر", "قائمة غرف السيرفر", "get server rooms"):
             if not is_private:
                 self.send_room_text(room, "⏳ جاري طلب قائمة غرف السيرفر... سأرسل النتيجة في الخاص.")
@@ -18964,13 +20996,11 @@ class TalkinBot:
             live = sorted({
                 str(r).strip() for r in (
                     list(getattr(self, "connected_rooms", set()))
-                    + list(getattr(self, "room_users", {}).keys())
-                    + list(_persistent_rooms())
                 )
                 if str(r).strip() and _norm_room(r) not in blocked
             }, key=str.casefold)
             if not is_private:
-                self.send_room_text(room, "📡 أعرض كامل غرف البوت المستعادة والمؤكدة.")
+                self.send_room_text(room, "📡 أعرض الغرف التي أكد الخادم دخول البوت إليها فعليًا.")
             self._send_room_names_pages(
                 sender, room, live, from_server=True,
                 language=_detect_text_language(text) or self._effective_room_language(room),
@@ -19136,7 +21166,7 @@ class TalkinBot:
             self.send_private_text(target, f"✅ تم توثيق حسابك @{target} بنجاح.\n🎉 يمكنك الآن استخدام أوامر البوت.")
             self.send_private_text(sender, f"✅ تم توثيق @{target}.")
             return True
-        if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("سحب التوثيق@") or low.startswith("uns@"): 
+        if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("سحب التوثيق@") or low.startswith("uns@"):
             if not _is_verification_manager(sender):
                 return True
             prefix = "uns@" if low.startswith("uns@") else ("سحب التوثيق@" if low.startswith("سحب التوثيق@") else text.split("@",1)[0]+"@")
@@ -20177,6 +22207,74 @@ class TalkinBot:
         self.log("[JOINLEAVE] ignored automatic member restore after ban:", room, username)
         return False
 
+    def _handle_reaction_command(self, room, body, sender):
+        """Handle reaction tokens; reports are private to the configured master."""
+        reaction = re.match(r"^(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?$", str(body or "").strip(), re.I)
+        if not reaction:
+            return False
+        action, code = reaction.group(1).lower(), reaction.group(2).lower()
+        extra = (reaction.group(3) or "").strip()
+        info = getattr(self, "reaction_targets", {}).get(code)
+        if not info or time.time() - float(info.get("created_at", 0) or 0) > 86400:
+            return False
+
+        publisher = str(info.get("publisher") or "").strip()
+        labels = {"lk": "👍 إعجاب", "lv": "❤️ حب", "dl": "👎 عدم إعجاب", "cm": "💬 تعليق", "report": "🚨 بلاغ"}
+        source_desc = str(info.get("description") or info.get("title") or "").strip()
+        owner_label = "صاحب الأغنية" if str(info.get("kind") or "").lower() == "music" else "اسم الناشر"
+
+        if action == "report":
+            master = str(BOT_MASTER or "").strip().lstrip("@")
+            if not master:
+                self.log("[REACTION] report could not be delivered: BOT_MASTER is not configured")
+                return True
+            notice = (
+                "🚨 بلاغ جديد عن أغنية/صورة\n"
+                f"🧾 الرمز: {code}\n👤 المبلّغ: {sender}\n"
+                f"👤 الناشر: {publisher or 'غير معروف'}\n"
+                f"📌 النوع: {owner_label}\n🏠 الغرفة: {room}"
+            )
+            if source_desc:
+                notice += f"\n📝 المحتوى: {source_desc}"
+            if extra:
+                notice += f"\n💬 تفاصيل البلاغ: {extra}"
+            notice = _fit_text_to_packet("chat_message", notice, to=master)
+            reply_state = getattr(self, "_master_reply_local", None)
+            old_rerouting = getattr(reply_state, "rerouting", False) if reply_state else False
+            try:
+                if reply_state:
+                    reply_state.rerouting = True
+                if self.send_private_text(master, notice) is False:
+                    self.log("[REACTION] private master report was rejected", master)
+            except Exception as exc:
+                self.log("[REACTION] private master report failed", repr(exc))
+            finally:
+                if reply_state:
+                    reply_state.rerouting = old_rerouting
+            return True
+
+        notice = f"لقد تفاعلت مع {labels.get(action, action)}\n👤 المتفاعل: {sender}\n📌 {owner_label}: {publisher}"
+        if source_desc:
+            notice += f"\n📝 المحتوى: {source_desc}"
+        if extra:
+            notice += f"\n💬 رسالة التفاعل: {extra}"
+        self.send_room_text(room, notice)
+        if publisher and _norm_user(publisher) != _norm_user(sender):
+            private_notice = notice + f"\n🏠 الغرفة: {room}"
+            reply_state = getattr(self, "_master_reply_local", None)
+            old_rerouting = getattr(reply_state, "rerouting", False) if reply_state else False
+            try:
+                if reply_state:
+                    reply_state.rerouting = True
+                if self.send_private_text(publisher, private_notice) is False:
+                    self.log("[REACTION] private publisher notice was rejected", publisher)
+            except Exception as exc:
+                self.log("[REACTION] private publisher notice failed", repr(exc))
+            finally:
+                if reply_state:
+                    reply_state.rerouting = old_rerouting
+        return True
+
     def handle_room_event(self, result):
         event = (result.get("room_event") or {}) if isinstance(result, dict) else {}
         event_type = str(event.get(1, ""))
@@ -20222,6 +22320,44 @@ class TalkinBot:
         to = str(event.get(3, ""))
         body = str(event.get(6, ""))
         room = str(event.get(13) or self.room or "").strip()
+        # Text commands must be routed by the canonical username immediately.
+        # Field 2 can be a numeric ID or an opaque Talkin account token; field
+        # 22 is the normal username field and field 17 is the older fallback.
+        event_user_17 = str(event.get(17, "") or "").strip().lstrip("@")
+        event_user_22 = str(event.get(22, "") or "").strip().lstrip("@")
+        command_username = next(
+            (candidate for candidate in (event_user_22, event_user_17, frm.strip().lstrip("@"))
+             if candidate and not candidate.isdigit()),
+            "",
+        )
+        event_id_candidates = (
+            event.get(14), event.get("user_id"),
+            frm if frm.strip().isdigit() else "",
+        )
+        sender_id = next(
+            (str(value).strip() for value in event_id_candidates
+             if str(value or "").strip().isdigit()),
+            "",
+        )
+        if event_type == "text" and command_username:
+            frm = command_username
+            # Persist only the ID received in this event. The disk operation is
+            # deliberately asynchronous so no command waits for room_users.json.
+            if sender_id:
+                _remember_roster_async(room, [{
+                    "username": command_username,
+                    "user_id": sender_id,
+                    "role": str(event.get(8, event.get("role", "none")) or "none"),
+                }])
+        elif sender_id and frm.isdigit():
+            frm = _stored_username_for_id(sender_id, room) or frm
+        if event_type == "text" and frm:
+            self._last_message_identity = {
+                "user_id": sender_id,
+                "username": frm,
+                "room": room,
+                "identity_key": f"id:{sender_id}" if sender_id else _norm_user(frm),
+            }
         # Receiving an actual room text event proves this session can see that
         # room, even if the server omitted/reordered the explicit join ack.
         if room and event_type == "text":
@@ -20238,10 +22374,15 @@ class TalkinBot:
             known_before = len(self.known_rooms)
             self.known_rooms.add(room)
             if len(self.known_rooms) != known_before:
-                _save_persistent_rooms(self.known_rooms)
+                # Local/GitHub persistence must never delay command routing.
+                snapshot = set(self.known_rooms)
+                threading.Thread(
+                    target=_save_persistent_rooms,
+                    args=(snapshot,),
+                    daemon=True,
+                    name="persist-room-list",
+                ).start()
         event_id = str(event.get(41, ""))
-        event_user_17 = str(event.get(17, "") or "").strip()
-        event_user_22 = str(event.get(22, "") or "").strip()
         if event_type in ("user_joined", "user_left"):
             username = event_user_17 or event_user_22
             if event_type == "user_left" and _norm_user(username) == _norm_user(BOT_ID):
@@ -20258,9 +22399,16 @@ class TalkinBot:
                     self.log(f"[MOD_EVENT] ignored ambiguous bot user_left after moderation of another account in {room}")
                     username = ""
         else:
-            username = event_user_22
+            username = event_user_22 or event_user_17 or (frm if event_type == "text" else "")
         monitored_username = username or frm or str(event.get(17, "") or "").strip()
-        self._report_monitored_event(room, event_type, monitored_username, body)
+        if (_norm_user(monitored_username)
+                and _norm_user(monitored_username) in getattr(self, "monitored_users", set())):
+            threading.Thread(
+                target=self._report_monitored_event,
+                args=(room, event_type, monitored_username, body),
+                daemon=True,
+                name="monitor-event-report",
+            ).start()
         # Some server builds return L@a/L@m/L@o as a RoomEvent text `User List:`.
         # Consume that native response before ordinary room-command handling.
         if self._complete_pending_room_list_text(room, body):
@@ -20346,7 +22494,7 @@ class TalkinBot:
                         self.send_room_text(room, f"🚫 تم حظر @{username} (حظر IP) بسبب تكرار الدخول والخروج.")
                     except Exception as exc:
                         self.log("[JOINLEAVE] ban failed", repr(exc))
-        
+
         if event_type == "user_joined" and username:
             # Optional room protection: reject accounts with no profile photo.
             # Field 3 is the native UserItem photo field; the cache is used as
@@ -20365,7 +22513,11 @@ class TalkinBot:
                         self.log("[NO-PHOTO] ban failed", repr(exc))
                     return
             self.room_users.setdefault(room, {})[username] = role or "none"
-            _remember_roster(room, [{"username": username, "role": role or "none"}])
+            _remember_roster_async(room, [{"username": username, "role": role or "none"}])
+            # Do not start a members_list request for every person who enters.
+            # This traffic was multiplying roster requests across all restored rooms.
+            if BACKGROUND_ID_SYNC_ON_JOIN and _norm_user(username) != _norm_user(BOT_ID):
+                self._schedule_room_id_sync(room)
             # Keep a separate history for .r. Only events received after the
             # bot's own you_joined/you_rejoined timestamp are recorded.
             entry_room = _norm_room(room)
@@ -20378,13 +22530,15 @@ class TalkinBot:
                 self._master_online_rooms.add(_norm_room(room))
                 self.master_online = True
                 self.master_last_seen = time.time()
-            # Welcome the master using the exact configured BOT_MASTER account.
             welcome = None
-            if _norm_user(username) == _norm_user(BOT_MASTER):
-                welcome = f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}"
-            elif username and _norm_user(username) != _norm_user(BOT_ID):
+            if username and _norm_user(username) != _norm_user(BOT_ID):
                 welcomes_enabled = bool(getattr(self, "custom_welcome_enabled", True))
-                cw = getattr(self, "custom_welcomes", {}).get(_norm_user(username)) if welcomes_enabled else None
+                welcome_data = getattr(self, "custom_welcomes", {})
+                cw = welcome_data.get(_norm_user(username)) if welcomes_enabled else None
+                if welcomes_enabled and cw is None:
+                    cw = next((welcome_data.get(_norm_user(alias))
+                               for alias in _stored_user_aliases(username, room)
+                               if welcome_data.get(_norm_user(alias)) is not None), None)
                 welcome = _join_welcome_message(username, room, welcomes_enabled, cw)
             if username and _norm_user(username) != _norm_user(BOT_ID) and self._is_dragon_hunter(username):
                 if self._configured_room_language(room) == "en":
@@ -20392,6 +22546,13 @@ class TalkinBot:
                 else:
                     hunter_welcome = f"🐉 أهلاً بعودة صائد التنين @{username}!"
                 welcome = f"{welcome}\n{hunter_welcome}" if welcome else hunter_welcome
+            custom_entry = getattr(self, "custom_welcomes", {}).get(_norm_user(username), {})
+            welcome_image = str(custom_entry.get("image_url") or "") if isinstance(custom_entry, dict) else ""
+            if welcome_image:
+                try:
+                    self.send_room_media(room, welcome_image, "image")
+                except Exception as exc:
+                    self.log("[WELCOME] image send failed", repr(exc))
             if welcome:
                 self.send_room_text(room, welcome)
         if event_type in ("you_joined", "you_rejoined"):
@@ -20402,6 +22563,9 @@ class TalkinBot:
                 # Start a fresh history for this bot entry/re-entry. Members
                 # who were already in the room are NOT part of .r.
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
+                # Roster IDs are loaded only when needed unless explicitly enabled.
+                if BACKGROUND_ID_SYNC_ON_JOIN:
+                    self._schedule_room_id_sync(room)
 
         elif event_type == "user_left" and username:
             self.room_users.get(room, {}).pop(username, None)
@@ -20417,6 +22581,7 @@ class TalkinBot:
                 if getattr(self, "_intentional_leaves", None) and _norm_room(room) in self._intentional_leaves:
                     self.log(f"[USER_LEFT_DETECTED] Bot left {room} intentionally; skipping auto-rejoin.")
                 else:
+                    self._send_master_room_departure_notice(room, event_type, event)
                     self.log(f"[USER_LEFT_DETECTED] Bot left {room}; rejoining automatically...")
                     self._schedule_auto_rejoin(room)
             if _norm_user(username) == _norm_user(BOT_MASTER):
@@ -20472,6 +22637,13 @@ class TalkinBot:
                             connected for connected in self.connected_rooms
                             if _norm_room(connected) != _norm_room(room)
                         }
+                        if not (
+                            getattr(self, "_intentional_leaves", None)
+                            and _norm_room(room) in self._intentional_leaves
+                        ):
+                            self._send_master_room_departure_notice(
+                                room, event_type, event, role=changed_role
+                            )
                         self.log(f"[KICK_DETECTED] Bot was removed from {room}; rejoining automatically...")
                         self._schedule_auto_rejoin(room)
                 else:
@@ -20549,14 +22721,24 @@ class TalkinBot:
             rejoin_state = getattr(self, "_auto_rejoin_state", {}).get(rnorm)
             if rejoin_state is not None:
                 rejoin_state["joined_at"] = time.monotonic()
+                # A server ACK ends this one-request wait cycle and permits a
+                # fresh recovery if the room drops the bot again later.
+                rejoin_state["attempts"] = []
             auto_pending = getattr(self, "_auto_rejoin_pending", None)
-            if auto_pending is not None:
+            auto_waiting_ack = getattr(self, "_auto_rejoin_waiting_ack", None)
+            if auto_pending is not None or auto_waiting_ack is not None:
                 lock = getattr(self, "_auto_rejoin_lock", None)
                 if lock is None:
-                    auto_pending.discard(rnorm)
+                    if auto_pending is not None:
+                        auto_pending.discard(rnorm)
+                    if auto_waiting_ack is not None:
+                        auto_waiting_ack.discard(rnorm)
                 else:
                     with lock:
-                        auto_pending.discard(rnorm)
+                        if auto_pending is not None:
+                            auto_pending.discard(rnorm)
+                        if auto_waiting_ack is not None:
+                            auto_waiting_ack.discard(rnorm)
             pending_join = self._pending_room_joins.pop(rnorm, None)
             if pending_join and pending_join.get("timer"):
                 pending_join["timer"].cancel()
@@ -20567,20 +22749,17 @@ class TalkinBot:
             self._blocked_room_notices.discard(rnorm)
             if room:
                 self.known_rooms.add(room)
+                self.send_room_text(room, "انا جيت ادري اشتقتولي😚😚😚😚")
                 _save_persistent_rooms(self.known_rooms)
             requester = str((pending_join or {}).get("requested_by", "") or "").strip()
             # Confirm immediately when the server ACK arrives. Roster loading
             # can involve a slow database/WebSocket round trip and must never
             # delay the user's entry confirmation.
             if requester:
-                self.send_private_text(requester, f"✅ أكد الخادم دخول البوت إلى الغرفة: {room}")
-            if room:
-                try:
-                    self.request_room_occupants(room)
-                except Exception as exc:
-                    self.log("[ROOM] occupants refresh after join failed:", repr(exc))
-            if requester:
-                self.send_room_text(room, "مرحبا لقد عدت ادري وحشتكم🙂😋")
+                self.send_private_text(requester, f"✅ البوت داخل الغرفة: {room}")
+            # Do not request a full occupants list for every room during a
+            # bulk restore. That floods the WebSocket and starves commands;
+            # IDs are collected gradually from message events/background sync.
         elif event_type in (
             "room_full", "room_unauthorized", "room_wrong_password",
             "room_needs_captcha", "room_needs_password", "room_membership_required",
@@ -20621,6 +22800,7 @@ class TalkinBot:
                             self.log("[ACK] stale join-failure ack failed:", exc)
                     return
                 reason_text = self._room_failure_message(room, event_type)
+                getattr(self, "_auto_rejoin_waiting_ack", set()).discard(blocked_room)
                 pending_join = self._pending_room_joins.pop(blocked_room, None)
                 if pending_join and pending_join.get("timer"):
                     pending_join["timer"].cancel()
@@ -20681,6 +22861,28 @@ class TalkinBot:
             if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
                 media_senders.append(candidate)
 
+        # A purchased custom-image welcome consumes the next image from that
+        # account and stores it with the existing custom welcome profile.
+        if media_url and getattr(self, "custom_welcome_image_pending", {}):
+            pending_welcomes = getattr(self, "custom_welcome_image_pending", {})
+            for image_sender in media_senders:
+                key = _norm_user(image_sender)
+                pending = pending_welcomes.get(key)
+                if not isinstance(pending, dict):
+                    continue
+                if time.time() - float(pending.get("created_at", 0) or 0) > 120:
+                    pending_welcomes.pop(key, None)
+                    self.send_private_text(image_sender, "⌛ انتهت مهلة صورة الترحيب؛ أرسل ترحيب_صورة من جديد.")
+                    return
+                entry = getattr(self, "custom_welcomes", {}).setdefault(key, {"username": image_sender})
+                entry["username"] = str(entry.get("username") or image_sender)
+                entry["image_url"] = media_url
+                self.custom_welcome_enabled = True
+                self._save_social_features()
+                pending_welcomes.pop(key, None)
+                self.send_private_text(image_sender, "✅ تم حفظ صورة الترحيب المخصص.")
+                return
+
         # sav@ owns the next image from the same sender and has priority over
         # the generic public-image publisher.
         if media_url and getattr(self, "custom_gift_pending", {}):
@@ -20723,16 +22925,18 @@ class TalkinBot:
         #   رساله اسم_المستخدم نص الرسالة
         #   رساله@اسم_المستخدم نص الرسالة
         # This MUST be intercepted before the admin-command gate so it is
-        # never echoed to the room. No public confirmation is sent either.
-        m_direct_public = re.fullmatch(r"(?:رساله|رسالة)\s*@?([^\s@]+)\s+(.+)", body.strip(), re.I | re.S)
+        # never echoed to the room; delivery status is sent privately.
+        m_direct_public = re.fullmatch(r"(?:رساله|رسالة|message)\s*@?([^\s@]+)\s+(.+)", body.strip(), re.I | re.S)
         if m_direct_public:
-            target = m_direct_public.group(1).strip()
+            target = m_direct_public.group(1).strip().lstrip("@")
             message_text = m_direct_public.group(2).strip()
             if target and message_text:
+                english = body.strip().casefold().startswith("message")
                 try:
-                    self.send_private_text(target, message_text)
-                except Exception as exc:
-                    self.log("[DIRECT-MESSAGE] failed", target, repr(exc))
+                    english = english or self._effective_room_language(room) == "en"
+                except Exception:
+                    pass
+                self._deliver_user_private_message(frm, target, message_text, english=english)
                 return
 
         # Personal bot ban: silently ignore subsequent traffic except for a
@@ -20857,26 +23061,10 @@ class TalkinBot:
         if self._handle_lookalike_command(room, body, frm):
             return
 
-        # Reactions/comments/reports: notify the original publisher privately.
-        reaction=re.match(r"^(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?$", body.strip(), re.I)
-        if reaction:
-            action,code,extra=reaction.group(1).lower(),reaction.group(2).lower(),(reaction.group(3) or "").strip()
-            info=self.reaction_targets.get(code)
-            if info and time.time()-float(info.get("created_at",0)) <= 86400:
-                publisher=str(info.get("publisher") or "").strip()
-                labels={"lk":"👍 إعجاب","lv":"❤️ حب","dl":"👎 عدم إعجاب","cm":"💬 تعليق","report":"🚨 بلاغ"}
-                source_desc = str(info.get("description") or info.get("title") or "").strip()
-                owner_label = "صاحب الأغنية" if str(info.get("kind") or "").lower() == "music" else "اسم الناشر"
-                notice=f"لقد تفاعلت مع {labels.get(action,action)}\n👤 المتفاعل: {frm}\n📌 {owner_label}: {publisher}"
-                if source_desc: notice += f"\n📝 المحتوى: {source_desc}"
-                if extra: notice += f"\n💬 رسالة التفاعل: {extra}"
-                # التفاعل يظهر داخل نفس الغرفة، وتصل نسخة مطابقة أيضاً
-                # إلى صاحب الصورة/الأغنية على الخاص.
-                self.send_room_text(room, notice)
-                if publisher and _norm_user(publisher) != _norm_user(frm):
-                    private_notice = notice + f"\n🏠 الغرفة: {room}"
-                    self.send_private_text(publisher, private_notice)
-                return
+        # Reports go to the master privately; other reactions retain their
+        # existing room and publisher notifications.
+        if self._handle_reaction_command(room, body, frm):
+            return
 
         # نقاطي متاح للجميع ولا يحتاج توثيقاً.
         if body.strip().casefold() in ("نقاطي", "points"):
@@ -21089,8 +23277,40 @@ class TalkinBot:
                 join_after=bool(pending.get("join_after")),
             )
 
+    def _send_paginated_text_pages(self, sender, room, packet_type, pages, route_fields, language="ar"):
+        """Store a result list for `ns` and send its first safe page."""
+        if not pages:
+            return False
+        result_pages = getattr(self, "_result_pages", {})
+        if not isinstance(result_pages, dict):
+            result_pages = {}
+        key_room = "" if packet_type == "chat_message" else str(room or "")
+        key = (packet_type, key_room, str(sender or ""))
+        if len(pages) > 1:
+            result_pages[key] = {
+                "pages": pages, "part": 1, "kwargs": dict(route_fields or {}),
+                "language": language,
+            }
+        else:
+            result_pages.pop(key, None)
+        self._result_pages = result_pages
+
+        english = str(language or "ar").casefold() == "en"
+        if len(pages) > 1:
+            footer = "\n\n📌 Type ns for the next list." if english else "\n\n📌 اكتب ns للقائمة التالية."
+        else:
+            footer = "\n\n✅ End of list." if english else "\n\n✅ انتهت القوائم."
+        message = pages[0] + footer
+        if packet_type == "chat_message":
+            if getattr(self, "ws", None):
+                return self._send_text_packets(packet_type, message, **dict(route_fields or {}))
+            return self.send_private_text(sender, message)
+        if getattr(self, "ws", None):
+            return self._send_text_packets(packet_type, message, **dict(route_fields or {}))
+        return self.send_room_text(room, message)
+
     def _send_room_names_pages(self, sender, room, rooms, from_server=False, language=None):
-        """Display all room names with safe pagination."""
+        """Display all room names in pages bounded by both count and wire bytes."""
         names = sorted({str(item).strip() for item in rooms or [] if str(item).strip()}, key=str.casefold)
         language = language or self._effective_room_language(room)
         if not names:
@@ -21100,29 +23320,16 @@ class TalkinBot:
             else:
                 self.send_private_text(sender, text)
             return
-        total = (len(names) + 29) // 30
-        pages = []
-        for offset in range(0, len(names), 30):
-            page_no = offset // 30 + 1
-            title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else f"🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else f"🏠 Bot rooms — rooms file")
-            lines = [title, f"📄 القائمة {page_no}/{total}"]
-            lines.extend(f"{i}. {name}" for i, name in enumerate(names[offset:offset + 30], offset + 1))
-            pages.append("\n".join(lines))
-        key = ("chat_message", "", str(sender or ""))
-        result_pages = getattr(self, "_result_pages", {})
-        if not isinstance(result_pages, dict):
-            result_pages = {}
-        result_pages[key] = {"pages": pages, "part": 1, "kwargs": {"to": str(sender or "")}, "language": language}
-        self._result_pages = result_pages
-        first = pages[0]
-        first += "\n\n📌 اكتب ns للقائمة التالية." if total > 1 and language == "ar" else ("\n\n📌 Type ns for the next list." if total > 1 else "\n\n✅ انتهت القوائم.")
-        if total == 1:
-            result_pages.pop(key, None)
-            self._result_pages = result_pages
-        if getattr(self, "ws", None):
-            self._send_text_packets("chat_message", first, to=str(sender or ""))
-        else:
-            self.send_private_text(sender, first)
+        title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else "🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else "🏠 Bot rooms — rooms file")
+        items = [f"{index}. {name}" for index, name in enumerate(names, 1)]
+        route_fields = {"to": str(sender or "")}
+        pages = _safe_text_pages_from_items(
+            "chat_message", route_fields, [title], items,
+            max_items_per_page=30, language=language,
+        )
+        self._send_paginated_text_pages(
+            sender, "", "chat_message", pages, route_fields, language=language,
+        )
 
     def _finish_full_room_sync(self, rooms, from_server=False, join_after=False):
         state = getattr(self, "_pending_full_room_sync", None)
@@ -21191,6 +23398,13 @@ class TalkinBot:
         return True
 
     def _event_worker_loop(self):
+        """Process queued WebSocket frames in priority order.
+
+        Room-text handlers are dispatched to their own executors by
+        _dispatch_room_event(), so this worker should only do protocol decode
+        and state updates. Keeping one ordered frame consumer avoids races in
+        join acknowledgements, roster responses and pending-request state.
+        """
         while not self.stop_event.is_set():
             try:
                 _priority, _seq, ws, message = self._event_queue.get(timeout=1.0)
@@ -21207,15 +23421,110 @@ class TalkinBot:
                 except Exception:
                     pass
 
+    def _dispatch_incoming_message(self, ws, message):
+        """Submit every inbound frame to a bounded command executor."""
+        executor = getattr(self, "_incoming_executor", None)
+        if executor is None:
+            lock = getattr(self, "_incoming_executor_lock", None)
+            if lock is None:
+                lock = self._incoming_executor_lock = threading.Lock()
+            with lock:
+                executor = getattr(self, "_incoming_executor", None)
+                if executor is None:
+                    executor = self._incoming_executor = ThreadPoolExecutor(
+                        max_workers=max(2, int(os.getenv("INCOMING_COMMAND_WORKERS", "6") or 6)),
+                        thread_name_prefix="incoming-command",
+                    )
+        try:
+            return executor.submit(self._process_message, ws, message)
+        except Exception as exc:
+            self.log("[EVENT-DISPATCH] async submit failed; processing inline:", repr(exc))
+            return self._process_message(ws, message)
+
+    def _dispatch_room_event(self, result):
+        """Process room text outside the transport worker.
+
+        Games, media, roster work, and persistence can take time. Keeping them
+        on the single WebSocket worker makes later commands wait behind an
+        earlier event, so command text and ordinary text use separate bounded
+        executors. A burst of presence/chat traffic can no longer occupy every
+        worker needed by a command.
+        """
+        event = result.get("room_event") if isinstance(result, dict) else None
+        is_text = (
+            isinstance(event, dict)
+            and str(event.get(1, "")) == "text"
+            and bool(event.get(6, ""))
+        )
+        if not is_text:
+            return self.handle_room_event(result)
+        body = str(event.get(6, "") or "")
+        is_media = _looks_like_media_command(body)
+        is_priority = _looks_like_priority_command(body)
+        is_command = _looks_like_bot_command(body)
+        # Music searches/downloads can take many seconds (or longer when a
+        # provider fails). Give them an isolated, deliberately small pool so
+        # repeated music requests cannot consume workers used for chat commands.
+        executor_name = (
+            "_room_media_executor" if is_media
+            else "_room_priority_executor" if is_priority
+            else "_room_command_executor" if is_command
+            else "_room_event_executor"
+        )
+        lock_name = f"{executor_name}_lock"
+        executor = getattr(self, executor_name, None)
+        if executor is None:
+            lock = getattr(self, lock_name, None)
+            if lock is None:
+                lock = threading.Lock()
+                setattr(self, lock_name, lock)
+            with lock:
+                executor = getattr(self, executor_name, None)
+                if executor is None:
+                    if is_media:
+                        default_workers = "2"
+                        env_name = "ROOM_MEDIA_WORKERS"
+                    elif is_priority:
+                        default_workers = "12"
+                        env_name = "ROOM_PRIORITY_WORKERS"
+                    elif is_command:
+                        default_workers = "8"
+                        env_name = "ROOM_COMMAND_WORKERS"
+                    else:
+                        default_workers = "4"
+                        env_name = "ROOM_EVENT_WORKERS"
+                    executor = ThreadPoolExecutor(
+                        max_workers=max(2, int(os.getenv(
+                            env_name,
+                            default_workers,
+                        ) or default_workers)),
+                        thread_name_prefix=(
+                            "room-media" if is_media else
+                            "room-priority" if is_priority else
+                            "room-command" if is_command else "room-event"
+                        ),
+                    )
+                    setattr(self, executor_name, executor)
+        try:
+            return executor.submit(self.handle_room_event, result)
+        except Exception as exc:
+            self.log("[ROOM-COMMAND] async dispatch failed; processing inline:", repr(exc))
+            return self.handle_room_event(result)
+
     def on_message(self, ws, message):
-        """Queue inbound frames so expensive decoding/commands never block recv()."""
+        """Quickly enqueue incoming frames, prioritizing likely chat commands.
+
+        The WebSocket callback does only a shallow protobuf decode and queue
+        insertion. Full decoding and protocol handling happen on the worker;
+        room text itself is dispatched to separate command/event pools.
+        """
         if isinstance(message, str):
             return
         try:
-            # One shallow protobuf pass is enough to prioritize chat/room text
-            # above low-value roster/stream traffic. The full decode happens
-            # once, inside the worker.
-            top = decode_message(message)
+            raw = bytes(message)
+            top = decode_message(raw)
+            # These protobuf fields have historically identified room/private
+            # message frames in TalkinChat. Prioritize them over roster noise.
             priority = 2
             if 9 in top or 10 in top:
                 priority = 0
@@ -21225,20 +23534,18 @@ class TalkinBot:
                 self._event_queue_seq += 1
                 seq = self._event_queue_seq
             try:
-                self._event_queue.put_nowait((priority, seq, ws, bytes(message)))
+                self._event_queue.put_nowait((priority, seq, ws, raw))
             except queue.Full:
-                # Never let a burst of presence/stream frames freeze command
-                # reception. If the queue is full, make one immediate worker
-                # pass for command-bearing frames; otherwise drop the oldest
-                # low-priority pressure rather than blocking the socket.
+                # Never block the socket reader behind a full queue. Preserve
+                # urgent chat frames as a last resort; discard lower-value
+                # background frames and log only when event debugging is on.
                 if priority == 0:
                     try:
-                        self._process_message(ws, bytes(message))
+                        self._process_message(ws, raw)
                     except Exception as exc:
-                        self.log("[EVENT-WORKER] urgent frame failed:", repr(exc))
-                else:
-                    if ROOM_EVENT_DEBUG:
-                        self.log("[EVENT-QUEUE] dropped low-priority frame; queue full")
+                        self.log("[EVENT-QUEUE] urgent frame failed:", repr(exc))
+                elif ROOM_EVENT_DEBUG:
+                    self.log("[EVENT-QUEUE] dropped low-priority frame; queue full")
         except Exception as exc:
             self.last_error = str(exc)
             self.log("[EVENT-QUEUE] enqueue failed:", repr(exc))
@@ -21288,7 +23595,7 @@ class TalkinBot:
                     "uid": result.get("uid", ""),
                 })
             if "room_event" in result:
-                self.handle_room_event(result)
+                self._dispatch_room_event(result)
             if result.get("rooms"):
                 self._process_room_list(result.get("rooms"))
             if result.get("users") or result.get("room_admin"):
@@ -21368,7 +23675,7 @@ class TalkinBot:
                             connected = set()
                             self.connected_rooms = connected
                         connected.add(cm_room)
-                        self.handle_room_event({"room_event": {
+                        self._dispatch_room_event({"room_event": {
                             1: "text", 2: str(cm.get(3, "") or ""),
                             6: str(cm.get(5, "") or ""), 13: cm_room,
                             41: str(cm.get(41, "") or ""),
@@ -21650,7 +23957,7 @@ class TalkinBot:
             self.last_error = str(e)
             self.log("[WS] decode error:", repr(e))
             if DEBUG and isinstance(message, (bytes, bytearray)):
-                self.log("[WS] raw:", bytes(message).hex()[:1000])
+                self.log("[WS] raw frame omitted; bytes:", len(message))
 
     def on_open(self, ws):
         # Room join is deliberately performed once by bootstrap_after_connect(),
@@ -21676,13 +23983,20 @@ class TalkinBot:
                     pass
         pending.clear()
         auto_pending = getattr(self, "_auto_rejoin_pending", None)
+        auto_waiting_ack = getattr(self, "_auto_rejoin_waiting_ack", None)
         lock = getattr(self, "_auto_rejoin_lock", None)
-        if auto_pending is not None:
+        if auto_pending is not None or auto_waiting_ack is not None:
             if lock is None:
-                auto_pending.clear()
+                if auto_pending is not None:
+                    auto_pending.clear()
+                if auto_waiting_ack is not None:
+                    auto_waiting_ack.clear()
             else:
                 with lock:
-                    auto_pending.clear()
+                    if auto_pending is not None:
+                        auto_pending.clear()
+                    if auto_waiting_ack is not None:
+                        auto_waiting_ack.clear()
 
     def on_close(self, ws, code, msg):
         # These are rooms connected to THIS WebSocket session. Once it closes,
@@ -21778,9 +24092,14 @@ class TalkinBot:
         # OFF = only the configured GROUP_TO_JOIN/FIRST_ROOM.
         # ON  = all rooms saved in tracked_rooms.json plus GROUP_TO_JOIN.
         # Manual `.دخول غرفي` is independent and always joins the saved list.
-        if MASTER_SERVICE_ENABLED:
+        restore_generation = getattr(self, "_room_restore_generation", None)
+        restore_already_scheduled = restore_generation == getattr(self, "_connection_generation", None)
+        if restore_already_scheduled:
+            self.log("[ROOM] saved-room restore already scheduled for this connection; skipping duplicate")
             rooms_to_restore = set()
-        else:
+        elif MASTER_SERVICE_ENABLED:
+            rooms_to_restore = set()
+        elif AUTO_JOIN_ALL_ROOMS:
             # tracked_rooms.json is the authoritative startup source. The
             # in-memory known_rooms set may be a truncated/stale view after a
             # reconnect and was the reason only a subset was restored.
@@ -21790,7 +24109,10 @@ class TalkinBot:
             }
             if self.room:
                 rooms_to_restore.add(str(self.room).strip())
+        else:
+            rooms_to_restore = {str(self.room).strip()} if self.room else set()
         if rooms_to_restore:
+            self._room_restore_generation = getattr(self, "_connection_generation", None)
             self._room_restore_candidates = {
                 _norm_room(room_name) for room_name in rooms_to_restore if _norm_room(room_name)
             }
