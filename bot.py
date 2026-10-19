@@ -20731,14 +20731,18 @@ class TalkinBot:
                 return True
             if bulk_lock is not None:
                 bulk_lock.release()
+            # This is a manual join request, not a reconnect restore. The
+            # fast_restore mode intentionally sends joins without waiting for
+            # ACKs, so Talkin can drop later room_join packets before the first
+            # you_joined event. Manual `دخول غرفي` must confirm each room first.
             threading.Thread(
-                target=self._join_rooms_serially, args=(saved_rooms, sender, True),
+                target=self._join_rooms_serially, args=(saved_rooms, sender, False),
                 daemon=True, name="manual-join-my-rooms",
             ).start()
             self.send_private_text(
                 sender,
-                f"📨 أرسلت طلبات دخول {len(saved_rooms)} غرفة بسرعة. "
-                "لن أعتبر أي غرفة دخلتها إلا بعد تأكيد الخادم، وستظهر رسالة الدخول داخل كل غرفة.",
+                f"📨 بدأ دخول {len(saved_rooms)} غرفة بالتتابع. "
+                "سأنتظر تأكيد الخادم لكل غرفة قبل الانتقال إلى التالية، وستظهر رسالة الدخول داخل كل غرفة.",
             )
             return True
 

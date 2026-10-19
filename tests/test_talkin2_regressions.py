@@ -1972,7 +1972,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             )
             self.assertTrue(bot._handle_management_command_impl("", "دخول غرفي", "Master", is_private=True))
 
-        self.assertEqual(joined, [(["North", "South"], "Master", True)])
+        self.assertEqual(joined, [(["North", "South"], "Master", False)])
         self.assertIn("2 غرفة", sent[-1])
 
     def test_enter_server_rooms_fetches_then_joins_in_one_operation(self):
