@@ -7136,12 +7136,6 @@ class TalkinBot:
         self._event_queue = queue.PriorityQueue(maxsize=max(500, int(os.getenv("EVENT_QUEUE_MAX", "2500"))))
         self._event_queue_seq = 0
         self._event_queue_lock = threading.Lock()
-        # Room text is queued per room and executed in order. This keeps the
-        # transport worker free while preventing game turns and menu replies
-        # in the same room from racing each other.
-        self._room_serial_lock = threading.Lock()
-        self._room_serial_queues = {}
-        self._room_serial_running = set()
         self._event_worker = threading.Thread(
             target=self._event_worker_loop, name="ws-event-worker", daemon=True
         )
@@ -8706,39 +8700,69 @@ class TalkinBot:
         return True
 
     def leave_all_rooms(self):
-        """Leave all rooms temporarily while preserving the saved room list.
+        """Request exit from every known, pending, or server-confirmed room.
 
-        The command خروج is a session pause, not deletion.  The names remain
-        in known_rooms/tracked_rooms.json so bootstrap_after_connect() restores
-        them after the process is restarted.
+        Room names are deduplicated case-insensitively. The persistent saved
+        list is retained for restart restoration, but the live connection view
+        is cleared using normalized room names so capitalization differences
+        cannot leave phantom rooms in "غرفي".
         """
-        rooms = [str(r).strip() for r in self.known_rooms if str(r).strip()]
+        candidates = {}
+        # Do not iterate known_rooms here: that file can contain the server's
+        # full room catalog, not just rooms this bot has joined. Only live
+        # server-confirmed rooms and joins currently awaiting confirmation are
+        # valid targets for an actual leave request.
+        for source in (
+            getattr(self, "connected_rooms", set()),
+            getattr(self, "_pending_room_joins", {}).values(),
+        ):
+            for item in source:
+                value = item.get("room", "") if isinstance(item, dict) else item
+                name = str(value or "").strip()
+                key = _norm_room(name)
+                if name and key:
+                    candidates.setdefault(key, name)
+        rooms = list(candidates.values())
         if not hasattr(self, "_intentional_leaves"):
             self._intentional_leaves = set()
         if rooms:
             backup_ok = _flush_github_backup()
             self.log("[BACKUP_BEFORE_LEAVE_ALL]", "complete" if backup_ok else "not-confirmed")
-        for room in rooms:
+        failed = []
+        for index, room in enumerate(rooms):
+            room_key = _norm_room(room)
             try:
-                room_key = _norm_room(room)
                 self._intentional_leaves.add(room_key)
-                pending = self._pending_room_joins.pop(room_key, None)
+                pending = getattr(self, "_pending_room_joins", {}).pop(room_key, None)
                 if pending and pending.get("timer"):
                     try:
                         pending["timer"].cancel()
                     except Exception:
                         pass
+                # Send a leave packet for each unique room even if the local
+                # cache was stale; the server remains the authority on membership.
                 with self._room_bulk_lock:
                     self.send_query(encode_query("room_leave", room=room))
-                    self.connected_rooms.discard(room)
-                    self.room_users.pop(room, None)
-                    self._last_join_sent.pop(room, None)
-                self.log("[ROOM] left temporarily; preserved for restart:", room)
-                if room != rooms[-1]:
-                    time.sleep(max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5)))
-            except Exception as e:
-                self.log("[ROOM] leave failed", room, repr(e))
-        # Deliberately do not call _save_persistent_rooms with a reduced set.
+                self.log("[ROOM] leave requested; saved for restart:", room)
+            except Exception as exc:
+                failed.append(room)
+                self.log("[ROOM] leave failed", room, repr(exc))
+            if index < len(rooms) - 1:
+                time.sleep(max(0.15, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "0.5") or 0.5)))
+        # Remove by normalized name, not exact spelling.
+        room_keys = set(candidates)
+        self.connected_rooms = {
+            name for name in getattr(self, "connected_rooms", set())
+            if _norm_room(name) not in room_keys
+        }
+        for name in list(getattr(self, "room_users", {})):
+            if _norm_room(name) in room_keys:
+                self.room_users.pop(name, None)
+        for name in list(getattr(self, "_last_join_sent", {})):
+            if _norm_room(name) in room_keys:
+                self._last_join_sent.pop(name, None)
+        # Deliberately preserve known_rooms for restoration after restart.
+        return [room for room in rooms if room not in failed]
         # known_rooms remains the source used by reconnect/bootstrap.
         return rooms
 
@@ -21546,21 +21570,9 @@ class TalkinBot:
                 is_private=is_private,
             )
             return True
-        if low in ("خروج", "leave", "exit", "غادر", "leave room") and room and not is_private:
-            if not _is_primary_master(sender):
-                self.send_room_text(room, "🔒 هذا الأمر مخصص للماستر الأساسي فقط.")
-                return True
-            target = room
-            self.send_room_text(target, "وداعاً نلتقي مرة أخرى")
-            def _cycle_current_room():
-                try:
-                    self.leave_room(target)
-                    time.sleep(max(0.5, float(os.getenv("ROOM_CYCLE_DELAY_SECONDS", "1.0"))))
-                    self.join_room(target, force=True, requested_by=sender)
-                except Exception as exc:
-                    self.log("[ROOM] master cycle failed:", target, repr(exc))
-            threading.Thread(target=_cycle_current_room, daemon=True, name="master-room-cycle").start()
-            return True
+        # "خروج" without a room argument means leave ALL rooms, regardless
+        # of whether it was issued in a room or by private message. Do not turn
+        # it into a leave/rejoin cycle of the current room.
         if low in ("خروج","leave","exit") or low.startswith(("خروج ","leave ","exit ")):
             parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
             if target:
@@ -21568,7 +21580,7 @@ class TalkinBot:
                 self.send_private_text(sender,f"{'✅ خرجت من الغرفة' if ok else '❌ تعذر الخروج'}: {target}")
             else:
                 rooms=self.leave_all_rooms()
-                self.send_private_text(sender,f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
+                self.send_private_text(sender, f"📤 أُرسل طلب الخروج من {len(rooms)} غرفة متصلة/قيد الدخول.\n📌 الغرف المحفوظة لم تُحذف من ملف الاستعادة.")
             return True
         if (low.startswith("invmsg") or low.startswith("رسالةدعوة")
                 or low.startswith("invite message") or low.startswith("invmsg@")):
@@ -22509,12 +22521,10 @@ class TalkinBot:
                 "room": room,
                 "identity_key": f"id:{sender_id}" if sender_id else _norm_user(frm),
             }
-        # Receiving an actual room text event proves this session can see that
-        # room, even if the server omitted/reordered the explicit join ack.
-        if room and event_type == "text":
-            if not hasattr(self, "connected_rooms") or not isinstance(self.connected_rooms, set):
-                self.connected_rooms = set()
-            self.connected_rooms.add(room)
+        # Do not infer room membership from an ordinary text event. Only the
+        # server's explicit you_joined/you_rejoined acknowledgement may add a
+        # room to connected_rooms; otherwise stale or delayed room events can
+        # make "غرفي" report rooms the bot is no longer connected to.
         if body:
             self._remember_inflight_command(room, body, frm, is_private=False)
         if room and room != BOT_MASTER and _norm_room(room) not in getattr(self, "blocked_rooms", set()):
@@ -23595,59 +23605,6 @@ class TalkinBot:
             self.log("[EVENT-DISPATCH] async submit failed; processing inline:", repr(exc))
             return self._process_message(ws, message)
 
-    def _room_serial_start_next(self, room_key):
-        """Submit the next queued text event for a room without blocking a worker."""
-        with self._room_serial_lock:
-            pending = self._room_serial_queues.get(room_key, [])
-            if not pending:
-                self._room_serial_running.discard(room_key)
-                self._room_serial_queues.pop(room_key, None)
-                return
-            executor, result = pending[0]
-        try:
-            future = executor.submit(self.handle_room_event, result)
-        except Exception as exc:
-            self.log("[ROOM-COMMAND] async dispatch failed:", repr(exc))
-            self._room_serial_done(room_key, None)
-            return
-        future.add_done_callback(lambda completed, key=room_key: self._room_serial_done(key, completed))
-
-    def _room_serial_done(self, room_key, future):
-        """Advance a room's serial queue after its current event finishes."""
-        if future is not None:
-            try:
-                error = future.exception()
-                if error is not None:
-                    self.log("[ROOM-COMMAND] handler failed:", repr(error))
-            except Exception:
-                pass
-        with self._room_serial_lock:
-            pending = self._room_serial_queues.get(room_key, [])
-            if pending:
-                pending.pop(0)
-            has_more = bool(pending)
-            if not has_more:
-                self._room_serial_queues.pop(room_key, None)
-                self._room_serial_running.discard(room_key)
-        if has_more:
-            self._room_serial_start_next(room_key)
-
-    def _enqueue_room_event_serially(self, result, executor):
-        """Keep events ordered within each room while allowing rooms to run concurrently."""
-        event = result.get("room_event", {}) if isinstance(result, dict) else {}
-        room_key = str(event.get(13) or event.get(2) or result.get("room") or "__unknown_room__").strip()
-        if not room_key:
-            room_key = "__unknown_room__"
-        should_start = False
-        with self._room_serial_lock:
-            self._room_serial_queues.setdefault(room_key, []).append((executor, result))
-            if room_key not in self._room_serial_running:
-                self._room_serial_running.add(room_key)
-                should_start = True
-        if should_start:
-            self._room_serial_start_next(room_key)
-        return True
-
     def _dispatch_room_event(self, result):
         """Process room text outside the transport worker.
 
@@ -23664,36 +23621,17 @@ class TalkinBot:
             and bool(event.get(6, ""))
         )
         if not is_text:
-            # Presence/member/system room events can arrive in large bursts when
-            # the bot joins several rooms. Some handlers perform storage work or
-            # send follow-up queries; running them on the sole protocol worker
-            # delays decoding subsequent chat commands across every room.
-            # Route them through the shared per-room ordered event queue instead.
-            executor_name = "_room_event_executor"
-            lock_name = "_room_event_executor_lock"
-            executor = getattr(self, executor_name, None)
-            if executor is None:
-                lock = getattr(self, lock_name, None)
-                if lock is None:
-                    lock = threading.Lock()
-                    setattr(self, lock_name, lock)
-                with lock:
-                    executor = getattr(self, executor_name, None)
-                    if executor is None:
-                        executor = ThreadPoolExecutor(
-                            max_workers=max(2, int(os.getenv("ROOM_EVENT_WORKERS", "8") or 8)),
-                            thread_name_prefix="room-event",
-                        )
-                        setattr(self, executor_name, executor)
-            return self._enqueue_room_event_serially(result, executor)
+            return self.handle_room_event(result)
         body = str(event.get(6, "") or "")
         is_media = _looks_like_media_command(body)
         is_priority = _looks_like_priority_command(body)
         is_command = _looks_like_bot_command(body)
-        # Do not execute text commands inline on the single protocol worker.
-        # Even a command classified as "fast" can touch storage, send network
-        # requests, or wait on a lock; running it inline stalls every incoming
-        # frame. All text events are dispatched below, with per-room ordering.
+        # Fast path copied from the reference bot: short commands are handled
+        # immediately after the frame is decoded, avoiding a second executor
+        # hand-off and its scheduling latency. Slow operations remain isolated
+        # below so music, roster queries, and room joins cannot block commands.
+        if _is_fast_room_command(body):
+            return self.handle_room_event(result)
         # Music searches/downloads can take many seconds (or longer when a
         # provider fails). Give them an isolated, deliberately small pool so
         # repeated music requests cannot consume workers used for chat commands.
@@ -23737,7 +23675,11 @@ class TalkinBot:
                         ),
                     )
                     setattr(self, executor_name, executor)
-        return self._enqueue_room_event_serially(result, executor)
+        try:
+            return executor.submit(self.handle_room_event, result)
+        except Exception as exc:
+            self.log("[ROOM-COMMAND] async dispatch failed; processing inline:", repr(exc))
+            return self.handle_room_event(result)
 
     def on_message(self, ws, message):
         """Quickly enqueue incoming frames, prioritizing likely chat commands.
@@ -23768,13 +23710,10 @@ class TalkinBot:
                 # urgent chat frames as a last resort; discard lower-value
                 # background frames and log only when event debugging is on.
                 if priority == 0:
-                    # Keep the socket callback non-blocking even during bursts.
-                    # The fallback executor is used only when the ordered queue
-                    # is saturated, so urgent chat frames are not processed inline.
                     try:
-                        self._dispatch_incoming_message(ws, raw)
+                        self._process_message(ws, raw)
                     except Exception as exc:
-                        self.log("[EVENT-QUEUE] urgent frame dispatch failed:", repr(exc))
+                        self.log("[EVENT-QUEUE] urgent frame failed:", repr(exc))
                 elif ROOM_EVENT_DEBUG:
                     self.log("[EVENT-QUEUE] dropped low-priority frame; queue full")
         except Exception as exc:
