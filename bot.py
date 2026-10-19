@@ -522,8 +522,6 @@ AUTO_JOIN_ALL_ROOMS = (
 # Background member-ID sync is expensive on busy rooms. Keep it opt-in during
 # automatic joins; commands that truly need a numeric ID still request it on demand.
 BACKGROUND_ID_SYNC_ON_JOIN = os.getenv("BACKGROUND_ID_SYNC_ON_JOIN", "0").strip().casefold() in {"1", "true", "yes", "on"}
-# Automatic roster rebuilding is paused by default: usernames drive normal gameplay; IDs are fetched only on demand.
-ROSTER_BACKGROUND_SYNC_ENABLED = os.getenv("ROSTER_BACKGROUND_SYNC_ENABLED", "0").strip().casefold() in {"1", "true", "yes", "on"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -19273,9 +19271,6 @@ class TalkinBot:
             return False
         pending_lists.pop(room_key, None)
         if pending.get("code") in {"id_sync", "mine_uid"}:
-            if pending.get("code") == "id_sync":
-                # Don't keep hammering a room that doesn't answer roster requests.
-                self._room_id_sync_seen.add(_norm_room(pending.get("room") or room_key))
             for followup in pending.get("mine_followups", []) or []:
                 if isinstance(followup, dict):
                     sender = str(followup.get("sender") or "").strip().lstrip("@")
@@ -19342,9 +19337,7 @@ class TalkinBot:
             self.log("[ROSTER] background member-ID request failed:", repr(exc))
 
     def _start_low_priority_roster_sync(self):
-        """Start the optional delayed ID roster worker; disabled by default."""
-        if not ROSTER_BACKGROUND_SYNC_ENABLED:
-            return False
+        """Start one delayed roster worker; it never runs on the command thread."""
         lock = getattr(self, "_room_id_sync_worker_lock", None)
         if lock is None:
             lock = self._room_id_sync_worker_lock = threading.Lock()
@@ -23532,10 +23525,8 @@ class TalkinBot:
             return self.handle_room_event(result)
         body = str(event.get(6, "") or "")
         is_media = _looks_like_media_command(body)
+        is_priority = _looks_like_priority_command(body)
         is_command = _looks_like_bot_command(body)
-        # Every recognized bot command gets the high-priority pool, not just
-        # commands listed in the explicit fast-path table. Music stays isolated.
-        is_priority = _looks_like_priority_command(body) or (is_command and not is_media)
         # Music searches/downloads can take many seconds (or longer when a
         # provider fails). Give them an isolated, deliberately small pool so
         # repeated music requests cannot consume workers used for chat commands.
@@ -23559,13 +23550,13 @@ class TalkinBot:
                         default_workers = "2"
                         env_name = "ROOM_MEDIA_WORKERS"
                     elif is_priority:
-                        default_workers = "16"
+                        default_workers = "12"
                         env_name = "ROOM_PRIORITY_WORKERS"
                     elif is_command:
-                        default_workers = "6"
+                        default_workers = "8"
                         env_name = "ROOM_COMMAND_WORKERS"
                     else:
-                        default_workers = "3"
+                        default_workers = "4"
                         env_name = "ROOM_EVENT_WORKERS"
                     executor = ThreadPoolExecutor(
                         max_workers=max(2, int(os.getenv(
@@ -24336,8 +24327,9 @@ class TalkinBot:
                 "Missing required deployment variables: " + ", ".join(missing) + ". "
                 "Add them to Railway Variables (not the source code) and redeploy."
             )
-        # Keep the saved username/role roster on restart. Automatic ID rebuilding
-        # is disabled by default; IDs remain optional metadata for future use.
+        # User requested a fresh ID roster on each process start. Only the
+        # member roster is reset; points, games, verification, gifts, and rooms remain.
+        _reset_room_rosters_for_fresh_id_build()
         if TELEGRAM_BOT_TOKEN and TELEGRAM_POLL_ENABLED:
             threading.Thread(target=self._telegram_poll_loop, name="telegram-poll", daemon=True).start()
         elif TELEGRAM_BOT_TOKEN:
