@@ -7524,9 +7524,6 @@ class TalkinBot:
         # packets and media broadcasts concurrently can make the gateway
         # replay room_join/room_leave events or close the WebSocket.
         self._room_bulk_lock = threading.Lock()
-        # Serializes room-join batches without blocking unrelated room commands
-        # during server ACK waits. _room_bulk_lock is only for short send sections.
-        self._room_join_sequence_lock = threading.Lock()
         self._game_broadcast_lock = threading.Lock()
         self._last_join_sent = {}
         self._rejoin_attempts = defaultdict(int)
@@ -12267,16 +12264,6 @@ class TalkinBot:
         try:
             for username in usernames:
                 try:
-                    # Bulk room joins are latency-sensitive. Pause the optional
-                    # invitation flood until the join sequence finishes so it
-                    # cannot compete with room_join/command traffic.
-                    join_sequence_lock = getattr(self, "_room_join_sequence_lock", None)
-                    while join_sequence_lock is not None and join_sequence_lock.locked():
-                        if not getattr(self, "_invite_pause_logged", False):
-                            self.log("[INV] pausing invitation worker while bulk room join is active")
-                            self._invite_pause_logged = True
-                        time.sleep(0.5)
-                    self._invite_pause_logged = False
                     if not getattr(self, "invites_enabled", True):
                         self.log("[INV] stopped: invitations disabled by master")
                         break
@@ -18769,13 +18756,11 @@ class TalkinBot:
         return True
 
     def _join_rooms_serially(self, rooms, sender="", fast_restore=False, sync_id=None):
-        """Join rooms serially, but never hold the shared room-operation lock while waiting for ACKs.
+        """Join rooms one at a time and wait for each server acknowledgement.
 
-        The old implementation held _room_bulk_lock across the entire list and
-        each server acknowledgement wait (up to ~20 seconds per room). Other
-        commands that needed the same lock could therefore stall behind a bulk
-        join. A dedicated sequence lock serializes join batches; the shared
-        operation lock is held only while sending the individual join packet.
+        Talkin's gateway is sensitive to a burst of room_join packets.  More
+        importantly, sending the next join before the previous result arrives
+        can look like an enter/leave loop.
         """
         cleaned=[]; seen=set()
         for value in rooms or []:
@@ -18787,18 +18772,21 @@ class TalkinBot:
             return {"sent": 0, "skipped": 0}
         sent=0; skipped=0
         if fast_restore:
+            # Startup restore must not wait for one ACK per room. The reader
+            # remains free to process all ACKs/events while joins are sent at
+            # a small gateway-safe pace.
             gap=max(0.20, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.45") or 0.45))
         else:
             gap=max(0.8, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
         timeout=max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20") or 20))
-        sequence_lock = getattr(self, "_room_join_sequence_lock", None)
-        if sequence_lock is None:
-            sequence_lock = self._room_join_sequence_lock = threading.Lock()
-
-        with sequence_lock:
+        with self._room_bulk_lock:
             for target in cleaned:
                 key=_norm_room(target)
                 if any(_norm_room(r)==key for r in getattr(self, "connected_rooms", set())):
+                    # The server already confirmed this room in the current
+                    # session. Never leave/rejoin it just because the master
+                    # requested the saved-room list; that race used to produce
+                    # a false "unable to enter" timeout after a real success.
                     if sender:
                         try:
                             self.send_private_text(sender, f"✅ البوت موجود داخل الغرفة: {target}")
@@ -18808,8 +18796,10 @@ class TalkinBot:
                     if sync_id:
                         self._record_room_sync_result(sync_id, target, True, "موجودة ومتصل بها البوت")
                     continue
-
                 if sender and key in getattr(self, "_room_restore_candidates", set()):
+                    # A restore candidate is only a queued join, never proof of
+                    # membership. Wait for the pending server acknowledgement;
+                    # do not tell the requester the bot is present prematurely.
                     pending_joins = getattr(self, "_pending_room_joins", {})
                     if key in pending_joins:
                         deadline = time.time() + timeout + 1.0
@@ -18838,17 +18828,14 @@ class TalkinBot:
                             self._record_room_sync_result(sync_id, target, False, "طلب الدخول ما زال بانتظار تأكيد الخادم")
                         continue
                     getattr(self, "_room_restore_candidates", set()).discard(key)
-
                 try:
-                    # Keep the shared lock only around the packet send. Never
-                    # hold it while waiting for the gateway's you_joined event.
-                    with self._room_bulk_lock:
-                        joined_request_sent = self.join_room(target, force=bool(fast_restore), requested_by=sender)
-                    if joined_request_sent:
+                    if self.join_room(target, force=bool(fast_restore), requested_by=sender):
                         sent += 1
                         if fast_restore:
                             getattr(self, "_room_restore_candidates", set()).add(key)
-                        else:
+                        if not fast_restore:
+                            # Manual joins wait for you_joined/you_rejoined so
+                            # the next request cannot create an enter/leave loop.
                             deadline=time.time()+timeout+1.0
                             while time.time() < deadline and key in getattr(self, "_pending_room_joins", {}):
                                 time.sleep(0.25)
