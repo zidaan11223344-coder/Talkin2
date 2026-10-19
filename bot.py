@@ -519,9 +519,9 @@ AUTO_JOIN_ALL_ROOMS = (
     or os.getenv("AUTO_JOIN_ROOMS")
     or "on"
 ).strip().casefold() in {"1", "true", "yes", "on", "enable", "enabled"}
-# Background member-ID sync is expensive on busy rooms. Keep it opt-in during
-# automatic joins; commands that truly need a numeric ID still request it on demand.
-BACKGROUND_ID_SYNC_ON_JOIN = os.getenv("BACKGROUND_ID_SYNC_ON_JOIN", "0").strip().casefold() in {"1", "true", "yes", "on"}
+# Rebuild IDs only for new/incomplete room rosters. Existing complete room_users.json
+# entries are reused on restart; the worker is delayed, serialized and rate-limited.
+BACKGROUND_ID_SYNC_ON_JOIN = os.getenv("BACKGROUND_ID_SYNC_ON_JOIN", "1").strip().casefold() in {"1", "true", "yes", "on"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -2353,6 +2353,54 @@ def _github_put_file(local_path, data, sha=None):
         print(f"[GITHUB] write failed for {name}: {exc}", flush=True)
         return False
 
+def _merge_room_rosters_snapshots(authoritative, secondary):
+    """Merge local and Talkin4 room identities without dropping numeric IDs."""
+    def unpack(value):
+        rooms = value.get("rooms", value) if isinstance(value, dict) else {}
+        return rooms if isinstance(rooms, dict) else {}
+
+    merged = copy.deepcopy(unpack(authoritative))
+    incoming = unpack(secondary)
+    for room, roster in incoming.items():
+        if not isinstance(roster, dict):
+            continue
+        target = merged.setdefault(room, {})
+        if not isinstance(target, dict):
+            target = merged[room] = {}
+        for member_key, local_item in roster.items():
+            if not isinstance(local_item, dict):
+                target.setdefault(member_key, copy.deepcopy(local_item))
+                continue
+            remote_item = target.get(member_key)
+            if not isinstance(remote_item, dict):
+                target[member_key] = copy.deepcopy(local_item)
+                continue
+            try:
+                local_seen = int(local_item.get("last_seen", 0) or 0)
+            except (TypeError, ValueError):
+                local_seen = 0
+            try:
+                remote_seen = int(remote_item.get("last_seen", 0) or 0)
+            except (TypeError, ValueError):
+                remote_seen = 0
+            winner = copy.deepcopy(local_item if local_seen > remote_seen else remote_item)
+            local_id = str(local_item.get("user_id") or "").strip()
+            remote_id = str(remote_item.get("user_id") or "").strip()
+            if not str(winner.get("user_id") or "").strip().isdigit():
+                if local_id.isdigit():
+                    winner["user_id"] = local_id
+                elif remote_id.isdigit():
+                    winner["user_id"] = remote_id
+            aliases = []
+            for source in (remote_item.get("aliases", []), local_item.get("aliases", [])):
+                if isinstance(source, list):
+                    aliases.extend(str(alias).strip().lstrip("@") for alias in source if str(alias).strip())
+            name = str(winner.get("username") or member_key).strip().lstrip("@")
+            winner["aliases"] = list(dict.fromkeys(alias for alias in aliases if alias and _norm_user(alias) != _norm_user(name)))
+            target[member_key] = winner
+    return {"version": 1, "rooms": merged}
+
+
 def _github_restore_or_seed_state():
     global _GITHUB_RESTORING
     if not GITHUB_SYNC_ENABLED:
@@ -2387,6 +2435,8 @@ def _github_restore_or_seed_state():
                     remote_has_data = bool(remote) if isinstance(remote, (dict, list)) else remote not in (None, "", 0, False)
                     if name == "points.json" and remote_has_data and local_has_data:
                         remote = _merge_points_snapshots(remote, local_data)
+                    elif name == "room_users.json" and remote_has_data and local_has_data:
+                        remote = _merge_room_rosters_snapshots(remote, local_data)
                     if (remote_has_data and not local_has_data) or (
                         remote_has_data and local_data != remote
                     ):
@@ -2580,6 +2630,38 @@ def _queue_github_full_backup():
     return queued
 
 
+_GITHUB_FULL_BACKUP_LOCK = threading.Lock()
+_GITHUB_FULL_BACKUP_RUNNING = False
+_GITHUB_FULL_BACKUP_REQUESTED = False
+
+
+def _schedule_github_full_backup(reason="state-change"):
+    """Request a full Talkin4 backup without blocking commands or room actions."""
+    global _GITHUB_FULL_BACKUP_RUNNING, _GITHUB_FULL_BACKUP_REQUESTED
+    if not GITHUB_SYNC_ENABLED:
+        return False
+    with _GITHUB_FULL_BACKUP_LOCK:
+        _GITHUB_FULL_BACKUP_REQUESTED = True
+        if _GITHUB_FULL_BACKUP_RUNNING:
+            return True
+        _GITHUB_FULL_BACKUP_RUNNING = True
+    def worker():
+        global _GITHUB_FULL_BACKUP_RUNNING, _GITHUB_FULL_BACKUP_REQUESTED
+        while True:
+            with _GITHUB_FULL_BACKUP_LOCK:
+                if not _GITHUB_FULL_BACKUP_REQUESTED:
+                    _GITHUB_FULL_BACKUP_RUNNING = False
+                    return
+                _GITHUB_FULL_BACKUP_REQUESTED = False
+            try:
+                queued = _queue_github_full_backup()
+                print(f"[GITHUB] queued background backup ({reason}): {queued} files", flush=True)
+            except Exception as exc:
+                print(f"[GITHUB] background full-backup queue failed: {exc!r}", flush=True)
+    threading.Thread(target=worker, name="github-full-backup-queue", daemon=True).start()
+    return True
+
+
 def _flush_local_persistence(timeout=5.0):
     """Write queued JSON snapshots before a durability-critical backup."""
     deadline = time.monotonic() + max(0.1, float(timeout or 5.0))
@@ -2726,7 +2808,9 @@ def _github_sync_worker():
             except Exception as exc:
                 print(f"[GITHUB] backup completion notice failed: {exc}", flush=True)
         if not backup_ok:
-            time.sleep(max(5.0, float(os.getenv("GITHUB_SYNC_RETRY_SECONDS", "30") or 30)))
+            # Keep one lightweight retry worker; do not hammer the API while
+            # offline/rate-limited. Failed paths remain queued above.
+            time.sleep(max(5.0, float(os.getenv("GITHUB_RETRY_SECONDS", "30") or 30)))
 
 
 def _database_sync_status_text():
@@ -3072,10 +3156,16 @@ def _stored_user_aliases(username, preferred_room=""):
 
 
 def _user_identity_key(username, preferred_room=""):
-    # Username is the primary identity for commands, points, and games.
-    # Numeric IDs are retained as reference metadata for future features only.
+    # Game history keeps its established username-based keys for compatibility.
     raw = str(username or "").strip().lstrip("@")
     return _norm_user(raw)
+
+
+def _points_identity_key(username, preferred_room=""):
+    """Use Talkin's stable numeric ID for new points accounts whenever known."""
+    raw = str(username or "").strip().lstrip("@")
+    user_id = _stored_user_id(raw, preferred_room)
+    return f"id:{user_id}" if user_id.isdigit() else _norm_user(raw)
 
 
 def _save_persistent_rosters(rosters):
@@ -4375,6 +4465,44 @@ def _points_account_candidates(data, username, *, exact_only=False):
     wanted = _norm_user(username)
     if not wanted or not isinstance(data, dict):
         return []
+
+    # If the roster knows the numeric ID, identity matching takes priority over
+    # the visible name. A same-named account carrying a different ID is never
+    # treated as the requested player.
+    preferred_room = ""
+    identity_context = getattr(_IDENTITY_CONTEXT, "value", None)
+    if isinstance(identity_context, tuple) and len(identity_context) == 2 and identity_context[0] == wanted:
+        preferred_room = identity_context[1]
+    wanted_id = _stored_user_id(username, preferred_room)
+    if wanted_id:
+        by_id = []
+        for key, item in data.items():
+            if not isinstance(item, dict):
+                continue
+            saved_name = item.get("username") or key
+            saved_id = str(item.get("user_id") or "").strip()
+            if not saved_id.isdigit():
+                saved_id = _stored_user_id(saved_name)
+            if saved_id == wanted_id:
+                by_id.append((str(key), item))
+        if by_id:
+            return by_id
+        roster_ids = _transfer_identity_ids(username, preferred_room)
+        if len(roster_ids) != 1 or next(iter(roster_ids)) != wanted_id:
+            return []
+        exact = []
+        for key, item in data.items():
+            if not isinstance(item, dict):
+                continue
+            if _norm_user(key) != wanted and _norm_user(item.get("username")) != wanted:
+                continue
+            saved_id = str(item.get("user_id") or "").strip()
+            if not saved_id or saved_id == wanted_id:
+                exact.append((str(key), item))
+        # A legacy account without an ID may be adopted only when the roster
+        # maps this name uniquely to the same numeric ID.
+        return exact
+
     exact = []
     for key, item in data.items():
         if not isinstance(item, dict):
@@ -4383,19 +4511,6 @@ def _points_account_candidates(data, username, *, exact_only=False):
             exact.append((str(key), item))
     if exact or exact_only:
         return exact
-    # ID lookup is a compatibility fallback for renamed/legacy accounts only.
-    wanted_id = _stored_user_id(username)
-    if wanted_id:
-        by_id = []
-        for key, item in data.items():
-            if not isinstance(item, dict):
-                continue
-            saved_name = item.get("username") or key
-            saved_id = str(item.get("user_id") or _stored_user_id(saved_name) or "").strip()
-            if saved_id == wanted_id:
-                by_id.append((str(key), item))
-        if by_id:
-            return by_id
     canonical = _game_name_key(username)
     if not canonical:
         return []
@@ -4423,6 +4538,95 @@ def _resolve_points_account(data, username, *, exact_only=False):
             int(_norm_user(pair[0]) == wanted or _norm_user(pair[1].get("username")) == wanted),
         ),
     )
+
+
+def _transfer_identity_ids(username, preferred_room=""):
+    """Collect roster IDs for a display name, preferring the command's room."""
+    raw = str(username or "").strip().lstrip("@")
+    wanted = _norm_user(raw)
+    if not wanted:
+        return set()
+    if raw.isdigit():
+        return {raw}
+    data = _persistent_rosters()
+    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+    if not isinstance(rooms, dict):
+        return set()
+    exact, decorated, preferred_ids = [], [], []
+    preferred_name_seen = False
+    decorated_wanted = _game_name_key(raw)
+    preferred = _norm_room(preferred_room)
+    for room_name, roster in rooms.items():
+        if not isinstance(roster, dict):
+            continue
+        is_preferred = bool(preferred and _norm_room(room_name) == preferred)
+        for key, value in roster.items():
+            if not isinstance(value, dict):
+                continue
+            saved_name = str(value.get("username") or key).strip().lstrip("@")
+            aliases = value.get("aliases", []) if isinstance(value.get("aliases"), list) else []
+            names = [saved_name] + [str(alias or "").strip().lstrip("@") for alias in aliases]
+            exact_match = any(_norm_user(name) == wanted for name in names if name)
+            decorated_match = bool(not exact_match and decorated_wanted and any(
+                _game_name_key(name) == decorated_wanted for name in names if name
+            ))
+            if is_preferred and (exact_match or decorated_match):
+                preferred_name_seen = True
+            if not exact_match and not decorated_match:
+                continue
+            user_id = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
+            if not user_id.isdigit():
+                continue
+            if exact_match:
+                exact.append((room_name, user_id))
+                if is_preferred:
+                    preferred_ids.append(user_id)
+            else:
+                decorated.append((room_name, user_id))
+                if is_preferred:
+                    preferred_ids.append(user_id)
+    # If the requested name exists in the command room but has no numeric ID,
+    # do not silently resolve a same-named person from a different room.
+    if preferred and preferred_name_seen:
+        return set(preferred_ids)
+    matches = exact or decorated
+    return {uid for _room, uid in matches}
+
+
+def _resolve_transfer_points_account(data, username, *, preferred_room="", allow_alias=False):
+    """Resolve one points record safely; ambiguous names/IDs deliberately fail closed."""
+    raw = str(username or "").strip().lstrip("@")
+    wanted = _norm_user(raw)
+    if not wanted or not isinstance(data, dict):
+        return None
+    ids = _transfer_identity_ids(raw, preferred_room)
+    if len(ids) == 1:
+        wanted_id = next(iter(ids))
+        id_matches = []
+        for key, item in data.items():
+            if not isinstance(item, dict):
+                continue
+            saved_id = str(item.get("user_id") or "").strip()
+            if not saved_id.isdigit():
+                saved_id = _stored_user_id(str(item.get("username") or key), preferred_room)
+            if saved_id == wanted_id:
+                id_matches.append((str(key), item))
+        if len(id_matches) == 1:
+            return id_matches[0]
+        if len(id_matches) > 1:
+            return None
+        # Legacy account without a saved ID: adopt only a unique exact-name row,
+        # and never override a conflicting ID already attached to that row.
+        exact = [(str(key), item) for key, item in data.items() if isinstance(item, dict)
+                 and (_norm_user(key) == wanted or _norm_user(item.get("username")) == wanted)]
+        if len(exact) == 1:
+            saved_id = str(exact[0][1].get("user_id") or "").strip()
+            if not saved_id or saved_id == wanted_id:
+                return exact[0]
+        return None
+    # A transfer is not allowed to fall back to a display name alone. The
+    # roster must provide a numeric ID, otherwise no balance is changed.
+    return None
 
 
 def _mutate_points_state(updater):
@@ -4489,7 +4693,7 @@ def _add_points(username, amount):
         else:
             if amount < 0:
                 raise PointsInsufficientError("No saved points account for this player")
-            key = _user_identity_key(display_name)
+            key = _points_identity_key(display_name)
             item = {"username": display_name, "points": 0}
         old_balance = _points_balance(item)
         if amount < 0 and old_balance < -amount:
@@ -4543,7 +4747,7 @@ def _apply_points_delta_once(username, delta, transaction_id, reason, *, stock_m
         if not resolved:
             if delta < 0:
                 return {"ok": False, "error": "target_not_found"}, False
-            key = _user_identity_key(display_name)
+            key = _points_identity_key(display_name)
             item = {"username": display_name, "points": 0}
         else:
             key, saved = resolved
@@ -4639,26 +4843,38 @@ def _deduct_points(username, amount, *, actor=""):
 
 
 def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_source=True,
-                     require_exact_target=True, create_target_if_missing=False):
+                     require_exact_target=True, create_target_if_missing=False, preferred_room=""):
     """Move points and append the audit entry in the same points.json commit."""
     amount = int(amount)
     if amount <= 0:
         return {"ok": False, "error": "invalid_amount"}
     sender_name = str(sender or "").strip().lstrip("@")
     target_name = str(target or "").strip().lstrip("@")
+    identity_context = getattr(_IDENTITY_CONTEXT, "value", None)
+    if not preferred_room and isinstance(identity_context, tuple) and len(identity_context) == 2:
+        if identity_context[0] == _norm_user(sender_name):
+            preferred_room = identity_context[1]
 
     def update(accounts, history):
-        source = _resolve_points_account(accounts, sender_name, exact_only=not allow_alias_source)
-        destination = _resolve_points_account(accounts, target_name, exact_only=require_exact_target)
+        source = _resolve_transfer_points_account(
+            accounts, sender_name, preferred_room=preferred_room, allow_alias=allow_alias_source
+        )
+        destination = _resolve_transfer_points_account(
+            accounts, target_name, preferred_room=preferred_room, allow_alias=not require_exact_target
+        )
         if not destination and create_target_if_missing and _norm_user(target_name):
-            destination = (_user_identity_key(target_name), {"username": target_name, "points": 0})
+            destination = (_points_identity_key(target_name, preferred_room), {"username": target_name, "points": 0})
         if not destination:
             return {"ok": False, "error": "target_not_found"}, False
         if not source:
             return {"ok": False, "error": "sender_not_found"}, False
         source_key, source_item = source
         target_key, target_item = destination
-        if source_key == target_key:
+        source_identity_id = _stored_user_id(sender_name, preferred_room)
+        target_identity_id = _stored_user_id(target_name, preferred_room)
+        if source_key == target_key or (
+            source_identity_id and target_identity_id and source_identity_id == target_identity_id
+        ):
             return {"ok": False, "error": "same_account"}, False
         source_balance = _points_balance(source_item)
         if source_balance < amount:
@@ -4670,8 +4886,8 @@ def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_s
         target_item["points"] = target_balance + amount
         source_item["username"] = str(source_item.get("username") or sender_name)
         target_item["username"] = str(target_item.get("username") or target_name)
-        source_id = _stored_user_id(sender_name)
-        target_id = _stored_user_id(target_name)
+        source_id = source_identity_id
+        target_id = target_identity_id
         if source_id:
             source_item["user_id"] = source_id
         if target_id:
@@ -4855,31 +5071,27 @@ def _fmt_points(value):
 
 
 def _money_game_win_text(game, username, language="ar"):
-    """Short, bilingual winner announcement for the million/billion games."""
+    """Compact result notice; million uses 🏦 and billion uses 💎."""
     game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
     name = str(username or "").strip().lstrip("@")
-    amount = "1b" if game == "billion" else "1m"
-    stars = "⭐" * 9
+    icon = "💎" if game == "billion" else "🏦"
     if language == "en":
         title = "billion" if game == "billion" else "million"
-        return (f"🏆✨ Congratulations! You got the {title}! ✨🏆\n\n"
-                f"✅ {name}\n💰 Prize: +{amount} points\n🎉 Congrats, champ!\n{stars}")
-    title = "المليار" if game == "billion" else "المليون"
-    return (f"🏆✨ مبروك! تم الحصول على {title} ✨🏆\n\n"
-            f"✅ {name}\n💰 مبلغ الفوز: +{amount} نقطة\n🎉 مبروك يا بطل!\n{stars}")
+        return f"{icon} {name}\nYou got the {title}!\n━━━━━━━━{icon}━━━━━━━━"
+    title = "المليار" if game == "billion" else "مليون"
+    return f"{icon} {name}\nتم الحصول على {title}\nــــــــــــــــ{icon}ــــــــــــــــ"
 
 
 def _money_game_short_win_text(game, username, language="ar"):
-    """Compact winner notice for rooms other than the game origin."""
+    """Short win notice for other connected rooms; icons distinguish the games."""
     game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
     name = str(username or "").strip().lstrip("@")
-    title = ("billion" if game == "billion" else "million") if language == "en" else (
-        "المليار" if game == "billion" else "المليون"
-    )
-    decoration = "💵💸" if game == "billion" else "🟩🟨🏆"
+    icon = "💎" if game == "billion" else "🏦"
     if language == "en":
-        return f"{decoration}✨ @{name} won the {title}! ✨{decoration}"
-    return f"{decoration}✨ حصل @{name} على {title}! ✨{decoration}"
+        title = "billion" if game == "billion" else "million"
+        return f"{icon} {name} got the {title}! {icon}"
+    title = "المليار" if game == "billion" else "مليون"
+    return f"{icon} {name} حصل على {title} {icon}"
 
 
 DEFAULT_REPLY_MESSAGES = {
@@ -7136,6 +7348,12 @@ class TalkinBot:
         self._event_queue = queue.PriorityQueue(maxsize=max(500, int(os.getenv("EVENT_QUEUE_MAX", "2500"))))
         self._event_queue_seq = 0
         self._event_queue_lock = threading.Lock()
+        # Room text is queued per room and executed in order. This keeps the
+        # transport worker free while preventing game turns and menu replies
+        # in the same room from racing each other.
+        self._room_serial_lock = threading.Lock()
+        self._room_serial_queues = {}
+        self._room_serial_running = set()
         self._event_worker = threading.Thread(
             target=self._event_worker_loop, name="ws-event-worker", daemon=True
         )
@@ -8661,8 +8879,6 @@ class TalkinBot:
         room = str(room or "").strip()
         if not room:
             return False
-        backup_ok = _flush_github_backup()
-        self.log("[BACKUP_BEFORE_LEAVE]", room, "complete" if backup_ok else "not-confirmed")
         if not hasattr(self, "_intentional_leaves"):
             self._intentional_leaves = set()
         self._intentional_leaves.add(_norm_room(room))
@@ -8697,73 +8913,43 @@ class TalkinBot:
             if _norm_room(saved) != room_norm
         ]
         self.log("[ROOM] left", room)
+        _schedule_github_full_backup("leave-room")
         return True
 
     def leave_all_rooms(self):
-        """Request exit from every known, pending, or server-confirmed room.
+        """Leave all rooms temporarily while preserving the saved room list.
 
-        Room names are deduplicated case-insensitively. The persistent saved
-        list is retained for restart restoration, but the live connection view
-        is cleared using normalized room names so capitalization differences
-        cannot leave phantom rooms in "غرفي".
+        The command خروج is a session pause, not deletion.  The names remain
+        in known_rooms/tracked_rooms.json so bootstrap_after_connect() restores
+        them after the process is restarted.
         """
-        candidates = {}
-        # Do not iterate known_rooms here: that file can contain the server's
-        # full room catalog, not just rooms this bot has joined. Only live
-        # server-confirmed rooms and joins currently awaiting confirmation are
-        # valid targets for an actual leave request.
-        for source in (
-            getattr(self, "connected_rooms", set()),
-            getattr(self, "_pending_room_joins", {}).values(),
-        ):
-            for item in source:
-                value = item.get("room", "") if isinstance(item, dict) else item
-                name = str(value or "").strip()
-                key = _norm_room(name)
-                if name and key:
-                    candidates.setdefault(key, name)
-        rooms = list(candidates.values())
+        rooms = [str(r).strip() for r in self.known_rooms if str(r).strip()]
         if not hasattr(self, "_intentional_leaves"):
             self._intentional_leaves = set()
-        if rooms:
-            backup_ok = _flush_github_backup()
-            self.log("[BACKUP_BEFORE_LEAVE_ALL]", "complete" if backup_ok else "not-confirmed")
-        failed = []
-        for index, room in enumerate(rooms):
-            room_key = _norm_room(room)
+        for room in rooms:
             try:
+                room_key = _norm_room(room)
                 self._intentional_leaves.add(room_key)
-                pending = getattr(self, "_pending_room_joins", {}).pop(room_key, None)
+                pending = self._pending_room_joins.pop(room_key, None)
                 if pending and pending.get("timer"):
                     try:
                         pending["timer"].cancel()
                     except Exception:
                         pass
-                # Send a leave packet for each unique room even if the local
-                # cache was stale; the server remains the authority on membership.
                 with self._room_bulk_lock:
                     self.send_query(encode_query("room_leave", room=room))
-                self.log("[ROOM] leave requested; saved for restart:", room)
-            except Exception as exc:
-                failed.append(room)
-                self.log("[ROOM] leave failed", room, repr(exc))
-            if index < len(rooms) - 1:
-                time.sleep(max(0.15, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "0.5") or 0.5)))
-        # Remove by normalized name, not exact spelling.
-        room_keys = set(candidates)
-        self.connected_rooms = {
-            name for name in getattr(self, "connected_rooms", set())
-            if _norm_room(name) not in room_keys
-        }
-        for name in list(getattr(self, "room_users", {})):
-            if _norm_room(name) in room_keys:
-                self.room_users.pop(name, None)
-        for name in list(getattr(self, "_last_join_sent", {})):
-            if _norm_room(name) in room_keys:
-                self._last_join_sent.pop(name, None)
-        # Deliberately preserve known_rooms for restoration after restart.
-        return [room for room in rooms if room not in failed]
+                    self.connected_rooms.discard(room)
+                    self.room_users.pop(room, None)
+                    self._last_join_sent.pop(room, None)
+                self.log("[ROOM] left temporarily; preserved for restart:", room)
+                if room != rooms[-1]:
+                    time.sleep(max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5)))
+            except Exception as e:
+                self.log("[ROOM] leave failed", room, repr(e))
+        # Deliberately do not call _save_persistent_rooms with a reduced set.
         # known_rooms remains the source used by reconnect/bootstrap.
+        if rooms:
+            _schedule_github_full_backup("leave-all-rooms")
         return rooms
 
     def _split_talkin_text(self, text: str, limit: int = None):
@@ -16301,15 +16487,15 @@ class TalkinBot:
             return True
         english = self._configured_room_language(room) == "en"
         if english:
-            self.send_room_text(room, f"🏦✨ Million Bank ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the prize...\n━━━━━━━━━━━━━━")
+            self.send_room_text(room, f"🏦 {sender_name}\nSpinning the million wheel\n━━━━━━━━🏦━━━━━━━━")
         else:
-            self.send_room_text(room, f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن الجائزة...\n━━━━━━━━━━━━━━")
+            self.send_room_text(room, f"🏦 {sender_name}\nجاري تدوير عجلة المليون\nــــــــــــــــ🏦ــــــــــــــــ")
         won = _money_game_roll("million")
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
         if not won:
-            loss_text = (f"🏦 Million Bank\n━━━━━━━━━━━━━━\n❌ {sender_name}, no luck this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
-                         if english else f"🏦 بنك مليون\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحالفه الحظ هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
+            loss_text = (f"🏦 {sender_name}\nYou did not get the million\n━━━━━━━━🏦━━━━━━━━"
+                         if english else f"🏦 {sender_name}\nلم يتم الحصول على مليون\nــــــــــــــــ🏦ــــــــــــــــ")
             # محاولة الحصول على المليون تبقى داخل الغرفة التي أُرسلت منها.
             self.send_room_text(room, loss_text)
             return True
@@ -17867,9 +18053,9 @@ class TalkinBot:
                 return True
             english = self._configured_room_language(room) == "en"
             if english:
-                self.send_room_text(room, f"🎰✨ Billion game ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the billion...\n━━━━━━━━━━━━━━")
+                self.send_room_text(room, f"💎 {sender_name}\nSpinning the billion wheel\n━━━━━━━━💎━━━━━━━━")
             else:
-                self.send_room_text(room, f"🎰✨ لعبة المليار ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن مليار...\n━━━━━━━━━━━━━━")
+                self.send_room_text(room, f"💎 {sender_name}\nجاري تدوير عجلة المليار\nــــــــــــــــ💎ــــــــــــــــ")
             won = _money_game_roll("billion")
             reward = 1000000000 if won else 0
             _record_game(sender_name, "billion", reward, 0)
@@ -17902,8 +18088,8 @@ class TalkinBot:
                     before_each_room=announce_winner_text,
                 )
             else:
-                loss_text = (f"🎰🍀 Billion game\n━━━━━━━━━━━━━━\n❌ {sender_name} did not get the billion this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
-                             if english else f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحصل على المليار هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
+                loss_text = (f"💎 {sender_name}\nYou did not get the billion\n━━━━━━━━💎━━━━━━━━"
+                             if english else f"💎 {sender_name}\nلم يتم الحصول على المليار\nــــــــــــــــ💎ــــــــــــــــ")
                 self.send_room_text(room, loss_text)
             return True
         if game_low in ("حظ","الحظ","luck"):
@@ -19461,6 +19647,27 @@ class TalkinBot:
         ).start()
         return True
 
+    def _room_roster_has_complete_ids(self, room, roster_data=None):
+        """Return True when a persisted room roster already has numeric IDs for all rows."""
+        room_key = _norm_room(room)
+        if not room_key:
+            return False
+        data = roster_data if isinstance(roster_data, dict) else _persistent_rosters()
+        rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+        if not isinstance(rooms, dict):
+            return False
+        roster = next((value for name, value in rooms.items()
+                       if _norm_room(name) == room_key), None)
+        if not isinstance(roster, dict) or not roster:
+            return False
+        for key, value in roster.items():
+            if not isinstance(value, dict):
+                return False
+            user_id = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
+            if not user_id.isdigit():
+                return False
+        return True
+
     def _low_priority_roster_sync_loop(self):
         """Rebuild room IDs slowly, yielding to normal commands and games."""
         # Let bulk room restoration and initial game traffic settle first.
@@ -19476,8 +19683,19 @@ class TalkinBot:
                     list(getattr(self, "connected_rooms", set()) or []),
                     key=_norm_room,
                 )
-                target = next((room for room in rooms
-                               if _norm_room(room) and _norm_room(room) not in self._room_id_sync_seen), None)
+                target = None
+                saved_roster_data = _persistent_rosters()
+                for candidate in rooms:
+                    candidate_key = _norm_room(candidate)
+                    if not candidate_key or candidate_key in self._room_id_sync_seen:
+                        continue
+                    if self._room_roster_has_complete_ids(candidate, saved_roster_data):
+                        # IDs already survived in room_users.json from the prior
+                        # run; do not issue another members_list request on restart.
+                        self._room_id_sync_seen.add(candidate_key)
+                        continue
+                    target = candidate
+                    break
                 if not target:
                     # New rooms may be joined later; check occasionally without
                     # polling or creating repeated worker threads.
@@ -19498,7 +19716,7 @@ class TalkinBot:
                         if self.stop_event.wait(1.0):
                             return
                     # Give games/chat a quiet window before the next room request.
-                    if self.stop_event.wait(max(5.0, float(os.getenv("ROSTER_SYNC_GAP_SECONDS", "10") or 10))):
+                    if self.stop_event.wait(max(120.0, float(os.getenv("ROSTER_SYNC_GAP_SECONDS", "120") or 120))):
                         return
                 else:
                     if self.stop_event.wait(5.0):
@@ -21046,11 +21264,16 @@ class TalkinBot:
             if not target or amount <= 0:
                 self.send_private_text(sender, "❌ الصيغة: sb@اسم المستخدم@عدد النقاط")
                 return True
-            result = _transfer_points(sender, target, amount)
+            result = _transfer_points(
+                sender, target, amount,
+                preferred_room=(room if not is_private else ""),
+            )
             if not result.get("ok"):
                 error = result.get("error")
-                if error in {"target_not_found", "sender_not_found"}:
-                    message = "❌ فشل التحويل: اكتب اسم المستخدم الصحيح كما هو محفوظ في ملف النقاط. لم يتم خصم أي نقاط."
+                if error == "target_not_found":
+                    message = "❌ فشل التحويل: تعذر التحقق من ID المستلم أو الاسم غير فريد في بيانات الغرف. لم يتم خصم أي نقاط."
+                elif error == "sender_not_found":
+                    message = "❌ فشل التحويل: تعذر التحقق من ID حسابك في بيانات الغرف. لم يتم خصم أي نقاط."
                 elif error == "insufficient":
                     message = f"❌ رصيدك غير كافٍ. رصيدك الحالي: {_fmt_points(result.get('sender_balance'))} نقطة. لم يتم خصم شيء."
                 elif error == "same_account":
@@ -21059,8 +21282,8 @@ class TalkinBot:
                     message = "⚠️ تعذر حفظ التحويل بأمان؛ لم يتم تأكيده. أعد المحاولة لاحقاً."
                 if _detect_text_language(text) == "en":
                     message = {
-                        "target_not_found": "❌ Transfer failed: enter the exact username saved in the points file. No points were deducted.",
-                        "sender_not_found": "❌ Transfer failed: your points account was not found. No points were deducted.",
+                        "target_not_found": "❌ Transfer failed: the recipient ID could not be verified or the name is ambiguous. No points were deducted.",
+                        "sender_not_found": "❌ Transfer failed: your account ID could not be verified. No points were deducted.",
                         "insufficient": f"❌ Insufficient balance: {_fmt_points(result.get('sender_balance'))} points. Nothing was deducted.",
                         "same_account": "❌ You cannot transfer points to the same account. No points were deducted.",
                         "persistence_failed": "⚠️ The transfer could not be safely saved; it was not confirmed. Please retry later.",
@@ -21570,9 +21793,21 @@ class TalkinBot:
                 is_private=is_private,
             )
             return True
-        # "خروج" without a room argument means leave ALL rooms, regardless
-        # of whether it was issued in a room or by private message. Do not turn
-        # it into a leave/rejoin cycle of the current room.
+        if low in ("خروج", "leave", "exit", "غادر", "leave room") and room and not is_private:
+            if not _is_primary_master(sender):
+                self.send_room_text(room, "🔒 هذا الأمر مخصص للماستر الأساسي فقط.")
+                return True
+            target = room
+            self.send_room_text(target, "وداعاً نلتقي مرة أخرى")
+            def _cycle_current_room():
+                try:
+                    self.leave_room(target)
+                    time.sleep(max(0.5, float(os.getenv("ROOM_CYCLE_DELAY_SECONDS", "1.0"))))
+                    self.join_room(target, force=True, requested_by=sender)
+                except Exception as exc:
+                    self.log("[ROOM] master cycle failed:", target, repr(exc))
+            threading.Thread(target=_cycle_current_room, daemon=True, name="master-room-cycle").start()
+            return True
         if low in ("خروج","leave","exit") or low.startswith(("خروج ","leave ","exit ")):
             parts=text.split(None,1); target=parts[1].strip() if len(parts)==2 else ""
             if target:
@@ -21580,7 +21815,7 @@ class TalkinBot:
                 self.send_private_text(sender,f"{'✅ خرجت من الغرفة' if ok else '❌ تعذر الخروج'}: {target}")
             else:
                 rooms=self.leave_all_rooms()
-                self.send_private_text(sender, f"📤 أُرسل طلب الخروج من {len(rooms)} غرفة متصلة/قيد الدخول.\n📌 الغرف المحفوظة لم تُحذف من ملف الاستعادة.")
+                self.send_private_text(sender,f"✅ خرجت من جميع الغرف. العدد: {len(rooms)}")
             return True
         if (low.startswith("invmsg") or low.startswith("رسالةدعوة")
                 or low.startswith("invite message") or low.startswith("invmsg@")):
@@ -22521,10 +22756,12 @@ class TalkinBot:
                 "room": room,
                 "identity_key": f"id:{sender_id}" if sender_id else _norm_user(frm),
             }
-        # Do not infer room membership from an ordinary text event. Only the
-        # server's explicit you_joined/you_rejoined acknowledgement may add a
-        # room to connected_rooms; otherwise stale or delayed room events can
-        # make "غرفي" report rooms the bot is no longer connected to.
+        # Receiving an actual room text event proves this session can see that
+        # room, even if the server omitted/reordered the explicit join ack.
+        if room and event_type == "text":
+            if not hasattr(self, "connected_rooms") or not isinstance(self.connected_rooms, set):
+                self.connected_rooms = set()
+            self.connected_rooms.add(room)
         if body:
             self._remember_inflight_command(room, body, frm, is_private=False)
         if room and room != BOT_MASTER and _norm_room(room) not in getattr(self, "blocked_rooms", set()):
@@ -23605,6 +23842,59 @@ class TalkinBot:
             self.log("[EVENT-DISPATCH] async submit failed; processing inline:", repr(exc))
             return self._process_message(ws, message)
 
+    def _room_serial_start_next(self, room_key):
+        """Submit the next queued text event for a room without blocking a worker."""
+        with self._room_serial_lock:
+            pending = self._room_serial_queues.get(room_key, [])
+            if not pending:
+                self._room_serial_running.discard(room_key)
+                self._room_serial_queues.pop(room_key, None)
+                return
+            executor, result = pending[0]
+        try:
+            future = executor.submit(self.handle_room_event, result)
+        except Exception as exc:
+            self.log("[ROOM-COMMAND] async dispatch failed:", repr(exc))
+            self._room_serial_done(room_key, None)
+            return
+        future.add_done_callback(lambda completed, key=room_key: self._room_serial_done(key, completed))
+
+    def _room_serial_done(self, room_key, future):
+        """Advance a room's serial queue after its current event finishes."""
+        if future is not None:
+            try:
+                error = future.exception()
+                if error is not None:
+                    self.log("[ROOM-COMMAND] handler failed:", repr(error))
+            except Exception:
+                pass
+        with self._room_serial_lock:
+            pending = self._room_serial_queues.get(room_key, [])
+            if pending:
+                pending.pop(0)
+            has_more = bool(pending)
+            if not has_more:
+                self._room_serial_queues.pop(room_key, None)
+                self._room_serial_running.discard(room_key)
+        if has_more:
+            self._room_serial_start_next(room_key)
+
+    def _enqueue_room_event_serially(self, result, executor):
+        """Keep events ordered within each room while allowing rooms to run concurrently."""
+        event = result.get("room_event", {}) if isinstance(result, dict) else {}
+        room_key = str(event.get(13) or event.get(2) or result.get("room") or "__unknown_room__").strip()
+        if not room_key:
+            room_key = "__unknown_room__"
+        should_start = False
+        with self._room_serial_lock:
+            self._room_serial_queues.setdefault(room_key, []).append((executor, result))
+            if room_key not in self._room_serial_running:
+                self._room_serial_running.add(room_key)
+                should_start = True
+        if should_start:
+            self._room_serial_start_next(room_key)
+        return True
+
     def _dispatch_room_event(self, result):
         """Process room text outside the transport worker.
 
@@ -23621,17 +23911,36 @@ class TalkinBot:
             and bool(event.get(6, ""))
         )
         if not is_text:
-            return self.handle_room_event(result)
+            # Presence/member/system room events can arrive in large bursts when
+            # the bot joins several rooms. Some handlers perform storage work or
+            # send follow-up queries; running them on the sole protocol worker
+            # delays decoding subsequent chat commands across every room.
+            # Route them through the shared per-room ordered event queue instead.
+            executor_name = "_room_event_executor"
+            lock_name = "_room_event_executor_lock"
+            executor = getattr(self, executor_name, None)
+            if executor is None:
+                lock = getattr(self, lock_name, None)
+                if lock is None:
+                    lock = threading.Lock()
+                    setattr(self, lock_name, lock)
+                with lock:
+                    executor = getattr(self, executor_name, None)
+                    if executor is None:
+                        executor = ThreadPoolExecutor(
+                            max_workers=max(2, int(os.getenv("ROOM_EVENT_WORKERS", "8") or 8)),
+                            thread_name_prefix="room-event",
+                        )
+                        setattr(self, executor_name, executor)
+            return self._enqueue_room_event_serially(result, executor)
         body = str(event.get(6, "") or "")
         is_media = _looks_like_media_command(body)
         is_priority = _looks_like_priority_command(body)
         is_command = _looks_like_bot_command(body)
-        # Fast path copied from the reference bot: short commands are handled
-        # immediately after the frame is decoded, avoiding a second executor
-        # hand-off and its scheduling latency. Slow operations remain isolated
-        # below so music, roster queries, and room joins cannot block commands.
-        if _is_fast_room_command(body):
-            return self.handle_room_event(result)
+        # Do not execute text commands inline on the single protocol worker.
+        # Even a command classified as "fast" can touch storage, send network
+        # requests, or wait on a lock; running it inline stalls every incoming
+        # frame. All text events are dispatched below, with per-room ordering.
         # Music searches/downloads can take many seconds (or longer when a
         # provider fails). Give them an isolated, deliberately small pool so
         # repeated music requests cannot consume workers used for chat commands.
@@ -23675,11 +23984,7 @@ class TalkinBot:
                         ),
                     )
                     setattr(self, executor_name, executor)
-        try:
-            return executor.submit(self.handle_room_event, result)
-        except Exception as exc:
-            self.log("[ROOM-COMMAND] async dispatch failed; processing inline:", repr(exc))
-            return self.handle_room_event(result)
+        return self._enqueue_room_event_serially(result, executor)
 
     def on_message(self, ws, message):
         """Quickly enqueue incoming frames, prioritizing likely chat commands.
@@ -23710,10 +24015,13 @@ class TalkinBot:
                 # urgent chat frames as a last resort; discard lower-value
                 # background frames and log only when event debugging is on.
                 if priority == 0:
+                    # Keep the socket callback non-blocking even during bursts.
+                    # The fallback executor is used only when the ordered queue
+                    # is saturated, so urgent chat frames are not processed inline.
                     try:
-                        self._process_message(ws, raw)
+                        self._dispatch_incoming_message(ws, raw)
                     except Exception as exc:
-                        self.log("[EVENT-QUEUE] urgent frame failed:", repr(exc))
+                        self.log("[EVENT-QUEUE] urgent frame dispatch failed:", repr(exc))
                 elif ROOM_EVENT_DEBUG:
                     self.log("[EVENT-QUEUE] dropped low-priority frame; queue full")
         except Exception as exc:
@@ -24437,9 +24745,10 @@ class TalkinBot:
                 "Missing required deployment variables: " + ", ".join(missing) + ". "
                 "Add them to Railway Variables (not the source code) and redeploy."
             )
-        # User requested a fresh ID roster on each process start. Only the
-        # member roster is reset; points, games, verification, gifts, and rooms remain.
-        _reset_room_rosters_for_fresh_id_build()
+        # Preserve the existing member-ID roster across restarts. The low-priority
+        # background worker merges fresh IDs gradually; never erase room_users.json
+        # at startup, because doing so loses useful IDs and creates unnecessary work.
+        self.log("[ROSTER] preserving room_users.json; member IDs will refresh gradually in background")
         if TELEGRAM_BOT_TOKEN and TELEGRAM_POLL_ENABLED:
             threading.Thread(target=self._telegram_poll_loop, name="telegram-poll", daemon=True).start()
         elif TELEGRAM_BOT_TOKEN:
