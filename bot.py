@@ -7710,7 +7710,7 @@ class TalkinBot:
 
         threads = [thread.name for thread in threading.enumerate() if thread.is_alive()]
         worker_names = {
-            "event-worker", "ws-event-worker", "fast-room-restore", "manual-join-my-rooms",
+            "event-worker", "ws-event-worker", "master-priority", "fast-room-restore", "manual-join-my-rooms",
             "serial-room-join", "server-room-catalog-join",
             "low-priority-room-id-sync", "room-id-roster-save",
             "persist-member-identity", "game-command", "stock-market-worker",
@@ -7759,6 +7759,7 @@ class TalkinBot:
             f"CPU آخر قياس: {cpu:.1f}% | التبريد: {'فعال' if getattr(self, '_cpu_cooling', False) else 'غير فعال'}\n"
             f"نسخ معلقة: GitHub={github_pending}/{github_inflight}، قاعدة البيانات={state_pending}/{state_inflight}\n"
             f"حفظ أعضاء بالخلفية: {roster_queue} | آخر معالجة حدث: {event_worker_duration:.3f}s | أحداث معالجة: {event_worker_count}\n"
+            f"أوامر الماستر العاجلة: {int(getattr(self, '_master_priority_dispatched', 0) or 0)}\n"
             f"العمال النشطة: {', '.join(busy_workers[:12]) or 'لا يوجد'}"
         )
 
@@ -23883,6 +23884,53 @@ class TalkinBot:
             self.log("[ROOM-COMMAND] async dispatch failed; processing inline:", repr(exc))
             return self.handle_room_event(result)
 
+    def _dispatch_master_private_priority(self, ws, raw):
+        """Run configured-master DMs outside the shared inbound event queue.
+
+        The normal event worker must preserve protocol ordering, but a burst of
+        room/member frames can delay a private master command. Decode only the
+        lightweight ChatMessage envelope here; the complete command handling is
+        still performed by _process_message in a dedicated daemon thread.
+        """
+        try:
+            result = decode_result_message(raw)
+            cm = result.get("chat_message") if isinstance(result, dict) else None
+            if not isinstance(cm, dict):
+                return False
+            # A room field means this is room traffic, even when the server
+            # wraps it in ChatMessage instead of RoomEvent.
+            room = str(cm.get(4, "") or cm.get(13, "") or "").strip()
+            if room:
+                return False
+            frm = str(cm.get(3, "") or "").strip()
+            canonical = _canonical_message_username(
+                cm.get(22, "") or cm.get("username", "") or cm.get("sender", ""),
+                cm.get(17, ""),
+                frm,
+            )
+            sender = canonical or frm
+            body = str(cm.get(5, "") or "").strip()
+            if not sender or not body or not _is_configured_master_account(sender):
+                return False
+            # Do not enqueue this frame. If a slow room handler or roster
+            # operation is occupying ws-event-worker, the master still gets a
+            # response from this independent path.
+            threading.Thread(
+                target=self._process_message,
+                args=(ws, raw),
+                daemon=True,
+                name="master-priority",
+            ).start()
+            self._master_priority_dispatched = int(
+                getattr(self, "_master_priority_dispatched", 0) or 0
+            ) + 1
+            return True
+        except Exception as exc:
+            # Fall back to the normal queue if the envelope is not one of the
+            # server's known private-message shapes.
+            self.log("[MASTER-PRIORITY] envelope detection failed:", repr(exc))
+            return False
+
     def on_message(self, ws, message):
         """Quickly enqueue incoming frames, prioritizing likely chat commands.
 
@@ -23894,6 +23942,8 @@ class TalkinBot:
             return
         try:
             raw = bytes(message)
+            if self._dispatch_master_private_priority(ws, raw):
+                return
             top = decode_message(raw)
             # These protobuf fields have historically identified room/private
             # message frames in TalkinChat. Prioritize them over roster noise.
