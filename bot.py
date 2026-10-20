@@ -290,9 +290,9 @@ _SOCIAL_HUNT_PHOTO_LOCK = threading.Lock()
 # الألعاب وصورها معطلة بناءً على إعداد البوت المطلوب؛ لا تُرسل صور ألعاب.
 GAME_IMAGE_FILES = {
     "bet": "game_bet.jpg",
-    "billion": "game_billion.jpg",
-    "million": "game_million_bank.jpg",
-    "بنك مليون": "game_million_bank.jpg",
+    "billion": "game_billion_prize.jpg",
+    "million": "game_million_prize.jpg",
+    "بنك مليون": "game_million_prize.jpg",
     "duel": "game_duel.jpg",
     "luck": "game_luck.jpg",
     "investment": "game_investment.jpg",
@@ -16787,18 +16787,37 @@ class TalkinBot:
         redeem_match = re.fullmatch(r"(?:r|rdem)\s+(.+)", raw, re.I)
         red_code_match = re.fullmatch(r"red(?:\s+(\d+))?", raw, re.I)
         is_diamond_test = low in {"فحص الماس", "فحص الالماس"}
+        is_rare_mining_test = low in {"فحص التنقيب", "فحص الماسة النادرة", "فحص الالماسة النادرة"}
+        is_rare_event_join = low in {"تنقيب", "نقب", "rare diamond", "rare-diamond"}
         is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining"}
         is_store = low in store_commands
         is_inventory = low in inventory_commands
         is_top = low in top_commands
-        if low in {"تنقيب", "نقب", "rare diamond", "rare-diamond"}:
+        if is_rare_event_join:
             try:
                 if self._join_rare_diamond_event(room, sender_name):
                     return True
             except Exception as exc:
                 self.log("[RARE-DIAMOND] join failed:", repr(exc))
-        if not (is_store or is_inventory or is_top or redeem_match or red_code_match or is_dig or is_diamond_test):
+            # The timed rare expedition is separate from ordinary mining.
+            # If no event is open, never fall through to the iron/normal dig game.
+            self.send_room_text(room, "💎 لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم كل 5 دقائق.")
+            return True
+        if not (is_store or is_inventory or is_top or redeem_match or red_code_match or is_dig or is_diamond_test or is_rare_mining_test):
             return False
+
+        if is_rare_mining_test:
+            if not _is_master_name(sender_name):
+                self.send_room_text(room, "🔒 أمر فحص التنقيب مخصص للماستر فقط.")
+                return True
+            if not room:
+                self.send_private_text(sender_name, "📌 أرسل أمر فحص التنقيب داخل الغرفة ليظهر اسمك على صورة الفائز.")
+                return True
+            self.send_room_text(room, f"💎 فحص التنقيب — @{sender_name} يظهر الآن كأنه الفائز بالألماسة النادرة.")
+            sent = self._send_rare_diamond_winner_card(room, sender_name)
+            if not sent:
+                self.send_room_text(room, "⚠️ تعذر إرسال صورة الفحص. تأكد من وجود صورة الألماسة النادرة داخل assets/treasures ومن إعداد رابط الوسائط العام.")
+            return True
 
         if is_diamond_test:
             if not _is_master_name(sender_name):
@@ -17106,7 +17125,7 @@ class TalkinBot:
         mining_low = mining_raw.casefold().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
         mining_commands = {
             "الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining",
-            "فحص الماس", "فحص الالماس", "sv", "مخزني", "مخزون", "مخزون الكنوز",
+            "فحص الماس", "فحص الالماس", "فحص التنقيب", "فحص الماسة النادرة", "فحص الالماسة النادرة", "sv", "مخزني", "مخزون", "مخزون الكنوز",
             "inventory", "my inventory", "bag", "متجر الكنوز", "سوق الكنوز",
             "treasure shop", "store treasures", "توب الماس", "توب الالماس",
             "top diamonds", "top gems", "اغنى المنقبين", "red",
