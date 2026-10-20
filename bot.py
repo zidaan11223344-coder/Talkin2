@@ -16770,7 +16770,7 @@ class TalkinBot:
         is_classic = game_key in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"}
         required_players = 5 if is_classic else 7
         prize_ar, prize_en = ("100 مليون نقطة", "100 million points") if is_classic else ("500 مليون نقطة", "500 million points")
-        for target_room in rooms:
+        for target_room in ([] if test_mode else rooms):
             try:
                 language = str(self._effective_room_language(target_room) or "ar").casefold()
                 if language.startswith("en") or language in {"english", "eng"}:
@@ -16810,8 +16810,18 @@ class TalkinBot:
             if not isinstance(event, dict) or time.time() >= float(event.get("ends_at", 0) or 0):
                 return False
             if requested_game and event.get("game_key") != requested_game:
-                # A valid game command was used, but it is not the active game.
-                return False
+                # Make the reason explicit: a different game is currently open.
+                active_title = str(event.get("game_title", "اللعبة الحالية"))
+                active_commands = {
+                    "rare_diamond": "تنقيب / mining", "gold_treasure": "كنز / treasure",
+                    "treasure_island": "جزيرة / island", "fortune_hunt": "ثروه أو ثروة / fortune",
+                    "gem_mine": "منجم / gem mine", "imperial_jade": "يشم / jade",
+                    "imperial_sickness": "طبيب / doctor", "flight_radar": "كابتن / captain",
+                    "mercenary_escape": "أمن / police",
+                }
+                active_command = active_commands.get(str(event.get("game_key", "")), "أمر اللعبة المعلن")
+                self.send_room_text(room, f"🎮 لم تُفتح هذه اللعبة بعد. الجولة المفتوحة الآن: {active_title}.\n📌 أمر المشاركة الحالي: {active_command}")
+                return True
             event_rooms = event.get("rooms") or [event.get("room", "")]
             if not any(_norm_room(room) == _norm_room(r) for r in event_rooms):
                 return False
@@ -17063,7 +17073,9 @@ class TalkinBot:
         raw = str(text or "").strip()
         low = raw.casefold()
         low = low.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
-        low = low.replace("ى", "ي")
+        low = low.replace("ى", "ي").replace("ة", "ه")
+        low = re.sub(r"[\u064b-\u065f\u0670]", "", low)
+        low = re.sub(r"\s+", " ", low).strip()
         store_commands = {"متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures"}
         inventory_commands = {"sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag"}
         top_commands = {"توب الماس", "توب الالماس", "top diamonds", "top gems", "أغنى المنقبين", "اغنى المنقبين"}
@@ -17076,12 +17088,12 @@ class TalkinBot:
             "تنقيب": "rare_diamond", "نقب": "rare_diamond", "rare diamond": "rare_diamond", "rare-diamond": "rare_diamond", "mining": "rare_diamond",
             "كنز": "gold_treasure", "treasure": "gold_treasure", "gold treasure": "gold_treasure",
             "جزيرة": "treasure_island", "island": "treasure_island", "treasure island": "treasure_island",
-            "ثروة": "fortune_hunt", "fortune": "fortune_hunt", "wealth hunt": "fortune_hunt",
+            "ثروه": "fortune_hunt", "fortune": "fortune_hunt", "wealth hunt": "fortune_hunt",
             "منجم": "gem_mine", "gem mine": "gem_mine", "gemstone mine": "gem_mine",
             "يشم": "imperial_jade", "jade": "imperial_jade", "imperial jade": "imperial_jade",
             "طبيب": "imperial_sickness", "doctor": "imperial_sickness", "emperor doctor": "imperial_sickness",
             "كابتن": "flight_radar", "captain": "flight_radar", "radar": "flight_radar", "flight attack": "flight_radar",
-            "امن": "mercenary_escape", "أمن": "mercenary_escape", "police": "mercenary_escape", "security": "mercenary_escape", "chase": "mercenary_escape",
+            "امن": "mercenary_escape", "police": "mercenary_escape", "security": "mercenary_escape", "chase": "mercenary_escape",
         }
         timed_game_key = timed_game_commands.get(low)
         is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining"}
@@ -17422,7 +17434,7 @@ class TalkinBot:
             "الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining",
             "كنز", "treasure", "gold treasure",
             "جزيرة", "island", "treasure island",
-            "ثروة", "fortune", "wealth hunt",
+            "ثروة", "ثروه", "fortune", "wealth hunt",
             "منجم", "gem mine", "gemstone mine",
             "يشم", "jade", "imperial jade",
             "طبيب", "doctor", "emperor doctor",
@@ -17435,7 +17447,7 @@ class TalkinBot:
             # Join commands for all nine scheduled treasure games.
             "كنز", "treasure", "gold treasure",
             "جزيرة", "island", "treasure island",
-            "ثروة", "fortune", "wealth hunt",
+            "ثروة", "ثروه", "fortune", "wealth hunt",
             "منجم", "gem mine", "gemstone mine",
             "يشم", "jade", "imperial jade",
             "طبيب", "doctor", "emperor doctor",
