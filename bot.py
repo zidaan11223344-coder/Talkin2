@@ -7710,13 +7710,15 @@ class TalkinBot:
 
         threads = [thread.name for thread in threading.enumerate() if thread.is_alive()]
         worker_names = {
-            "event-worker", "fast-room-restore", "manual-join-my-rooms",
+            "event-worker", "ws-event-worker", "fast-room-restore", "manual-join-my-rooms",
             "serial-room-join", "server-room-catalog-join",
             "low-priority-room-id-sync", "room-id-roster-save",
             "persist-member-identity", "game-command", "stock-market-worker",
             "local-persistence", "github-sync", "state-db-worker",
         }
-        busy_workers = [name for name in threads if name in worker_names]
+        busy_workers = [name for name in threads if name in worker_names or name.startswith((
+            "room-command", "room-priority", "room-event", "room-media", "incoming-command",
+        ))]
         pending_joins = size(getattr(self, "_pending_room_joins", {}))
         pending_lists = size(getattr(self, "_pending_room_lists", {}))
         sync_jobs = size(getattr(self, "_room_sync_jobs", {}))
@@ -7742,6 +7744,12 @@ class TalkinBot:
             state_pending = len(_STATE_DB_PENDING)
             state_inflight = int(_STATE_DB_INFLIGHT or 0)
         cpu = float(getattr(self, "_cpu_last_percent", 0.0) or 0.0)
+        try:
+            roster_queue = _ROSTER_ASYNC_QUEUE.qsize()
+        except Exception:
+            roster_queue = -1
+        event_worker_duration = float(getattr(self, "_event_worker_last_duration", 0.0) or 0.0)
+        event_worker_count = int(getattr(self, "_event_worker_processed", 0) or 0)
         return (
             "🩺 تشخيص تأخير الرد — للماستر فقط\n"
             f"النتيجة الصريحة: {queue_reason}\n"
@@ -7750,6 +7758,7 @@ class TalkinBot:
             f"دخول معلق: {pending_joins} | قوائم أعضاء معلقة: {pending_lists} | مزامنة غرف: {sync_jobs}\n"
             f"CPU آخر قياس: {cpu:.1f}% | التبريد: {'فعال' if getattr(self, '_cpu_cooling', False) else 'غير فعال'}\n"
             f"نسخ معلقة: GitHub={github_pending}/{github_inflight}، قاعدة البيانات={state_pending}/{state_inflight}\n"
+            f"حفظ أعضاء بالخلفية: {roster_queue} | آخر معالجة حدث: {event_worker_duration:.3f}s | أحداث معالجة: {event_worker_count}\n"
             f"العمال النشطة: {', '.join(busy_workers[:12]) or 'لا يوجد'}"
         )
 
@@ -12317,7 +12326,10 @@ class TalkinBot:
             if previous != current:
                 cache[cache_key] = current
                 self._stream_member_cache = cache
-                _remember_roster(room, [item])
+                # STREAM events can arrive in bursts while a room is active.
+                # Never serialize room_users.json from the WebSocket worker;
+                # coalesce the update in the dedicated roster writer instead.
+                _remember_roster_async(room, [item])
             return True
         except Exception as exc:
             self.log("[ROSTER] STREAM member cache failed:", repr(exc))
@@ -23761,12 +23773,15 @@ class TalkinBot:
                 _priority, _seq, ws, message = self._event_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
+            started = time.monotonic()
             try:
                 self._process_message(ws, message)
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log("[EVENT-WORKER] processing failed:", repr(exc))
             finally:
+                self._event_worker_last_duration = time.monotonic() - started
+                self._event_worker_processed = int(getattr(self, "_event_worker_processed", 0) or 0) + 1
                 try:
                     self._event_queue.task_done()
                 except Exception:
