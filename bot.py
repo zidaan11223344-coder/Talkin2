@@ -980,9 +980,9 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 # or to the persistent runtime log. Set QUIET_MODE=0 and DEBUG=1 temporarily
 # only when troubleshooting is needed.
 QUIET_MODE = os.getenv("QUIET_MODE", "1").strip() == "1"
-# Room chat is high-volume and must never be copied into the host/runtime log.
-# Keep this opt-in for short, controlled debugging only.
-LOG_ROOM_MESSAGES = os.getenv("LOG_ROOM_MESSAGES", "0").strip() == "1"
+# Room-message tracing is enabled for latency troubleshooting. Set
+# LOG_ROOM_MESSAGES=0 to stop recording message bodies and timings.
+LOG_ROOM_MESSAGES = os.getenv("LOG_ROOM_MESSAGES", "1").strip() == "1"
 # Successful per-file backup messages are noisy; errors always remain visible.
 LOG_GITHUB_SYNC_SUCCESS = os.getenv("LOG_GITHUB_SYNC_SUCCESS", "0").strip() == "1"
 # Runtime room-event diagnostics are disabled by default. Set ROOM_EVENT_DEBUG=1 only while debugging.
@@ -7878,16 +7878,17 @@ class TalkinBot:
 
     def log(self, *args):
         """Optional diagnostics. Quiet mode avoids stdout and persistent log growth."""
-        if QUIET_MODE and not DEBUG:
+        is_room_message_log = any(
+            isinstance(value, dict) and value.get("_room_message_body")
+            for value in args
+        )
+        if QUIET_MODE and not DEBUG and not (LOG_ROOM_MESSAGES and is_room_message_log):
             return
         try:
             # A room-message body is user content, not a diagnostic.  The
             # normal room handler does not pass it here; this guard also keeps
             # future diagnostic calls from accidentally filling Riven logs.
-            if not LOG_ROOM_MESSAGES and any(
-                isinstance(value, dict) and value.get("_room_message_body")
-                for value in args
-            ):
+            if not LOG_ROOM_MESSAGES and is_room_message_log:
                 return
             line = " ".join(str(x) for x in args)
             self._cpu_log_suppressed = int(getattr(self, "_cpu_log_suppressed", 0) or 0)
@@ -23969,11 +23970,44 @@ class TalkinBot:
                     )
                     setattr(self, executor_name, executor)
         try:
-            return executor.submit(self.handle_room_event, result)
+            return executor.submit(self._timed_room_event, result)
         except Exception as exc:
             self.log("[ROOM-COMMAND] async dispatch failed; processing inline:", repr(exc))
             return self.handle_room_event(result)
 
+    def _timed_room_event(self, result):
+        """Trace room-message receipt/processing/response timing."""
+        event = result.get("room_event") if isinstance(result, dict) else {}
+        body = str(event.get(6, "") or "") if isinstance(event, dict) else ""
+        room = str(event.get(13, "") or "") if isinstance(event, dict) else ""
+        sender = str(event.get(22, "") or event.get(2, "") or "") if isinstance(event, dict) else ""
+        marker = {"_room_message_body": True}
+        received_at = time.time()
+        started = time.monotonic()
+        if LOG_ROOM_MESSAGES and body:
+            self.log(
+                "[ROOM-MESSAGE] received",
+                marker,
+                f"at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(received_at))}",
+                f"room={room!r}", f"sender={sender!r}", f"body={body!r}",
+            )
+            self.log(
+                "[ROOM-MESSAGE] handler-start",
+                marker,
+                f"mono={started:.6f}", f"room={room!r}", f"body={body!r}",
+            )
+        try:
+            return self.handle_room_event(result)
+        finally:
+            if LOG_ROOM_MESSAGES and body:
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                self.log(
+                    "[ROOM-MESSAGE] handler-end",
+                    marker,
+                    f"at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}",
+                    f"duration_ms={elapsed_ms:.2f}",
+                    f"room={room!r}", f"body={body!r}",
+                )
     def _dispatch_master_private_priority(self, ws, raw):
         """Run configured-master DMs outside the shared inbound event queue.
 
