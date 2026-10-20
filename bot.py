@@ -2913,12 +2913,11 @@ def _looks_like_priority_command(text):
     )
 
 def _is_fast_room_command(text):
-    """Identify commands safe to run inline on the event worker.
+    """Identify latency-sensitive commands for the priority executor.
 
-    The original fast bot handled ordinary commands directly after decoding a
-    frame. Keep that low-latency path for games, navigation, and short admin
-    actions, while routing operations that wait for another server response or
-    perform media/network work to their background executors.
+    These commands must never run inline on ``ws-event-worker``.  The helper is
+    retained as a classifier for compatibility, but dispatch always happens on
+    the dedicated room-priority pool below.
     """
     value = str(text or "").strip()
     low = value.casefold()
@@ -23829,12 +23828,6 @@ class TalkinBot:
         is_media = _looks_like_media_command(body)
         is_priority = _looks_like_priority_command(body)
         is_command = _looks_like_bot_command(body)
-        # Fast path copied from the reference bot: short commands are handled
-        # immediately after the frame is decoded, avoiding a second executor
-        # hand-off and its scheduling latency. Slow operations remain isolated
-        # below so music, roster queries, and room joins cannot block commands.
-        if _is_fast_room_command(body):
-            return self.handle_room_event(result)
         # Music searches/downloads can take many seconds (or longer when a
         # provider fails). Give them an isolated, deliberately small pool so
         # repeated music requests cannot consume workers used for chat commands.
