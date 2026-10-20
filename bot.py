@@ -7717,6 +7717,7 @@ class TalkinBot:
         }
         busy_workers = [name for name in threads if name in worker_names or name.startswith((
             "room-command", "room-priority", "room-event", "room-media", "incoming-command",
+            "ws-event-bg",
         ))]
         pending_joins = size(getattr(self, "_pending_room_joins", {}))
         pending_lists = size(getattr(self, "_pending_room_lists", {}))
@@ -23760,6 +23761,27 @@ class TalkinBot:
         threading.Timer(max(2.0, float(os.getenv("ROOM_LIST_SYNC_TIMEOUT_SECONDS", "4") or 4)), fallback).start()
         return True
 
+    def _dispatch_background_event(self, ws, message):
+        """Process roster/presence frames outside the ordered queue consumer."""
+        executor = getattr(self, "_event_background_executor", None)
+        if executor is None:
+            lock = getattr(self, "_event_background_executor_lock", None)
+            if lock is None:
+                lock = self._event_background_executor_lock = threading.Lock()
+            with lock:
+                executor = getattr(self, "_event_background_executor", None)
+                if executor is None:
+                    try:
+                        workers = max(2, int(os.getenv("EVENT_BACKGROUND_WORKERS", "4") or 4))
+                    except (TypeError, ValueError):
+                        workers = 4
+                    executor = ThreadPoolExecutor(
+                        max_workers=workers,
+                        thread_name_prefix="ws-event-bg",
+                    )
+                    self._event_background_executor = executor
+        return executor.submit(self._process_message, ws, message)
+
     def _event_worker_loop(self):
         """Process queued WebSocket frames in priority order.
 
@@ -23773,6 +23795,18 @@ class TalkinBot:
                 _priority, _seq, ws, message = self._event_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
+            # Priority 0/1 frames retain ordered handling because they may be
+            # commands or protocol acknowledgements. Presence, roster and
+            # other ordinary server frames are priority 2; dispatching them to
+            # a small pool prevents 36 busy rooms from building a permanent
+            # backlog behind one consumer.
+            if _priority >= 2:
+                try:
+                    self._dispatch_background_event(ws, message)
+                    self._event_queue.task_done()
+                    continue
+                except Exception as exc:
+                    self.log("[EVENT-BACKGROUND] dispatch failed; processing inline:", repr(exc))
             started = time.monotonic()
             try:
                 self._process_message(ws, message)
