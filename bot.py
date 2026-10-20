@@ -16566,8 +16566,8 @@ class TalkinBot:
         return True
 
     def _rare_diamond_event_worker(self):
-        """Open a five-player rare-diamond expedition every five minutes."""
-        next_start = time.time() + 300.0
+        """Open a rare-diamond round as soon as a room is available, then every five minutes."""
+        next_start = 0.0
         while not self.stop_event.wait(1.0):
             now = time.time()
             with self._rare_diamond_lock:
@@ -16583,10 +16583,13 @@ class TalkinBot:
                     self.log("[RARE-DIAMOND] timeout notice failed:", repr(exc))
             if now >= next_start:
                 try:
-                    self._start_rare_diamond_event()
+                    started = self._start_rare_diamond_event()
+                    # If there is no active room yet, retry shortly rather than
+                    # silently waiting another five minutes after a missed attempt.
+                    next_start = time.time() + (300.0 if started else 10.0)
                 except Exception as exc:
                     self.log("[RARE-DIAMOND] event start failed:", repr(exc))
-                next_start = now + 300.0
+                    next_start = time.time() + 10.0
 
     def _start_rare_diamond_event(self):
         rooms = [str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()]
@@ -16654,7 +16657,7 @@ class TalkinBot:
         winner_credit = {"ok": False}
         try:
             winner_credit = _apply_points_delta_once(
-                winner, 100_000, f"{round_id}:winner:{_norm_user(winner)}", "rare diamond expedition prize"
+                winner, 500_000_000, f"{round_id}:winner:{_norm_user(winner)}", "rare diamond expedition prize"
             )
         except Exception as exc:
             self.log("[RARE-DIAMOND] winner credit failed:", winner, repr(exc))
@@ -16715,9 +16718,9 @@ class TalkinBot:
 
         lines = [f"💎 @{winner} فاز بالتنقيب عن الألماسة النادرة!"]
         if isinstance(winner_credit, dict) and winner_credit.get("ok"):
-            lines.append("💰 الجائزة: +100k نقطة")
+            lines.append("💰 الجائزة: +500,000,000 نقطة (نصف مليار)")
         else:
-            lines.append("⚠️ تعذر اعتماد 100k نقطة للفائز؛ راجع سجل البوت.")
+            lines.append("⚠️ تعذر اعتماد جائزة نصف مليار نقطة للفائز؛ راجع سجل البوت.")
         if granted:
             item_name = str((awarded_item or {}).get("name") or (MINING_ITEMS.get(rare_key, {}).get("name") if rare_key and isinstance(MINING_ITEMS.get(rare_key), dict) else "الألماسة النادرة"))
             lines.append(f"💎 أُضيفت {item_name} إلى مخزون الفائز.")
