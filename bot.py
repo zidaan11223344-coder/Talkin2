@@ -8469,78 +8469,6 @@ class TalkinBot:
         exact = cached
         if value in exact:
             return exact[value]
-        # Dedicated English localization for the nine-game treasure/royal event system.
-        # Dynamic usernames, counts, prize values and game titles are preserved.
-        game_titles_en = {
-            "💎 الألماس النادر": "Rare Diamond", "🪙 كنز الذهب": "Gold Treasure",
-            "🏴‍☠️ جزيرة الكنز": "Treasure Island", "💰 صيد الثروة": "Fortune Hunt",
-            "💎 منجم الأحجار النادرة": "Rare Gem Mine", "💚 اليشم الإمبراطوري": "Imperial Jade",
-            "👑 مرض الإمبراطور": "The Emperor's Illness", "🚨 الرادار وهجوم الطيران": "Radar and Air Strike",
-            "🚔 هرب قاتل مأجور من السجن": "The Escaped Hitman",
-        }
-        game_stories_en = {
-            "🩺 الإمبراطور مريض! ساعد الطبيب في إنقاذه.": "🩺 The emperor is ill! Help the doctor save him.",
-            "📡 الرادار رصد هجومًا جويًا! تولَّ القيادة وساعد في صدّه.": "📡 Radar has detected an air attack! Take command and help repel it.",
-            "🚨 هرب قاتل مأجور من السجن! ساعد الشرطة في مطاردته والقبض عليه.": "🚨 A hitman has escaped from prison! Help the police chase and capture him.",
-            "✨ شارك في المغامرة واربح الجائزة الكبرى!": "✨ Join the adventure and win the grand prize!",
-        }
-        event_announcement = re.fullmatch(
-            r"✨ بدأت لعبة (.+?) \| (.+?)! ✨\n(.*?)\n🎮 أمر المشاركة / Join command: (.*?)\n👥 نحتاج إلى (\d+) لاعبين / (\d+) players needed\.\n🏆 الجائزة / Prize: (.*?)\n⏳ تنتهي فرصة المشاركة بعد 3 دقائق / Join within 3 minutes\.",
-            value, re.S,
-        )
-        if event_announcement:
-            ar_title, en_title, story, commands, required_ar, required_en, prize = event_announcement.groups()
-            command_en = commands.split("/")[-1].strip()
-            return (f"✨ {en_title} has started! ✨\n{game_stories_en.get(story, story)}\n"
-                    f"🎮 Join command: {command_en}\n👥 {required_en} players needed.\n"
-                    f"🏆 Prize: {prize.split('/')[0].strip()}\n⏳ Join within 3 minutes.")
-        match = re.fullmatch(r"⌛ انتهى وقت الجولة ولم يكتمل عدد (\d+) لاعبين؛ أُغلقت اللعبة\.", value)
-        if match:
-            return f"⌛ Time is up. The required {match.group(1)} players did not join, so the game has closed."
-        match = re.fullmatch(r"🚫 @(.+?) أنت محظور من ممارسة الطب لفشلك في إنقاذ الإمبراطور وادعائك أنك طبيب! 😁", value)
-        if match:
-            return f"🚫 @{match.group(1)}, you are banned from the doctor game because you failed to save the emperor while claiming to be a doctor! 😁"
-        match = re.fullmatch(r"🎮 @(.+?) أنت مشارك بالفعل \((\d+)/(\d+)\)\.", value)
-        if match:
-            return f"🎮 @{match.group(1)}, you have already joined ({match.group(2)}/{match.group(3)})."
-        match = re.fullmatch(r"🎮 @(.+?) أكمل العدد \((\d+)/(\d+)\)!", value)
-        if match:
-            return f"🎮 @{match.group(1)} completed the player count ({match.group(2)}/{match.group(3)})!"
-        match = re.fullmatch(r"🎮 اكتمل عدد المشاركين \((\d+)\)؛ انتظر الجولة التالية\.", value)
-        if match:
-            return f"🎮 The game is full ({match.group(1)} players). Please wait for the next round."
-        match = re.fullmatch(r"🔥 اكتمل المشاركون \((\d+)\)! بدأت جولة (.+?)\.\.\.", value)
-        if match:
-            title = game_titles_en.get(match.group(2), match.group(2))
-            return f"🔥 All {match.group(1)} players have joined! The {title} round is starting..."
-        match = re.fullmatch(r"🎮 @(.+?) انضم إلى (.+?) \((\d+)/(\d+)\)\.", value)
-        if match:
-            title = game_titles_en.get(match.group(2), match.group(2))
-            return f"🎮 @{match.group(1)} joined {title} ({match.group(3)}/{match.group(4)})."
-        match = re.fullmatch(r"✅ نجح الدكتور @(.+?)! أنقذ الإمبراطور وحصل على المكافأة (.+?) 🩺👑", value)
-        if match:
-            return f"✅ Doctor @{match.group(1)} succeeded! The emperor was saved and the reward of {match.group(2)} was awarded. 🩺👑"
-        match = re.fullmatch(r"🏥 نجح الدكتور @(.+?) في إنقاذ الإمبراطور، لكن تعذّر اعتماد المكافأة (.+?)؛ راجع سجل البوت\.", value)
-        if match:
-            return f"🏥 Doctor @{match.group(1)} saved the emperor, but the {match.group(2)} reward could not be credited; check the bot log."
-        match = re.fullmatch(r"❌ فشل الدكتور @(.+?) في إنقاذ الإمبراطور، وتم حظره من ممارسة الطب! 😂🩺\n🚫 في جولة الطب القادمة ستظهر له الرسالة: أنت محظور من ممارسة الطب لادعائك الطب 😁", value)
-        if match:
-            return (f"❌ Doctor @{match.group(1)} failed to save the emperor and has been banned from the doctor game! 😂🩺\n"
-                    "🚫 In future doctor rounds, they will see: You are banned from practicing medicine for falsely claiming to be a doctor. 😁")
-        match = re.fullmatch(r"🏆 @(.+?) فاز في لعبة (.+?)!\n💰 الجائزة: (.+)", value, re.S)
-        if match:
-            title = game_titles_en.get(match.group(2), match.group(2))
-            return f"🏆 @{match.group(1)} won {title}!\n💰 Prize: {match.group(3)}"
-        match = re.fullmatch(r"🏆 @(.+?) فاز في لعبة (.+?)!\n⚠️ تعذر اعتماد جائزة (.+?) للفائز؛ راجع سجل البوت\.", value, re.S)
-        if match:
-            title = game_titles_en.get(match.group(2), match.group(2))
-            return f"🏆 @{match.group(1)} won {title}!\n⚠️ The {match.group(3)} prize could not be credited; check the bot log."
-        match = re.fullmatch(r"@(.+?): -10k نقطة", value)
-        if match:
-            return f"@{match.group(1)}: -10k points"
-        match = re.fullmatch(r"@(.+?): لم يُخصم 10k لعدم كفاية الرصيد أو تعذر تحديثه\.", value)
-        if match:
-            return f"@{match.group(1)}: 10k was not deducted because the balance was insufficient or could not be updated."
         cricket_start = re.fullmatch(
             r"🏏 بدأت مباراة الكريكيت\n(.+)\n(.+)\n🎯 يبدأ الهجوم: (.+)\. لكل لاعب 6 كرات في كل دور\.",
             value,
@@ -16855,23 +16783,16 @@ class TalkinBot:
             "mercenary_escape": ("mercenary_escape_3d.jpg", "بطل مطاردة القاتل المأجور"),
         }
         filename, title = assets.get(game_key, assets["rare_diamond"])
-        treasure_dir = ASSETS_DIR / "treasures"
-        source = treasure_dir / filename
-        # Accept either JPG/JPEG or PNG for all nine game artworks, regardless
-        # of the extension listed in the default map. Prefer the configured name.
+        source = ASSETS_DIR / "treasures" / filename
         if not source.is_file():
-            stem = Path(filename).stem
-            alternatives = [treasure_dir / f"{stem}{ext}" for ext in (".jpg", ".jpeg", ".png", ".webp")]
-            source = next((candidate for candidate in alternatives if candidate.is_file()), source)
-        if not source.is_file():
-            # Backward-compatible artwork fallback for older installations.
+            # Use the existing treasure artwork as a safe fallback until a dedicated royal card is installed.
             fallback = {
-                "imperial_sickness": "imperial_jade_3d",
-                "flight_radar": "treasure_island_3d",
-                "mercenary_escape": "rare_diamond_3d",
+                "imperial_sickness": "imperial_jade_3d.jpg",
+                "flight_radar": "treasure_island_3d.jpg",
+                "mercenary_escape": "rare_diamond_3d.jpg",
             }.get(game_key)
             if fallback:
-                source = next((treasure_dir / f"{fallback}{ext}" for ext in (".jpg", ".jpeg", ".png", ".webp") if (treasure_dir / f"{fallback}{ext}").is_file()), source)
+                source = ASSETS_DIR / "treasures" / fallback
             if not source.is_file() and game_key == "rare_diamond":
                 source = _rare_diamond_asset_path()
             if not source or not Path(source).is_file():
