@@ -519,6 +519,26 @@ AUTO_JOIN_ALL_ROOMS = (
     or os.getenv("AUTO_JOIN_ROOMS")
     or "on"
 ).strip().casefold() in {"1", "true", "yes", "on", "enable", "enabled"}
+# Room joins are background work. Keep the acknowledgement wait short so a
+# slow/blocked room cannot hold up commands, games, or the next room.
+try:
+    JOIN_CONFIRM_TIMEOUT_SECONDS = min(
+        8.0, max(2.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "4") or 4))
+    )
+except (TypeError, ValueError):
+    JOIN_CONFIRM_TIMEOUT_SECONDS = 4.0
+try:
+    FAST_ROOM_RESTORE_DELAY_SECONDS = max(
+        0.05, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.15") or 0.15)
+    )
+except (TypeError, ValueError):
+    FAST_ROOM_RESTORE_DELAY_SECONDS = 0.15
+try:
+    ROOM_JOIN_DELAY_SECONDS = max(
+        0.10, float(os.getenv("ROOM_JOIN_DELAY_SECONDS", "0.25") or 0.25)
+    )
+except (TypeError, ValueError):
+    ROOM_JOIN_DELAY_SECONDS = 0.25
 # Background member-ID sync is expensive on busy rooms. Keep it opt-in during
 # automatic joins; commands that truly need a numeric ID still request it on demand.
 BACKGROUND_ID_SYNC_ON_JOIN = False  # Permanently disabled: never fetch room members automatically on entry.
@@ -8719,7 +8739,7 @@ class TalkinBot:
         # have already been fixed.
         self.send_query(encode_query("room_join", room=room, int_value=0, force_int_value=True))
         timer = threading.Timer(
-            max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20"))),
+            JOIN_CONFIRM_TIMEOUT_SECONDS,
             self._join_timeout,
             args=(_norm_room(room),),
         )
@@ -15412,7 +15432,14 @@ class TalkinBot:
             try:
                 now = time.time()
                 next_announcement = float(getattr(self, "_stock_market_next_announcement", 0) or 0)
-                if STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED and now >= next_announcement and self._active_rooms():
+                # Do not create/send a round before the WebSocket has been
+                # established and at least one room has been confirmed live.
+                if (
+                    STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED
+                    and getattr(self, "ws", None) is not None
+                    and now >= next_announcement
+                    and getattr(self, "connected_rooms", set())
+                ):
                     self._start_stock_market_round(now, force=True)
                 self._cleanup_expired_wagers()
                 self._process_stock_market_investments(now)
@@ -18721,107 +18748,104 @@ class TalkinBot:
         return True
 
     def _join_rooms_serially(self, rooms, sender="", fast_restore=False, sync_id=None):
-        """Join rooms one at a time and wait for each server acknowledgement.
+        """Queue room joins without blocking the event worker or room-wide lock.
 
-        Talkin's gateway is sensitive to a burst of room_join packets.  More
-        importantly, sending the next join before the previous result arrives
-        can look like an enter/leave loop.
+        Each join is sent quickly, then observed for only a short acknowledgement
+        window. A missing/slow acknowledgement marks that room pending and the
+        worker immediately continues with the next room. The WebSocket reader
+        and command executor therefore remain available during bulk restore.
         """
-        cleaned=[]; seen=set()
+        cleaned = []
+        seen = set()
         for value in rooms or []:
-            room_name=str(value or "").strip()
-            key=_norm_room(room_name)
+            room_name = str(value or "").strip()
+            key = _norm_room(room_name)
             if room_name and key not in seen:
-                seen.add(key); cleaned.append(room_name)
+                seen.add(key)
+                cleaned.append(room_name)
         if not cleaned:
             return {"sent": 0, "skipped": 0}
-        sent=0; skipped=0
-        if fast_restore:
-            # Startup restore must not wait for one ACK per room. The reader
-            # remains free to process all ACKs/events while joins are sent at
-            # a small gateway-safe pace.
-            gap=max(0.20, float(os.getenv("FAST_ROOM_RESTORE_DELAY_SECONDS", "0.45") or 0.45))
-        else:
-            gap=max(0.8, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
-        timeout=max(10.0, float(os.getenv("JOIN_CONFIRM_TIMEOUT_SECONDS", "20") or 20))
-        with self._room_bulk_lock:
-            for target in cleaned:
-                key=_norm_room(target)
-                if any(_norm_room(r)==key for r in getattr(self, "connected_rooms", set())):
-                    # The server already confirmed this room in the current
-                    # session. Never leave/rejoin it just because the master
-                    # requested the saved-room list; that race used to produce
-                    # a false "unable to enter" timeout after a real success.
+
+        sent = 0
+        skipped = 0
+        gap = FAST_ROOM_RESTORE_DELAY_SECONDS if fast_restore else ROOM_JOIN_DELAY_SECONDS
+        timeout = JOIN_CONFIRM_TIMEOUT_SECONDS
+        for target in cleaned:
+            key = _norm_room(target)
+            try:
+                if any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set())):
                     if sender:
-                        try:
-                            self.send_private_text(sender, f"✅ البوت موجود داخل الغرفة: {target}")
-                        except Exception as exc:
-                            self.log("[ROOM] connected-room notice failed:", target, repr(exc))
+                        self.send_private_text(sender, f"✅ البوت موجود داخل الغرفة: {target}")
                     skipped += 1
                     if sync_id:
                         self._record_room_sync_result(sync_id, target, True, "موجودة ومتصل بها البوت")
                     continue
-                if sender and key in getattr(self, "_room_restore_candidates", set()):
-                    # A restore candidate is only a queued join, never proof of
-                    # membership. Wait for the pending server acknowledgement;
-                    # do not tell the requester the bot is present prematurely.
-                    pending_joins = getattr(self, "_pending_room_joins", {})
-                    if key in pending_joins:
-                        deadline = time.time() + timeout + 1.0
-                        while time.time() < deadline:
-                            if any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set())):
-                                break
-                            if key not in pending_joins:
-                                break
-                            time.sleep(0.25)
-                    if any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set())):
-                        try:
-                            self.send_private_text(sender, f"✅ البوت داخل الغرفة: {target}")
-                        except Exception as exc:
-                            self.log("[ROOM] confirmed restore notice failed:", target, repr(exc))
-                        skipped += 1
-                        if sync_id:
-                            self._record_room_sync_result(sync_id, target, True, "أكد الخادم وجود البوت في الغرفة")
-                        continue
-                    if key in getattr(self, "_pending_room_joins", {}):
-                        try:
-                            self.send_private_text(sender, f"⏳ طلب دخول البوت إلى {target} ما زال بانتظار تأكيد الخادم؛ لم أؤكد وجوده بعد.")
-                        except Exception:
-                            pass
-                        skipped += 1
-                        if sync_id:
-                            self._record_room_sync_result(sync_id, target, False, "طلب الدخول ما زال بانتظار تأكيد الخادم")
-                        continue
-                    getattr(self, "_room_restore_candidates", set()).discard(key)
-                try:
-                    if self.join_room(target, force=bool(fast_restore), requested_by=sender):
-                        sent += 1
-                        if fast_restore:
-                            getattr(self, "_room_restore_candidates", set()).add(key)
-                        if not fast_restore:
-                            # Manual joins wait for you_joined/you_rejoined so
-                            # the next request cannot create an enter/leave loop.
-                            deadline=time.time()+timeout+1.0
-                            while time.time() < deadline and key in getattr(self, "_pending_room_joins", {}):
-                                time.sleep(0.25)
-                        if sync_id:
-                            connected = any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set()))
-                            detail = "تم تأكيد الدخول" if connected else getattr(self, "_blocked_room_reasons", {}).get(key, "لم يصل تأكيد من السيرفر")
-                            self._record_room_sync_result(sync_id, target, connected, detail)
-                    else:
-                        skipped += 1
-                        if sync_id:
-                            connected = any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set()))
-                            self._record_room_sync_result(sync_id, target, connected, "الغرفة متصلة مسبقاً" if connected else getattr(self, "_blocked_room_reasons", {}).get(key, "تعذر إرسال طلب الدخول"))
-                except Exception as exc:
-                    skipped += 1
-                    self.log("[ROOM] serial join failed:", target, repr(exc))
-                    if sync_id:
-                        self._record_room_sync_result(sync_id, target, False, str(exc)[:180])
-                if target != cleaned[-1]:
-                    time.sleep(gap)
-        return {"sent": sent, "skipped": skipped}
 
+                # Never wait for the bulk lock. A broadcast/leave operation may
+                # be running; room_join itself is serialized by _join_lock and
+                # RawWebSocket's own send lock.
+                bulk_lock = getattr(self, "_room_bulk_lock", None)
+                if bulk_lock is not None and not bulk_lock.acquire(blocking=False):
+                    self.log("[ROOM] bulk lock busy; sending join asynchronously:", target)
+                try:
+                    accepted = self.join_room(
+                        target, force=bool(fast_restore), requested_by=sender
+                    )
+                finally:
+                    if bulk_lock is not None:
+                        try:
+                            bulk_lock.release()
+                        except RuntimeError:
+                            pass
+
+                if not accepted:
+                    skipped += 1
+                    if sync_id:
+                        connected = any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set()))
+                        self._record_room_sync_result(
+                            sync_id, target, connected,
+                            "الغرفة متصلة مسبقاً" if connected else getattr(
+                                self, "_blocked_room_reasons", {}
+                            ).get(key, "تعذر إرسال طلب الدخول"),
+                        )
+                    continue
+
+                sent += 1
+                if fast_restore:
+                    getattr(self, "_room_restore_candidates", set()).add(key)
+                else:
+                    # Do not hold any global lock while observing the ACK.
+                    # Four seconds is the upper bound by default; then move on.
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        if any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set())):
+                            break
+                        if key not in getattr(self, "_pending_room_joins", {}):
+                            break
+                        time.sleep(0.05)
+                    if key in getattr(self, "_pending_room_joins", {}):
+                        self.log("[ROOM] join acknowledgement still pending; continuing:", target)
+                        if sender:
+                            self.send_private_text(
+                                sender,
+                                f"⏳ طلب دخول {target} أُرسل؛ تأكيد السيرفر ما زال معلقاً، تابعت بقية الغرف.",
+                            )
+
+                if sync_id:
+                    connected = any(_norm_room(r) == key for r in getattr(self, "connected_rooms", set()))
+                    detail = "تم تأكيد الدخول" if connected else getattr(
+                        self, "_blocked_room_reasons", {}
+                    ).get(key, "لم يصل تأكيد من السيرفر بعد")
+                    self._record_room_sync_result(sync_id, target, connected, detail)
+            except Exception as exc:
+                skipped += 1
+                self.log("[ROOM] async join failed:", target, repr(exc))
+                if sync_id:
+                    self._record_room_sync_result(sync_id, target, False, str(exc)[:180])
+            if target != cleaned[-1]:
+                # Yield to commands, game handlers, and the event worker.
+                time.sleep(gap)
+        return {"sent": sent, "skipped": skipped}
     def _begin_join_rooms_language(self, sender, rooms, response_room="", is_private=True):
         """Ask once for language, then join all requested rooms.
 
