@@ -1992,6 +1992,37 @@ _LOCAL_JSON_WRITE_LOCK = threading.RLock()
 _LOCAL_BG_CONDITION = threading.Condition()
 _LOCAL_BG_PENDING = {}
 _LOCAL_BG_WORKER_STARTED = False
+_LAST_ACTION_SAVE_CONDITION = threading.Condition()
+_LAST_ACTION_SAVE_PENDING = None
+_LAST_ACTION_SAVE_WORKER_STARTED = False
+
+def _queue_last_action_save(action):
+    """Persist the undo record without blocking a room command."""
+    global _LAST_ACTION_SAVE_PENDING, _LAST_ACTION_SAVE_WORKER_STARTED
+    snapshot = copy.deepcopy(action) if isinstance(action, dict) else {}
+    with _LAST_ACTION_SAVE_CONDITION:
+        _LAST_ACTION_SAVE_PENDING = snapshot
+        if not _LAST_ACTION_SAVE_WORKER_STARTED:
+            _LAST_ACTION_SAVE_WORKER_STARTED = True
+            threading.Thread(
+                target=_last_action_save_worker,
+                name="persist-last-action",
+                daemon=True,
+            ).start()
+        _LAST_ACTION_SAVE_CONDITION.notify()
+
+def _last_action_save_worker():
+    global _LAST_ACTION_SAVE_PENDING
+    while True:
+        with _LAST_ACTION_SAVE_CONDITION:
+            while _LAST_ACTION_SAVE_PENDING is None:
+                _LAST_ACTION_SAVE_CONDITION.wait()
+            action = _LAST_ACTION_SAVE_PENDING
+            _LAST_ACTION_SAVE_PENDING = None
+        try:
+            _save_local_json(DATA_DIR / "last_action.json", action)
+        except Exception as exc:
+            print(f"[UNDO] background save failed: {exc!r}", flush=True)
 
 def _save_local_json(path, data, *, persist_state_db=True):
     """Atomically save local JSON without sharing one fixed .tmp file.
@@ -9723,12 +9754,9 @@ class TalkinBot:
             "created_at": int(time.time()),
         }
         self.last_bot_action = action
-        try:
-            _save_local_json(DATA_DIR / "last_action.json", action)
-        except Exception as exc:
-            self.log("[UNDO] save last action failed:", repr(exc))
-        if LOG_ROOM_MESSAGES:
-            self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
+        _queue_last_action_save(action)
+        if ROOM_EVENT_DEBUG:
+            self.log(f"[UNDO] last action queued: {text!r} room={room!r} sender={sender!r}")
 
     def _cleanup_memory_state(self):
         """Prune bounded runtime caches and force Python GC without touching persistent data."""
