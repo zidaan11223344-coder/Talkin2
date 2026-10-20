@@ -747,7 +747,6 @@ MINING_FILE = DATA_DIR / "mining_game.json"
 GAME_STATS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_stats.duplicates-backup.json"
 GAME_LEVELS_DEDUPE_BACKUP_FILE = DATA_DIR / "game_levels.duplicates-backup.json"
 GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
-BANNED_DOCTORS_FILE = DATA_DIR / "banned_doctors.json"
 CROP_PLOTS_FILE = DATA_DIR / "crop_plots.json"
 STOCK_MARKET_FILE = DATA_DIR / "stock_market_investments.json"
 STOCK_MARKET_HISTORY_FILE = DATA_DIR / "stock_market_history.json"
@@ -6902,16 +6901,6 @@ class TalkinBot:
         self._rare_diamond_round_seq = 0
         self._treasure_cycle_index = 0
         self._treasure_cycle_next_start = 0.0
-        self._treasure_slot_count = 0
-        self._royal_cycle_index = 0
-        self._doctor_ban_lock = threading.RLock()
-        _saved_doctors = _load_local_json(BANNED_DOCTORS_FILE, {})
-        self._banned_doctors = _saved_doctors if isinstance(_saved_doctors, dict) else {}
-        # Normalize stored keys so Arabic/English casing and Unicode variants are stable.
-        self._banned_doctors = {
-            _norm_user(k): (v if isinstance(v, dict) else {"name": str(v)})
-            for k, v in self._banned_doctors.items() if _norm_user(k)
-        }
         self.fruit_games = {}
         # Auto replies and per-user custom welcome messages.
         self.auto_replies_enabled = True
@@ -8469,78 +8458,6 @@ class TalkinBot:
         exact = cached
         if value in exact:
             return exact[value]
-        # Dedicated English localization for the nine-game treasure/royal event system.
-        # Dynamic usernames, counts, prize values and game titles are preserved.
-        game_titles_en = {
-            "💎 الألماس النادر": "Rare Diamond", "🪙 كنز الذهب": "Gold Treasure",
-            "🏴‍☠️ جزيرة الكنز": "Treasure Island", "💰 صيد الثروة": "Fortune Hunt",
-            "💎 منجم الأحجار النادرة": "Rare Gem Mine", "💚 اليشم الإمبراطوري": "Imperial Jade",
-            "👑 مرض الإمبراطور": "The Emperor's Illness", "🚨 الرادار وهجوم الطيران": "Radar and Air Strike",
-            "🚔 هرب قاتل مأجور من السجن": "The Escaped Hitman",
-        }
-        game_stories_en = {
-            "🩺 الإمبراطور مريض! ساعد الطبيب في إنقاذه.": "🩺 The emperor is ill! Help the doctor save him.",
-            "📡 الرادار رصد هجومًا جويًا! تولَّ القيادة وساعد في صدّه.": "📡 Radar has detected an air attack! Take command and help repel it.",
-            "🚨 هرب قاتل مأجور من السجن! ساعد الشرطة في مطاردته والقبض عليه.": "🚨 A hitman has escaped from prison! Help the police chase and capture him.",
-            "✨ شارك في المغامرة واربح الجائزة الكبرى!": "✨ Join the adventure and win the grand prize!",
-        }
-        event_announcement = re.fullmatch(
-            r"✨ بدأت لعبة (.+?) \| (.+?)! ✨\n(.*?)\n🎮 أمر المشاركة / Join command: (.*?)\n👥 نحتاج إلى (\d+) لاعبين / (\d+) players needed\.\n🏆 الجائزة / Prize: (.*?)\n⏳ تنتهي فرصة المشاركة بعد 3 دقائق / Join within 3 minutes\.",
-            value, re.S,
-        )
-        if event_announcement:
-            ar_title, en_title, story, commands, required_ar, required_en, prize = event_announcement.groups()
-            command_en = commands.split("/")[-1].strip()
-            return (f"✨ {en_title} has started! ✨\n{game_stories_en.get(story, story)}\n"
-                    f"🎮 Join command: {command_en}\n👥 {required_en} players needed.\n"
-                    f"🏆 Prize: {prize.split('/')[0].strip()}\n⏳ Join within 3 minutes.")
-        match = re.fullmatch(r"⌛ انتهى وقت الجولة ولم يكتمل عدد (\d+) لاعبين؛ أُغلقت اللعبة\.", value)
-        if match:
-            return f"⌛ Time is up. The required {match.group(1)} players did not join, so the game has closed."
-        match = re.fullmatch(r"🚫 @(.+?) أنت محظور من ممارسة الطب لفشلك في إنقاذ الإمبراطور وادعائك أنك طبيب! 😁", value)
-        if match:
-            return f"🚫 @{match.group(1)}, you are banned from the doctor game because you failed to save the emperor while claiming to be a doctor! 😁"
-        match = re.fullmatch(r"🎮 @(.+?) أنت مشارك بالفعل \((\d+)/(\d+)\)\.", value)
-        if match:
-            return f"🎮 @{match.group(1)}, you have already joined ({match.group(2)}/{match.group(3)})."
-        match = re.fullmatch(r"🎮 @(.+?) أكمل العدد \((\d+)/(\d+)\)!", value)
-        if match:
-            return f"🎮 @{match.group(1)} completed the player count ({match.group(2)}/{match.group(3)})!"
-        match = re.fullmatch(r"🎮 اكتمل عدد المشاركين \((\d+)\)؛ انتظر الجولة التالية\.", value)
-        if match:
-            return f"🎮 The game is full ({match.group(1)} players). Please wait for the next round."
-        match = re.fullmatch(r"🔥 اكتمل المشاركون \((\d+)\)! بدأت جولة (.+?)\.\.\.", value)
-        if match:
-            title = game_titles_en.get(match.group(2), match.group(2))
-            return f"🔥 All {match.group(1)} players have joined! The {title} round is starting..."
-        match = re.fullmatch(r"🎮 @(.+?) انضم إلى (.+?) \((\d+)/(\d+)\)\.", value)
-        if match:
-            title = game_titles_en.get(match.group(2), match.group(2))
-            return f"🎮 @{match.group(1)} joined {title} ({match.group(3)}/{match.group(4)})."
-        match = re.fullmatch(r"✅ نجح الدكتور @(.+?)! أنقذ الإمبراطور وحصل على المكافأة (.+?) 🩺👑", value)
-        if match:
-            return f"✅ Doctor @{match.group(1)} succeeded! The emperor was saved and the reward of {match.group(2)} was awarded. 🩺👑"
-        match = re.fullmatch(r"🏥 نجح الدكتور @(.+?) في إنقاذ الإمبراطور، لكن تعذّر اعتماد المكافأة (.+?)؛ راجع سجل البوت\.", value)
-        if match:
-            return f"🏥 Doctor @{match.group(1)} saved the emperor, but the {match.group(2)} reward could not be credited; check the bot log."
-        match = re.fullmatch(r"❌ فشل الدكتور @(.+?) في إنقاذ الإمبراطور، وتم حظره من ممارسة الطب! 😂🩺\n🚫 في جولة الطب القادمة ستظهر له الرسالة: أنت محظور من ممارسة الطب لادعائك الطب 😁", value)
-        if match:
-            return (f"❌ Doctor @{match.group(1)} failed to save the emperor and has been banned from the doctor game! 😂🩺\n"
-                    "🚫 In future doctor rounds, they will see: You are banned from practicing medicine for falsely claiming to be a doctor. 😁")
-        match = re.fullmatch(r"🏆 @(.+?) فاز في لعبة (.+?)!\n💰 الجائزة: (.+)", value, re.S)
-        if match:
-            title = game_titles_en.get(match.group(2), match.group(2))
-            return f"🏆 @{match.group(1)} won {title}!\n💰 Prize: {match.group(3)}"
-        match = re.fullmatch(r"🏆 @(.+?) فاز في لعبة (.+?)!\n⚠️ تعذر اعتماد جائزة (.+?) للفائز؛ راجع سجل البوت\.", value, re.S)
-        if match:
-            title = game_titles_en.get(match.group(2), match.group(2))
-            return f"🏆 @{match.group(1)} won {title}!\n⚠️ The {match.group(3)} prize could not be credited; check the bot log."
-        match = re.fullmatch(r"@(.+?): -10k نقطة", value)
-        if match:
-            return f"@{match.group(1)}: -10k points"
-        match = re.fullmatch(r"@(.+?): لم يُخصم 10k لعدم كفاية الرصيد أو تعذر تحديثه\.", value)
-        if match:
-            return f"@{match.group(1)}: 10k was not deducted because the balance was insufficient or could not be updated."
         cricket_start = re.fullmatch(
             r"🏏 بدأت مباراة الكريكيت\n(.+)\n(.+)\n🎯 يبدأ الهجوم: (.+)\. لكل لاعب 6 كرات في كل دور\.",
             value,
@@ -16657,8 +16574,8 @@ class TalkinBot:
         return True
 
     def _rare_diamond_event_worker(self):
-        """Schedule classic games every 5m, doctor every 7m, and other royal games every 10m; never overlap rounds."""
-        classic = [
+        """Rotate six room games, opening the next round every five minutes."""
+        cycle = [
             ("rare_diamond", "💎 الألماس النادر", "تنقيب / mining"),
             ("gold_treasure", "🪙 كنز الذهب", "كنز / treasure"),
             ("treasure_island", "🏴‍☠️ جزيرة الكنز", "جزيرة / island"),
@@ -16666,13 +16583,7 @@ class TalkinBot:
             ("gem_mine", "💎 منجم الأحجار النادرة", "منجم / gem mine"),
             ("imperial_jade", "💚 اليشم الإمبراطوري", "يشم / jade"),
         ]
-        royal = [
-            ("imperial_sickness", "👑 مرض الإمبراطور", "طبيب / doctor"),
-            ("flight_radar", "🚨 الرادار وهجوم الطيران", "كابتن / captain"),
-            ("mercenary_escape", "🚔 هرب قاتل مأجور من السجن", "أمن / police"),
-        ]
-        now = time.time()
-        due = {"classic": now, "royal": now + 480.0}
+        next_start = 0.0
         while not self.stop_event.wait(1.0):
             now = time.time()
             with self._rare_diamond_lock:
@@ -16682,43 +16593,29 @@ class TalkinBot:
                 with self._rare_diamond_lock:
                     if self._rare_diamond_event is event:
                         self._rare_diamond_event = None
+                # Notify only rooms where at least one player joined this round.
                 joined_rooms = sorted({str(p.get("room", "")).strip() for p in event.get("players", {}).values()
                                        if isinstance(p, dict) and str(p.get("room", "")).strip()}, key=str.casefold)
-                required = int(event.get("required_players", 5 if event.get("game_key") in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"} else 7))
-                notice = f"⌛ انتهى وقت الجولة ولم يكتمل عدد {required} لاعبين؛ أُغلقت اللعبة."
+                notice = "⌛ انتهى وقت الجولة ولم يكتمل عدد 5 لاعبين؛ أُغلقت اللعبة."
                 for target_room in joined_rooms:
                     try:
                         self.send_room_text(target_room, notice)
                     except Exception as exc:
                         self.log("[TREASURE-CYCLE] timeout notice failed:", target_room, repr(exc))
-            with self._rare_diamond_lock:
-                active = isinstance(self._rare_diamond_event, dict) and now < float(self._rare_diamond_event.get("ends_at", 0) or 0)
-            if active:
-                continue
-            category = min(due, key=due.get)
-            if now < due[category]:
-                continue
-            try:
-                if category == "classic":
-                    game = classic[self._treasure_cycle_index % len(classic)]
-                    interval = 300.0
-                else:
-                    game = royal[self._royal_cycle_index % len(royal)]
-                    interval = 480.0
-                started = self._start_rare_diamond_event(game)
-                if started:
-                    if category == "classic":
-                        self._treasure_cycle_index = (self._treasure_cycle_index + 1) % len(classic)
+            if now >= next_start:
+                try:
+                    game = cycle[self._treasure_cycle_index % len(cycle)]
+                    started = self._start_rare_diamond_event(game)
+                    if started:
+                        self._treasure_cycle_index = (self._treasure_cycle_index + 1) % len(cycle)
+                        next_start = time.time() + 300.0
                     else:
-                        self._royal_cycle_index = (self._royal_cycle_index + 1) % len(royal)
-                    due[category] = time.time() + interval
-                else:
-                    due[category] = time.time() + 10.0
-            except Exception as exc:
-                self.log("[TREASURE-CYCLE] game start failed:", repr(exc))
-                due[category] = time.time() + 10.0
+                        next_start = time.time() + 10.0
+                except Exception as exc:
+                    self.log("[TREASURE-CYCLE] game start failed:", repr(exc))
+                    next_start = time.time() + 10.0
 
-    def _start_rare_diamond_event(self, game=None, test_mode=False):
+    def _start_rare_diamond_event(self, game=None):
         game = game or ("rare_diamond", "💎 الألماس النادر", "تنقيب / mining")
         game_key, game_title, commands = game
         rooms = [str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()]
@@ -16739,54 +16636,16 @@ class TalkinBot:
             self._rare_diamond_event = {
                 "id": f"treasure-{game_key}-{int(now)}-{self._rare_diamond_round_seq}",
                 "game_key": game_key, "game_title": game_title,
-                "room": rooms[0], "rooms": rooms, "players": {}, "ends_at": now + (300.0 if test_mode else 180.0),
-                "required_players": 1 if test_mode else (5 if game_key in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"} else 7),
-                "test_mode": bool(test_mode),
+                "room": rooms[0], "rooms": rooms, "players": {}, "ends_at": now + 180.0,
             }
-        story_ar = {
-            "imperial_sickness": "🩺 الإمبراطور مريض! ساعد الطبيب في إنقاذه.",
-            "flight_radar": "📡 الرادار رصد هجومًا جويًا! تولَّ القيادة وساعد في صدّه.",
-            "mercenary_escape": "🚨 هرب قاتل مأجور من السجن! ساعد الشرطة في مطاردته والقبض عليه.",
-        }.get(game_key, "✨ شارك في المغامرة واربح الجائزة الكبرى!")
-        title_en = {
-            "imperial_sickness": "The Emperor's Illness", "flight_radar": "Radar and Air Strike",
-            "mercenary_escape": "The Escaped Hitman", "rare_diamond": "Rare Diamond",
-            "gold_treasure": "Gold Treasure", "treasure_island": "Treasure Island",
-            "fortune_hunt": "Fortune Hunt", "gem_mine": "Rare Gem Mine", "imperial_jade": "Imperial Jade",
-        }.get(game_key, game_title)
-        story_en = {
-            "rare_diamond": "💎 Join the rare diamond mining adventure!",
-            "gold_treasure": "🪙 Search for the hidden gold treasure!",
-            "treasure_island": "🏴‍☠️ Explore the treasure island and claim the prize!",
-            "fortune_hunt": "💰 Join the fortune hunt and win the grand prize!",
-            "gem_mine": "💎 Mine rare gems and win the grand prize!",
-            "imperial_jade": "💚 Search for imperial jade and claim the prize!",
-            "imperial_sickness": "🩺 The emperor is ill! Help the doctor save him.",
-            "flight_radar": "📡 Radar has detected an air attack! Take command and help repel it.",
-            "mercenary_escape": "🚨 A hitman has escaped from prison! Help the police chase and capture him.",
-        }.get(game_key, "✨ Join the adventure and win the grand prize!")
-        command_ar, _, command_en = commands.partition("/")
-        command_ar, command_en = command_ar.strip(), command_en.strip()
-        is_classic = game_key in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"}
-        required_players = 5 if is_classic else 7
-        prize_ar, prize_en = ("100 مليون نقطة", "100 million points") if is_classic else ("500 مليون نقطة", "500 million points")
-        for target_room in ([] if test_mode else rooms):
+        announcement = (
+            f"✨ بدأت لعبة {game_title}! ✨\n"
+            f"🎮 أمر المشاركة: {commands}\n"
+            "👥 نحتاج إلى 5 لاعبين لاكتمال الجولة.\n"
+            "⏳ تنتهي فرصة المشاركة بعد 3 دقائق."
+        )
+        for target_room in rooms:
             try:
-                language = str(self._effective_room_language(target_room) or "ar").casefold()
-                if language.startswith("en") or language in {"english", "eng"}:
-                    announcement = (
-                        f"✨ {title_en} has started! ✨\n{story_en}\n"
-                        f"🎮 Join command: {command_en}\n👥 {required_players} players needed.\n"
-                        f"🏆 Prize: {prize_en}\n⏳ Join within 3 minutes."
-                        + ("\n🧪 MASTER TEST: only the master can join; the round closes after the test." if test_mode else "")
-                    )
-                else:
-                    announcement = (
-                        f"✨ بدأت لعبة {game_title}! ✨\n{story_ar}\n"
-                        f"🎮 أمر المشاركة: {command_ar}\n👥 نحتاج إلى {required_players} لاعبين.\n"
-                        f"🏆 الجائزة: {prize_ar}\n⏳ تنتهي فرصة المشاركة بعد 3 دقائق."
-                        + ("\n🧪 اختبار للماستر فقط: تنضم للتجربة ثم تُغلق الجولة دون جائزة." if test_mode else "")
-                    )
                 self.send_room_text(target_room, announcement)
             except Exception as exc:
                 self.log("[TREASURE-CYCLE] room announcement failed:", target_room, repr(exc))
@@ -16798,43 +16657,22 @@ class TalkinBot:
         key = _norm_user(name)
         if not key:
             return False
-        # A doctor who failed a previous emperor round is barred from all later medical rounds.
-        if requested_game == "imperial_sickness":
-            with self._doctor_ban_lock:
-                ban_record = self._banned_doctors.get(key)
-            if ban_record:
-                self.send_room_text(room, f"🚫 @{name} أنت محظور من ممارسة الطب لفشلك في إنقاذ الإمبراطور وادعائك أنك طبيب! 😁")
-                return True
         with self._rare_diamond_lock:
             event = self._rare_diamond_event
             if not isinstance(event, dict) or time.time() >= float(event.get("ends_at", 0) or 0):
                 return False
             if requested_game and event.get("game_key") != requested_game:
-                # Make the reason explicit: a different game is currently open.
-                active_title = str(event.get("game_title", "اللعبة الحالية"))
-                active_commands = {
-                    "rare_diamond": "تنقيب / mining", "gold_treasure": "كنز / treasure",
-                    "treasure_island": "جزيرة / island", "fortune_hunt": "ثروه أو ثروة / fortune",
-                    "gem_mine": "منجم / gem mine", "imperial_jade": "يشم / jade",
-                    "imperial_sickness": "طبيب / doctor", "flight_radar": "كابتن / captain",
-                    "mercenary_escape": "أمن / police",
-                }
-                active_command = active_commands.get(str(event.get("game_key", "")), "أمر اللعبة المعلن")
-                self.send_room_text(room, f"🎮 لم تُفتح هذه اللعبة بعد. الجولة المفتوحة الآن: {active_title}.\n📌 أمر المشاركة الحالي: {active_command}")
-                return True
+                # A valid game command was used, but it is not the active game.
+                return False
             event_rooms = event.get("rooms") or [event.get("room", "")]
             if not any(_norm_room(room) == _norm_room(r) for r in event_rooms):
                 return False
-            if event.get("test_mode") and not _is_master_name(name):
-                self.send_room_text(room, "🔒 هذه جولة اختبار مخصصة للماستر فقط.")
-                return True
             players = event.setdefault("players", {})
-            required_players = int(event.get("required_players", 5 if event.get("game_key") in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"} else 7))
             if key in players:
                 count = len(players)
                 already_joined = True
                 ready = False
-            elif len(players) >= required_players:
+            elif len(players) >= 5:
                 count = len(players)
                 already_joined = False
                 ready = False
@@ -16842,34 +16680,27 @@ class TalkinBot:
                 players[key] = {"name": name, "room": str(room)}
                 count = len(players)
                 already_joined = False
-                ready = count >= required_players
+                ready = count >= 5
             round_id = event["id"]
             game_title = event.get("game_title", "💎 الألماس النادر")
             joined_rooms = sorted({str(p.get("room", "")).strip() for p in players.values()
                                    if isinstance(p, dict) and str(p.get("room", "")).strip()}, key=str.casefold)
-            test_completed = bool(event.get("test_mode") and not already_joined and key in players)
-            if test_completed and self._rare_diamond_event is event:
-                self._rare_diamond_event = None
-        if test_completed:
-            self.send_room_text(room, f"🧪 @{name} تم الانضمام بنجاح إلى اختبار {game_title}. أُغلقت جولة الاختبار دون توزيع جائزة.")
-            self.log("[TREASURE-CYCLE] master test completed", event.get("game_key"), "by", name)
-            return True
         if already_joined:
-            self.send_room_text(room, f"🎮 @{name} أنت مشارك بالفعل ({count}/{required_players}).")
+            self.send_room_text(room, f"🎮 @{name} أنت مشارك بالفعل ({count}/5).")
             return True
-        if count >= required_players and not ready:
-            self.send_room_text(room, f"🎮 اكتمل عدد المشاركين ({required_players})؛ انتظر الجولة التالية.")
+        if count >= 5 and not ready:
+            self.send_room_text(room, "🎮 اكتمل عدد المشاركين؛ انتظر الجولة التالية.")
             return True
-        if count == required_players and ready:
-            self.send_room_text(room, f"🎮 @{name} أكمل العدد ({count}/{required_players})!")
+        if count == 5 and ready:
+            self.send_room_text(room, f"🎮 @{name} أكمل العدد ({count}/5)!")
             for target_room in joined_rooms:
                 try:
-                    self.send_room_text(target_room, f"🔥 اكتمل المشاركون ({required_players})! بدأت جولة {game_title}...")
+                    self.send_room_text(target_room, f"🔥 اكتمل المشاركون الخمسة! بدأت جولة {game_title}...")
                 except Exception as exc:
                     self.log("[TREASURE-CYCLE] ready notice failed:", target_room, repr(exc))
             threading.Thread(target=self._resolve_rare_diamond_event, args=(round_id,), name="treasure-game-resolve", daemon=True).start()
         else:
-            self.send_room_text(room, f"🎮 @{name} انضم إلى {game_title} ({count}/{required_players}).")
+            self.send_room_text(room, f"🎮 @{name} انضم إلى {game_title} ({count}/5).")
         return True
 
     def _send_treasure_game_result_card(self, room, game_key, winner_name):
@@ -16885,29 +16716,12 @@ class TalkinBot:
             "fortune_hunt": ("fortune_hunt_3d.png", "الفائز بصيد الثروة"),
             "gem_mine": ("gem_mine_3d.png", "الفائز بمنجم الأحجار النادرة"),
             "imperial_jade": ("imperial_jade_3d.png", "الفائز باليشم الإمبراطوري"),
-            "imperial_sickness": ("imperial_sickness_3d.jpg", "منقذ الإمبراطور"),
-            "flight_radar": ("flight_radar_3d.jpg", "قائد الرادار والطيران"),
-            "mercenary_escape": ("mercenary_escape_3d.jpg", "بطل مطاردة القاتل المأجور"),
         }
         filename, title = assets.get(game_key, assets["rare_diamond"])
-        treasure_dir = ASSETS_DIR / "treasures"
-        source = treasure_dir / filename
-        # Accept either JPG/JPEG or PNG for all nine game artworks, regardless
-        # of the extension listed in the default map. Prefer the configured name.
+        source = ASSETS_DIR / "treasures" / filename
         if not source.is_file():
-            stem = Path(filename).stem
-            alternatives = [treasure_dir / f"{stem}{ext}" for ext in (".jpg", ".jpeg", ".png", ".webp")]
-            source = next((candidate for candidate in alternatives if candidate.is_file()), source)
-        if not source.is_file():
-            # Backward-compatible artwork fallback for older installations.
-            fallback = {
-                "imperial_sickness": "imperial_jade_3d",
-                "flight_radar": "treasure_island_3d",
-                "mercenary_escape": "rare_diamond_3d",
-            }.get(game_key)
-            if fallback:
-                source = next((treasure_dir / f"{fallback}{ext}" for ext in (".jpg", ".jpeg", ".png", ".webp") if (treasure_dir / f"{fallback}{ext}").is_file()), source)
-            if not source.is_file() and game_key == "rare_diamond":
+            # Backwards compatibility with the old rare-diamond asset locations.
+            if game_key == "rare_diamond":
                 source = _rare_diamond_asset_path()
             if not source or not Path(source).is_file():
                 self.log("[TREASURE-CYCLE] missing result art:", filename)
@@ -16937,85 +16751,26 @@ class TalkinBot:
             game_key = event.get("game_key", "rare_diamond")
             game_title = event.get("game_title", "💎 الألماس النادر")
             self._rare_diamond_event = None
-        required_players = 5 if game_key in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"} else 7
-        if len(player_records) != required_players:
+        if len(player_records) != 5:
             return
 
         players = [p.get("name", "") if isinstance(p, dict) else str(p) for p in player_records]
-        player_rooms = {
-            _norm_user(p.get("name", "")): str(p.get("room", "")).strip()
-            for p in player_records if isinstance(p, dict) and p.get("name")
-        }
+        # Deduplicate destinations and only send results to rooms that had joiners.
         rooms = sorted({str(p.get("room", "")).strip() for p in player_records
                         if isinstance(p, dict) and str(p.get("room", "")).strip()}, key=str.casefold)
         winner = secrets.choice(players)
-        winner_key = _norm_user(winner)
-        losers = [player for player in players if _norm_user(player) != winner_key]
-        prize_amount = 500_000_000 if game_key in {"imperial_sickness", "flight_radar", "mercenary_escape"} else 100_000_000
-        prize_label = "500m" if prize_amount == 500_000_000 else "100m"
         try:
             winner_credit = _apply_points_delta_once(
-                winner, prize_amount, f"{round_id}:winner:{winner_key}", f"{game_key} prize"
+                winner, 100_000_000, f"{round_id}:winner:{_norm_user(winner)}", f"{game_key} prize"
             )
         except Exception as exc:
             self.log("[TREASURE-CYCLE] winner credit failed:", winner, repr(exc))
             winner_credit = {"ok": False}
 
-        if game_key == "imperial_sickness":
-            # The winning doctor succeeds and receives the 500m prize; the other six
-            # are recorded persistently as failed doctors and cannot join future medical rounds.
-            if isinstance(winner_credit, dict) and winner_credit.get("ok"):
-                success_line = f"✅ نجح الدكتور @{winner}! أنقذ الإمبراطور وحصل على المكافأة {prize_label} 🩺👑"
-            else:
-                success_line = f"🏥 نجح الدكتور @{winner} في إنقاذ الإمبراطور، لكن تعذّر اعتماد المكافأة {prize_label}؛ راجع سجل البوت."
-            with self._doctor_ban_lock:
-                for player in losers:
-                    key = _norm_user(player)
-                    if key:
-                        self._banned_doctors[key] = {
-                            "name": player,
-                            "failed_at": int(time.time()),
-                            "round_id": round_id,
-                            "reason": "failed to save the emperor",
-                        }
-                _save_local_json(BANNED_DOCTORS_FILE, self._banned_doctors)
-            # Preserve the existing game participation debit behavior.
-            for player in players:
-                if _norm_user(player) == winner_key:
-                    continue
-                try:
-                    _apply_points_delta_once(
-                        player, -10_000, f"{round_id}:loss:{_norm_user(player)}", f"{game_key} participation"
-                    )
-                except Exception as exc:
-                    self.log("[TREASURE-CYCLE] doctor loss debit failed:", player, repr(exc))
-            for target_room in rooms:
-                try:
-                    self.send_room_text(target_room, success_line)
-                    self._send_treasure_game_result_card(target_room, game_key, winner)
-                except Exception as exc:
-                    self.log("[TREASURE-CYCLE] doctor success send failed:", target_room, repr(exc))
-            # Each failed doctor receives the ban notice in the room where they joined.
-            for player in losers:
-                target_room = player_rooms.get(_norm_user(player), "")
-                if not target_room:
-                    continue
-                try:
-                    self.send_room_text(
-                        target_room,
-                        f"❌ فشل الدكتور @{player} في إنقاذ الإمبراطور، وتم حظره من ممارسة الطب! 😂🩺\n"
-                        "🚫 في جولة الطب القادمة ستظهر له الرسالة: أنت محظور من ممارسة الطب لادعائك الطب 😁",
-                    )
-                except Exception as exc:
-                    self.log("[TREASURE-CYCLE] doctor ban notice failed:", player, repr(exc))
-            return
-
-        lines = [f"🏆 @{winner} فاز في لعبة {game_title}!",
-                 f"💰 الجائزة: {prize_label}" if isinstance(winner_credit, dict) and winner_credit.get("ok")
-                 else f"⚠️ تعذر اعتماد جائزة {prize_label} للفائز؛ راجع سجل البوت."]
+        lines = [f"🏆 @{winner} فاز في لعبة {game_title}!", "💰 الجائزة: 100m" if isinstance(winner_credit, dict) and winner_credit.get("ok") else "⚠️ تعذر اعتماد جائزة 100m للفائز؛ راجع سجل البوت."]
         # Keep the existing participation debit behavior, without adding any item to treasure_mining inventory.
         for player in players:
-            if _norm_user(player) == winner_key:
+            if _norm_user(player) == _norm_user(winner):
                 continue
             try:
                 result = _apply_points_delta_once(
@@ -17073,9 +16828,7 @@ class TalkinBot:
         raw = str(text or "").strip()
         low = raw.casefold()
         low = low.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
-        low = low.replace("ى", "ي").replace("ة", "ه")
-        low = re.sub(r"[\u064b-\u065f\u0670]", "", low)
-        low = re.sub(r"\s+", " ", low).strip()
+        low = low.replace("ى", "ي")
         store_commands = {"متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures"}
         inventory_commands = {"sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag"}
         top_commands = {"توب الماس", "توب الالماس", "top diamonds", "top gems", "أغنى المنقبين", "اغنى المنقبين"}
@@ -17088,12 +16841,9 @@ class TalkinBot:
             "تنقيب": "rare_diamond", "نقب": "rare_diamond", "rare diamond": "rare_diamond", "rare-diamond": "rare_diamond", "mining": "rare_diamond",
             "كنز": "gold_treasure", "treasure": "gold_treasure", "gold treasure": "gold_treasure",
             "جزيرة": "treasure_island", "island": "treasure_island", "treasure island": "treasure_island",
-            "ثروه": "fortune_hunt", "fortune": "fortune_hunt", "wealth hunt": "fortune_hunt",
+            "ثروة": "fortune_hunt", "fortune": "fortune_hunt", "wealth hunt": "fortune_hunt",
             "منجم": "gem_mine", "gem mine": "gem_mine", "gemstone mine": "gem_mine",
             "يشم": "imperial_jade", "jade": "imperial_jade", "imperial jade": "imperial_jade",
-            "طبيب": "imperial_sickness", "doctor": "imperial_sickness", "emperor doctor": "imperial_sickness",
-            "كابتن": "flight_radar", "captain": "flight_radar", "radar": "flight_radar", "flight attack": "flight_radar",
-            "امن": "mercenary_escape", "police": "mercenary_escape", "security": "mercenary_escape", "chase": "mercenary_escape",
         }
         timed_game_key = timed_game_commands.get(low)
         is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining"}
@@ -17429,30 +17179,11 @@ class TalkinBot:
         mining_raw = original_raw
         mining_low = mining_raw.casefold().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
         mining_commands = {
-            # All nine timed treasure-game join commands must pass through this
-            # dispatcher before _execute_mining_command_with_id can recognize them.
             "الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining",
-            "كنز", "treasure", "gold treasure",
-            "جزيرة", "island", "treasure island",
-            "ثروة", "ثروه", "fortune", "wealth hunt",
-            "منجم", "gem mine", "gemstone mine",
-            "يشم", "jade", "imperial jade",
-            "طبيب", "doctor", "emperor doctor",
-            "كابتن", "captain", "radar", "flight attack",
-            "امن", "أمن", "police", "security", "chase",
             "فحص الماس", "فحص الالماس", "فحص التنقيب", "فحص الماسة النادرة", "فحص الالماسة النادرة", "sv", "مخزني", "مخزون", "مخزون الكنوز",
             "inventory", "my inventory", "bag", "متجر الكنوز", "سوق الكنوز",
             "treasure shop", "store treasures", "توب الماس", "توب الالماس",
             "top diamonds", "top gems", "اغنى المنقبين", "red",
-            # Join commands for all nine scheduled treasure games.
-            "كنز", "treasure", "gold treasure",
-            "جزيرة", "island", "treasure island",
-            "ثروة", "ثروه", "fortune", "wealth hunt",
-            "منجم", "gem mine", "gemstone mine",
-            "يشم", "jade", "imperial jade",
-            "طبيب", "doctor", "emperor doctor",
-            "كابتن", "captain", "radar", "flight attack",
-            "امن", "أمن", "police", "security", "chase",
         }
         if mining_low in mining_commands or re.fullmatch(r"(?:r|rdem)\s+.+", mining_raw, re.I) or re.fullmatch(r"red(?:\s+\d+)?", mining_raw, re.I):
             normalized_sender = _norm_user(sender_name)
@@ -22854,36 +22585,6 @@ class TalkinBot:
                     if _norm_user(frm) == _norm_user(BOT_MASTER):
                         self.master_online = True
                         self.master_last_seen = time.time()
-                    # Master-only live test: "تجربه 1" through "تجربه 9" opens a real test round.
-                    # Only the master can join; the round closes immediately after the master joins.
-                    _test_match = re.fullmatch(r"تجرب(?:ه|ة)\s*([1-9])", str(body or "").strip(), re.I)
-                    if _test_match:
-                        if not _is_master_name(frm):
-                            self.send_private_text(frm, "🔒 أوامر تجربة الألعاب مخصصة للماستر فقط.")
-                            return
-                        _test_games = [
-                            ("rare_diamond", "💎 الألماس النادر", "تنقيب / mining"),
-                            ("gold_treasure", "🪙 كنز الذهب", "كنز / treasure"),
-                            ("treasure_island", "🏴‍☠️ جزيرة الكنز", "جزيرة / island"),
-                            ("fortune_hunt", "💰 صيد الثروة", "ثروة / fortune"),
-                            ("gem_mine", "💎 منجم الأحجار النادرة", "منجم / gem mine"),
-                            ("imperial_jade", "💚 اليشم الإمبراطوري", "يشم / jade"),
-                            ("imperial_sickness", "👑 مرض الإمبراطور", "طبيب / doctor"),
-                            ("flight_radar", "🚨 الرادار وهجوم الطيران", "كابتن / captain"),
-                            ("mercenary_escape", "🚔 هرب قاتل مأجور من السجن", "أمن / police"),
-                        ]
-                        _game = _test_games[int(_test_match.group(1)) - 1]
-                        with self._rare_diamond_lock:
-                            _active = self._rare_diamond_event
-                            _still_active = isinstance(_active, dict) and time.time() < float(_active.get("ends_at", 0) or 0)
-                        if _still_active:
-                            self.send_private_text(frm, "⚠️ توجد جولة أخرى مفتوحة. انتظر حتى تنتهي قبل بدء الاختبار.")
-                            return
-                        if self._start_rare_diamond_event(_game, test_mode=True):
-                            self.send_private_text(frm, f"🧪 فُتحت جولة اختبار: {_game[1]}\nاكتب أمر المشاركة المطابق داخل إحدى الغرف المتصلة: {_game[2].split('/')[0].strip()} أو {_game[2].split('/')[-1].strip()}.\nعند انضمامك سيؤكد البوت «تم الانضمام» ثم يغلق الاختبار دون منح نقاط.")
-                        else:
-                            self.send_private_text(frm, "⚠️ تعذر فتح الاختبار: لا توجد غرف متصلة لإرسال الإعلان إليها.")
-                        return
                     if body and self._handle_master_process_command(frm, body, is_private=True):
                         return
                     # The standalone master account is a four-option support
