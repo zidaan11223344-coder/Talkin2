@@ -539,9 +539,10 @@ try:
     )
 except (TypeError, ValueError):
     ROOM_JOIN_DELAY_SECONDS = 0.25
-# Background member-ID sync is expensive on busy rooms. Keep it opt-in during
-# automatic joins; commands that truly need a numeric ID still request it on demand.
-BACKGROUND_ID_SYNC_ON_JOIN = False  # Permanently disabled: never fetch room members automatically on entry.
+# Member-ID fetching is disabled permanently to keep room commands responsive.
+# Usernames and roles remain available in the live in-memory room cache.
+MEMBER_ID_FETCH_ENABLED = False
+BACKGROUND_ID_SYNC_ON_JOIN = False
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -2509,6 +2510,8 @@ def _merge_roster_backup(remote, local):
 
 def _restore_roster_backup_always():
     """Restore room_users.json from Talkin4 even when another state DB exists."""
+    if not MEMBER_ID_FETCH_ENABLED:
+        return False
     if not GITHUB_SYNC_ENABLED:
         return False
     try:
@@ -3462,6 +3465,8 @@ def _remember_roster_async(room, users):
     and let the event/command threads return immediately.
     """
     global _ROSTER_ASYNC_WORKER_STARTED
+    if not MEMBER_ID_FETCH_ENABLED:
+        return False
     snapshot = [dict(user) for user in (users or []) if isinstance(user, dict)]
     if not snapshot:
         return False
@@ -8921,6 +8926,9 @@ class TalkinBot:
         HTTP batches. Only when the database cannot provide the roster do we fall
         back to Talkin's occupants_list WebSocket response.
         """
+        if not MEMBER_ID_FETCH_ENABLED:
+            self.log("[ROSTER] member-ID fetch disabled; skipping occupants request")
+            return False
         room = _norm_room(room)
         if not room:
             return False
@@ -12477,6 +12485,8 @@ class TalkinBot:
             if previous != current:
                 cache[cache_key] = current
                 self._stream_member_cache = cache
+                if not MEMBER_ID_FETCH_ENABLED:
+                    return True
                 # STREAM events can arrive in bursts while a room is active.
                 # Never serialize room_users.json from the WebSocket worker;
                 # coalesce the update in the dedicated roster writer instead.
