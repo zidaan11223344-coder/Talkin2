@@ -23030,8 +23030,12 @@ class TalkinBot:
                         self.log("[NO-PHOTO] ban failed", repr(exc))
                     return
             self.room_users.setdefault(room, {})[username] = role or "none"
-            _remember_roster_async(room, [{"username": username, "role": role or "none"}])
-            # Member-ID refresh is handled by one paced background worker.
+            # A user_joined event contains only a delta (usually just a name),
+            # not the complete roster or a durable numeric ID. Persisting the
+            # entire room_users.json file here for every join repeatedly
+            # serializes a large file and starves chat/game workers during
+            # bulk room restore. Keep the live delta in memory; full member
+            # lists are persisted only from occupants/members responses.
             # Never request members_list from a user_joined event: it competes
             # with game/chat commands in busy rooms.
             # Keep a separate history for .r. Only events received after the
