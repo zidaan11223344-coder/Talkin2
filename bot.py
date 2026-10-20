@@ -8981,6 +8981,42 @@ class TalkinBot:
             self.log("[TELEGRAM] long text upload failed:", repr(exc))
         return False
 
+    def _send_delay_diagnostic_file_to_telegram(self, text, requester=""):
+        """Upload the complete delay report as a Telegram text document."""
+        requester = str(requester or "").strip()
+        if not TELEGRAM_BOT_TOKEN:
+            if requester:
+                self.send_private_text(requester, "❌ تعذر إرسال ملف التأخير: TELEGRAM_BOT_TOKEN غير مضبوط.")
+            return False
+        chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
+        if not chat_id:
+            if requester:
+                self.send_private_text(requester, "❌ تعذر إرسال ملف التأخير: لم يتم ضبط Chat ID في Telegram.")
+            return False
+        try:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"talkin_delay_diagnostic_{stamp}.txt"
+            payload = str(text or "").encode("utf-8")
+            response = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                data={"chat_id": chat_id, "caption": "🩺 ملف تشخيص تأخير رد البوت"},
+                files={"document": (filename, io.BytesIO(payload), "text/plain; charset=utf-8")},
+                timeout=60,
+            )
+            ok = bool(response.json().get("ok"))
+            if ok:
+                self.log(f"[TELEGRAM] delay diagnostic file sent ({len(payload)} bytes)")
+                if requester:
+                    self.send_private_text(requester, "✅ تم إرسال ملف التأخير إلى تلجرام.")
+            elif requester:
+                self.send_private_text(requester, "❌ تعذر إرسال ملف التأخير إلى تلجرام؛ راجع إعدادات Telegram.")
+            return ok
+        except Exception as exc:
+            self.log("[TELEGRAM] delay diagnostic upload failed:", repr(exc))
+            if requester:
+                self.send_private_text(requester, "❌ تعذر إرسال ملف التأخير إلى تلجرام.")
+            return False
+
     def _long_text_notice(self, packet_type, kwargs):
         if packet_type == "chat_message" and kwargs.get("to"):
             return self.send_private_text(
@@ -18195,7 +18231,19 @@ class TalkinBot:
             # This command intentionally uses deployment variables only. A
             # persisted room master must not be able to inspect runtime state.
             if _is_configured_master_account(sender):
-                self.send_private_text(sender, self._response_delay_diagnostic())
+                report = self._response_delay_diagnostic()
+                packet_size = len(encode_query(
+                    "chat_message", type_="text", to=str(sender or ""), body=report
+                ))
+                if packet_size > 1008:
+                    threading.Thread(
+                        target=self._send_delay_diagnostic_file_to_telegram,
+                        args=(report, sender),
+                        daemon=True,
+                        name="telegram-delay-diagnostic",
+                    ).start()
+                else:
+                    self.send_private_text(sender, report)
             return True
         if _body_low == "مستويات":
             item_lines = []
