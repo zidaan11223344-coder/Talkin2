@@ -1604,16 +1604,33 @@ class RawWebSocket:
         else:
             hdr = bytes([0x82, 0x80 | 127]) + struct.pack('!Q', n)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        with self._send_lock:
+        # A dead/stalled socket must not make every room-command worker wait
+        # behind one send forever. Dropping one frame is safer than starving
+        # the command pool and delaying all subsequent game replies.
+        lock_timeout = max(0.05, float(os.getenv("WS_SEND_LOCK_TIMEOUT_SECONDS", "0.75") or 0.75))
+        if not self._send_lock.acquire(timeout=lock_timeout):
+            print("[WS] send lock busy; dropping frame to keep commands responsive", flush=True)
+            return False
+        try:
             self.sock.sendall(hdr + mask + masked)
+            return True
+        finally:
+            self._send_lock.release()
 
     def send_control(self, opcode, payload=b''):
         payload = bytes(payload); mask = os.urandom(4)
         if len(payload) > 125: raise ValueError('control frame too large')
         hdr = bytes([0x80 | opcode, 0x80 | len(payload)])
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        with self._send_lock:
+        lock_timeout = max(0.05, float(os.getenv("WS_SEND_LOCK_TIMEOUT_SECONDS", "0.75") or 0.75))
+        if not self._send_lock.acquire(timeout=lock_timeout):
+            print("[WS] control send lock busy; skipping control frame", flush=True)
+            return False
+        try:
             self.sock.sendall(hdr + mask + masked)
+            return True
+        finally:
+            self._send_lock.release()
 
     def recv(self):
         b1, b2 = self._recv_exact(2)
@@ -22844,12 +22861,7 @@ class TalkinBot:
             if len(self.known_rooms) != known_before:
                 # Local/GitHub persistence must never delay command routing.
                 snapshot = set(self.known_rooms)
-                threading.Thread(
-                    target=_save_persistent_rooms,
-                    args=(snapshot,),
-                    daemon=True,
-                    name="persist-room-list",
-                ).start()
+                _queue_persistent_rooms_save(snapshot)
         event_id = str(event.get(41, ""))
         if event_type in ("user_joined", "user_left"):
             username = event_user_17 or event_user_22
