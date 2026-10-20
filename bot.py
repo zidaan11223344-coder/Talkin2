@@ -7757,6 +7757,7 @@ class TalkinBot:
             roster_queue = -1
         event_worker_duration = float(getattr(self, "_event_worker_last_duration", 0.0) or 0.0)
         event_worker_count = int(getattr(self, "_event_worker_processed", 0) or 0)
+        background_pending = int(getattr(self, "_event_background_pending", 0) or 0)
         return (
             "🩺 تشخيص تأخير الرد — للماستر فقط\n"
             f"النتيجة الصريحة: {queue_reason}\n"
@@ -7766,6 +7767,7 @@ class TalkinBot:
             f"CPU آخر قياس: {cpu:.1f}% | التبريد: {'فعال' if getattr(self, '_cpu_cooling', False) else 'غير فعال'}\n"
             f"نسخ معلقة: GitHub={github_pending}/{github_inflight}، قاعدة البيانات={state_pending}/{state_inflight}\n"
             f"حفظ أعضاء بالخلفية: {roster_queue} | آخر معالجة حدث: {event_worker_duration:.3f}s | أحداث معالجة: {event_worker_count}\n"
+            f"إطارات قيد المعالجة بالخلفية: {background_pending}\n"
             f"أوامر الماستر العاجلة: {int(getattr(self, '_master_priority_dispatched', 0) or 0)}\n"
             f"العمال النشطة: {', '.join(busy_workers[:12]) or 'لا يوجد'}"
         )
@@ -23818,7 +23820,7 @@ class TalkinBot:
         return True
 
     def _dispatch_background_event(self, ws, message):
-        """Process roster/presence frames outside the ordered queue consumer."""
+        """Process every non-master frame outside the queue consumer."""
         executor = getattr(self, "_event_background_executor", None)
         if executor is None:
             lock = getattr(self, "_event_background_executor_lock", None)
@@ -23828,7 +23830,7 @@ class TalkinBot:
                 executor = getattr(self, "_event_background_executor", None)
                 if executor is None:
                     try:
-                        workers = max(2, int(os.getenv("EVENT_BACKGROUND_WORKERS", "4") or 4))
+                        workers = max(4, int(os.getenv("EVENT_BACKGROUND_WORKERS", "8") or 8))
                     except (TypeError, ValueError):
                         workers = 4
                     executor = ThreadPoolExecutor(
@@ -23836,7 +23838,23 @@ class TalkinBot:
                         thread_name_prefix="ws-event-bg",
                     )
                     self._event_background_executor = executor
-        return executor.submit(self._process_message, ws, message)
+        self._event_background_pending = int(
+            getattr(self, "_event_background_pending", 0) or 0
+        ) + 1
+        return executor.submit(self._process_background_event, ws, message)
+
+    def _process_background_event(self, ws, message):
+        started = time.monotonic()
+        try:
+            self._process_message(ws, message)
+        finally:
+            self._event_worker_last_duration = time.monotonic() - started
+            self._event_worker_processed = int(
+                getattr(self, "_event_worker_processed", 0) or 0
+            ) + 1
+            self._event_background_pending = max(
+                0, int(getattr(self, "_event_background_pending", 1) or 1) - 1
+            )
 
     def _event_worker_loop(self):
         """Process queued WebSocket frames in priority order.
@@ -23851,27 +23869,16 @@ class TalkinBot:
                 _priority, _seq, ws, message = self._event_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-            # Priority 0/1 frames retain ordered handling because they may be
-            # commands or protocol acknowledgements. Presence, roster and
-            # other ordinary server frames are priority 2; dispatching them to
-            # a small pool prevents 36 busy rooms from building a permanent
-            # backlog behind one consumer.
-            if _priority >= 2:
-                try:
-                    self._dispatch_background_event(ws, message)
-                    self._event_queue.task_done()
-                    continue
-                except Exception as exc:
-                    self.log("[EVENT-BACKGROUND] dispatch failed; processing inline:", repr(exc))
-            started = time.monotonic()
             try:
-                self._process_message(ws, message)
+                # The transport worker must never decode/execute a frame. A
+                # single private command, roster response, or server callback
+                # can block for seconds; submit all queued frames to the pool.
+                # Configured-master DMs bypass this queue earlier in on_message.
+                self._dispatch_background_event(ws, message)
             except Exception as exc:
                 self.last_error = str(exc)
-                self.log("[EVENT-WORKER] processing failed:", repr(exc))
+                self.log("[EVENT-BACKGROUND] dispatch failed:", repr(exc))
             finally:
-                self._event_worker_last_duration = time.monotonic() - started
-                self._event_worker_processed = int(getattr(self, "_event_worker_processed", 0) or 0) + 1
                 try:
                     self._event_queue.task_done()
                 except Exception:
