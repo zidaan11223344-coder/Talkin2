@@ -2632,6 +2632,78 @@ def _persistent_rosters():
     data = _load_local_json(ROOM_USERS_FILE, {})
     return data if isinstance(data, dict) else {}
 
+def _stored_user_id(username, preferred_room=""):
+    """Resolve a username to a previously stored native Talkin user ID."""
+    raw = str(username or "").strip().lstrip("@")
+    if raw.isdigit():
+        return raw
+    wanted = _norm_user(raw)
+    if not wanted:
+        return ""
+    data = _persistent_rosters()
+    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+    if not isinstance(rooms, dict):
+        return ""
+    preferred = _norm_room(preferred_room)
+    room_names = sorted(rooms, key=lambda name: 0 if preferred and _norm_room(name) == preferred else 1)
+    exact, decorated = [], []
+    wanted_decorated = _game_name_key(raw)
+    for room_name in room_names:
+        roster = rooms.get(room_name)
+        if not isinstance(roster, dict):
+            continue
+        for key, value in roster.items():
+            if not isinstance(value, dict):
+                continue
+            saved_name = str(value.get("username") or key).strip().lstrip("@")
+            uid = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
+            aliases = value.get("aliases", []) if isinstance(value.get("aliases"), list) else []
+            if not uid.isdigit():
+                continue
+            if _norm_user(saved_name) == wanted or any(_norm_user(a) == wanted for a in aliases):
+                exact.append((room_name, uid))
+            elif wanted_decorated and (_game_name_key(saved_name) == wanted_decorated or any(_game_name_key(a) == wanted_decorated for a in aliases)):
+                decorated.append((room_name, uid))
+    def unique(matches):
+        preferred_matches = [uid for room_name, uid in matches if preferred and _norm_room(room_name) == preferred]
+        candidates = preferred_matches or [uid for _, uid in matches]
+        candidates = set(candidates)
+        return next(iter(candidates)) if len(candidates) == 1 else ""
+    return unique(exact) or unique(decorated)
+
+
+def _stored_user_aliases(username, preferred_room=""):
+    """Return known display-name aliases for a stored user ID."""
+    raw = str(username or "").strip().lstrip("@")
+    uid = _stored_user_id(raw, preferred_room)
+    if not uid:
+        return [raw] if raw else []
+    data = _persistent_rosters()
+    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+    found = {}
+    if isinstance(rooms, dict):
+        for roster in rooms.values():
+            if not isinstance(roster, dict):
+                continue
+            for key, value in roster.items():
+                if not isinstance(value, dict):
+                    continue
+                saved_id = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
+                if saved_id != uid:
+                    continue
+                name = str(value.get("username") or "").strip().lstrip("@")
+                if name:
+                    found.setdefault(_norm_user(name), name)
+                aliases = value.get("aliases", []) if isinstance(value.get("aliases"), list) else []
+                for alias in aliases:
+                    alias = str(alias or "").strip().lstrip("@")
+                    if alias:
+                        found.setdefault(_norm_user(alias), alias)
+    if raw:
+        found.setdefault(_norm_user(raw), raw)
+    return list(found.values())
+
+
 def _save_persistent_rosters(rosters):
     _save_local_json(ROOM_USERS_FILE, {"version": 1, "rooms": rosters})
 
@@ -2879,6 +2951,13 @@ def _looks_like_bot_command(text):
     normalized_low = low.replace("ة", "ه")
     normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
     normalized_games = {str(x).casefold().replace("ة", "ه") for x in (*GAME_COMMANDS, *GAME_COMMANDS.values())}
+    mining_exact = {
+        "sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag",
+        "متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures",
+        "توب الماس", "توب الالماس", "top diamonds", "top gems", "اغنى المنقبين",
+        "فحص الماس", "فحص الالماس", "red", "احفر", "تنقيب", "نقب",
+    }
+    mining_normalized = {value.replace("ة", "ه") for value in mining_exact}
     return (
         low.startswith(prefixes)
         or normalized_low.startswith(normalized_prefixes)
@@ -2886,6 +2965,9 @@ def _looks_like_bot_command(text):
         or normalized_low in ("مساعده", "games", "game")
         or low in {x.casefold() for x in GAME_COMMANDS}
         or normalized_low in normalized_games
+        or low in mining_exact
+        or normalized_low in mining_normalized
+        or low.startswith(("rdem ", "r ", "red "))
     )
 
 
@@ -4157,18 +4239,15 @@ def _fmt_points(value):
 
 
 def _money_game_win_text(game, username, language="ar"):
-    """Short, bilingual winner announcement for the million/billion games."""
     game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
     name = str(username or "").strip().lstrip("@")
-    amount = "1b" if game == "billion" else "1m"
-    stars = "⭐" * 9
-    if language == "en":
-        title = "billion" if game == "billion" else "million"
-        return (f"🏆✨ Congratulations! You got the {title}! ✨🏆\n\n"
-                f"✅ {name}\n💰 Prize: +{amount} points\n🎉 Congrats, champ!\n{stars}")
+    symbol = "🏛️" if game == "billion" else "🏦"
     title = "المليار" if game == "billion" else "المليون"
-    return (f"🏆✨ مبروك! تم الحصول على {title} ✨🏆\n\n"
-            f"✅ {name}\n💰 مبلغ الفوز: +{amount} نقطة\n🎉 مبروك يا بطل!\n{stars}")
+    amount = "1b" if game == "billion" else "1m"
+    if language == "en":
+        title_en = "billion" if game == "billion" else "million"
+        return f"{symbol}\n{name}\nGot the {title_en} (+{amount})\n{symbol}"
+    return f"{symbol}\n{name}\nتم الحصول على {title} (+{amount})\n{symbol}"
 
 
 DEFAULT_REPLY_MESSAGES = {
@@ -5686,6 +5765,171 @@ def render_money_game_winner_card(game_key, winner_name, winner_photo_url="", la
     return out
 
 
+
+def _rare_diamond_item_key():
+    """Resolve the catalog key behind the user's RED rare-diamond code."""
+    catalog = MINING_ITEMS if isinstance(MINING_ITEMS, dict) else {}
+
+    # Let the catalog's own alias resolver define RED first, where supported.
+    try:
+        resolved = resolve_item_keys("red")
+    except Exception:
+        resolved = []
+    if isinstance(resolved, str):
+        resolved = [resolved]
+    if isinstance(resolved, (list, tuple, set)):
+        for key in resolved:
+            key = str(key or "").strip()
+            if key in catalog:
+                return key
+
+    explicit = (
+        "rare_diamond", "diamond_rare", "red_diamond", "diamond_red",
+        "rare-diamond", "red", "diamond_rare_red", "الماسة_النادرة",
+        "الماس_النادر", "الماسه_النادره",
+    )
+    normalized_catalog = {str(key).strip().casefold(): str(key) for key in catalog}
+    for candidate in explicit:
+        if candidate.casefold() in normalized_catalog:
+            return normalized_catalog[candidate.casefold()]
+
+    def words(value):
+        return re.sub(r"[^a-z0-9\u0600-\u06ff]+", " ", str(value or "").casefold()).strip()
+
+    # DIAMOND_KEYS may list canonical catalog identifiers separately.
+    try:
+        known_keys = list(DIAMOND_KEYS)
+    except Exception:
+        known_keys = []
+    ordered = []
+    for key in known_keys:
+        key = str(key or "").strip()
+        if key in catalog and key not in ordered:
+            ordered.append(key)
+    for key in catalog:
+        if str(key) not in ordered:
+            ordered.append(str(key))
+
+    for key in ordered:
+        item = catalog.get(key, {})
+        if not isinstance(item, dict):
+            continue
+        description = words(" ".join(str(part or "") for part in (key, item.get("name", ""), item.get("code", ""), item.get("symbol", ""))))
+        has_rare = any(token in description for token in ("rare", "نادر"))
+        has_diamond = any(token in description for token in ("diamond", "gem", "الماس", "ماسه", "جوهرة", "جواهر"))
+        has_red = any(token in description for token in ("red", "احمر", "حمراء"))
+        if (has_rare and has_diamond) or (has_red and has_diamond):
+            return key
+
+    # Last-resort: a key or catalog code literally named RED is the configured
+    # redemption code only if it is an actual catalog item.
+    for key, item in catalog.items():
+        item = item if isinstance(item, dict) else {}
+        if str(key).strip().casefold() == "red" or str(item.get("code", "")).strip().casefold() == "red":
+            return str(key)
+    return ""
+
+
+def _rare_diamond_asset_path():
+    """Find the existing rare-diamond artwork used for the teaser and winner card."""
+    candidates = []
+    key = _rare_diamond_item_key()
+    item = MINING_ITEMS.get(key, {}) if key and isinstance(MINING_ITEMS, dict) else {}
+    if isinstance(item, dict):
+        image_name = str(item.get("image") or "").strip()
+        if image_name:
+            candidate = Path(image_name)
+            candidates.append(candidate if candidate.is_absolute() else (ASSETS_DIR / "treasures" / candidate.name))
+
+    candidates.extend([
+        ASSETS_DIR / "treasures" / "rare_diamond_3d.png",
+        ASSETS_DIR / "treasures" / "rare_diamond_3d.jpg",
+        ASSETS_DIR / "treasures" / "rare_diamond.png",
+        ASSETS_DIR / "treasures" / "rare_diamond.jpg",
+        ASSETS_DIR / "treasures" / "diamond_rare.png",
+        ASSETS_DIR / "treasures" / "diamond_rare.jpg",
+        ASSETS_DIR / "treasures" / "red_diamond.png",
+        ASSETS_DIR / "treasures" / "red_diamond.jpg",
+        ASSETS_DIR / "game_rare_diamond.jpg",
+        ASSETS_DIR / "game_rare_diamond.png",
+    ])
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            if resolved not in seen and resolved.is_file():
+                seen.add(resolved)
+                return resolved
+            seen.add(resolved)
+        except Exception:
+            continue
+    return None
+
+
+def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_path=None):
+    """Overlay the winner name on the rare-diamond artwork, like money-game cards.
+
+    The base rare-diamond image is expected to be supplied in the assets tree;
+    no base image is generated here.
+    """
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبت")
+    source = Path(source_path) if source_path else _rare_diamond_asset_path()
+    if not source or not source.is_file():
+        raise FileNotFoundError("صورة الألماسة النادرة غير موجودة ضمن assets/treasures")
+
+    image = Image.open(source).convert("RGBA")
+    target_w = 1100
+    target_h = max(1, round(target_w * image.height / image.width))
+    image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    w, h = image.size
+    panel_box = (int(w * .06), int(h * .785), int(w * .94), int(h * .95))
+    draw.rounded_rectangle(
+        panel_box, radius=max(20, int(w * .025)),
+        fill=(3, 12, 32, 238), outline=(60, 203, 255, 255),
+        width=max(3, int(w * .004)),
+    )
+    avatar_size = min(max(86, int(h * .07)), panel_box[3] - panel_box[1] - 28)
+    avatar = _load_sender_avatar(winner_photo_url, avatar_size)
+    margin = max(20, int(w * .035))
+    if avatar is not None:
+        avatar_x = panel_box[2] - margin - avatar_size
+        avatar_y = panel_box[1] + (panel_box[3] - panel_box[1] - avatar_size) // 2
+        overlay.alpha_composite(avatar, (int(avatar_x), int(avatar_y)))
+        text_left = panel_box[0] + margin
+        text_right = avatar_x - max(18, int(w * .025))
+    else:
+        text_left = panel_box[0] + margin
+        text_right = panel_box[2] - margin
+    center_x = (text_left + text_right) / 2
+    _draw_centered(
+        draw, (center_x, panel_box[1] + (panel_box[3] - panel_box[1]) * .32),
+        "💎 الفائز بالألماسة النادرة", max(27, int(h * .038)),
+        (115, 225, 255, 255), max(80, text_right - text_left),
+    )
+    _draw_name_centered(
+        draw, (center_x, panel_box[1] + (panel_box[3] - panel_box[1]) * .70),
+        "@" + str(winner_name or ""), max(34, int(h * .045)),
+        (255, 255, 255, 255), max(80, text_right - text_left),
+    )
+    image = Image.alpha_composite(image, overlay).convert("RGB")
+    out_dir = BASE_DIR / "generated_games"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        old = sorted((x for x in out_dir.iterdir() if x.is_file()), key=lambda x: x.stat().st_mtime, reverse=True)
+        for fp in old[29:]:
+            fp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    out = out_dir / f"rare_diamond_winner_{uuid.uuid4().hex}.jpg"
+    for quality in (92, 88, 84, 80, 76):
+        image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+        if out.stat().st_size <= 300 * 1024:
+            break
+    return out
+
 def render_game_winner_card(game_key, winner_name, winner_photo_url="", language="ar"):
     """Elegant winner card in the same style as the gift cards.
 
@@ -6646,6 +6890,9 @@ class TalkinBot:
         self._fishing_cooldowns = {}
         self._fishing_dragon_pending = ""
         self._fishing_dragon_caught = False
+        self._rare_diamond_lock = threading.RLock()
+        self._rare_diamond_event = None
+        self._rare_diamond_round_seq = 0
         self.fruit_games = {}
         # Auto replies and per-user custom welcome messages.
         self.auto_replies_enabled = True
@@ -6658,6 +6905,9 @@ class TalkinBot:
         if not MASTER_SERVICE_ENABLED:
             threading.Thread(target=self._fishing_event_worker, name="fishing-event-worker", daemon=True).start()
             threading.Thread(target=self._stock_market_worker, name="stock-market-worker", daemon=True).start()
+        self._mining_cooldown_lock = threading.RLock()
+        self._mining_last_dig = {}
+        threading.Thread(target=self._rare_diamond_event_worker, name="rare-diamond-worker", daemon=True).start()
         self.invite_message_template = _message_template("invite", "default", "يوجد معجب مخفي في {room}")
 
     def _load_social_features(self):
@@ -12721,6 +12971,54 @@ class TalkinBot:
             self.log("[GAME] winner card send failed:", game_key, repr(exc))
             return False
 
+
+    def _send_rare_diamond_winner_card(self, room, winner_name):
+        """Send a personalized rare-diamond winner image when its base artwork exists."""
+        base = _public_base_url()
+        if not base:
+            self.log("[RARE-DIAMOND] winner image skipped: public media URL is not configured")
+            return False
+        source = _rare_diamond_asset_path()
+        if not source:
+            self.log("[RARE-DIAMOND] winner image skipped: rare-diamond artwork has not been added yet")
+            return False
+        try:
+            winner_key = _norm_user(winner_name)
+            winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
+            if not winner_photo:
+                winner_photo = self._lookup_profile_photo(winner_name)
+            card = render_rare_diamond_winner_card(winner_name, winner_photo, source)
+            url = f"{base}/games/{card.name}"
+            self._verify_public_media_url(url, "image")
+            sent = self.send_room_media(room, url, "image") is not False
+            self.log("[RARE-DIAMOND] winner card", winner_name, "sent=" + str(sent))
+            return sent
+        except Exception as exc:
+            self.log("[RARE-DIAMOND] winner card failed:", repr(exc))
+            return False
+
+    def _send_rare_diamond_teaser(self, room):
+        """Send the configured rare-diamond base art with the event announcement."""
+        source = _rare_diamond_asset_path()
+        if not source:
+            self.log("[RARE-DIAMOND] teaser image skipped: rare-diamond artwork has not been added yet")
+            return False
+        try:
+            try:
+                relative = source.resolve().relative_to(ASSETS_DIR.resolve())
+                parent = relative.parent.as_posix()
+                route = "assets" if parent in (".", "") else "assets/" + parent
+            except Exception:
+                route = "assets/treasures"
+            url = self._game_public_image(source, route=route)
+            if not url:
+                return False
+            self._verify_public_media_url(url, "image")
+            return self.send_room_media(room, url, "image") is not False
+        except Exception as exc:
+            self.log("[RARE-DIAMOND] teaser image failed:", repr(exc))
+            return False
+
     def game_help(self, room, sender=None):
         """Open the canonical A3 game catalog and let ns page through it."""
         if sender:
@@ -15144,15 +15442,15 @@ class TalkinBot:
             return True
         english = self._configured_room_language(room) == "en"
         if english:
-            self.send_room_text(room, f"🏦✨ Million Bank ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the prize...\n━━━━━━━━━━━━━━")
+            self.send_room_text(room, f"🏦\n{sender_name}\nSearching for a million\n🏦")
         else:
-            self.send_room_text(room, f"🏦✨ بنك مليون ✨🏦\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن الجائزة...\n━━━━━━━━━━━━━━")
+            self.send_room_text(room, f"🏦\n{sender_name}\nجاري البحث عن مليون\n🏦")
         won = _money_game_roll("million")
         reward = 1_000_000 if won else 0
         _record_game(sender_name, "million", reward, 0)
         if not won:
-            loss_text = (f"🏦 Million Bank\n━━━━━━━━━━━━━━\n❌ {sender_name}, no luck this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
-                         if english else f"🏦 بنك مليون\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحالفه الحظ هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
+            loss_text = (f"🏦\n{sender_name}\nDid not get the million\n🏦"
+                         if english else f"🏦\n{sender_name}\nلم يتم الحصول على مليون\n🏦")
             # محاولة الحصول على المليون تبقى داخل الغرفة التي أُرسلت منها.
             self.send_room_text(room, loss_text)
             return True
@@ -16267,6 +16565,184 @@ class TalkinBot:
             self.send_room_text(room, f"✨ {command} @{sender}: {value}")
         return True
 
+    def _rare_diamond_event_worker(self):
+        """Open a five-player rare-diamond expedition every five minutes."""
+        next_start = time.time() + 300.0
+        while not self.stop_event.wait(1.0):
+            now = time.time()
+            with self._rare_diamond_lock:
+                event = self._rare_diamond_event
+                expired = isinstance(event, dict) and now >= float(event.get("ends_at", 0) or 0)
+            if expired:
+                with self._rare_diamond_lock:
+                    if self._rare_diamond_event is event:
+                        self._rare_diamond_event = None
+                try:
+                    self.send_room_text(event.get("room", ""), "⌛ انتهى وقت التنقيب ولم يكتمل عدد 5 لاعبين؛ أُغلقت الجولة.")
+                except Exception as exc:
+                    self.log("[RARE-DIAMOND] timeout notice failed:", repr(exc))
+            if now >= next_start:
+                try:
+                    self._start_rare_diamond_event()
+                except Exception as exc:
+                    self.log("[RARE-DIAMOND] event start failed:", repr(exc))
+                next_start = now + 300.0
+
+    def _start_rare_diamond_event(self):
+        rooms = [str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()]
+        if not rooms:
+            try:
+                rooms = [str(r).strip() for r in self._active_rooms() if str(r).strip()]
+            except Exception:
+                rooms = []
+        if not rooms:
+            return False
+        room = sorted(set(rooms), key=str.casefold)[0]
+        with self._rare_diamond_lock:
+            if isinstance(self._rare_diamond_event, dict) and time.time() < float(self._rare_diamond_event.get("ends_at", 0) or 0):
+                return False
+            self._rare_diamond_round_seq += 1
+            self._rare_diamond_event = {
+                "id": f"rare-diamond-{int(time.time())}-{self._rare_diamond_round_seq}",
+                "room": room, "players": {}, "ends_at": time.time() + 180.0,
+            }
+        self.send_room_text(room, "💎 ظهر ألماس نادر للمشاركة في التنقيب!\nاكتب: تنقيب\nنحتاج 5 لاعبين لاكتمال المشاركة.")
+        self._send_rare_diamond_teaser(room)
+        return True
+
+    def _join_rare_diamond_event(self, room, username):
+        name = str(username or "").strip().lstrip("@")
+        key = _norm_user(name)
+        if not key:
+            return False
+        with self._rare_diamond_lock:
+            event = self._rare_diamond_event
+            if not isinstance(event, dict) or time.time() >= float(event.get("ends_at", 0) or 0):
+                return False
+            if _norm_room(room) != _norm_room(event.get("room", "")):
+                return False
+            players = event.setdefault("players", {})
+            if key in players:
+                self.send_room_text(room, f"💎 @{name} أنت مشارك بالفعل ({len(players)}/5).")
+                return True
+            if len(players) >= 5:
+                self.send_room_text(room, "💎 اكتمل عدد المشاركين؛ انتظر الجولة التالية.")
+                return True
+            players[key] = name
+            count = len(players)
+            round_id = event["id"]
+            ready = count >= 5
+        self.send_room_text(room, f"💎 @{name} انضم للتنقيب ({count}/5).")
+        if ready:
+            self.send_room_text(room, "⛏️ اكتمل المشاركون الخمسة! بدأ التنقيب عن الألماس النادر...")
+            threading.Thread(target=self._resolve_rare_diamond_event, args=(round_id,), name="rare-diamond-resolve", daemon=True).start()
+        return True
+
+    def _resolve_rare_diamond_event(self, round_id):
+        time.sleep(3.0)
+        with self._rare_diamond_lock:
+            event = self._rare_diamond_event
+            if not isinstance(event, dict) or event.get("id") != round_id:
+                return
+            players = list(event.get("players", {}).values())
+            room = event.get("room", "")
+            self._rare_diamond_event = None
+        if len(players) != 5:
+            return
+
+        winner = secrets.choice(players)
+        winner_credit = {"ok": False}
+        try:
+            winner_credit = _apply_points_delta_once(
+                winner, 100_000, f"{round_id}:winner:{_norm_user(winner)}", "rare diamond expedition prize"
+            )
+        except Exception as exc:
+            self.log("[RARE-DIAMOND] winner credit failed:", winner, repr(exc))
+
+        # Grant the catalog's rare/red diamond, not an arbitrary test treasure.
+        granted = False
+        awarded_item = None
+        winner_id = "name:" + _norm_user(winner)
+        rare_key = _rare_diamond_item_key()
+        grant_methods = (
+            "give_rare_diamond", "award_rare_diamond", "grant_rare_diamond",
+            "add_item", "grant_item", "give_item", "award_item",
+            "add_to_inventory", "award_diamond", "give_test_diamond",
+        )
+        for method_name in grant_methods:
+            method = getattr(MINING_STORE, method_name, None)
+            if not callable(method):
+                continue
+            attempts = []
+            if method_name in {"give_rare_diamond", "award_rare_diamond", "grant_rare_diamond"}:
+                attempts = [(winner_id, winner), (winner_id, winner, 1)]
+            elif rare_key:
+                # Do not call the generic two-argument test helper: only use
+                # forms that explicitly identify the rare catalog item.
+                attempts = [
+                    (winner_id, winner, rare_key, 1),
+                    (winner_id, winner, rare_key),
+                ]
+            else:
+                continue
+            for args in attempts:
+                try:
+                    result = method(*args)
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    self.log("[RARE-DIAMOND] inventory grant failed:", method_name, repr(exc))
+                    break
+                if isinstance(result, dict):
+                    if result.get("ok") or result.get("success") or result.get("item"):
+                        granted = True
+                        awarded_item = result.get("item") if isinstance(result.get("item"), dict) else result
+                        break
+                    # Explicit failure; continue with other supported APIs.
+                    if result.get("error"):
+                        continue
+                    # A non-empty dict without an error is treated as success.
+                    if result:
+                        granted = True
+                        awarded_item = result
+                        break
+                elif result is not False:
+                    # Methods that mutate successfully often return None.
+                    granted = True
+                    break
+            if granted:
+                break
+
+        lines = [f"💎 @{winner} فاز بالتنقيب عن الألماسة النادرة!"]
+        if isinstance(winner_credit, dict) and winner_credit.get("ok"):
+            lines.append("💰 الجائزة: +100k نقطة")
+        else:
+            lines.append("⚠️ تعذر اعتماد 100k نقطة للفائز؛ راجع سجل البوت.")
+        if granted:
+            item_name = str((awarded_item or {}).get("name") or (MINING_ITEMS.get(rare_key, {}).get("name") if rare_key and isinstance(MINING_ITEMS.get(rare_key), dict) else "الألماسة النادرة"))
+            lines.append(f"💎 أُضيفت {item_name} إلى مخزون الفائز.")
+        else:
+            lines.append("⚠️ لم يستطع مخزون الكنوز تسجيل الألماسة النادرة تلقائيًا؛ تحقق من دالة منح العناصر في treasure_mining.py.")
+
+        for player in players:
+            if _norm_user(player) == _norm_user(winner):
+                continue
+            try:
+                result = _apply_points_delta_once(
+                    player, -10_000, f"{round_id}:loss:{_norm_user(player)}", "rare diamond expedition participation"
+                )
+            except Exception as exc:
+                self.log("[RARE-DIAMOND] loss debit failed:", player, repr(exc))
+                result = {"ok": False}
+            if isinstance(result, dict) and result.get("ok"):
+                lines.append(f"@{player}: -10k نقطة")
+            else:
+                lines.append(f"@{player}: لم يُخصم 10k لعدم كفاية الرصيد أو تعذر تحديثه.")
+
+        self.send_room_text(room, "\n".join(lines))
+        # Like the million/billion games, the image is personalized at send time.
+        self._send_rare_diamond_winner_card(room, winner)
+
     def _resume_pending_mining_redemption(self, room, sender_name, user_id):
         pending = MINING_STORE.pending_redemption(user_id)
         if not pending:
@@ -16309,12 +16785,19 @@ class TalkinBot:
         inventory_commands = {"sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag"}
         top_commands = {"توب الماس", "توب الالماس", "top diamonds", "top gems", "أغنى المنقبين", "اغنى المنقبين"}
         redeem_match = re.fullmatch(r"(?:r|rdem)\s+(.+)", raw, re.I)
+        red_code_match = re.fullmatch(r"red(?:\s+(\d+))?", raw, re.I)
         is_diamond_test = low in {"فحص الماس", "فحص الالماس"}
         is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining"}
         is_store = low in store_commands
         is_inventory = low in inventory_commands
         is_top = low in top_commands
-        if not (is_store or is_inventory or is_top or redeem_match or is_dig or is_diamond_test):
+        if low in {"تنقيب", "نقب", "rare diamond", "rare-diamond"}:
+            try:
+                if self._join_rare_diamond_event(room, sender_name):
+                    return True
+            except Exception as exc:
+                self.log("[RARE-DIAMOND] join failed:", repr(exc))
+        if not (is_store or is_inventory or is_top or redeem_match or red_code_match or is_dig or is_diamond_test):
             return False
 
         if is_diamond_test:
@@ -16354,26 +16837,41 @@ class TalkinBot:
 
         if is_store:
             lines = ["⛏️ متجر الكنوز — الأسعار بالنقاط"]
-            lines.extend(
-                f"{item['icon']} {item['name']}: {item['price']:,} نقطة"
-                for item in MINING_ITEMS.values()
-            )
-            lines.extend(("للتنقيب: احفر", "للمخزون: sv", "للاستبدال: Rdem اسم_الكنز [العدد]"))
+            rare_key = _rare_diamond_item_key()
+            for key, item in MINING_ITEMS.items():
+                code = " (RED)" if rare_key and str(key) == rare_key else ""
+                lines.append(f"{item['icon']} {item['name']}{code}: {item['price']:,} نقطة")
+            lines.extend(("للتنقيب: احفر", "للمخزون: sv", "لاستبدال ألماسة نادرة: red [العدد] أو Rdem red [العدد]", "لاستبدال أي كنز آخر: Rdem اسم_الكنز [العدد]"))
             self.send_room_text(room, "\n".join(lines))
             return True
 
         if is_inventory:
             inventory = MINING_STORE.inventory(user_id, sender_name)
+            current_items = inventory.get("inventory", {}) if isinstance(inventory, dict) else {}
+            if not isinstance(current_items, dict):
+                current_items = {}
             lines = [f"🎒 مخزون @{sender_name}"]
             owned = False
+            rare_key = _rare_diamond_item_key()
             for key, item in MINING_ITEMS.items():
-                count = int(inventory["inventory"].get(key, 0) or 0)
+                count = int(current_items.get(key, 0) or 0)
                 if count:
                     owned = True
-                    lines.append(f"{item['icon']} {item['name']}: {count}")
+                    code = " (RED)" if rare_key and str(key) == rare_key else ""
+                    lines.append(f"{item.get('icon', '💎')} {item.get('name', key)}{code}: {count}")
+            if rare_key:
+                rare_item = MINING_ITEMS.get(rare_key, {})
+                rare_item = rare_item if isinstance(rare_item, dict) else {}
+                rare_count = int(current_items.get(rare_key, 0) or 0)
+                rare_price = int(rare_item.get("price", 0) or 0)
+                lines.append(f"🔴 ألماسة نادرة RED: {rare_count} — الاستبدال: red [العدد] ({rare_price:,} نقطة للقطعة)")
+            else:
+                lines.append("⚠️ رمز RED غير مرتبط بألماسة نادرة في كتالوج الكنوز.")
             if not owned:
-                lines.append("لا توجد كنوز بعد؛ جرّب أمر احفر.")
-            lines.append(f"💎 إجمالي الألماس الذي عثرت عليه: {inventory['diamonds_found']}")
+                lines.append("لا توجد كنوز بعد؛ جرّب أمر احفر أو شارك في تنقيب الألماسة النادرة.")
+            found = inventory.get("diamonds_found", 0) if isinstance(inventory, dict) else 0
+            lines.append(f"💎 إجمالي الألماس الذي عثرت عليه: {found}")
+            lines.append("🔁 لاستبدال كنز آخر: Rdem اسم_الكنز [العدد]")
             self.send_room_text(room, "\n".join(lines))
             return True
 
@@ -16389,17 +16887,28 @@ class TalkinBot:
             self.send_room_text(room, "\n".join(lines))
             return True
 
-        if redeem_match:
-            selection = redeem_match.group(1).strip()
-            selection = selection.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-            quantity = None
-            quantity_match = re.fullmatch(r"(.+?)\s+(\d+)", selection)
-            if quantity_match:
-                selection = quantity_match.group(1).strip()
-                quantity = int(quantity_match.group(2))
-            item_keys = resolve_item_keys(selection)
+        if redeem_match or red_code_match:
+            if red_code_match:
+                selection = "red"
+                quantity = int(red_code_match.group(1)) if red_code_match.group(1) else 1
+            else:
+                selection = redeem_match.group(1).strip()
+                selection = selection.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+                quantity = None
+                quantity_match = re.fullmatch(r"(.+?)\s+(\d+)", selection)
+                if quantity_match:
+                    selection = quantity_match.group(1).strip()
+                    quantity = int(quantity_match.group(2))
+            if str(selection).strip().casefold() == "red":
+                rare_key = _rare_diamond_item_key()
+                item_keys = [rare_key] if rare_key else []
+            else:
+                item_keys = resolve_item_keys(selection)
             if not item_keys:
-                self.send_room_text(room, "❌ اسم الكنز غير معروف. اكتب متجر الكنوز لمعرفة الأسماء والأسعار.")
+                if str(selection).strip().casefold() == "red":
+                    self.send_room_text(room, "❌ رمز RED غير مربوط بعنصر ألماسة نادرة في treasure_mining.py؛ أضف العنصر إلى كتالوج الكنوز أولًا.")
+                else:
+                    self.send_room_text(room, "❌ اسم الكنز غير معروف. اكتب متجر الكنوز لمعرفة الأسماء والأسعار.")
                 return True
             reserved = MINING_STORE.reserve_redemption(
                 user_id, sender_name, item_keys, quantity,
@@ -16434,11 +16943,20 @@ class TalkinBot:
             return True
 
         if is_dig:
+            mining_key = _norm_user(sender_name)
+            now = time.time()
+            with self._mining_cooldown_lock:
+                last_dig = float(self._mining_last_dig.get(mining_key, 0) or 0)
+                remaining_gate = 60.0 - (now - last_dig)
+                if remaining_gate > 0:
+                    self.send_room_text(room, f"⌛ {sender_name} يمكنك التنقيب مرة كل دقيقة. تبقّى {format_cooldown(int(remaining_gate) + 1)}.")
+                    return True
+                self._mining_last_dig[mining_key] = now
             outcome = MINING_STORE.dig(user_id, sender_name)
             if not outcome.get("ok"):
                 if outcome.get("error") == "cooldown":
-                    remaining = int(outcome.get("remaining", 0) or 0)
-                    self.send_room_text(room, f"⌛ {sender_name} يمكنك التنقيب مرة كل 30 ثانية. تبقّى {format_cooldown(remaining)}.")
+                    remaining = max(60, int(outcome.get("remaining", 0) or 0))
+                    self.send_room_text(room, f"⌛ {sender_name} يمكنك التنقيب مرة كل دقيقة. تبقّى {format_cooldown(remaining)}.")
                 elif outcome.get("error") == "pending_redemption":
                     self.send_room_text(room, "⌛ لديك استبدال كنوز ينتظر التسوية؛ استخدم Rdem مرة أخرى بعد قليل.")
                 return True
@@ -16470,6 +16988,7 @@ class TalkinBot:
 
     def handle_game_command(self, room, text, sender_name):
         stock_order = _parse_stock_market_order(text)
+        original_raw = str(text or "").strip()
         raw=_normalize_game_command_text(text)
         raw_digits = raw.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
         if stock_order:
@@ -16580,16 +17099,19 @@ class TalkinBot:
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
-        mining_raw = raw.strip()
+        # Keep the user's original mining text: the game normalizer maps "تنقيب"
+        # and "احفر" to "الماس", but only the original "تنقيب" joins the timed
+        # rare-diamond expedition instead of starting an ordinary dig.
+        mining_raw = original_raw
         mining_low = mining_raw.casefold().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
         mining_commands = {
             "الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining",
             "فحص الماس", "فحص الالماس", "sv", "مخزني", "مخزون", "مخزون الكنوز",
             "inventory", "my inventory", "bag", "متجر الكنوز", "سوق الكنوز",
             "treasure shop", "store treasures", "توب الماس", "توب الالماس",
-            "top diamonds", "top gems", "اغنى المنقبين",
+            "top diamonds", "top gems", "اغنى المنقبين", "red",
         }
-        if mining_low in mining_commands or re.fullmatch(r"(?:r|rdem)\s+.+", mining_raw, re.I):
+        if mining_low in mining_commands or re.fullmatch(r"(?:r|rdem)\s+.+", mining_raw, re.I) or re.fullmatch(r"red(?:\s+\d+)?", mining_raw, re.I):
             normalized_sender = _norm_user(sender_name)
             user_id = ("name:" + normalized_sender) if normalized_sender else (
                 str(sender_name).strip() if str(sender_name).strip().isdigit() else ""
@@ -16701,9 +17223,9 @@ class TalkinBot:
                 return True
             english = self._configured_room_language(room) == "en"
             if english:
-                self.send_room_text(room, f"🎰✨ Billion game ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 Searching for the billion...\n━━━━━━━━━━━━━━")
+                self.send_room_text(room, f"🏛️\n{sender_name}\nSearching for a billion\n🏛️")
             else:
-                self.send_room_text(room, f"🎰✨ لعبة المليار ✨🎰\n━━━━━━━━━━━━━━\n✅ {sender_name}\n🔎 جاري البحث عن مليار...\n━━━━━━━━━━━━━━")
+                self.send_room_text(room, f"🏛️\n{sender_name}\nجاري البحث عن مليار\n🏛️")
             won = _money_game_roll("billion")
             reward = 1000000000 if won else 0
             _record_game(sender_name, "billion", reward, 0)
@@ -16741,8 +17263,8 @@ class TalkinBot:
                 except Exception as exc:
                     self.log("[GAME] billion winner card failed:", repr(exc))
             else:
-                loss_text = (f"🎰🍀 Billion game\n━━━━━━━━━━━━━━\n❌ {sender_name} did not get the billion this time.\n🍀 Better luck next time!\n━━━━━━━━━━━━━━"
-                             if english else f"🎰🍀 لعبة المليار\n━━━━━━━━━━━━━━\n❌ {sender_name} لم يحصل على المليار هذه المرة.\n🍀 حظاً أوفر في المحاولة القادمة!\n━━━━━━━━━━━━━━")
+                loss_text = (f"🏛️\n{sender_name}\nDid not get the billion\n🏛️"
+                             if english else f"🏛️\n{sender_name}\nلم يتم الحصول على مليار\n🏛️")
                 self.send_room_text(room, loss_text)
             return True
         if game_low in ("حظ","الحظ","luck"):
