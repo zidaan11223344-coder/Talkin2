@@ -2400,6 +2400,58 @@ def _github_restore_or_seed_state():
     finally:
         _GITHUB_RESTORING = False
 
+
+def _merge_roster_backup(remote, local):
+    """Merge the durable Talkin4 roster with a possibly partial local copy.
+
+    A restart must retain usernames and numeric IDs already collected from
+    previous sessions.  The GitHub roster is the authoritative durable copy;
+    local-only rooms/users are kept as a safety measure when a deployment has
+    received a newer event just before it restarted.
+    """
+    def rooms(value):
+        if not isinstance(value, dict):
+            return {}
+        value = value.get("rooms", value)
+        return value if isinstance(value, dict) else {}
+
+    merged = {}
+    for source in (rooms(remote), rooms(local)):
+        for room, roster in source.items():
+            room_key = _norm_room(room)
+            if not room_key or not isinstance(roster, dict):
+                continue
+            target = merged.setdefault(room_key, {})
+            for username, record in roster.items():
+                user_key = _norm_user(username)
+                if not user_key:
+                    continue
+                # Keep the first (remote) record when available so a local
+                # empty/stale value cannot erase a durable numeric user ID.
+                target.setdefault(user_key, record)
+    return {"version": 1, "rooms": merged}
+
+
+def _restore_roster_backup_always():
+    """Restore room_users.json from Talkin4 even when another state DB exists."""
+    if not GITHUB_SYNC_ENABLED:
+        return False
+    try:
+        remote = _github_get_file(ROOM_USERS_FILE)
+        if not isinstance(remote, dict) or not remote:
+            return False
+        local = _load_local_json(ROOM_USERS_FILE, {})
+        merged = _merge_roster_backup(remote, local)
+        local_rooms = local.get("rooms", local) if isinstance(local, dict) else {}
+        if merged.get("rooms") and merged != local:
+            _save_local_json(ROOM_USERS_FILE, merged)
+            print(f"[GITHUB] restored room roster: {len(merged['rooms'])} rooms", flush=True)
+            return True
+        return bool(local_rooms)
+    except Exception as exc:
+        print(f"[GITHUB] room roster restore failed: {exc}", flush=True)
+        return False
+
 def _state_has_data(value):
     return bool(value) if isinstance(value, (dict, list)) else value not in (None, "", 0, False)
 
@@ -2537,6 +2589,11 @@ if _STATE_DB_ENABLED:
 # only for scheduled/manual backups. On first setup, GitHub can seed the DB.
 if not _STATE_DB_HAS_DATA:
     _github_restore_or_seed_state()
+# The persistent SQL store can be populated while the member roster still
+# exists only in Talkin4.  Restore this file independently on every startup;
+# never let the SQL/GitHub selection logic turn it into an empty local roster.
+if _STATE_DB_HAS_DATA:
+    _restore_roster_backup_always()
 
 
 def _github_sync_after_local_save(path, data, force=False):
