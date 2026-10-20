@@ -3542,6 +3542,8 @@ def _looks_like_bot_command(text):
         "transfer history", "transfer log", "billion record", "billion history", "million record", "million history",
         "top b", "topb", "top m", "topm", "room message@", "rooms message@", "room broadcast@",
         "حالة قاعدة البيانات", "حاله قاعده البيانات",
+        "مالذي يؤخرك", "مالذي يوخرك", "ما الذي يؤخرك", "ما الذي يوخرك",
+        "سبب التأخير", "سبب التاخير", "تشخيص التأخير", "تشخيص التاخير",
         "حالة النسخ", "database status", "database sync status", "db status", "dbsync",
     )
     normalized_low = low.replace("ة", "ه")
@@ -5581,7 +5583,7 @@ def _default_help_sections():
             '📋 أوامر الإدارة — 3 | التوثيق وVIP\n━━━━━━━━━━━━\nvi@اسم — توثيق مستخدم\nuns@اسم — سحب التوثيق\nسحب التوثيق@اسم — سحب التوثيق\nإزالة توثيق@اسم — سحب التوثيق\nتوثيق الكل — توثيق كل الأعضاء\nvi — عدد الموثقين\nvip@اسم — منح VIP\nunvip@اسم — سحب VIP\nvip — عدد أعضاء VIP\nmvip@اسم — إضافة ماستر توثيق\numvip@اسم — سحب ماستر توثيق\nl@mvip — عرض ماسترات التوثيق',
             '📋 أوامر الإدارة — 4 | التوثيق والحماية\n━━━━━━━━━━━━\nتشغيل التوثيق — تشغيل نظام التوثيق\nإيقاف التوثيق — إيقاف نظام التوثيق\nحماية@اسم_الغرفة — قائمة الحماية الخاصة بالماستر\nتشغيل/إيقاف الحماية — إعداد عام للغرفة\nحالة الحماية — عرض الحالة\nحمايه البوت — حماية داخلية للبوت\nالمحظورين — المحظورون داخل البوت',
             '📋 أوامر الإدارة — 5 | الفلتر والنشر\n━━━━━━━━━━━━\nmf@on — تشغيل فلتر الكلمات\nmf@off — إيقاف فلتر الكلمات\n+mf@كلمة — إضافة كلمة للفلتر\n-mf@كلمة — حذف كلمة من الفلتر\nl@mf — عرض كلمات الفلتر\nclear@mf — مسح كلمات الفلتر\nl@mfb — عرض المحظورين بسبب الفلتر\nl@mbp — عرض الممنوعين من النشر\nmbp@اسم — فك منع النشر\namf@اسم — استثناء مستخدم من حظر الفلتر',
-            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nفحص الماس — منح ألماسة اختبارية متغيرة النوع وصورتها في الغرفة\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nغرفي / myrooms — الغرف المتصلة\nدخول الكل / دخولكل / .دخول غرفي — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم / is@اسم — البحث عن مستخدم\nl@a / l@m / l@o / l@b — قوائم الرتب',
+            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nمالذي يؤخرك — تشخيص صريح لسبب تأخر الرد (لماستر المتغيرات فقط)\nفحص الماس — منح ألماسة اختبارية متغيرة النوع وصورتها في الغرفة\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nغرفي / myrooms — الغرف المتصلة\nدخول الكل / دخولكل / .دخول غرفي — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم / is@اسم — البحث عن مستخدم\nl@a / l@m / l@o / l@b — قوائم الرتب',
         ],
         2: [
             '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال: .sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
@@ -7665,6 +7667,70 @@ class TalkinBot:
             f"music={len(getattr(self, 'music_current', {}))} "
             f"crops={len(getattr(self, 'crop_plots', {}))} "
             f"workers={','.join(active_threads[:18])}"
+        )
+
+    def _response_delay_diagnostic(self):
+        """Return a compact, actionable explanation of current reply delay."""
+        def size(value):
+            try:
+                return len(value)
+            except Exception:
+                return 0
+
+        try:
+            event_queue = self._event_queue.qsize()
+        except Exception:
+            event_queue = -1
+        try:
+            room_lock_busy = not self._room_bulk_lock.acquire(blocking=False)
+            if not room_lock_busy:
+                self._room_bulk_lock.release()
+        except Exception:
+            room_lock_busy = False
+
+        threads = [thread.name for thread in threading.enumerate() if thread.is_alive()]
+        worker_names = {
+            "event-worker", "fast-room-restore", "manual-join-my-rooms",
+            "serial-room-join", "server-room-catalog-join",
+            "low-priority-room-id-sync", "room-id-roster-save",
+            "persist-member-identity", "game-command", "stock-market-worker",
+            "local-persistence", "github-sync", "state-db-worker",
+        }
+        busy_workers = [name for name in threads if name in worker_names]
+        pending_joins = size(getattr(self, "_pending_room_joins", {}))
+        pending_lists = size(getattr(self, "_pending_room_lists", {}))
+        sync_jobs = size(getattr(self, "_room_sync_jobs", {}))
+        connected = size(getattr(self, "connected_rooms", set()))
+        queue_reason = "لا يوجد تراكم ظاهر في طابور الأحداث"
+        if event_queue > 0:
+            queue_reason = f"طابور الأحداث متراكم ({event_queue})؛ هذا هو سبب التأخير الأقوى"
+        elif room_lock_busy:
+            queue_reason = "قفل عمليات الغرف مشغول؛ دخول الغرف أو بث جماعي يمنع بعض الإرسال"
+        elif pending_joins or sync_jobs:
+            queue_reason = f"عمليات غرف معلقة: دخول={pending_joins}، مزامنة={sync_jobs}"
+        elif pending_lists:
+            queue_reason = f"طلبات جلب أعضاء/قوائم معلقة ({pending_lists})"
+        elif getattr(self, "_cpu_cooling", False):
+            queue_reason = "تبريد CPU فعّال؛ تم كبح السجل فقط، ولم يتم فصل الاتصال"
+        else:
+            queue_reason = "لا يوجد مانع داخلي واضح؛ الاحتمال الأكبر تأخير من السيرفر أو الشبكة"
+
+        with _GITHUB_PENDING_CONDITION:
+            github_pending = len(_GITHUB_PENDING)
+            github_inflight = int(_GITHUB_INFLIGHT or 0)
+        with _STATE_DB_CONDITION:
+            state_pending = len(_STATE_DB_PENDING)
+            state_inflight = int(_STATE_DB_INFLIGHT or 0)
+        cpu = float(getattr(self, "_cpu_last_percent", 0.0) or 0.0)
+        return (
+            "🩺 تشخيص تأخير الرد — للماستر فقط\n"
+            f"النتيجة الصريحة: {queue_reason}\n"
+            f"الاتصال: {'متصل' if getattr(self, 'ws', None) else 'غير متصل'} | الغرف المؤكدة: {connected}\n"
+            f"طابور الأحداث: {event_queue} | قفل الغرف: {'مشغول' if room_lock_busy else 'متاح'}\n"
+            f"دخول معلق: {pending_joins} | قوائم أعضاء معلقة: {pending_lists} | مزامنة غرف: {sync_jobs}\n"
+            f"CPU آخر قياس: {cpu:.1f}% | التبريد: {'فعال' if getattr(self, '_cpu_cooling', False) else 'غير فعال'}\n"
+            f"نسخ معلقة: GitHub={github_pending}/{github_inflight}، قاعدة البيانات={state_pending}/{state_inflight}\n"
+            f"العمال النشطة: {', '.join(busy_workers[:12]) or 'لا يوجد'}"
         )
 
     def _cpu_guard_loop(self):
@@ -18120,6 +18186,17 @@ class TalkinBot:
         # master-only management gate below.
         _body_text = str(body or "").strip()
         _body_low = _body_text.casefold()
+        delay_diagnostic_commands = {
+            "مالذي يؤخرك", "مالذي يوخرك", "ما الذي يؤخرك", "ما الذي يوخرك",
+            "سبب التأخير", "سبب التاخير", "تشخيص التأخير", "تشخيص التاخير",
+            "response delay", "delay diagnosis",
+        }
+        if _body_low in delay_diagnostic_commands:
+            # This command intentionally uses deployment variables only. A
+            # persisted room master must not be able to inspect runtime state.
+            if _is_configured_master_account(sender):
+                self.send_private_text(sender, self._response_delay_diagnostic())
+            return True
         if _body_low == "مستويات":
             item_lines = []
             tier_titles = {
