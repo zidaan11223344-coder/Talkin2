@@ -8926,30 +8926,30 @@ class TalkinBot:
         return self._send_text_packets(packet_type, text, **kwargs)
 
     def _active_rooms(self):
+        """Return rooms confirmed in the current WebSocket session.
+
+        ``known_rooms`` and ``_server_room_catalog`` are persistence/sync
+        sources, not proof that the bot is currently inside a room. Including
+        them here made every game, welcome, fishing or broadcast operation
+        send packets to stale rooms; the delay became very visible once the
+        saved list grew beyond a handful of rooms.
+        """
         blocked = getattr(self, "blocked_rooms", set())
-        rooms = {
-            str(r).strip() for r in getattr(self, "known_rooms", set())
-            if str(r).strip() and _norm_room(r) not in blocked
+        connected = {
+            str(room).strip()
+            for room in getattr(self, "connected_rooms", set())
+            if str(room).strip() and _norm_room(room) not in blocked
         }
-        if self.room and _norm_room(self.room) not in blocked:
-            rooms.add(str(self.room).strip())
-        rooms.update(
-            str(r).strip() for r in self.room_users.keys()
-            if str(r).strip() and _norm_room(r) not in blocked
-        )
-        rooms.update(
-            str(r).strip() for r in getattr(self, "connected_rooms", set())
-            if str(r).strip() and _norm_room(r) not in blocked
-        )
-        rooms.update(
-            str(r).strip() for r in getattr(self, "_server_room_catalog", [])
-            if str(r).strip() and _norm_room(r) not in blocked
-        )
-        rooms.update(
-            str(r).strip() for r in _persistent_rooms()
-            if str(r).strip() and _norm_room(r) not in blocked
-        )
-        return sorted(rooms)
+        if connected:
+            return sorted(connected)
+        # Before the first room acknowledgement, retain the old fallback so
+        # startup-only commands/tests still have a target. Once even one room
+        # is confirmed, historical rooms are intentionally excluded.
+        return sorted({
+            str(room).strip()
+            for room in getattr(self, "known_rooms", set())
+            if str(room).strip() and _norm_room(room) not in blocked
+        })
 
     def broadcast_all_rooms(self, text: str, *, return_details=False):
         """Send a room-wide announcement serially without disturbing joins."""
