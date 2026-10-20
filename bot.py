@@ -15497,6 +15497,13 @@ class TalkinBot:
 
     def _broadcast_stock_market_round(self, rooms):
         # A round belongs to one room; never announce it across all rooms.
+        # The worker can wake up during process startup, before the WebSocket
+        # handshake has completed. Do not spend a worker on a doomed send or
+        # emit a misleading "round announcement failed" error.
+        ws = getattr(self, "ws", None)
+        if ws is None or getattr(ws, "sock", None) is None:
+            self.log("[STOCK] round announcement skipped: WebSocket not ready")
+            return
         for target_room in list(rooms)[:1]:
             language = self._configured_room_language(target_room)
             try:
@@ -22903,11 +22910,13 @@ class TalkinBot:
         role = str(event.get(8, event.get("role", "")) or "").strip().lower()
         count = str(event.get(23, "") or "").strip()
         reconnected = str(event.get(24, "") or "").strip()
-        # Do not log room message contents, usernames, room names, or media events.
-        _skip_room_text_signature_dedup = (not event_id and event_type == "text")
+        # Talkin may replay a room text frame without event id 41. The legacy
+        # bot log showed every test command twice, which made duplicate game
+        # work compete with real commands. Use the short content-signature TTL
+        # in _is_duplicate_incoming for text too; NS remains intentionally
+        # exempt so rapid pagination presses are never swallowed.
         if (
             not is_ns_navigation
-            and not _skip_room_text_signature_dedup
             and self._is_duplicate_incoming(
                 "room",
                 (event_type, room, frm, to, body, str(event.get(7, "") or ""),
@@ -24347,13 +24356,12 @@ class TalkinBot:
                             return
 
                     _private_event_id = str(cm.get(41, "") or result.get("uid", "") or "")
-                    # A missing ChatMessage event id means content-signature
-                    # de-duplication is not safe for legitimate repeated text.
-                    # Keep signature de-duplication only for media messages.
-                    _skip_text_signature_dedup = (not _private_event_id and not media_url)
+                    # Some server versions replay private text without an
+                    # event id. A short signature TTL removes transport
+                    # duplicates while still allowing a later legitimate
+                    # repeated command.
                     if (
                         not _is_ns_command(body)
-                        and not _skip_text_signature_dedup
                         and self._is_duplicate_incoming(
                             "private",
                             (frm, body, media_url),
