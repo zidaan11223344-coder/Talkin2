@@ -771,6 +771,13 @@ TELEGRAM_CHAT_FILE = Path(os.getenv("TELEGRAM_CHAT_FILE", str(DATA_DIR / "telegr
 # large reports, diagnostics, lists, or processing details.
 TELEGRAM_LONG_TEXT_CHARS = max(800, int(os.getenv("TELEGRAM_LONG_TEXT_CHARS", "1800")))
 TELEGRAM_LONG_TEXT_ENABLED = os.getenv("TELEGRAM_LONG_TEXT_ENABLED", "1").strip() == "1"
+# Automatic delay diagnostics are deliberately conservative: one report per
+# cooldown window prevents a burst of room events from spamming the master.
+AUTO_DELAY_DIAGNOSTIC_ENABLED = os.getenv("AUTO_DELAY_DIAGNOSTIC_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+AUTO_DELAY_DIAGNOSTIC_INTERVAL_SECONDS = max(3.0, float(os.getenv("AUTO_DELAY_DIAGNOSTIC_INTERVAL_SECONDS", "10") or 10))
+AUTO_DELAY_DIAGNOSTIC_QUEUE_THRESHOLD = max(5, int(os.getenv("AUTO_DELAY_DIAGNOSTIC_QUEUE_THRESHOLD", "10") or 10))
+AUTO_DELAY_DIAGNOSTIC_SLOW_EVENT_SECONDS = max(0.25, float(os.getenv("AUTO_DELAY_DIAGNOSTIC_SLOW_EVENT_SECONDS", "0.5") or 0.5))
+AUTO_DELAY_DIAGNOSTIC_COOLDOWN_SECONDS = max(30.0, float(os.getenv("AUTO_DELAY_DIAGNOSTIC_COOLDOWN_SECONDS", "300") or 300))
 
 # Every mutable bot record lives in its own dedicated JSON file.
 MASTERS_FILE = DATA_DIR / "masters.json"
@@ -7763,6 +7770,55 @@ class TalkinBot:
             f"العمال النشطة: {', '.join(busy_workers[:12]) or 'لا يوجد'}"
         )
 
+    def _auto_delay_diagnostic_once(self):
+        """Send one automatic delay report when the live path is unhealthy."""
+        if not AUTO_DELAY_DIAGNOSTIC_ENABLED or not BOT_MASTER:
+            return False
+        try:
+            queue_size = self._event_queue.qsize()
+        except Exception:
+            queue_size = 0
+        slow_event = float(getattr(self, "_event_worker_last_duration", 0.0) or 0.0)
+        if queue_size < AUTO_DELAY_DIAGNOSTIC_QUEUE_THRESHOLD and slow_event < AUTO_DELAY_DIAGNOSTIC_SLOW_EVENT_SECONDS:
+            return False
+        now = time.monotonic()
+        last = float(getattr(self, "_auto_delay_last_notice", 0.0) or 0.0)
+        if now - last < AUTO_DELAY_DIAGNOSTIC_COOLDOWN_SECONDS:
+            return False
+        self._auto_delay_last_notice = now
+        report = self._response_delay_diagnostic()
+        try:
+            packet_size = len(encode_query(
+                "chat_message", type_="text", to=str(BOT_MASTER), body=report
+            ))
+        except Exception:
+            packet_size = 1009
+        if packet_size > 1008:
+            threading.Thread(
+                target=self._send_delay_diagnostic_file_to_telegram,
+                args=(report, BOT_MASTER),
+                daemon=True,
+                name="auto-delay-telegram",
+            ).start()
+            self.log("[AUTO-DELAY] report exceeded 1008 bytes; queued Telegram upload")
+        else:
+            threading.Thread(
+                target=self.send_private_text,
+                args=(BOT_MASTER, report),
+                daemon=True,
+                name="auto-delay-master",
+            ).start()
+            self.log("[AUTO-DELAY] report sent to configured master")
+        return True
+
+    def _delay_diagnostic_loop(self):
+        """Monitor queue/handler latency without touching the WebSocket."""
+        while not self.stop_event.wait(AUTO_DELAY_DIAGNOSTIC_INTERVAL_SECONDS):
+            try:
+                self._auto_delay_diagnostic_once()
+            except Exception as exc:
+                self.log("[AUTO-DELAY] monitor failed:", repr(exc))
+
     def _cpu_guard_loop(self):
         """Reduce diagnostic/logging pressure when this process uses over 50% CPU.
 
@@ -9037,7 +9093,7 @@ class TalkinBot:
             if ok:
                 self.log(f"[TELEGRAM] delay diagnostic file sent ({len(payload)} bytes)")
                 if requester:
-                    self.send_private_text(requester, "✅ تم إرسال ملف التأخير إلى تلجرام.")
+                    self.send_private_text(requester, "✅ تم إرسال سبب التأخير إلى Telegram.")
             elif requester:
                 self.send_private_text(requester, "❌ تعذر إرسال ملف التأخير إلى تلجرام؛ راجع إعدادات Telegram.")
             return ok
@@ -24726,6 +24782,13 @@ class TalkinBot:
         else:
             self.log("[TELEGRAM] TELEGRAM_BOT_TOKEN is not configured; Telegram log upload disabled")
         self._start_cpu_guard()
+        if AUTO_DELAY_DIAGNOSTIC_ENABLED and getattr(self, "_delay_monitor_thread", None) is None:
+            self._delay_monitor_thread = threading.Thread(
+                target=self._delay_diagnostic_loop,
+                name="delay-diagnostic-monitor",
+                daemon=True,
+            )
+            self._delay_monitor_thread.start()
         self._cleanup_thread = start_runtime_cleanup(self.stop_event, self)
         self.asset_server = start_asset_server()
         while not self.stop_event.is_set():
