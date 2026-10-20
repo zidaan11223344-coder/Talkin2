@@ -7724,7 +7724,7 @@ class TalkinBot:
         }
         busy_workers = [name for name in threads if name in worker_names or name.startswith((
             "room-command", "room-priority", "room-event", "room-media", "incoming-command",
-            "ws-event-bg",
+            "ws-event-bg", "ws-command",
         ))]
         pending_joins = size(getattr(self, "_pending_room_joins", {}))
         pending_lists = size(getattr(self, "_pending_room_lists", {}))
@@ -7758,6 +7758,7 @@ class TalkinBot:
         event_worker_duration = float(getattr(self, "_event_worker_last_duration", 0.0) or 0.0)
         event_worker_count = int(getattr(self, "_event_worker_processed", 0) or 0)
         background_pending = int(getattr(self, "_event_background_pending", 0) or 0)
+        command_pending = int(getattr(self, "_event_command_pending", 0) or 0)
         return (
             "🩺 تشخيص تأخير الرد — للماستر فقط\n"
             f"النتيجة الصريحة: {queue_reason}\n"
@@ -7768,6 +7769,7 @@ class TalkinBot:
             f"نسخ معلقة: GitHub={github_pending}/{github_inflight}، قاعدة البيانات={state_pending}/{state_inflight}\n"
             f"حفظ أعضاء بالخلفية: {roster_queue} | آخر معالجة حدث: {event_worker_duration:.3f}s | أحداث معالجة: {event_worker_count}\n"
             f"إطارات قيد المعالجة بالخلفية: {background_pending}\n"
+            f"إطارات الأوامر قيد المعالجة: {command_pending}\n"
             f"أوامر الماستر العاجلة: {int(getattr(self, '_master_priority_dispatched', 0) or 0)}\n"
             f"العمال النشطة: {', '.join(busy_workers[:12]) or 'لا يوجد'}"
         )
@@ -23820,31 +23822,35 @@ class TalkinBot:
         threading.Timer(max(2.0, float(os.getenv("ROOM_LIST_SYNC_TIMEOUT_SECONDS", "4") or 4)), fallback).start()
         return True
 
-    def _dispatch_background_event(self, ws, message):
-        """Process every non-master frame outside the queue consumer."""
-        executor = getattr(self, "_event_background_executor", None)
+    def _dispatch_background_event(self, ws, message, urgent=False):
+        """Dispatch chat frames separately from slow synchronization frames."""
+        executor_attr = "_event_command_executor" if urgent else "_event_background_executor"
+        lock_attr = f"{executor_attr}_lock"
+        executor = getattr(self, executor_attr, None)
         if executor is None:
-            lock = getattr(self, "_event_background_executor_lock", None)
+            lock = getattr(self, lock_attr, None)
             if lock is None:
-                lock = self._event_background_executor_lock = threading.Lock()
+                lock = threading.Lock()
+                setattr(self, lock_attr, lock)
             with lock:
-                executor = getattr(self, "_event_background_executor", None)
+                executor = getattr(self, executor_attr, None)
                 if executor is None:
+                    env_name = "EVENT_COMMAND_WORKERS" if urgent else "EVENT_BACKGROUND_WORKERS"
+                    default_workers = "16" if urgent else "8"
                     try:
-                        workers = max(4, int(os.getenv("EVENT_BACKGROUND_WORKERS", "8") or 8))
+                        workers = max(4, int(os.getenv(env_name, default_workers) or default_workers))
                     except (TypeError, ValueError):
-                        workers = 4
+                        workers = 16 if urgent else 8
                     executor = ThreadPoolExecutor(
                         max_workers=workers,
-                        thread_name_prefix="ws-event-bg",
+                        thread_name_prefix="ws-command" if urgent else "ws-event-bg",
                     )
-                    self._event_background_executor = executor
-        self._event_background_pending = int(
-            getattr(self, "_event_background_pending", 0) or 0
-        ) + 1
-        return executor.submit(self._process_background_event, ws, message)
+                    setattr(self, executor_attr, executor)
+        pending_attr = "_event_command_pending" if urgent else "_event_background_pending"
+        setattr(self, pending_attr, int(getattr(self, pending_attr, 0) or 0) + 1)
+        return executor.submit(self._process_background_event, ws, message, pending_attr)
 
-    def _process_background_event(self, ws, message):
+    def _process_background_event(self, ws, message, pending_attr="_event_background_pending"):
         started = time.monotonic()
         try:
             self._process_message(ws, message)
@@ -23853,9 +23859,9 @@ class TalkinBot:
             self._event_worker_processed = int(
                 getattr(self, "_event_worker_processed", 0) or 0
             ) + 1
-            self._event_background_pending = max(
-                0, int(getattr(self, "_event_background_pending", 1) or 1) - 1
-            )
+            setattr(self, pending_attr, max(
+                0, int(getattr(self, pending_attr, 1) or 1) - 1
+            ))
 
     def _event_worker_loop(self):
         """Process queued WebSocket frames in priority order.
@@ -23875,7 +23881,7 @@ class TalkinBot:
                 # single private command, roster response, or server callback
                 # can block for seconds; submit all queued frames to the pool.
                 # Configured-master DMs bypass this queue earlier in on_message.
-                self._dispatch_background_event(ws, message)
+                self._dispatch_background_event(ws, message, urgent=(_priority == 0))
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log("[EVENT-BACKGROUND] dispatch failed:", repr(exc))
