@@ -23881,7 +23881,10 @@ class TalkinBot:
                 # single private command, roster response, or server callback
                 # can block for seconds; submit all queued frames to the pool.
                 # Configured-master DMs bypass this queue earlier in on_message.
-                self._dispatch_background_event(ws, message, urgent=(_priority == 0))
+                # Talkin versions encode room text as either top-level 9/10
+                # (priority 0) or field 8 (priority 1). Both are commands or
+                # chat and must bypass the slow roster/sync pool.
+                self._dispatch_background_event(ws, message, urgent=(_priority <= 1))
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log("[EVENT-BACKGROUND] dispatch failed:", repr(exc))
