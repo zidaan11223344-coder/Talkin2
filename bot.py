@@ -16667,11 +16667,12 @@ class TalkinBot:
             ("imperial_jade", "💚 اليشم الإمبراطوري", "يشم / jade"),
         ]
         royal = [
+            ("imperial_sickness", "👑 مرض الإمبراطور", "طبيب / doctor"),
             ("flight_radar", "🚨 الرادار وهجوم الطيران", "كابتن / captain"),
             ("mercenary_escape", "🚔 هرب قاتل مأجور من السجن", "أمن / police"),
         ]
         now = time.time()
-        due = {"classic": now, "doctor": now + 420.0, "royal": now + 600.0}
+        due = {"classic": now, "royal": now + 480.0}
         while not self.stop_event.wait(1.0):
             now = time.time()
             with self._rare_diamond_lock:
@@ -16701,17 +16702,14 @@ class TalkinBot:
                 if category == "classic":
                     game = classic[self._treasure_cycle_index % len(classic)]
                     interval = 300.0
-                elif category == "doctor":
-                    game = ("imperial_sickness", "👑 مرض الإمبراطور", "طبيب / doctor")
-                    interval = 420.0
                 else:
                     game = royal[self._royal_cycle_index % len(royal)]
-                    interval = 600.0
+                    interval = 480.0
                 started = self._start_rare_diamond_event(game)
                 if started:
                     if category == "classic":
                         self._treasure_cycle_index = (self._treasure_cycle_index + 1) % len(classic)
-                    elif category == "royal":
+                    else:
                         self._royal_cycle_index = (self._royal_cycle_index + 1) % len(royal)
                     due[category] = time.time() + interval
                 else:
@@ -16720,7 +16718,7 @@ class TalkinBot:
                 self.log("[TREASURE-CYCLE] game start failed:", repr(exc))
                 due[category] = time.time() + 10.0
 
-    def _start_rare_diamond_event(self, game=None):
+    def _start_rare_diamond_event(self, game=None, test_mode=False):
         game = game or ("rare_diamond", "💎 الألماس النادر", "تنقيب / mining")
         game_key, game_title, commands = game
         rooms = [str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()]
@@ -16741,8 +16739,9 @@ class TalkinBot:
             self._rare_diamond_event = {
                 "id": f"treasure-{game_key}-{int(now)}-{self._rare_diamond_round_seq}",
                 "game_key": game_key, "game_title": game_title,
-                "room": rooms[0], "rooms": rooms, "players": {}, "ends_at": now + 180.0,
-                "required_players": 5 if game_key in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"} else 7,
+                "room": rooms[0], "rooms": rooms, "players": {}, "ends_at": now + (300.0 if test_mode else 180.0),
+                "required_players": 1 if test_mode else (5 if game_key in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"} else 7),
+                "test_mode": bool(test_mode),
             }
         story_ar = {
             "imperial_sickness": "🩺 الإمبراطور مريض! ساعد الطبيب في إنقاذه.",
@@ -16779,12 +16778,14 @@ class TalkinBot:
                         f"✨ {title_en} has started! ✨\n{story_en}\n"
                         f"🎮 Join command: {command_en}\n👥 {required_players} players needed.\n"
                         f"🏆 Prize: {prize_en}\n⏳ Join within 3 minutes."
+                        + ("\n🧪 MASTER TEST: only the master can join; the round closes after the test." if test_mode else "")
                     )
                 else:
                     announcement = (
                         f"✨ بدأت لعبة {game_title}! ✨\n{story_ar}\n"
                         f"🎮 أمر المشاركة: {command_ar}\n👥 نحتاج إلى {required_players} لاعبين.\n"
                         f"🏆 الجائزة: {prize_ar}\n⏳ تنتهي فرصة المشاركة بعد 3 دقائق."
+                        + ("\n🧪 اختبار للماستر فقط: تنضم للتجربة ثم تُغلق الجولة دون جائزة." if test_mode else "")
                     )
                 self.send_room_text(target_room, announcement)
             except Exception as exc:
@@ -16814,6 +16815,9 @@ class TalkinBot:
             event_rooms = event.get("rooms") or [event.get("room", "")]
             if not any(_norm_room(room) == _norm_room(r) for r in event_rooms):
                 return False
+            if event.get("test_mode") and not _is_master_name(name):
+                self.send_room_text(room, "🔒 هذه جولة اختبار مخصصة للماستر فقط.")
+                return True
             players = event.setdefault("players", {})
             required_players = int(event.get("required_players", 5 if event.get("game_key") in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"} else 7))
             if key in players:
@@ -16833,6 +16837,13 @@ class TalkinBot:
             game_title = event.get("game_title", "💎 الألماس النادر")
             joined_rooms = sorted({str(p.get("room", "")).strip() for p in players.values()
                                    if isinstance(p, dict) and str(p.get("room", "")).strip()}, key=str.casefold)
+            test_completed = bool(event.get("test_mode") and not already_joined and key in players)
+            if test_completed and self._rare_diamond_event is event:
+                self._rare_diamond_event = None
+        if test_completed:
+            self.send_room_text(room, f"🧪 @{name} تم الانضمام بنجاح إلى اختبار {game_title}. أُغلقت جولة الاختبار دون توزيع جائزة.")
+            self.log("[TREASURE-CYCLE] master test completed", event.get("game_key"), "by", name)
+            return True
         if already_joined:
             self.send_room_text(room, f"🎮 @{name} أنت مشارك بالفعل ({count}/{required_players}).")
             return True
@@ -22831,47 +22842,36 @@ class TalkinBot:
                     if _norm_user(frm) == _norm_user(BOT_MASTER):
                         self.master_online = True
                         self.master_last_seen = time.time()
-                    # Master-only announcement preview: "تنقيب 1", "طبيب 1", etc.
-                    # This sends a preview to the master's private chat and never opens/changes a game round.
-                    _game_test = re.fullmatch(r"(.+?)\s+1", str(body or "").strip(), re.I)
-                    if _game_test:
-                        _test_alias = _game_test.group(1).strip().casefold()
-                        _test_alias = _test_alias.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
-                        _test_games = {
-                            "تنقيب": ("rare_diamond", "💎 الألماس النادر", "تنقيب / mining"), "نقب": ("rare_diamond", "💎 الألماس النادر", "تنقيب / mining"), "mining": ("rare_diamond", "💎 الألماس النادر", "تنقيب / mining"),
-                            "كنز": ("gold_treasure", "🪙 كنز الذهب", "كنز / treasure"), "treasure": ("gold_treasure", "🪙 كنز الذهب", "كنز / treasure"),
-                            "جزيرة": ("treasure_island", "🏴‍☠️ جزيرة الكنز", "جزيرة / island"), "island": ("treasure_island", "🏴‍☠️ جزيرة الكنز", "جزيرة / island"),
-                            "ثروة": ("fortune_hunt", "💰 صيد الثروة", "ثروة / fortune"), "fortune": ("fortune_hunt", "💰 صيد الثروة", "ثروة / fortune"),
-                            "منجم": ("gem_mine", "💎 منجم الأحجار النادرة", "منجم / gem mine"), "gem mine": ("gem_mine", "💎 منجم الأحجار النادرة", "منجم / gem mine"),
-                            "يشم": ("imperial_jade", "💚 اليشم الإمبراطوري", "يشم / jade"), "jade": ("imperial_jade", "💚 اليشم الإمبراطوري", "يشم / jade"),
-                            "طبيب": ("imperial_sickness", "👑 مرض الإمبراطور", "طبيب / doctor"), "doctor": ("imperial_sickness", "👑 مرض الإمبراطور", "طبيب / doctor"),
-                            "كابتن": ("flight_radar", "🚨 الرادار وهجوم الطيران", "كابتن / captain"), "captain": ("flight_radar", "🚨 الرادار وهجوم الطيران", "كابتن / captain"),
-                            "امن": ("mercenary_escape", "🚔 هرب قاتل مأجور من السجن", "أمن / police"), "police": ("mercenary_escape", "🚔 هرب قاتل مأجور من السجن", "أمن / police"),
-                        }
-                        _test_game = _test_games.get(_test_alias)
-                        if _test_game:
-                            if not _is_master_name(frm):
-                                self.send_private_text(frm, "🔒 أمر اختبار إعلانات الألعاب مخصص للماستر فقط.")
-                                return
-                            _gkey, _gtitle, _gcommands = _test_game
-                            _is_classic_test = _gkey in {"rare_diamond", "gold_treasure", "treasure_island", "fortune_hunt", "gem_mine", "imperial_jade"}
-                            _count = 5 if _is_classic_test else 7
-                            _prize_ar, _prize_en = ("100 مليون نقطة", "100 million points") if _is_classic_test else ("500 مليون نقطة", "500 million points")
-                            _story = {
-                                "rare_diamond": ("💎 بدأت مغامرة التنقيب عن الألماس النادر!", "💎 The rare diamond mining adventure begins!"),
-                                "gold_treasure": ("🪙 ابحث عن كنز الذهب المخفي!", "🪙 Search for the hidden gold treasure!"),
-                                "treasure_island": ("🏴‍☠️ استكشف جزيرة الكنز واربح الجائزة!", "🏴‍☠️ Explore the treasure island and win the prize!"),
-                                "fortune_hunt": ("💰 شارك في صيد الثروة واربح الجائزة الكبرى!", "💰 Join the fortune hunt and win the grand prize!"),
-                                "gem_mine": ("💎 نقّب عن الأحجار النادرة واربح الجائزة!", "💎 Mine rare gems and win the prize!"),
-                                "imperial_jade": ("💚 ابحث عن اليشم الإمبراطوري واربح الجائزة!", "💚 Search for imperial jade and win the prize!"),
-                                "imperial_sickness": ("🩺 الإمبراطور مريض! ساعد الطبيب في إنقاذه.", "🩺 The emperor is ill! Help the doctor save him."),
-                                "flight_radar": ("📡 الرادار رصد هجومًا جويًا! ساعد في صدّه.", "📡 Radar detected an air attack! Help repel it."),
-                                "mercenary_escape": ("🚨 هرب قاتل مأجور من السجن! ساعد الشرطة في القبض عليه.", "🚨 A hitman escaped from prison! Help the police capture him."),
-                            }[_gkey]
-                            _cmd_ar, _, _cmd_en = _gcommands.partition("/")
-                            _preview = (f"🧪 اختبار إعلان فقط — لم يتم فتح اللعبة\n✨ بدأت لعبة {_gtitle}! ✨\n{_story[0]}\n🎮 أمر المشاركة: {_cmd_ar.strip()}\n👥 نحتاج إلى {_count} لاعبين.\n🏆 الجائزة: {_prize_ar}\n⏳ تنتهي فرصة المشاركة بعد 3 دقائق.\n\n--- English preview ---\n✨ {_gtitle} has started! ✨\n{_story[1]}\n🎮 Join command: {_cmd_en.strip()}\n👥 {_count} players needed.\n🏆 Prize: {_prize_en}\n⏳ Join within 3 minutes.")
-                            self.send_private_text(frm, _preview)
+                    # Master-only live test: "تجربه 1" through "تجربه 9" opens a real test round.
+                    # Only the master can join; the round closes immediately after the master joins.
+                    _test_match = re.fullmatch(r"تجرب(?:ه|ة)\s*([1-9])", str(body or "").strip(), re.I)
+                    if _test_match:
+                        if not _is_master_name(frm):
+                            self.send_private_text(frm, "🔒 أوامر تجربة الألعاب مخصصة للماستر فقط.")
                             return
+                        _test_games = [
+                            ("rare_diamond", "💎 الألماس النادر", "تنقيب / mining"),
+                            ("gold_treasure", "🪙 كنز الذهب", "كنز / treasure"),
+                            ("treasure_island", "🏴‍☠️ جزيرة الكنز", "جزيرة / island"),
+                            ("fortune_hunt", "💰 صيد الثروة", "ثروة / fortune"),
+                            ("gem_mine", "💎 منجم الأحجار النادرة", "منجم / gem mine"),
+                            ("imperial_jade", "💚 اليشم الإمبراطوري", "يشم / jade"),
+                            ("imperial_sickness", "👑 مرض الإمبراطور", "طبيب / doctor"),
+                            ("flight_radar", "🚨 الرادار وهجوم الطيران", "كابتن / captain"),
+                            ("mercenary_escape", "🚔 هرب قاتل مأجور من السجن", "أمن / police"),
+                        ]
+                        _game = _test_games[int(_test_match.group(1)) - 1]
+                        with self._rare_diamond_lock:
+                            _active = self._rare_diamond_event
+                            _still_active = isinstance(_active, dict) and time.time() < float(_active.get("ends_at", 0) or 0)
+                        if _still_active:
+                            self.send_private_text(frm, "⚠️ توجد جولة أخرى مفتوحة. انتظر حتى تنتهي قبل بدء الاختبار.")
+                            return
+                        if self._start_rare_diamond_event(_game, test_mode=True):
+                            self.send_private_text(frm, f"🧪 فُتحت جولة اختبار: {_game[1]}\nاكتب أمر المشاركة المطابق داخل إحدى الغرف المتصلة: {_game[2].split('/')[0].strip()} أو {_game[2].split('/')[-1].strip()}.\nعند انضمامك سيؤكد البوت «تم الانضمام» ثم يغلق الاختبار دون منح نقاط.")
+                        else:
+                            self.send_private_text(frm, "⚠️ تعذر فتح الاختبار: لا توجد غرف متصلة لإرسال الإعلان إليها.")
+                        return
                     if body and self._handle_master_process_command(frm, body, is_private=True):
                         return
                     # The standalone master account is a four-option support
