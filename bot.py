@@ -2998,6 +2998,50 @@ def _persistent_rooms():
 def _save_persistent_rooms(rooms):
     _save_local_json(TRACKED_ROOMS_FILE, {"version": 1, "rooms": sorted({_norm_room(x) for x in rooms if _norm_room(x)})})
 
+
+# Joining many rooms can produce a burst of acknowledgements. Never perform
+# local/GitHub persistence synchronously from a room-event worker; retain only
+# the newest snapshot and save it from one daemon worker.
+_PERSISTENT_ROOMS_SAVE_CONDITION = threading.Condition()
+_PERSISTENT_ROOMS_SAVE_PENDING = None
+_PERSISTENT_ROOMS_SAVE_WORKER = None
+
+
+def _persistent_rooms_save_worker():
+    global _PERSISTENT_ROOMS_SAVE_PENDING
+    while True:
+        with _PERSISTENT_ROOMS_SAVE_CONDITION:
+            while _PERSISTENT_ROOMS_SAVE_PENDING is None:
+                _PERSISTENT_ROOMS_SAVE_CONDITION.wait()
+            snapshot = _PERSISTENT_ROOMS_SAVE_PENDING
+            _PERSISTENT_ROOMS_SAVE_PENDING = None
+        try:
+            _save_persistent_rooms(snapshot)
+        except Exception as exc:
+            # Persistence errors must not terminate the worker or affect the
+            # WebSocket and room-command paths.
+            print("[ROOM-PERSIST] async save failed:", repr(exc), flush=True)
+
+
+def _queue_persistent_rooms_save(rooms):
+    """Coalesce room-list saves so room events never wait on persistence."""
+    global _PERSISTENT_ROOMS_SAVE_PENDING, _PERSISTENT_ROOMS_SAVE_WORKER
+    snapshot = {
+        _norm_room(room) for room in (rooms or []) if _norm_room(room)
+    }
+    with _PERSISTENT_ROOMS_SAVE_CONDITION:
+        _PERSISTENT_ROOMS_SAVE_PENDING = snapshot
+        worker = _PERSISTENT_ROOMS_SAVE_WORKER
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(
+                target=_persistent_rooms_save_worker,
+                daemon=True,
+                name="room-persistence",
+            )
+            _PERSISTENT_ROOMS_SAVE_WORKER = worker
+            worker.start()
+        _PERSISTENT_ROOMS_SAVE_CONDITION.notify()
+
 def _persistent_blocked_rooms():
     data = _load_local_json(BLOCKED_ROOMS_FILE, {})
     rooms = data.get("rooms", []) if isinstance(data, dict) else data
@@ -7384,7 +7428,7 @@ class TalkinBot:
         self._pending_full_room_sync = None
         if self.room and _norm_room(self.room) not in self.blocked_rooms:
             self.known_rooms.add(_norm_room(self.room))
-        _save_persistent_rooms(self.known_rooms)
+        _queue_persistent_rooms_save(self.known_rooms)
         self._join_lock = threading.Lock()
         # All room-wide operations share one queue. Sending joins, moderation
         # packets and media broadcasts concurrently can make the gateway
@@ -8562,7 +8606,7 @@ class TalkinBot:
         self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != room}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != room}
         self.room_users.pop(room, None)
-        _save_persistent_rooms(self.known_rooms)
+        _queue_persistent_rooms_save(self.known_rooms)
         self.log("[ROOM] server rejected room; removed from tracked list:", room, reason)
 
     def _room_failure_message(self, room: str, event_type: str):
@@ -8592,7 +8636,7 @@ class TalkinBot:
             # The live session state is authoritative. Never send a timeout
             # failure for a room that this bot has already entered.
             self.known_rooms.add(room)
-            _save_persistent_rooms(self.known_rooms)
+            _queue_persistent_rooms_save(self.known_rooms)
             if requester:
                 self.send_private_text(requester, f"✅ البوت داخل الغرفة: {room}")
             return
@@ -8603,7 +8647,7 @@ class TalkinBot:
             # A missing acknowledgement is not a reason to send another join
             # packet. Keep the room tracked and wait for server/socket recovery.
             self.known_rooms.add(room)
-        _save_persistent_rooms(self.known_rooms)
+        _queue_persistent_rooms_save(self.known_rooms)
         self.log("[ROOM] join confirmation timeout:", room)
         if requester:
             self.send_private_text(
@@ -8776,7 +8820,7 @@ class TalkinBot:
                 if _norm_room(saved) != room_norm
             }
             self.room_users.pop(room_norm, None)
-            _save_persistent_rooms(self.known_rooms)
+            _queue_persistent_rooms_save(self.known_rooms)
             self.log("[ROOM] blocked room join suppressed:", room)
             return False
         known_norm = {_norm_room(r) for r in getattr(self, "known_rooms", set())}
@@ -8882,7 +8926,7 @@ class TalkinBot:
         if _norm_room(room) in getattr(self, "blocked_rooms", set()):
             self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
             self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
-            _save_persistent_rooms(self.known_rooms)
+            _queue_persistent_rooms_save(self.known_rooms)
             self.log("[ROOM] leave suppressed (room is blocked):", room)
             return False
         self.send_query(encode_query("room_leave", room=room))
@@ -8892,7 +8936,7 @@ class TalkinBot:
                 saved for saved in self.known_rooms
                 if _norm_room(saved) != room_norm
             }
-            _save_persistent_rooms(self.known_rooms)
+            _queue_persistent_rooms_save(self.known_rooms)
             self._last_join_sent = {
                 joined: timestamp for joined, timestamp in self._last_join_sent.items()
                 if _norm_room(joined) != room_norm
@@ -19036,7 +19080,7 @@ class TalkinBot:
                 existing.append(room_name)
                 existing_keys.add(_norm_room(room_name).casefold())
                 added.append(room_name)
-        _save_persistent_rooms(existing)
+        _queue_persistent_rooms_save(existing)
         self.known_rooms.update(room_name for room_name in existing if _norm_room(room_name) not in blocked)
         self.send_private_text(
             sender,
@@ -21215,7 +21259,7 @@ class TalkinBot:
                     self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(target)}
                     self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(target)}
             self._save_blocked_rooms()
-            _save_persistent_rooms(self.known_rooms)
+            _queue_persistent_rooms_save(self.known_rooms)
             response_room = str(room or getattr(self, "last_joined_room", "") or getattr(self, "room", "") or "").strip()
 
             # Accept immediately, but send one room_join at a time.
@@ -21809,7 +21853,7 @@ class TalkinBot:
                 self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != blocked_key}
                 self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != blocked_key}
                 self._save_blocked_rooms()
-                _save_persistent_rooms(self.known_rooms)
+                _queue_persistent_rooms_save(self.known_rooms)
             # Ask for the language before sending room_join. The previous
             # room-command path joined first and showed the prompt afterward.
             self._begin_join_rooms_language(
@@ -23175,7 +23219,7 @@ class TalkinBot:
             if room:
                 self.known_rooms.add(room)
                 self.send_room_text(room, "انا جيت ادري اشتقتولي😚😚😚😚")
-                _save_persistent_rooms(self.known_rooms)
+                _queue_persistent_rooms_save(self.known_rooms)
             requester = str((pending_join or {}).get("requested_by", "") or "").strip()
             # Confirm immediately when the server ACK arrives. Roster loading
             # can involve a slow database/WebSocket round trip and must never
@@ -23694,7 +23738,7 @@ class TalkinBot:
         # Keep every server-returned room so reconnect and `غرفي` use the
         # authoritative list instead of the truncated local view.
         self.known_rooms.update(found)
-        _save_persistent_rooms(self.known_rooms)
+        _queue_persistent_rooms_save(self.known_rooms)
         if isinstance(getattr(self, "_pending_full_room_sync", None), dict):
             pending = self._pending_full_room_sync
             self._finish_full_room_sync(
@@ -23774,7 +23818,7 @@ class TalkinBot:
                 self.known_rooms = set(rooms)
             else:
                 self.known_rooms.update(rooms)
-            _save_persistent_rooms(self.known_rooms)
+            _queue_persistent_rooms_save(self.known_rooms)
         sender = state.get("sender", "")
         if from_server:
             self.send_private_text(sender, f"✅ تم جلب غرف السيرفر بنجاح\n📊 عدد الغرف: {len(rooms)} غرفة")
