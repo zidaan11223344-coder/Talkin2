@@ -26,6 +26,29 @@ def test_timed_game_cycle_starts_with_mining_and_has_all_nine_games():
     assert all(bot_module.resolve_item_keys(item["icon"]) == (key,) for key, item in bot_module.MINING_ITEMS.items())
 
 
+def test_next_timed_game_is_due_five_minutes_after_round_resolution_finishes():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot._rare_diamond_lock = threading.RLock()
+    bot._rare_diamond_event = None
+    bot._rare_diamond_next_due = float("inf")
+    clock = [1_000.0]
+    finished = []
+
+    def finish_result(_round_id):
+        # Simulate result/card delivery completing after the round closes.
+        clock[0] = 1_245.0
+        finished.append(True)
+        bot._rare_diamond_event = None
+        bot._rare_diamond_next_due = float("inf")
+
+    bot._resolve_rare_diamond_event_impl = finish_result
+    with patch.object(bot_module.time, "time", side_effect=lambda: clock[0]):
+        bot._resolve_rare_diamond_event("round-1")
+
+    assert finished == [True]
+    assert bot._rare_diamond_next_due == 1_545.0
+
+
 def test_doctor_loser_is_refused_once_for_next_doctor_round_without_joining():
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
     bot._doctor_ban_lock = threading.RLock()

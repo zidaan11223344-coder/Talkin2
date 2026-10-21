@@ -17042,6 +17042,18 @@ class TalkinBot:
             return False
 
     def _resolve_rare_diamond_event(self, round_id):
+        """Resolve a round, then start the five-minute inter-game pause."""
+        try:
+            return self._resolve_rare_diamond_event_impl(round_id)
+        finally:
+            lock = getattr(self, "_rare_diamond_lock", None)
+            if lock is not None:
+                with lock:
+                    if (getattr(self, "_rare_diamond_event", None) is None
+                            and float(getattr(self, "_rare_diamond_next_due", 0) or 0) == float("inf")):
+                        self._rare_diamond_next_due = time.time() + 300.0
+
+    def _resolve_rare_diamond_event_impl(self, round_id):
         """Resolve one round. Results go only to rooms where its players joined."""
         time.sleep(3.0)
         with self._rare_diamond_lock:
@@ -17051,7 +17063,9 @@ class TalkinBot:
             player_records = list(event.get("players", {}).values())
             game_key = event.get("game_key", "rare_diamond")
             self._rare_diamond_event = None
-            self._rare_diamond_next_due = time.time() + 300.0
+            # Keep the cycle worker waiting until all result messages/cards are
+            # processed; the wrapper sets the real deadline in its finally block.
+            self._rare_diamond_next_due = float("inf")
         config = TIMED_TREASURE_GAMES.get(game_key, TIMED_TREASURE_GAMES["rare_diamond"])
         required_players = int(config["players"])
         if len(player_records) != required_players:
