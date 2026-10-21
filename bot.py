@@ -501,7 +501,10 @@ GIFT_CATALOG_EN = {
 
 # Keep the canonical names documented for Railway. The aliases preserve
 # compatibility with older deployments that used the original README names.
-BOT_ID = (os.getenv("BOT_ID") or os.getenv("BOT_USERNAME") or "").strip()
+# The primary public bot account contains a deliberate Unicode prefix before
+# the coffee symbol. Keep it as a non-secret fallback so hosts that normalize
+# or strip Unicode environment values can still authenticate the account.
+BOT_ID = (os.getenv("BOT_ID") or os.getenv("BOT_USERNAME") or "឵☕").strip()
 BOT_PWD = os.getenv("BOT_PWD") or os.getenv("BOT_PASSWORD") or ""
 BOT_MASTER = (os.getenv("BOT_MASTER") or os.getenv("MASTER_USERNAME") or "").strip()
 PRIMARY_BOT_ID = (os.getenv("PRIMARY_BOT_ID") or "").strip()
