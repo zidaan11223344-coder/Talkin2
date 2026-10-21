@@ -451,6 +451,7 @@ TIMED_TREASURE_GAME_ALIASES = {
 
 
 MILLION_BANK_COOLDOWN_SECONDS = 60.0
+WAGER_GAME_COOLDOWN_SECONDS = 120.0
 try:
     BILLION_GAME_COOLDOWN_SECONDS = max(1.0, float(os.getenv("BILLION_GAME_COOLDOWN_SECONDS", "60") or 60))
 except (TypeError, ValueError):
@@ -13311,8 +13312,14 @@ class TalkinBot:
                 self.send_room_text(room, f"⏳ @{sender} لديك لعبة {game_name} شغالة حالياً.\n🎯 ما زالت تبحث عن منافس.\n⌛ مدة البحث دقيقتان فقط، وبعدها تُلغى تلقائياً إذا لم يدخل منافس.")
                 return True
 
-        # الفاصل 40 ثانية لنفس اللعبة فقط، أما الألعاب المختلفة فمسموحة فوراً.
-        if not self._game_cooldown_notice(room, sender, 40.0, game_name):
+        # Keep aliases of the same wager on one two-minute per-player cooldown.
+        cooldown_game = {
+            "رهان": "bet", "مراهنة": "bet", "مراهنه": "bet",
+            "مضاربة": "duel", "مضاربه": "duel",
+            "استثمار": "investment", "حظي": "luck",
+            "حظ يا نصيب": "luck investment",
+        }.get(str(game_name).casefold(), str(game_name))
+        if not self._game_cooldown_notice(room, sender, WAGER_GAME_COOLDOWN_SECONDS, cooldown_game):
             return True
 
         # GLOBAL queue: the same game challenge is shared by every room.
@@ -13461,7 +13468,7 @@ class TalkinBot:
                 self.send_room_text(room, f"⏳ @{sender} لديك لعبة {game_name} شغالة حالياً.\n🎯 ما زالت تبحث عن منافس.\n⌛ مدة البحث دقيقتان فقط، وبعدها تُلغى تلقائياً إذا لم يدخل منافس.")
                 return True
 
-        if not self._game_cooldown_notice(room, sender, 40.0,game_name):
+        if not self._game_cooldown_notice(room, sender, WAGER_GAME_COOLDOWN_SECONDS, game_name):
             return True
         if _get_points(sender) < prize:
             self.send_room_text(room,f"❌ تحتاج {prize} نقطة للمشاركة في {game_name}. رصيدك: {_fmt_points(_get_points(sender))}")
@@ -14324,7 +14331,7 @@ class TalkinBot:
         return True
 
     def _lottery_game(self, room, sender, amount=0):
-        if not self._game_cooldown_notice(room, sender, 40.0, "حظ"):
+        if not self._game_cooldown_notice(room, sender, WAGER_GAME_COOLDOWN_SECONDS, "حظ"):
             return True
         amount = int(amount or 0)
         if amount < 0:
@@ -14904,7 +14911,7 @@ class TalkinBot:
         return True
 
     def _investment_bot_game(self, room, sender):
-        if not self._game_cooldown_notice(room, sender, 40.0, "استثمار"):
+        if not self._game_cooldown_notice(room, sender, WAGER_GAME_COOLDOWN_SECONDS, "استثمار"):
             return True
         """Free investment game against the bot. No @amount and no image."""
         # Free investment against the bot: a reward is granted only when the
@@ -18038,10 +18045,12 @@ class TalkinBot:
         }
         shop_command_text = str(body or "").strip()
         shop_command_digits = shop_command_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        pending_welcome_text = _norm_user(sender) in getattr(self, "custom_welcome_text_pending", {})
         member_shop_command = bool(
             shop_command_text.casefold() in {"متجر", "shop", "store", "story", "ترحيب_صورة", "welcome_image"}
             or re.fullmatch(r"(?:sby|buy|purchase|شراء|اشتر|اشتري)(?:\s*@?\s*)[1-6]", shop_command_digits, re.I)
             or re.fullmatch(r"(?:ترحيب|welcome)@.+", shop_command_text, re.I | re.S)
+            or pending_welcome_text
         )
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
         master_points_transfer_command = bool(re.fullmatch(r"msb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
@@ -19042,6 +19051,41 @@ class TalkinBot:
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
+
+        pending_text = getattr(self, "custom_welcome_text_pending", {})
+        pending_key = _norm_user(sender)
+        pending_welcome = pending_text.get(pending_key) if isinstance(pending_text, dict) else None
+        if isinstance(pending_welcome, dict):
+            if time.time() - float(pending_welcome.get("created_at") or 0) > 120:
+                pending_text.pop(pending_key, None)
+                self.send_private_text(sender, "⌛ انتهت مهلة إرسال نص الترحيب. أرسل شراء 5 لبدء الإعداد من جديد.")
+                return True
+            if low in {"إلغاء", "الغاء", "cancel"}:
+                pending_text.pop(pending_key, None)
+                self.send_private_text(sender, "تم إلغاء إعداد الترحيب النصي.")
+                return True
+            if text:
+                if not member_shop.active(
+                    "custom_welcome", username=sender,
+                    user_id=_stored_user_id(sender, room),
+                    aliases=_stored_user_aliases(sender, room),
+                ):
+                    pending_text.pop(pending_key, None)
+                    self.send_private_text(sender, "🔒 ميزة الترحيب النصي غير مفعّلة لهذا الحساب.")
+                    return True
+                command_welcome = re.fullmatch(r"(?:ترحيب|welcome)@(.+)", text, re.I | re.S)
+                welcome = (command_welcome.group(1).strip() if command_welcome else text)[:300]
+                current = getattr(self, "custom_welcomes", {}).get(pending_key)
+                if not isinstance(current, dict):
+                    current = {"username": sender}
+                current["username"] = sender
+                current["message"] = welcome
+                self.custom_welcomes[pending_key] = current
+                self.custom_welcome_enabled = True
+                self._save_social_features()
+                pending_text.pop(pending_key, None)
+                self.send_private_text(sender, "✅ تم حفظ نص الترحيب المخصص.")
+                return True
 
         result_toggle = re.fullmatch(r"sf@(on|off)", text, re.I)
         if result_toggle:
@@ -20272,7 +20316,8 @@ class TalkinBot:
             re.fullmatch(r"(?:ترحيب|welcome)@.+", shop_command_text, re.I | re.S)
             or shop_command_text.casefold() in {"ترحيب_صورة", "welcome_image"}
         )
-        verified_shop_action = _is_verified_user(sender) and (public_shop_command or public_welcome_command)
+        pending_welcome_text = _norm_user(sender) in getattr(self, "custom_welcome_text_pending", {})
+        verified_shop_action = _is_verified_user(sender) and (public_shop_command or public_welcome_command or pending_welcome_text)
         if not _is_master_name(sender) and not (_is_mvip_master(sender) and _is_verification_manager_command(text)) and not verified_shop_action:
             if _looks_like_admin_command(text):
                 self.send_private_text(sender, "🚫 هذا الأمر مخصص للماستر والإدارة فقط.")
@@ -20990,8 +21035,16 @@ class TalkinBot:
                 self.send_private_text(sender, error)
                 return True
             _github_sync_after_local_save(member_shop.SHOP_PATH, None)
-            if item["kind"] in {"custom_welcome", "image_welcome"}:
-                extra = "\nبعدها استخدم: ترحيب@النص" if item["kind"] == "custom_welcome" else "\nميزة الصورة مفعّلة للحساب، أرسل صورة الترحيب في الغرفة مع الأمر ترحيب_صورة."
+            if item["kind"] == "custom_welcome":
+                if not isinstance(getattr(self, "custom_welcome_text_pending", None), dict):
+                    self.custom_welcome_text_pending = {}
+                self.custom_welcome_text_pending[_norm_user(sender)] = {"username": sender, "created_at": time.time()}
+                extra = "\n✍️ أرسل نص الترحيب الآن (خلال دقيقتين)."
+            elif item["kind"] == "image_welcome":
+                if not isinstance(getattr(self, "custom_welcome_image_pending", None), dict):
+                    self.custom_welcome_image_pending = {}
+                self.custom_welcome_image_pending[_norm_user(sender)] = {"username": sender, "created_at": time.time()}
+                extra = "\n🖼️ أرسل صورة الترحيب الآن (خلال دقيقتين)."
             else:
                 extra = "\n⏱️ تنتهي الحماية بعد ساعة."
             self.send_private_text(sender, f"✅ تم شراء {item['icon']} {item['name']} مقابل {item['cost']:,} نقطة.{extra}")
@@ -21006,7 +21059,14 @@ class TalkinBot:
                 return True
             welcome = custom_welcome.group(1).strip()[:300]
             if welcome:
-                self.custom_welcomes[_norm_user(sender)] = {"username": sender, "message": welcome}
+                welcome_key = _norm_user(sender)
+                current = getattr(self, "custom_welcomes", {}).get(welcome_key)
+                if not isinstance(current, dict):
+                    current = {"username": sender}
+                current["username"] = sender
+                current["message"] = welcome
+                self.custom_welcomes[welcome_key] = current
+                getattr(self, "custom_welcome_text_pending", {}).pop(welcome_key, None)
                 self.custom_welcome_enabled = True
                 self._save_social_features()
                 self.send_private_text(sender, "✅ تم حفظ ترحيبك المخصص.")

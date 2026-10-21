@@ -20,7 +20,8 @@ def test_member_can_buy_and_activate_text_and_image_welcome(tmp_path, monkeypatc
     bot.custom_welcome_enabled = False
     bot.custom_welcome_image_pending = {}
     bot._master_reply_local = threading.local()
-    bot.send_private_text = lambda _user, _text: None
+    replies = []
+    bot.send_private_text = lambda user, text: replies.append((user, text))
     bot.send_room_text = lambda *_args: None
     bot._save_social_features = lambda: None
     bot._remember_bot_action = lambda *_args, **_kwargs: None
@@ -28,13 +29,14 @@ def test_member_can_buy_and_activate_text_and_image_welcome(tmp_path, monkeypatc
     # Buy the text welcome using the English purchase alias, then activate it.
     assert bot._handle_management_command("", "buy 5", "Player", is_private=True) is True
     assert shop.active("custom_welcome", username="Player")
-    assert bot._handle_management_command("", "ترحيب@أهلًا {username}", "Player", is_private=True) is True
+    assert "أرسل نص الترحيب الآن" in replies[-1][1]
+    assert bot._handle_management_command("", "أهلًا {username}", "Player", is_private=True) is True
     assert bot.custom_welcomes[bot_module._norm_user("Player")]["message"] == "أهلًا {username}"
 
-    # Buy the image welcome using Arabic numerals, then request an image upload.
+    # Buy the image welcome using Arabic numerals; the upload request is immediate.
     assert bot._handle_management_command("", "شراء ٦", "Player", is_private=True) is True
     assert shop.active("image_welcome", username="Player")
-    assert bot._handle_management_command("", "welcome_image", "Player", is_private=True) is True
+    assert "أرسل صورة الترحيب الآن" in replies[-1][1]
     assert bot.custom_welcome_image_pending[bot_module._norm_user("Player")]["username"] == "Player"
     image_url = "https://cdn.example.test/welcome.jpg"
     assert bot._try_custom_welcome_image_media("Hall", image_url, ["Player"]) is True
