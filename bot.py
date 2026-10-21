@@ -8384,7 +8384,7 @@ class TalkinBot:
             self.log("[WS] long-text notice failed:", repr(exc))
             return False
 
-    def _send_text_packets(self, packet_type: str, text: str, *, oversize_notice_user="", **kwargs):
+    def _send_text_packets(self, packet_type: str, text: str, *, oversize_notice_user="", notify_oversize=True, **kwargs):
         """Send text only when its full protobuf packet fits the hard limit."""
         text = str(text or "")
         if not text:
@@ -8413,7 +8413,7 @@ class TalkinBot:
             len(packet),
             f"حزمة النص تجاوزت الحد الصلب ({limit} بايت)؛ أُسقطت محلياً",
         )
-        if len(packet) > 1008:
+        if len(packet) > 1008 and notify_oversize:
             self._send_oversize_notice(
                 packet_type,
                 target=str(kwargs.get("to") or ""),
@@ -8839,6 +8839,80 @@ class TalkinBot:
                 self._restore_room_language_override(token)
         return run
 
+    @staticmethod
+    def _oversize_notice_exempt_command(command_text):
+        low = str(command_text or "").strip().casefold().replace("ة", "ه")
+        top_commands = {
+            "توب", "top", "توب الالعاب", "top games", "games top", "توب النقاط",
+            "توب النقاطي", "top points", "points top", "توب المليار", "توب مليار",
+            "top b", "topb", "توب المليون", "توب مليون", "top m", "topm",
+            "توب الماس", "توب الالماس", "top diamonds", "top gems", "اغنى المنقبين",
+            "ملياري", "مليارات", "مليوني", "ملايين",
+        }
+        room_commands = {
+            "غرفي", "myrooms", "my rooms", ".دخول غرفي", "دخول غرفي", "دخولغرفي",
+            "قائمة غرف السيرفر", "جلب غرف السيرفر", "جلب الغرف من السيرفر", "get server rooms",
+        }
+        return (
+            low in top_commands or low.startswith(("توب ", "top "))
+            or low in room_commands or bool(re.fullmatch(r"l@[amob]", low))
+        )
+
+    def _send_command_result_pages(self, packet_type, text, *, sender, room="", recipient="", language="ar"):
+        """Paginate a long leaderboard/room-list response without a size warning."""
+        route = {"to": str(recipient or "")} if packet_type == "chat_message" else {"room": str(room or "")}
+        limit = _ws_payload_limit()
+        reserve = "\n📄 القائمة 999/999\n\n📌 اكتب ns للقائمة التالية."
+
+        def fits(value):
+            return len(encode_query(packet_type, type_="text", body=value + reserve, **route)) <= limit
+
+        raw_pages = []
+        current = []
+        for line in str(text or "").splitlines() or [str(text or "")]:
+            pieces = [line]
+            if not fits(line):
+                # Extremely long single rows are split at Unicode code-point
+                # boundaries so no individual frame can cross the hard limit.
+                pieces = []
+                chunk = ""
+                for char in line:
+                    if chunk and not fits(chunk + char):
+                        pieces.append(chunk)
+                        chunk = char
+                    else:
+                        chunk += char
+                if chunk:
+                    pieces.append(chunk)
+            for piece in pieces:
+                candidate = "\n".join(current + [piece])
+                if current and not fits(candidate):
+                    raw_pages.append("\n".join(current))
+                    current = [piece]
+                else:
+                    current.append(piece)
+        if current:
+            raw_pages.append("\n".join(current))
+
+        total = len(raw_pages)
+        pages = [f"{page}\n📄 القائمة {index}/{total}" for index, page in enumerate(raw_pages, 1)]
+        result_key = (packet_type, "" if packet_type == "chat_message" else str(room or ""), str(sender or ""))
+        result_pages = getattr(self, "_result_pages", {})
+        if not isinstance(result_pages, dict):
+            result_pages = {}
+        result_pages[result_key] = {
+            "pages": pages, "part": 1, "kwargs": route, "language": language,
+        }
+        self._result_pages = result_pages
+        first = pages[0]
+        if total > 1:
+            first += "\n\n📌 Type ns for the next list." if language == "en" else "\n\n📌 اكتب ns للقائمة التالية."
+        else:
+            result_pages.pop(result_key, None)
+            self._result_pages = result_pages
+            first += "\n\n✅ End of list." if language == "en" else "\n\n✅ انتهت القوائم."
+        return self._send_text_packets(packet_type, first, notify_oversize=False, **route)
+
     def send_room_text(self, room: str, text: str):
         text = self._localize_room_text(room, text)
         if getattr(self._master_reply_local, "tracking", False):
@@ -8846,8 +8920,18 @@ class TalkinBot:
         if getattr(self._silent_master_local, "active", False):
             return True
         notice_user = getattr(self._master_reply_local, "command_sender", "")
+        command_text = getattr(self._master_reply_local, "command_text", "")
+        if self._oversize_notice_exempt_command(command_text):
+            packet = encode_query("room_message", type_="text", body=text, room=room)
+            if len(packet) > _ws_payload_limit():
+                return self._send_command_result_pages(
+                    "room_message", text,
+                    sender=notice_user, room=room,
+                    language=self._effective_room_language(room),
+                )
         return self._send_text_packets(
-            "room_message", text, room=room, oversize_notice_user=notice_user
+            "room_message", text, room=room, oversize_notice_user=notice_user,
+            notify_oversize=not self._oversize_notice_exempt_command(command_text),
         )
 
     def send_room_lines(self, room: str, lines):
@@ -9282,7 +9366,20 @@ class TalkinBot:
         username = str(username or "").strip()
         if not username or username == BOT_ID:
             return False
-        return self._send_text_packets("chat_message", text, to=username)
+        command_text = getattr(self._master_reply_local, "command_text", "")
+        exempt = self._oversize_notice_exempt_command(command_text)
+        if exempt:
+            packet = encode_query("chat_message", type_="text", to=username, body=str(text or ""))
+            if len(packet) > _ws_payload_limit():
+                return self._send_command_result_pages(
+                    "chat_message", text,
+                    sender=getattr(self._master_reply_local, "command_sender", username),
+                    recipient=username,
+                    language=_detect_text_language(command_text) or "ar",
+                )
+        return self._send_text_packets(
+            "chat_message", text, to=username, notify_oversize=not exempt
+        )
 
     def send_private_media(self, username: str, media_url: str, media_type: str, duration: int = 0):
         """Send media to a private chat using the same Query media fields as rooms.
@@ -18191,12 +18288,14 @@ class TalkinBot:
         old_command_private = getattr(self._master_reply_local, "command_private", True)
         old_command_sender = getattr(self._master_reply_local, "command_sender", "")
         old_command_room = getattr(self._master_reply_local, "command_room", "")
+        old_command_text = getattr(self._master_reply_local, "command_text", "")
         self._master_reply_local.tracking = True
         self._master_reply_local.replied = False
         self._master_reply_local.private_replied = False
         self._master_reply_local.command_private = bool(is_private)
         self._master_reply_local.command_sender = sender
         self._master_reply_local.command_room = room
+        self._master_reply_local.command_text = str(body or "").strip()
         try:
             handled = self._handle_management_command_impl(room, body, sender, is_private=is_private)
             if handled and not getattr(self, "_replaying_bot_action", False):
@@ -18209,6 +18308,7 @@ class TalkinBot:
             self._master_reply_local.command_private = old_command_private
             self._master_reply_local.command_sender = old_command_sender
             self._master_reply_local.command_room = old_command_room
+            self._master_reply_local.command_text = old_command_text
 
     def _room_language_pending_key(self, sender):
         return _norm_user(sender)
@@ -22752,14 +22852,26 @@ class TalkinBot:
             else:
                 self.send_private_text(sender, text)
             return
-        total = (len(names) + 29) // 30
-        pages = []
-        for offset in range(0, len(names), 30):
-            page_no = offset // 30 + 1
-            title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else f"🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else f"🏠 Bot rooms — rooms file")
-            lines = [title, f"📄 القائمة {page_no}/{total}"]
-            lines.extend(f"{i}. {name}" for i, name in enumerate(names[offset:offset + 30], offset + 1))
-            pages.append("\n".join(lines))
+        title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else f"🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else f"🏠 Bot rooms — rooms file")
+        reserve = "\n📄 القائمة 999/999\n\n📌 اكتب ns للقائمة التالية." if language == "ar" else "\n📄 List 999/999\n\n📌 Type ns for the next list."
+
+        def fits(body):
+            return len(encode_query("chat_message", type_="text", to=str(sender or ""), body=body + reserve)) <= _ws_payload_limit()
+
+        page_bodies = []
+        current = [title]
+        for index, name in enumerate(names, 1):
+            line = f"{index}. {name}"
+            if len(current) > 1 and (len(current) > 30 or not fits("\n".join(current + [line]))):
+                page_bodies.append("\n".join(current))
+                current = [title, line]
+            else:
+                current.append(line)
+        if len(current) > 1:
+            page_bodies.append("\n".join(current))
+        total = len(page_bodies)
+        pages = [f"{body}\n📄 القائمة {page_no}/{total}" if language == "ar" else f"{body}\n📄 List {page_no}/{total}"
+                 for page_no, body in enumerate(page_bodies, 1)]
         key = ("chat_message", "", str(sender or ""))
         result_pages = getattr(self, "_result_pages", {})
         if not isinstance(result_pages, dict):
@@ -22772,7 +22884,7 @@ class TalkinBot:
             result_pages.pop(key, None)
             self._result_pages = result_pages
         if getattr(self, "ws", None):
-            self._send_text_packets("chat_message", first, to=str(sender or ""))
+            self._send_text_packets("chat_message", first, to=str(sender or ""), notify_oversize=False)
         else:
             self.send_private_text(sender, first)
 
