@@ -44,15 +44,15 @@ ITEMS = {
         "image": "diamond_blue.jpg", "kind": "diamond",
     },
     "diamond_purple": {
-        "name": "الألماس البنفسجي", "icon": "💜", "price": 2_000_000,
+        "name": "الألماس البنفسجي", "icon": "💠", "price": 2_000_000,
         "image": "diamond_purple.jpg", "kind": "diamond",
     },
     "diamond_red": {
-        "name": "الألماس الأحمر", "icon": "❤️", "price": 4_000_000,
+        "name": "الألماس الأحمر", "icon": "♦️", "price": 4_000_000,
         "image": "diamond_red.jpg", "kind": "diamond",
     },
     "diamond_black": {
-        "name": "الألماس الأسود", "icon": "🖤", "price": 7_500_000,
+        "name": "الألماس الأسود", "icon": "◆", "price": 7_500_000,
         "image": "diamond_black.jpg", "kind": "diamond",
     },
     "diamond_royal": {
@@ -96,6 +96,13 @@ def resolve_item_keys(value: str) -> tuple[str, ...] | None:
     token = " ".join(str(value or "").strip().casefold().split())
     token = token.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     token = token.replace("ى", "ي")
+    # Accept the exact catalog icon as a compact item selector (e.g. red 💎 3).
+    for item_key, item in ITEMS.items():
+        if token == str(item.get("icon", "")).casefold():
+            return (item_key,)
+    # Also accept stable internal catalog keys.
+    if token in ITEMS:
+        return (token,)
     # The alias table contains both canonical Arabic spellings and common
     # hamza-free spellings; normalize its keys with the same routine lazily.
     for alias, keys in _ALIAS_TO_KEYS.items():
