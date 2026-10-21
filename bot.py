@@ -14612,7 +14612,7 @@ class TalkinBot:
                         "room": str(room or ""),
                         "asset": asset,
                         "amount": amount,
-                        "trap": asset == 3 and amount == 50_000_000_000,
+                        "trap": asset == 3,
                         "started_at": now,
                         "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
                         "status": "pending_debit",
@@ -14686,8 +14686,13 @@ class TalkinBot:
             # itself has a stable transaction id and cannot be applied twice.
             self.log("[STOCK] active state save deferred; recovery will reconcile:", repr(exc))
         data = STOCK_MARKET_ASSETS[asset]
-        if language == "en":
+        trap = asset == 3
+        if language == "en" and trap:
+            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n🪤 Trap warning: oil always loses 100% of the investment.\n⏱️ Result in 1 minute."
+        elif language == "en":
             text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss.\n⏳ You can invest again in 2 minutes."
+        elif trap:
+            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n🪤 تنبيه: استثمار النفط فخ؛ خسارته 100% دائمًا.\n⏱️ النتيجة بعد دقيقة."
         else:
             text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة.\n⏳ يمكنك الاستثمار مجدداً بعد دقيقتين."
         self.send_room_text(room, text)
@@ -14745,7 +14750,7 @@ class TalkinBot:
             if not investment_id or not username or amount <= 0 or asset not in STOCK_MARKET_ASSETS:
                 continue
             status = str(row.get("status") or "pending_debit")
-            trap = bool(row.get("trap")) or (asset == 3 and amount == 50_000_000_000)
+            trap = bool(row.get("trap")) or asset == 3
             if status == "pending_debit":
                 debit = _apply_points_delta_once(
                     username, -amount, f"stock-market-debit:{investment_id}",

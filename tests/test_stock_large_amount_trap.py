@@ -54,8 +54,11 @@ def test_oil_and_land_billion_suffix_orders_are_accepted_and_debited():
         row = bot.stock_investments[0]
         assert row["asset"] == expected_asset, command
         assert row["amount"] == expected_amount, command
+        assert row["trap"] is (expected_asset == 3), command
         assert point_updates[0][1] == -expected_amount, command
         assert any("تم قبول الاستثمار" in text for _room, text in messages), command
+        if expected_asset == 3:
+            assert any("100%" in text and "فخ" in text for _room, text in messages), command
 
 
 def test_oil_50b_is_a_persisted_trap_with_a_full_loss_message():
@@ -104,3 +107,33 @@ def test_oil_50b_is_a_persisted_trap_with_a_full_loss_message():
     assert len(private_messages) == 1
     assert "وقعت بالفخ" in private_messages[0][1]
     assert "100%" in private_messages[0][1]
+
+
+def test_oil_stakes_of_any_size_always_settle_as_a_full_loss():
+    for amount in (10, 1_000_000, 30_000_000_000):
+        bot = _market_bot()
+        bot.stock_investments = [{
+            "id": f"oil-trap-{amount}", "event_id": 7, "username": "Player", "room": "Hall",
+            "asset": 3, "amount": amount, "started_at": 100.0, "due_at": 900.0,
+            "status": "active", "trap": True,
+        }]
+        histories, room_messages, private_messages = [], [], []
+        bot._record_stock_market_history = lambda row: histories.append(dict(row)) or True
+        bot.send_room_text = lambda room, text: room_messages.append((room, text))
+        bot.send_private_text = lambda user, text: private_messages.append((user, text))
+
+        with patch.object(bot_module, "_get_points", return_value=0), \
+             patch.object(bot_module, "_record_game", return_value=None), \
+             patch.object(bot_module, "_save_local_json", return_value=None), \
+             patch.object(bot_module, "STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED", True), \
+             patch.object(bot_module.secrets, "randbelow", side_effect=AssertionError("oil must never profit")):
+            assert bot._process_stock_market_investments(now=1000.0) == 1, amount
+
+        result = histories[0]
+        assert result["outcome"] == "loss", amount
+        assert result["change_percent"] == 100, amount
+        assert result["change"] == amount, amount
+        assert result["payout"] == 0, amount
+        assert not bot.stock_investments, amount
+        assert "وقعت بالفخ" in room_messages[0][1], amount
+        assert "وقعت بالفخ" in private_messages[0][1], amount
