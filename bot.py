@@ -16784,7 +16784,7 @@ class TalkinBot:
                     announcement = (
                         f"✨ بدأت جولة {config['title_ar']}! ✨\n"
                         f"{config['story_ar']}\n"
-                        f"🎮 للمشاركة اكتب في الغرفة: {config['join_ar']}\n"
+                        f"🎮 للانضمام إلى الجولة، اكتب في الغرفة: {config['join_ar']}\n"
                         f"👥 نحتاج إلى {config['players']} لاعبين لاكتمال الجولة.\n"
                         f"🏆 الجائزة: {prize} نقطة.\n"
                         "⏳ تنتهي فرصة المشاركة بعد 3 دقائق!"
