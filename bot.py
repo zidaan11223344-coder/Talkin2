@@ -14570,8 +14570,6 @@ class TalkinBot:
         if asset not in STOCK_MARKET_ASSETS or amount < 10:
             self.send_room_text(room, "❌ الحد الأدنى للاستثمار 10 نقاط." if language != "en" else "❌ The minimum investment is 10 points.")
             return True
-        if asset == 1:
-            amount = min(amount, 1_000_000_000)
         now = time.time()
         user_key = _norm_user(sender)
         previous_cooldown = None
