@@ -18036,9 +18036,11 @@ class TalkinBot:
         verification_manager_command = _is_verification_manager_command(body) or str(body or "").strip().casefold() in {
             "vi", "vip", "ماستر توثيق"
         }
+        shop_command_text = str(body or "").strip()
+        shop_command_digits = shop_command_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
         member_shop_command = bool(
-            str(body or "").strip().casefold() in {"متجر", "shop", "store", "story"}
-            or re.fullmatch(r"sby\s+[1-6]", str(body or "").strip(), re.I)
+            shop_command_text.casefold() in {"متجر", "shop", "store", "story"}
+            or re.fullmatch(r"(?:sby|buy|purchase|شراء|اشتر|اشتري)(?:\s*@?\s*)[1-6]", shop_command_digits, re.I)
         )
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
         master_points_transfer_command = bool(re.fullmatch(r"msb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
@@ -20944,7 +20946,8 @@ class TalkinBot:
         if low in {"متجر", "shop", "store", "story"}:
             self.send_private_text(sender, member_shop.render_catalog())
             return True
-        buy = re.fullmatch(r"sby\s+([1-6])", text, re.I)
+        buy_text = text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        buy = re.fullmatch(r"(?:sby|buy|purchase|شراء|اشتر|اشتري)(?:\s*@?\s*)([1-6])", buy_text, re.I)
         if buy:
             item_id = int(buy.group(1))
             item = member_shop.ITEMS[item_id]
