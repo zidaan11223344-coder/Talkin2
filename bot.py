@@ -4373,6 +4373,9 @@ DEFAULT_REPLY_MESSAGES = {
 
 
 POINTS_LEADERBOARD_LIMIT = 15
+# Conservative ceiling for leaderboard/list frames: leave headroom below the
+# hard 1008-byte payload limit to avoid client disconnects at the boundary.
+SAFE_COMMAND_REPLY_BYTES = 850
 
 
 def _points_leaderboard_rows(min_balance=None):
@@ -8861,7 +8864,7 @@ class TalkinBot:
     def _send_command_result_pages(self, packet_type, text, *, sender, room="", recipient="", language="ar"):
         """Paginate a long leaderboard/room-list response without a size warning."""
         route = {"to": str(recipient or "")} if packet_type == "chat_message" else {"room": str(room or "")}
-        limit = _ws_payload_limit()
+        limit = min(_ws_payload_limit(), SAFE_COMMAND_REPLY_BYTES)
         reserve = "\n📄 القائمة 999/999\n\n📌 اكتب ns للقائمة التالية."
 
         def fits(value):
@@ -8923,7 +8926,7 @@ class TalkinBot:
         command_text = getattr(self._master_reply_local, "command_text", "")
         if self._oversize_notice_exempt_command(command_text):
             packet = encode_query("room_message", type_="text", body=text, room=room)
-            if len(packet) > _ws_payload_limit():
+            if len(packet) > min(_ws_payload_limit(), SAFE_COMMAND_REPLY_BYTES):
                 return self._send_command_result_pages(
                     "room_message", text,
                     sender=notice_user, room=room,
@@ -9370,7 +9373,7 @@ class TalkinBot:
         exempt = self._oversize_notice_exempt_command(command_text)
         if exempt:
             packet = encode_query("chat_message", type_="text", to=username, body=str(text or ""))
-            if len(packet) > _ws_payload_limit():
+            if len(packet) > min(_ws_payload_limit(), SAFE_COMMAND_REPLY_BYTES):
                 return self._send_command_result_pages(
                     "chat_message", text,
                     sender=getattr(self._master_reply_local, "command_sender", username),
@@ -22870,7 +22873,7 @@ class TalkinBot:
         reserve = "\n📄 القائمة 999/999\n\n📌 اكتب ns للقائمة التالية." if language == "ar" else "\n📄 List 999/999\n\n📌 Type ns for the next list."
 
         def fits(body):
-            return len(encode_query("chat_message", type_="text", to=str(sender or ""), body=body + reserve)) <= _ws_payload_limit()
+            return len(encode_query("chat_message", type_="text", to=str(sender or ""), body=body + reserve)) <= min(_ws_payload_limit(), SAFE_COMMAND_REPLY_BYTES)
 
         page_bodies = []
         current = [title]
