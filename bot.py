@@ -14612,6 +14612,7 @@ class TalkinBot:
                         "room": str(room or ""),
                         "asset": asset,
                         "amount": amount,
+                        "trap": asset == 3 and amount == 50_000_000_000,
                         "started_at": now,
                         "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
                         "status": "pending_debit",
@@ -14692,7 +14693,7 @@ class TalkinBot:
         self.send_room_text(room, text)
         return True
 
-    def _broadcast_stock_market_result(self, username, source_room, asset, amount, outcome, change_percent, change):
+    def _broadcast_stock_market_result(self, username, source_room, asset, amount, outcome, change_percent, change, trap=False):
         """Announce a settled investment only in its source room."""
         if not STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED:
             return
@@ -14706,19 +14707,21 @@ class TalkinBot:
         english = self._configured_room_language(target_room) == "en"
         if english:
             label = "PROFIT" if is_profit else "LOSS"
+            trap_line = "\n🪤 You fell into the trap! You lost 100% of this oil investment." if trap else ""
             text = (
                 f"📈 Stock-market result — {label}\n"
                 f"👤 Investor: @{display_user}\n"
                 f"{data.get('icon', '📈')} {data.get('en', 'Market')} | Invested: {_fmt_points(amount)} points\n"
-                f"📊 {label}: ({sign}{_fmt_points(change)})"
+                f"📊 {label}: ({sign}{_fmt_points(change)}){trap_line}"
             )
         else:
             label = "ربح" if is_profit else "خسارة"
+            trap_line = "\n🪤 وقعت بالفخ! خسرت 100% من استثمار النفط." if trap else ""
             text = (
                 f"📈 نتيجة البورصة — {label}\n"
                 f"👤 المستثمر: @{display_user}\n"
                 f"{data.get('icon', '📈')} {data.get('ar', 'البورصة')} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
-                f"📊 {label}: ({sign}{_fmt_points(change)})"
+                f"📊 {label}: ({sign}{_fmt_points(change)}){trap_line}"
             )
         try:
             self.send_room_text(target_room, text)
@@ -14742,6 +14745,7 @@ class TalkinBot:
             if not investment_id or not username or amount <= 0 or asset not in STOCK_MARKET_ASSETS:
                 continue
             status = str(row.get("status") or "pending_debit")
+            trap = bool(row.get("trap")) or (asset == 3 and amount == 50_000_000_000)
             if status == "pending_debit":
                 debit = _apply_points_delta_once(
                     username, -amount, f"stock-market-debit:{investment_id}",
@@ -14769,7 +14773,21 @@ class TalkinBot:
                 status = "active"
             if now < due_at:
                 continue
-            if status != "paying":
+            if trap:
+                outcome = "loss"
+                change_percent = 100
+                change = amount
+                with self._stock_market_lock:
+                    for item in self.stock_investments:
+                        if item.get("id") == investment_id:
+                            item.update(
+                                status="paying", outcome=outcome, trap=True,
+                                change_percent=change_percent, profit_percent=change_percent,
+                                change=change, profit=change,
+                            )
+                            row = dict(item)
+                            break
+            elif status != "paying":
                 outcome = "loss" if secrets.randbelow(2) else "profit"
                 change_percent = secrets.randbelow(101)
                 change = amount * change_percent // 100
@@ -14807,10 +14825,16 @@ class TalkinBot:
                 self.log("[STOCK] payout state save failed; retrying:", repr(exc))
                 continue
             payout = max(0, amount - change) if outcome == "loss" else amount + change
-            credit = _apply_points_delta_once(
-                username, payout, f"stock-market-payout:{investment_id}",
-                f"stock market {outcome} {change_percent}% settlement",
-            )
+            if payout == 0:
+                # A 100% loss needs no credit transaction. The points ledger
+                # rejects zero-value deltas, but the already-debited stake is
+                # still fully settled and must not remain stuck in "paying".
+                credit = {"ok": True, "balance": _get_points(username), "already_applied": True}
+            else:
+                credit = _apply_points_delta_once(
+                    username, payout, f"stock-market-payout:{investment_id}",
+                    f"stock market {outcome} {change_percent}% settlement",
+                )
             if not credit.get("ok"):
                 self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, credit.get("error"))
                 continue
@@ -14832,23 +14856,25 @@ class TalkinBot:
             result_label = "Loss" if outcome == "loss" else "Profit"
             result_sign = "-" if outcome == "loss" else "+"
             if language == "en":
+                trap_line = "\n🪤 You fell into the trap! You lost 100% of this oil investment." if trap else ""
                 result_text = (
                     f"📈 Your stock-market result — {result_label}\n👤 Investor: @{display_user}\n"
                     f"{data['icon']} {data['en']} | Invested: {_fmt_points(amount)} points\n"
                     f"📊 {result_label}: ({result_sign}{_fmt_points(change)})\n"
-                    f"💳 Balance: {_fmt_points(credit['balance'])}"
+                    f"💳 Balance: {_fmt_points(credit['balance'])}{trap_line}"
                 )
             else:
                 result_label = "الخسارة" if outcome == "loss" else "الربح"
+                trap_line = "\n🪤 وقعت بالفخ! خسرت 100% من استثمار النفط." if trap else ""
                 result_text = (
                     f"📈 نتيجتك في البورصة — {result_label}\n👤 المستثمر: @{display_user}\n"
                     f"{data['icon']} {data['ar']} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
                     f"📊 {result_label}: ({result_sign}{_fmt_points(change)})\n"
-                    f"💳 الرصيد: {_fmt_points(credit['balance'])}"
+                    f"💳 الرصيد: {_fmt_points(credit['balance'])}{trap_line}"
                 )
             try:
                 self._broadcast_stock_market_result(
-                    username, room, asset, amount, outcome, change_percent, change
+                    username, room, asset, amount, outcome, change_percent, change, trap=trap
                 )
             except Exception as exc:
                 self.log("[STOCK] result broadcast failed:", repr(exc))

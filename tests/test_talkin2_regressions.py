@@ -4239,7 +4239,10 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
 
                 change = 100_000 * expected_percent // 100
                 expected_payout = 100_000 + change if outcome == "profit" else 100_000 - change
-                self.assertEqual(point_ops[0][1], expected_payout)
+                if expected_payout == 0:
+                    self.assertEqual(point_ops, [])
+                else:
+                    self.assertEqual(point_ops[0][1], expected_payout)
                 self.assertEqual(bot.stock_market_history[0]["change_percent"], expected_percent)
                 self.assertEqual(bot.stock_market_history[0]["change"], change)
                 self.assertFalse(bot.stock_investments)
