@@ -27,18 +27,15 @@ def _market_bot():
     return bot
 
 
-def test_oil_and_land_billion_suffix_orders_are_accepted_and_debited():
+def test_all_manual_assets_accept_10b_and_keep_their_amount():
     commands = (
-        ("ذهب 30b", 1, 30_000_000_000), ("gold 30b", 1, 30_000_000_000),
-        ("نفط 30b", 3, 30_000_000_000), ("النفط 30b", 3, 30_000_000_000),
-        ("oil 30b", 3, 30_000_000_000), ("نفط 50b", 3, 50_000_000_000),
-        ("أرض 30b", 4, 30_000_000_000), ("الأرض 30b", 4, 30_000_000_000),
-        ("land 30b", 4, 30_000_000_000),
+        ("ذهب 10b", 1), ("gold 10b", 1),
+        ("نفط 10b", 3), ("النفط 10b", 3), ("oil 10b", 3),
+        ("أرض 10b", 4), ("الأرض 10b", 4), ("land 10b", 4),
     )
-    for command, expected_asset, expected_amount in commands:
+    for command, expected_asset in commands:
         bot = _market_bot()
-        point_updates = []
-        messages = []
+        point_updates, messages = [], []
         bot.send_room_text = lambda room, text: messages.append((room, text))
 
         def apply_once(username, delta, transaction_id, reason, **_kwargs):
@@ -54,87 +51,74 @@ def test_oil_and_land_billion_suffix_orders_are_accepted_and_debited():
         assert len(bot.stock_investments) == 1, command
         row = bot.stock_investments[0]
         assert row["asset"] == expected_asset, command
-        assert row["amount"] == expected_amount, command
-        assert row["trap"] is (expected_asset == 3), command
-        assert point_updates[0][1] == -expected_amount, command
-        assert any("تم قبول الاستثمار" in text for _room, text in messages), command
-        if expected_asset == 3:
-            assert any("100%" in text and "فخ" in text for _room, text in messages), command
+        assert row["amount"] == 10_000_000_000, command
+        assert "trap" not in row, command
+        assert point_updates[0][1] == -10_000_000_000, command
+        assert any("تم قبول الاستثمار" in text and "ربح أو خسارة" in text for _, text in messages), command
+        assert all("فخ" not in text for _, text in messages), command
 
 
-def test_oil_50b_is_a_persisted_trap_with_a_full_loss_message():
-    bot = _market_bot()
-    amount = 50_000_000_000
-    saved_history = []
-    bot._record_stock_market_history = lambda row: saved_history.append(dict(row)) or True
-    room_messages, private_messages, point_updates = [], [], []
-    bot.send_room_text = lambda room, text: room_messages.append((room, text))
-    bot.send_private_text = lambda user, text: private_messages.append((user, text))
+def test_any_stock_asset_above_10b_is_rejected_without_debit():
+    commands = ("ذهب 10.1b", "فضة 11b", "نفط 50b", "أرض 12b")
+    for command in commands:
+        bot = _market_bot()
+        messages, debits = [], []
+        bot.send_room_text = lambda room, text: messages.append((room, text))
 
-    def apply_once(username, delta, transaction_id, reason, **_kwargs):
-        point_updates.append((username, delta, transaction_id, reason))
-        return {"ok": True, "balance": max(0, int(delta))}
+        def apply_once(username, delta, transaction_id, reason, **_kwargs):
+            debits.append(delta)
+            return {"ok": True, "balance": 1_000_000_000_000}
 
-    with patch.object(bot_module, "_is_verified_user", return_value=True), \
-         patch.object(bot_module, "_games_enabled_for_room", return_value=True), \
-         patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), \
-         patch.object(bot_module.time, "time", return_value=1000.0):
-        assert bot.handle_game_command("Hall", "نفط 50b", "Player") is True
-    assert len(bot.stock_investments) == 1
-    assert bot.stock_investments[0]["amount"] == amount
-    assert bot.stock_investments[0]["trap"] is True
-    bot.stock_investments[0]["due_at"] = 900.0
+        with patch.object(bot_module, "_is_verified_user", return_value=True), \
+             patch.object(bot_module, "_games_enabled_for_room", return_value=True), \
+             patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), \
+             patch.object(bot_module.time, "time", return_value=1000.0):
+            assert bot.handle_game_command("Hall", command, "Player") is True, command
 
-    with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), \
-         patch.object(bot_module, "_record_game", return_value=None), \
-         patch.object(bot_module, "_save_local_json", return_value=None), \
-         patch.object(bot_module, "_get_points", return_value=0), \
-         patch.object(bot_module, "STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED", True), \
-         patch.object(bot_module.secrets, "randbelow", side_effect=AssertionError("trap must be deterministic")):
-        assert bot._process_stock_market_investments(now=1000.0) == 1
-
-    assert saved_history[0]["outcome"] == "loss"
-    assert saved_history[0]["change_percent"] == 100
-    assert saved_history[0]["change"] == amount
-    assert saved_history[0]["payout"] == 0
-    assert len(point_updates) == 1
-    assert point_updates[0][0] == "Player"
-    assert point_updates[0][1] == -amount
-    assert not bot.stock_investments
-    result_room_messages = [text for _room, text in room_messages if "نتيجة البورصة" in text]
-    assert len(result_room_messages) == 1
-    assert "وقعت بالفخ" in result_room_messages[0]
-    assert "100%" in result_room_messages[0]
-    assert len(private_messages) == 1
-    assert "وقعت بالفخ" in private_messages[0][1]
-    assert "100%" in private_messages[0][1]
+        assert not debits, command
+        assert not bot.stock_investments, command
+        assert any("10b" in text and "سقف" in text for _, text in messages), command
 
 
-def test_oil_stakes_of_any_size_always_settle_as_a_full_loss():
-    for amount in (10, 1_000_000, 30_000_000_000):
+def test_oil_outcome_and_percentage_are_randomly_set_by_the_market():
+    cases = (
+        # stake, market outcome draw, market percentage draw, outcome, percent, payout
+        (1_000, 0, 25, "profit", 25, 1_250),
+        (10_000_000_000, 1, 70, "loss", 70, 3_000_000_000),
+        (10_000_000_000, 1, 100, "loss", 100, 0),
+    )
+    for amount, outcome_draw, percent_draw, expected_outcome, expected_percent, expected_payout in cases:
         bot = _market_bot()
         bot.stock_investments = [{
-            "id": f"oil-trap-{amount}", "event_id": 7, "username": "Player", "room": "Hall",
-            "asset": 3, "amount": amount, "started_at": 100.0, "due_at": 900.0,
-            "status": "active", "trap": True,
+            "id": f"oil-random-{amount}-{outcome_draw}-{percent_draw}",
+            "event_id": 7, "username": "Player", "room": "Hall", "asset": 3,
+            "amount": amount, "started_at": 100.0, "due_at": 900.0, "status": "active",
         }]
-        histories, room_messages, private_messages = [], [], []
+        histories, room_messages, private_messages, point_ops = [], [], [], []
         bot._record_stock_market_history = lambda row: histories.append(dict(row)) or True
         bot.send_room_text = lambda room, text: room_messages.append((room, text))
         bot.send_private_text = lambda user, text: private_messages.append((user, text))
 
-        with patch.object(bot_module, "_get_points", return_value=0), \
+        def apply_once(username, delta, transaction_id, reason, **_kwargs):
+            point_ops.append((username, delta, transaction_id, reason))
+            return {"ok": True, "balance": delta}
+
+        with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), \
+             patch.object(bot_module, "_get_points", return_value=0), \
              patch.object(bot_module, "_record_game", return_value=None), \
              patch.object(bot_module, "_save_local_json", return_value=None), \
              patch.object(bot_module, "STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED", True), \
-             patch.object(bot_module.secrets, "randbelow", side_effect=AssertionError("oil must never profit")):
+             patch.object(bot_module.secrets, "randbelow", side_effect=[outcome_draw, percent_draw]) as random_draw:
             assert bot._process_stock_market_investments(now=1000.0) == 1, amount
 
         result = histories[0]
-        assert result["outcome"] == "loss", amount
-        assert result["change_percent"] == 100, amount
-        assert result["change"] == amount, amount
-        assert result["payout"] == 0, amount
-        assert not bot.stock_investments, amount
-        assert "وقعت بالفخ" in room_messages[0][1], amount
-        assert "وقعت بالفخ" in private_messages[0][1], amount
+        assert result["outcome"] == expected_outcome, amount
+        assert result["change_percent"] == expected_percent, amount
+        assert result["payout"] == expected_payout, amount
+        assert random_draw.call_count == 2
+        assert not bot.stock_investments
+        assert all("فخ" not in text for _, text in room_messages + private_messages)
+        if expected_payout == 0:
+            assert point_ops == []
+        else:
+            assert point_ops[0][1] == expected_payout

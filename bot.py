@@ -486,6 +486,7 @@ STOCK_MARKET_ASSETS = {
     3: {"icon": "🛢️", "ar": "النفط", "en": "Oil"},
     4: {"icon": "🏞️", "ar": "الأرض", "en": "Land"},
 }
+STOCK_MARKET_MAX_INVESTMENT = 10_000_000_000
 
 def _parse_compact_amount(value):
     """Convert plain or compact stakes (1k/1m/1b) to whole points."""
@@ -14570,6 +14571,14 @@ class TalkinBot:
         if asset not in STOCK_MARKET_ASSETS or amount < 10:
             self.send_room_text(room, "❌ الحد الأدنى للاستثمار 10 نقاط." if language != "en" else "❌ The minimum investment is 10 points.")
             return True
+        if amount > STOCK_MARKET_MAX_INVESTMENT:
+            text = (
+                "❌ أعلى سقف للاستثمار في البورصة هو 10b (10 مليارات نقطة)."
+                if language != "en" else
+                "❌ The maximum stock-market investment is 10b (10 billion points)."
+            )
+            self.send_room_text(room, text)
+            return True
         now = time.time()
         user_key = _norm_user(sender)
         previous_cooldown = None
@@ -14610,7 +14619,6 @@ class TalkinBot:
                         "room": str(room or ""),
                         "asset": asset,
                         "amount": amount,
-                        "trap": asset == 3,
                         "started_at": now,
                         "due_at": now + STOCK_MARKET_SETTLEMENT_SECONDS,
                         "status": "pending_debit",
@@ -14684,19 +14692,14 @@ class TalkinBot:
             # itself has a stable transaction id and cannot be applied twice.
             self.log("[STOCK] active state save deferred; recovery will reconcile:", repr(exc))
         data = STOCK_MARKET_ASSETS[asset]
-        trap = asset == 3
-        if language == "en" and trap:
-            text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n🪤 Trap warning: oil always loses 100% of the investment.\n⏱️ Result in 1 minute."
-        elif language == "en":
+        if language == "en":
             text = f"✅ Investment accepted: {data['icon']} {data['en']}\n💰 Amount: {_fmt_points(amount)} points\n⏱️ Result in 1 minute: profit or loss.\n⏳ You can invest again in 2 minutes."
-        elif trap:
-            text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n🪤 تنبيه: استثمار النفط فخ؛ خسارته 100% دائمًا.\n⏱️ النتيجة بعد دقيقة."
         else:
             text = f"✅ تم قبول الاستثمار: {data['icon']} {data['ar']}\n💰 المبلغ: {_fmt_points(amount)} نقطة\n⏱️ النتيجة بعد دقيقة: ربح أو خسارة.\n⏳ يمكنك الاستثمار مجدداً بعد دقيقتين."
         self.send_room_text(room, text)
         return True
 
-    def _broadcast_stock_market_result(self, username, source_room, asset, amount, outcome, change_percent, change, trap=False):
+    def _broadcast_stock_market_result(self, username, source_room, asset, amount, outcome, change_percent, change):
         """Announce a settled investment only in its source room."""
         if not STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED:
             return
@@ -14710,21 +14713,19 @@ class TalkinBot:
         english = self._configured_room_language(target_room) == "en"
         if english:
             label = "PROFIT" if is_profit else "LOSS"
-            trap_line = "\n🪤 You fell into the trap! You lost 100% of this oil investment." if trap else ""
             text = (
                 f"📈 Stock-market result — {label}\n"
                 f"👤 Investor: @{display_user}\n"
                 f"{data.get('icon', '📈')} {data.get('en', 'Market')} | Invested: {_fmt_points(amount)} points\n"
-                f"📊 {label}: ({sign}{_fmt_points(change)}){trap_line}"
+                f"📊 {label}: ({sign}{_fmt_points(change)})"
             )
         else:
             label = "ربح" if is_profit else "خسارة"
-            trap_line = "\n🪤 وقعت بالفخ! خسرت 100% من استثمار النفط." if trap else ""
             text = (
                 f"📈 نتيجة البورصة — {label}\n"
                 f"👤 المستثمر: @{display_user}\n"
                 f"{data.get('icon', '📈')} {data.get('ar', 'البورصة')} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
-                f"📊 {label}: ({sign}{_fmt_points(change)}){trap_line}"
+                f"📊 {label}: ({sign}{_fmt_points(change)})"
             )
         try:
             self.send_room_text(target_room, text)
@@ -14748,7 +14749,6 @@ class TalkinBot:
             if not investment_id or not username or amount <= 0 or asset not in STOCK_MARKET_ASSETS:
                 continue
             status = str(row.get("status") or "pending_debit")
-            trap = bool(row.get("trap")) or asset == 3
             if status == "pending_debit":
                 debit = _apply_points_delta_once(
                     username, -amount, f"stock-market-debit:{investment_id}",
@@ -14776,21 +14776,7 @@ class TalkinBot:
                 status = "active"
             if now < due_at:
                 continue
-            if trap:
-                outcome = "loss"
-                change_percent = 100
-                change = amount
-                with self._stock_market_lock:
-                    for item in self.stock_investments:
-                        if item.get("id") == investment_id:
-                            item.update(
-                                status="paying", outcome=outcome, trap=True,
-                                change_percent=change_percent, profit_percent=change_percent,
-                                change=change, profit=change,
-                            )
-                            row = dict(item)
-                            break
-            elif status != "paying":
+            if status != "paying":
                 outcome = "loss" if secrets.randbelow(2) else "profit"
                 change_percent = secrets.randbelow(101)
                 change = amount * change_percent // 100
@@ -14859,25 +14845,23 @@ class TalkinBot:
             result_label = "Loss" if outcome == "loss" else "Profit"
             result_sign = "-" if outcome == "loss" else "+"
             if language == "en":
-                trap_line = "\n🪤 You fell into the trap! You lost 100% of this oil investment." if trap else ""
                 result_text = (
                     f"📈 Your stock-market result — {result_label}\n👤 Investor: @{display_user}\n"
                     f"{data['icon']} {data['en']} | Invested: {_fmt_points(amount)} points\n"
                     f"📊 {result_label}: ({result_sign}{_fmt_points(change)})\n"
-                    f"💳 Balance: {_fmt_points(credit['balance'])}{trap_line}"
+                    f"💳 Balance: {_fmt_points(credit['balance'])}"
                 )
             else:
                 result_label = "الخسارة" if outcome == "loss" else "الربح"
-                trap_line = "\n🪤 وقعت بالفخ! خسرت 100% من استثمار النفط." if trap else ""
                 result_text = (
                     f"📈 نتيجتك في البورصة — {result_label}\n👤 المستثمر: @{display_user}\n"
                     f"{data['icon']} {data['ar']} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
                     f"📊 {result_label}: ({result_sign}{_fmt_points(change)})\n"
-                    f"💳 الرصيد: {_fmt_points(credit['balance'])}{trap_line}"
+                    f"💳 الرصيد: {_fmt_points(credit['balance'])}"
                 )
             try:
                 self._broadcast_stock_market_result(
-                    username, room, asset, amount, outcome, change_percent, change, trap=trap
+                    username, room, asset, amount, outcome, change_percent, change
                 )
             except Exception as exc:
                 self.log("[STOCK] result broadcast failed:", repr(exc))
@@ -17380,7 +17364,7 @@ class TalkinBot:
             if not _games_enabled_for_room(room):
                 self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
                 return True
-            amount = min(max(0, _get_points(sender_name)), 1_000_000_000)
+            amount = min(max(0, _get_points(sender_name)), STOCK_MARKET_MAX_INVESTMENT)
             if amount < 10:
                 self.send_room_text(room, "❌ رصيدك أقل من الحد الأدنى 10 نقاط.")
                 return True
@@ -17388,9 +17372,9 @@ class TalkinBot:
             pending[(_norm_room(room), _norm_user(sender_name))] = {"amount": amount, "created": time.time()}
             self._stock_auto_gold_pending = pending
             if self._configured_room_language(room) == "en":
-                notice = f"⚠️ Investment risk: gold can fall and you could lose the full amount. Your current balance ({_fmt_points(amount)} points) will be invested automatically, capped at 1 billion. To accept, type: confirm (within 1 minute)."
+                notice = f"⚠️ Investment risk: gold can fall and you could lose the full amount. Your current balance ({_fmt_points(amount)} points) will be invested automatically, capped at 10 billion. To accept, type: confirm (within 1 minute)."
             else:
-                notice = f"⚠️ تحذير استثماري: سعر الذهب قد يهبط وقد تخسر كامل المبلغ. سيُستثمر رصيدك الحالي تلقائياً ({_fmt_points(amount)} نقطة)، وبحد أقصى مليار. إذا كنت موافقاً أرسل: موافق (خلال دقيقة)."
+                notice = f"⚠️ تحذير استثماري: سعر الذهب قد يهبط وقد تخسر كامل المبلغ. سيُستثمر رصيدك الحالي تلقائياً ({_fmt_points(amount)} نقطة)، وبحد أقصى 10 مليارات (10b). إذا كنت موافقاً أرسل: موافق (خلال دقيقة)."
             self.send_room_text(room, notice)
             return True
         if confirm_gold:
@@ -17405,7 +17389,7 @@ class TalkinBot:
             if not order or time.time() - float(order.get("created", 0)) > 60:
                 self.send_room_text(room, "⌛ انتهت مهلة التأكيد؛ أرسل بورصة لعرض التحذير من جديد.")
                 return True
-            amount = min(int(order.get("amount", 0)), max(0, _get_points(sender_name)), 1_000_000_000)
+            amount = min(int(order.get("amount", 0)), max(0, _get_points(sender_name)), STOCK_MARKET_MAX_INVESTMENT)
             if amount < 10:
                 self.send_room_text(room, "❌ رصيدك الحالي لا يكفي للاستثمار.")
                 return True
