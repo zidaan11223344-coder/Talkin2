@@ -341,115 +341,6 @@ GAME_COMMANDS = {
     "lightning": "برق", "ruby": "ياقوت", "crash": "صدام", "detector": "كاشف", "guess who": "كاشف",
     "steal": "اسرق", "rob": "اسرق", "lookalike": "شبيه", "twin": "شبيه",
 }
-
-# Nine scheduled treasure/royal games. The artwork is stored in assets/treasures/.
-# Arabic and English aliases are normalized before lookup so hamza and ة/ه variants work.
-TIMED_TREASURE_GAMES = {
-    "rare_diamond": {
-        "title_ar": "💎 الألماس النادر", "title_en": "💎 Rare Diamond",
-        "winner_ar": "🏆 الفائز بالألماس النادر", "winner_en": "🏆 Rare Diamond Winner",
-        "join_ar": "تنقيب", "join_en": "mining",
-        "aliases": ("تنقيب", "نقب", "rare diamond", "rare-diamond", "mining", "diamond mining"),
-        "players": 5, "prize": 100_000_000, "cycle": "classic",
-        "story_ar": "⛏️ بدأت مغامرة البحث عن الألماس النادر!",
-        "story_en": "⛏️ The hunt for the rare diamond has begun!",
-        "image": "rare_diamond_3d.png",
-    },
-    "gold_treasure": {
-        "title_ar": "🪙 كنز الذهب", "title_en": "🪙 Gold Treasure",
-        "winner_ar": "🏆 الفائز بكنز الذهب", "winner_en": "🏆 Gold Treasure Winner",
-        "join_ar": "كنز", "join_en": "treasure",
-        "aliases": ("كنز", "treasure", "gold treasure"),
-        "players": 5, "prize": 100_000_000, "cycle": "classic",
-        "story_ar": "🪙 ظهر كنز الذهب؛ أسرعوا للمشاركة!",
-        "story_en": "🪙 A gold treasure has appeared. Join the hunt!",
-        "image": "gold_treasure_3d.png",
-    },
-    "treasure_island": {
-        "title_ar": "🏴‍☠️ جزيرة الكنز", "title_en": "🏴‍☠️ Treasure Island",
-        "winner_ar": "🏆 الفائز بجزيرة الكنز", "winner_en": "🏆 Treasure Island Winner",
-        "join_ar": "جزيرة", "join_en": "island",
-        "aliases": ("جزيرة", "island", "treasure island"),
-        "players": 5, "prize": 100_000_000, "cycle": "classic",
-        "story_ar": "🏴‍☠️ انطلقت الرحلة إلى جزيرة الكنز!",
-        "story_en": "🏴‍☠️ The voyage to Treasure Island has begun!",
-        "image": "treasure_island_3d.png",
-    },
-    "fortune_hunt": {
-        "title_ar": "💰 صيد الثروة", "title_en": "💰 Fortune Hunt",
-        "winner_ar": "🏆 الفائز بصيد الثروة", "winner_en": "🏆 Fortune Hunt Winner",
-        "join_ar": "ثروة", "join_en": "fortune",
-        "aliases": ("ثروة", "fortune", "wealth hunt"),
-        "players": 5, "prize": 100_000_000, "cycle": "classic",
-        "story_ar": "💰 بدأت مطاردة الثروة والجائزة الكبرى!",
-        "story_en": "💰 The fortune hunt for the grand prize is on!",
-        "image": "fortune_hunt_3d.png",
-    },
-    "gem_mine": {
-        "title_ar": "💎 منجم الأحجار النادرة", "title_en": "💎 Rare Gem Mine",
-        "winner_ar": "🏆 الفائز بمنجم الأحجار النادرة", "winner_en": "🏆 Rare Gem Mine Winner",
-        "join_ar": "منجم", "join_en": "gem mine",
-        "aliases": ("منجم", "gem mine", "gemstone mine"),
-        "players": 5, "prize": 100_000_000, "cycle": "classic",
-        "story_ar": "⛏️ فُتح منجم الأحجار النادرة؛ استعدوا للتنقيب!",
-        "story_en": "⛏️ The rare-gem mine is open. Get ready to dig!",
-        "image": "gem_mine_3d.png",
-    },
-    "imperial_jade": {
-        "title_ar": "💚 اليشم الإمبراطوري", "title_en": "💚 Imperial Jade",
-        "winner_ar": "🏆 الفائز باليشم الإمبراطوري", "winner_en": "🏆 Imperial Jade Winner",
-        "join_ar": "يشم", "join_en": "jade",
-        "aliases": ("يشم", "jade", "imperial jade"),
-        "players": 5, "prize": 100_000_000, "cycle": "classic",
-        "story_ar": "💚 ظهر اليشم الإمبراطوري النادر!",
-        "story_en": "💚 The rare Imperial Jade has appeared!",
-        "image": "imperial_jade_3d.png",
-    },
-    "imperial_sickness": {
-        "title_ar": "👑 مرض الإمبراطور", "title_en": "👑 The Emperor's Illness",
-        "winner_ar": "🏆 منقذ الإمبراطور", "winner_en": "🏆 The Emperor's Savior",
-        "join_ar": "طبيب", "join_en": "doctor",
-        "aliases": ("طبيب", "doctor", "emperor doctor"),
-        "players": 7, "prize": 500_000_000, "cycle": "doctor",
-        "story_ar": "🩺 الإمبراطور مريض ويحتاج إلى طبيب ماهر لإنقاذه!",
-        "story_en": "🩺 The Emperor is ill and needs a skilled doctor!",
-        "image": "imperial_sickness_3d.jpg",
-    },
-    "flight_radar": {
-        "title_ar": "🚨 الرادار وهجوم الطيران", "title_en": "🚨 Radar & Air Strike",
-        "winner_ar": "🏆 قائد الرادار والطيران", "winner_en": "🏆 Radar & Air-Strike Captain",
-        "join_ar": "كابتن", "join_en": "captain",
-        "aliases": ("كابتن", "captain", "radar", "flight attack"),
-        "players": 7, "prize": 500_000_000, "cycle": "royal",
-        "story_ar": "📡 رصد الرادار هجومًا جويًا؛ تولّوا القيادة!",
-        "story_en": "📡 Radar detected an air strike. Take command!",
-        "image": "flight_radar_3d.jpg",
-    },
-    "mercenary_escape": {
-        "title_ar": "🚔 هروب قاتل مأجور من السجن", "title_en": "🚔 Escaped Hitman Chase",
-        "winner_ar": "🏆 بطل مطاردة القاتل المأجور", "winner_en": "🏆 Escaped Hitman Chase Winner",
-        "join_ar": "أمن", "join_en": "police",
-        "aliases": ("أمن", "امن", "police", "security", "chase"),
-        "players": 7, "prize": 500_000_000, "cycle": "royal",
-        "story_ar": "🚨 هرب قاتل مأجور من السجن؛ ساعدوا الأمن في القبض عليه!",
-        "story_en": "🚨 A hired killer escaped prison. Help security catch him!",
-        "image": "mercenary_escape_3d.jpg",
-    },
-}
-
-def _normalize_timed_treasure_command(value):
-    text = str(value or "").strip().casefold()
-    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
-    text = text.replace("ى", "ي").replace("ة", "ه")
-    text = re.sub(r"[\u064b-\u065f\u0670]", "", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-TIMED_TREASURE_GAME_ALIASES = {
-    _normalize_timed_treasure_command(alias): game_key
-    for game_key, game in TIMED_TREASURE_GAMES.items()
-    for alias in game["aliases"]
-}
-
 MILLION_BANK_COOLDOWN_SECONDS = 60.0
 try:
     BILLION_GAME_COOLDOWN_SECONDS = max(1.0, float(os.getenv("BILLION_GAME_COOLDOWN_SECONDS", "60") or 60))
@@ -877,7 +768,6 @@ FILTER_EXCEPTIONS_FILE = DATA_DIR / "filter_exceptions.json"
 FILTER_BANS_FILE = DATA_DIR / "filter_bans.json"
 BOT_BANS_FILE = DATA_DIR / "bot_bans.json"
 LAST_BOT_BANS_FILE = DATA_DIR / "last_bot_bans.json"
-BANNED_DOCTORS_FILE = DATA_DIR / "banned_doctors.json"
 MONEY_GAME_WIN_STATE_FILE = DATA_DIR / "money_game_win_state.json"
 MONEY_GAME_SETTINGS_FILE = DATA_DIR / "money_game_settings.json"
 PUBLISH_BANS_FILE = DATA_DIR / "publish_bans.json"
@@ -3077,7 +2967,6 @@ def _looks_like_bot_command(text):
         or normalized_low in normalized_games
         or low in mining_exact
         or normalized_low in mining_normalized
-        or _normalize_timed_treasure_command(text) in TIMED_TREASURE_GAME_ALIASES
         or low.startswith(("rdem ", "r ", "red "))
     )
 
@@ -5977,7 +5866,7 @@ def _rare_diamond_asset_path():
     return None
 
 
-def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_path=None, title="💎 الفائز بالألماسة النادرة"):
+def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_path=None):
     """Overlay the winner name on the rare-diamond artwork, like money-game cards.
 
     The base rare-diamond image is expected to be supplied in the assets tree;
@@ -6017,7 +5906,7 @@ def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_pat
     center_x = (text_left + text_right) / 2
     _draw_centered(
         draw, (center_x, panel_box[1] + (panel_box[3] - panel_box[1]) * .32),
-        str(title or "💎 الفائز بالألماسة النادرة"), max(27, int(h * .038)),
+        "💎 الفائز بالألماسة النادرة", max(27, int(h * .038)),
         (115, 225, 255, 255), max(80, text_right - text_left),
     )
     _draw_name_centered(
@@ -7004,15 +6893,6 @@ class TalkinBot:
         self._rare_diamond_lock = threading.RLock()
         self._rare_diamond_event = None
         self._rare_diamond_round_seq = 0
-        self._treasure_cycle_index = 0
-        self._royal_cycle_index = 0
-        self._doctor_ban_lock = threading.RLock()
-        _saved_doctors = _load_local_json(BANNED_DOCTORS_FILE, {})
-        self._banned_doctors = _saved_doctors if isinstance(_saved_doctors, dict) else {}
-        self._banned_doctors = {
-            _norm_user(k): v for k, v in self._banned_doctors.items()
-            if _norm_user(k) and isinstance(v, dict)
-        }
         self.fruit_games = {}
         # Auto replies and per-user custom welcome messages.
         self.auto_replies_enabled = True
@@ -16686,11 +16566,8 @@ class TalkinBot:
         return True
 
     def _rare_diamond_event_worker(self):
-        """Cycle through the six classic games, emperor doctor, and two royal games without overlapping rounds."""
-        classic = [key for key, game in TIMED_TREASURE_GAMES.items() if game["cycle"] == "classic"]
-        royal = [key for key, game in TIMED_TREASURE_GAMES.items() if game["cycle"] == "royal"]
-        now = time.time()
-        due = {"classic": now, "doctor": now + 420.0, "royal": now + 600.0}
+        """Announce a shared rare-diamond round in every connected room every five minutes."""
+        next_start = 0.0
         while not self.stop_event.wait(1.0):
             now = time.time()
             with self._rare_diamond_lock:
@@ -16700,59 +16577,21 @@ class TalkinBot:
                 with self._rare_diamond_lock:
                     if self._rare_diamond_event is event:
                         self._rare_diamond_event = None
-                joined_rooms = sorted({
-                    str(player.get("room", "")).strip()
-                    for player in event.get("players", {}).values()
-                    if isinstance(player, dict) and str(player.get("room", "")).strip()
-                }, key=str.casefold)
-                required = int(event.get("required_players", 5))
-                for target_room in joined_rooms:
+                notice = "⌛ انتهى وقت التنقيب ولم يكتمل عدد 5 لاعبين؛ أُغلقت الجولة."
+                for target_room in event.get("rooms", [event.get("room", "")]):
                     try:
-                        if self._effective_room_language(target_room) == "en":
-                            notice = f"⌛ The {event.get('game_title_en', 'game')} round timed out before reaching {required} players. The round is closed."
-                        else:
-                            notice = f"⌛ انتهى وقت {event.get('game_title_ar', 'الجولة')} ولم يكتمل عدد {required} لاعبين؛ أُغلقت الجولة."
                         self.send_room_text(target_room, notice)
                     except Exception as exc:
-                        self.log("[TREASURE-CYCLE] timeout notice failed:", target_room, repr(exc))
+                        self.log("[RARE-DIAMOND] timeout notice failed:", target_room, repr(exc))
+            if now >= next_start:
+                try:
+                    started = self._start_rare_diamond_event()
+                    next_start = time.time() + (300.0 if started else 10.0)
+                except Exception as exc:
+                    self.log("[RARE-DIAMOND] event start failed:", repr(exc))
+                    next_start = time.time() + 10.0
 
-            with self._rare_diamond_lock:
-                active = isinstance(self._rare_diamond_event, dict) and now < float(self._rare_diamond_event.get("ends_at", 0) or 0)
-            if active:
-                continue
-            category = min(due, key=due.get)
-            if now < due[category]:
-                continue
-            try:
-                if category == "classic":
-                    game_key = classic[self._treasure_cycle_index % len(classic)]
-                    interval = 300.0
-                elif category == "doctor":
-                    game_key = "imperial_sickness"
-                    interval = 420.0
-                else:
-                    game_key = royal[self._royal_cycle_index % len(royal)]
-                    interval = 600.0
-                started = self._start_rare_diamond_event(game_key)
-                if started:
-                    if category == "classic":
-                        self._treasure_cycle_index = (self._treasure_cycle_index + 1) % len(classic)
-                    elif category == "royal":
-                        self._royal_cycle_index = (self._royal_cycle_index + 1) % len(royal)
-                    due[category] = time.time() + interval
-                else:
-                    due[category] = time.time() + 10.0
-            except Exception as exc:
-                self.log("[TREASURE-CYCLE] game start failed:", repr(exc))
-                due[category] = time.time() + 10.0
-
-    def _start_rare_diamond_event(self, game=None):
-        """Open a timed round and localize the announcement separately for each room."""
-        game_key = str(game or "rare_diamond")
-        config = TIMED_TREASURE_GAMES.get(game_key)
-        if not config:
-            game_key = "rare_diamond"
-            config = TIMED_TREASURE_GAMES[game_key]
+    def _start_rare_diamond_event(self):
         rooms = [str(r).strip() for r in getattr(self, "connected_rooms", set()) if str(r).strip()]
         if not rooms:
             try:
@@ -16766,60 +16605,26 @@ class TalkinBot:
         with self._rare_diamond_lock:
             current = self._rare_diamond_event
             if isinstance(current, dict) and now < float(current.get("ends_at", 0) or 0):
-                return False
+                return True
             self._rare_diamond_round_seq += 1
             self._rare_diamond_event = {
-                "id": f"treasure-{game_key}-{int(now)}-{self._rare_diamond_round_seq}",
-                "game_key": game_key,
-                "game_title": config["title_ar"],
-                "game_title_ar": config["title_ar"],
-                "game_title_en": config["title_en"],
-                "room": rooms[0], "rooms": rooms, "players": {},
-                "ends_at": now + 180.0, "required_players": int(config["players"]),
+                "id": f"rare-diamond-{int(now)}-{self._rare_diamond_round_seq}",
+                "room": rooms[0], "rooms": rooms, "players": {}, "ends_at": now + 180.0,
             }
-        prize = f"{config['prize']:,}"
+        announcement = "💎✨ ظهر الألماس النادر! ✨💎\n⛏️🔥 بدأت مغامرة التنقيب عن الألماس النادر!\n💎 طريقة المشاركة: اكتب في الغرفة: تنقيب\n👥 نحتاج إلى 5 لاعبين لاكتمال المشاركة."
         for target_room in rooms:
             try:
-                if self._effective_room_language(target_room) == "en":
-                    announcement = (
-                        f"✨ {config['title_en']} — ROUND OPEN! ✨\n"
-                        f"{config['story_en']}\n"
-                        f"🎮 Join by typing: {config['join_en']}\n"
-                        f"👥 {config['players']} players are needed.\n"
-                        f"🏆 Prize: {prize} points.\n"
-                        "⏳ Join within 3 minutes!"
-                    )
-                else:
-                    announcement = (
-                        f"✨ بدأت جولة {config['title_ar']}! ✨\n"
-                        f"{config['story_ar']}\n"
-                        f"🎮 للمشاركة اكتب في الغرفة: {config['join_ar']}\n"
-                        f"👥 نحتاج إلى {config['players']} لاعبين لاكتمال الجولة.\n"
-                        f"🏆 الجائزة: {prize} نقطة.\n"
-                        "⏳ تنتهي فرصة المشاركة بعد 3 دقائق!"
-                    )
                 self.send_room_text(target_room, announcement)
             except Exception as exc:
-                self.log("[TREASURE-CYCLE] room announcement failed:", target_room, repr(exc))
-        self.log("[TREASURE-CYCLE] round opened", game_key, "in rooms:", len(rooms))
+                self.log("[RARE-DIAMOND] room announcement failed:", target_room, repr(exc))
+        self.log("[RARE-DIAMOND] round opened in rooms:", len(rooms))
         return True
 
-    def _join_rare_diamond_event(self, room, username, requested_game=None):
-        """Join the current scheduled game; each player is counted once across rooms."""
+    def _join_rare_diamond_event(self, room, username):
         name = str(username or "").strip().lstrip("@")
         key = _norm_user(name)
         if not key:
             return False
-        language_en = self._effective_room_language(room) == "en"
-        if requested_game == "imperial_sickness":
-            with self._doctor_ban_lock:
-                ban_record = self._banned_doctors.get(key)
-            if ban_record:
-                if language_en:
-                    self.send_room_text(room, f"🚫 @{name}, you are barred from the doctor game after failing to save the Emperor in a previous round.")
-                else:
-                    self.send_room_text(room, f"🚫 @{name} أنت محظور من لعبة الطبيب لفشلك في إنقاذ الإمبراطور في جولة سابقة.")
-                return True
         with self._rare_diamond_lock:
             event = self._rare_diamond_event
             if not isinstance(event, dict) or time.time() >= float(event.get("ends_at", 0) or 0):
@@ -16827,250 +16632,148 @@ class TalkinBot:
             event_rooms = event.get("rooms") or [event.get("room", "")]
             if not any(_norm_room(room) == _norm_room(r) for r in event_rooms):
                 return False
-            active_key = str(event.get("game_key", "rare_diamond"))
-            if requested_game and active_key != requested_game:
-                active_title = event.get("game_title_en" if language_en else "game_title_ar", "game")
-                active_command = TIMED_TREASURE_GAMES.get(active_key, TIMED_TREASURE_GAMES["rare_diamond"])["join_en" if language_en else "join_ar"]
-                mismatch = True
-                players = event.setdefault("players", {})
+            players = event.setdefault("players", {})
+            if key in players:
                 count = len(players)
-                required_players = int(event.get("required_players", 5))
+                already_joined = True
                 ready = False
+            elif len(players) >= 5:
+                count = len(players)
                 already_joined = False
-                round_id = event.get("id", "")
-                joined_rooms = []
+                ready = False
             else:
-                mismatch = False
-                players = event.setdefault("players", {})
-                required_players = int(event.get("required_players", 5))
-                if key in players:
-                    count = len(players)
-                    already_joined = True
-                    ready = False
-                elif len(players) >= required_players:
-                    count = len(players)
-                    already_joined = False
-                    ready = False
-                else:
-                    players[key] = {"name": name, "room": str(room)}
-                    count = len(players)
-                    already_joined = False
-                    ready = count >= required_players
-                round_id = event["id"]
-                game_title = event.get("game_title_en" if language_en else "game_title_ar", "game")
-                joined_rooms = sorted({
-                    str(player.get("room", "")).strip()
-                    for player in players.values()
-                    if isinstance(player, dict) and str(player.get("room", "")).strip()
-                }, key=str.casefold)
-        if mismatch:
-            if language_en:
-                self.send_room_text(room, f"🎮 That game is not open yet. Current round: {active_title}.\n📌 Join command: {active_command}")
-            else:
-                self.send_room_text(room, f"🎮 هذه اللعبة لم تُفتح بعد. الجولة المفتوحة الآن: {active_title}.\n📌 أمر المشاركة الحالي: {active_command}")
-            return True
+                players[key] = {"name": name, "room": str(room)}
+                count = len(players)
+                already_joined = False
+                ready = count >= 5
+            round_id = event["id"]
         if already_joined:
-            if language_en:
-                self.send_room_text(room, f"🎮 @{name}, you have already joined ({count}/{required_players}).")
-            else:
-                self.send_room_text(room, f"🎮 @{name} أنت مشارك بالفعل ({count}/{required_players}).")
+            self.send_room_text(room, f"💎 @{name} أنت مشارك بالفعل ({count}/5).")
             return True
-        if count >= required_players and not ready:
-            self.send_room_text(room, "🎮 All participant slots are full; wait for the next round." if language_en else f"🎮 اكتمل عدد المشاركين ({required_players})؛ انتظر الجولة التالية.")
+        if count > 5 or (count == 5 and not ready):
+            self.send_room_text(room, "💎 اكتمل عدد المشاركين؛ انتظر الجولة التالية.")
             return True
-        if count == required_players and ready:
-            if language_en:
-                self.send_room_text(room, f"🎮 @{name} completed the roster ({count}/{required_players})!")
-            else:
-                self.send_room_text(room, f"🎮 @{name} أكمل العدد ({count}/{required_players})!")
-            for target_room in joined_rooms:
+        if count == 5 and ready:
+            self.send_room_text(room, f"💎 @{name} أكمل العدد ({count}/5)!")
+            for target_room in event_rooms:
                 try:
-                    if self._effective_room_language(target_room) == "en":
-                        ready_notice = f"🔥 All {required_players} players have joined! {TIMED_TREASURE_GAMES[active_key]['title_en']} is starting..."
-                    else:
-                        ready_notice = f"🔥 اكتمل المشاركون ({required_players})! بدأت جولة {TIMED_TREASURE_GAMES[active_key]['title_ar']}..."
-                    self.send_room_text(target_room, ready_notice)
+                    self.send_room_text(target_room, "⛏️ اكتمل المشاركون الخمسة! بدأ التنقيب...")
                 except Exception as exc:
-                    self.log("[TREASURE-CYCLE] ready notice failed:", target_room, repr(exc))
-            threading.Thread(target=self._resolve_rare_diamond_event, args=(round_id,), name="treasure-game-resolve", daemon=True).start()
+                    self.log("[RARE-DIAMOND] ready notice failed:", target_room, repr(exc))
+            threading.Thread(target=self._resolve_rare_diamond_event, args=(round_id,), name="rare-diamond-resolve", daemon=True).start()
         else:
-            if language_en:
-                self.send_room_text(room, f"🎮 @{name} joined {TIMED_TREASURE_GAMES[active_key]['title_en']} ({count}/{required_players}).")
-            else:
-                self.send_room_text(room, f"🎮 @{name} انضم إلى {TIMED_TREASURE_GAMES[active_key]['title_ar']} ({count}/{required_players}).")
+            self.send_room_text(room, f"💎 @{name} انضم للتنقيب ({count}/5).")
         return True
 
-    def _send_treasure_game_result_card(self, room, game_key, winner_name):
-        """Send a personalized game result card only to rooms containing participants."""
-        base = _public_base_url()
-        if not base:
-            self.log("[TREASURE-CYCLE] result image skipped: public media URL is not configured")
-            return False
-        config = TIMED_TREASURE_GAMES.get(game_key, TIMED_TREASURE_GAMES["rare_diamond"])
-        source = ASSETS_DIR / "treasures" / config["image"]
-        if not source.is_file():
-            stem = Path(config["image"]).stem
-            candidates = [ASSETS_DIR / "treasures" / f"{stem}.{ext}" for ext in ("png", "jpg", "jpeg")]
-            candidates.extend([ASSETS_DIR / "treasures" / "rare_diamond_3d.png", ASSETS_DIR / "treasures" / "rare_diamond_3d.jpg"] if game_key == "rare_diamond" else [])
-            source = next((candidate for candidate in candidates if candidate.is_file()), None)
-        if not source or not Path(source).is_file():
-            self.log("[TREASURE-CYCLE] missing result art:", config["image"])
-            return False
-        try:
-            winner_key = _norm_user(winner_name)
-            winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
-            if not winner_photo:
-                winner_photo = self._lookup_profile_photo(winner_name)
-            language_en = self._effective_room_language(room) == "en"
-            title = config["winner_en"] if language_en else config["winner_ar"]
-            card = render_rare_diamond_winner_card(winner_name, winner_photo, source_path=source, title=title)
-            url = f"{base}/games/{card.name}"
-            self._verify_public_media_url(url, "image")
-            sent = self.send_room_media(room, url, "image") is not False
-            self.log("[TREASURE-CYCLE] result card", game_key, room, "sent=" + str(sent))
-            return sent
-        except Exception as exc:
-            self.log("[TREASURE-CYCLE] result card failed:", game_key, repr(exc))
-            return False
-
     def _resolve_rare_diamond_event(self, round_id):
-        """Resolve one round. Results go only to rooms where its players joined."""
         time.sleep(3.0)
         with self._rare_diamond_lock:
             event = self._rare_diamond_event
             if not isinstance(event, dict) or event.get("id") != round_id:
                 return
             player_records = list(event.get("players", {}).values())
-            game_key = event.get("game_key", "rare_diamond")
+            rooms = list(event.get("rooms") or [event.get("room", "")])
             self._rare_diamond_event = None
-        config = TIMED_TREASURE_GAMES.get(game_key, TIMED_TREASURE_GAMES["rare_diamond"])
-        required_players = int(config["players"])
-        if len(player_records) != required_players:
+        if len(player_records) != 5:
             return
+
         players = [p.get("name", "") if isinstance(p, dict) else str(p) for p in player_records]
-        player_rooms = {
-            _norm_user(p.get("name", "")): str(p.get("room", "")).strip()
-            for p in player_records if isinstance(p, dict) and p.get("name")
-        }
-        rooms = sorted({
-            str(p.get("room", "")).strip()
-            for p in player_records if isinstance(p, dict) and str(p.get("room", "")).strip()
-        }, key=str.casefold)
-        if not rooms:
-            return
         winner = secrets.choice(players)
-        winner_key = _norm_user(winner)
-        losers = [player for player in players if _norm_user(player) != winner_key]
-        prize_amount = int(config["prize"])
-        prize_label_ar = f"{prize_amount:,} نقطة"
-        prize_label_en = f"{prize_amount:,} points"
+        winner_credit = {"ok": False}
         try:
             winner_credit = _apply_points_delta_once(
-                winner, prize_amount, f"{round_id}:winner:{winner_key}", f"{game_key} prize"
+                winner, 500_000_000, f"{round_id}:winner:{_norm_user(winner)}", "rare diamond expedition prize"
             )
         except Exception as exc:
-            self.log("[TREASURE-CYCLE] winner credit failed:", winner, repr(exc))
-            winner_credit = {"ok": False}
+            self.log("[RARE-DIAMOND] winner credit failed:", winner, repr(exc))
 
-        # For the emperor-doctor game, the only doctor who saves the Emperor wins;
-        # the other six are permanently barred from future doctor rounds.
-        if game_key == "imperial_sickness":
-            with self._doctor_ban_lock:
-                for player in losers:
-                    key = _norm_user(player)
-                    if key:
-                        self._banned_doctors[key] = {
-                            "name": player, "failed_at": int(time.time()), "round_id": round_id,
-                            "reason": "failed to save the emperor",
-                        }
-                _save_local_json(BANNED_DOCTORS_FILE, self._banned_doctors)
-            for player in losers:
-                try:
-                    _apply_points_delta_once(
-                        player, -10_000, f"{round_id}:loss:{_norm_user(player)}", f"{game_key} participation"
-                    )
-                except Exception as exc:
-                    self.log("[TREASURE-CYCLE] doctor loss debit failed:", player, repr(exc))
-            for target_room in rooms:
-                language_en = self._effective_room_language(target_room) == "en"
-                if language_en:
-                    result_text = (
-                        f"✅ @{winner} saved the Emperor and won {prize_label_en}! 👑🩺"
-                        if isinstance(winner_credit, dict) and winner_credit.get("ok")
-                        else f"🏥 @{winner} saved the Emperor, but the {prize_label_en} prize could not be credited."
-                    )
-                else:
-                    result_text = (
-                        f"✅ نجح الطبيب @{winner} في إنقاذ الإمبراطور وفاز بـ{prize_label_ar}! 👑🩺"
-                        if isinstance(winner_credit, dict) and winner_credit.get("ok")
-                        else f"🏥 أنقذ @{winner} الإمبراطور، لكن تعذّر اعتماد جائزة {prize_label_ar}."
-                    )
-                try:
-                    self.send_room_text(target_room, result_text)
-                    self._send_treasure_game_result_card(target_room, game_key, winner)
-                except Exception as exc:
-                    self.log("[TREASURE-CYCLE] doctor result send failed:", target_room, repr(exc))
-            for player in losers:
-                target_room = player_rooms.get(_norm_user(player), "")
-                if not target_room:
-                    continue
-                try:
-                    if self._effective_room_language(target_room) == "en":
-                        ban_notice = f"❌ @{player} failed to save the Emperor and is now barred from future doctor rounds."
-                    else:
-                        ban_notice = f"❌ فشل الطبيب @{player} في إنقاذ الإمبراطور، وتم حظره من جولات الطبيب القادمة."
-                    self.send_room_text(target_room, ban_notice)
-                except Exception as exc:
-                    self.log("[TREASURE-CYCLE] doctor ban notice failed:", player, repr(exc))
-            return
-
-        # Apply each non-winner's participation deduction once, then reuse the same
-        # outcome in every participant room's localized result.
-        debit_results = {}
-        for player in players:
-            if _norm_user(player) == winner_key:
+        # Grant the catalog's rare/red diamond, not an arbitrary test treasure.
+        granted = False
+        awarded_item = None
+        winner_id = "name:" + _norm_user(winner)
+        rare_key = _rare_diamond_item_key()
+        grant_methods = (
+            "give_rare_diamond", "award_rare_diamond", "grant_rare_diamond",
+            "add_item", "grant_item", "give_item", "award_item",
+            "add_to_inventory", "award_diamond", "give_test_diamond",
+        )
+        for method_name in grant_methods:
+            method = getattr(MINING_STORE, method_name, None)
+            if not callable(method):
                 continue
-            try:
-                debit_results[_norm_user(player)] = _apply_points_delta_once(
-                    player, -10_000, f"{round_id}:loss:{_norm_user(player)}", f"{game_key} participation"
-                )
-            except Exception as exc:
-                self.log("[TREASURE-CYCLE] loss debit failed:", player, repr(exc))
-                debit_results[_norm_user(player)] = {"ok": False}
-
-        for target_room in rooms:
-            language_en = self._effective_room_language(target_room) == "en"
-            if language_en:
-                lines = [
-                    f"🏆 @{winner} won {config['title_en']}!",
-                    f"💰 Prize: {prize_label_en}." if isinstance(winner_credit, dict) and winner_credit.get("ok")
-                    else f"⚠️ The {prize_label_en} prize could not be credited; the bot log should be checked.",
+            attempts = []
+            if method_name in {"give_rare_diamond", "award_rare_diamond", "grant_rare_diamond"}:
+                attempts = [(winner_id, winner), (winner_id, winner, 1)]
+            elif rare_key:
+                # Do not call the generic two-argument test helper: only use
+                # forms that explicitly identify the rare catalog item.
+                attempts = [
+                    (winner_id, winner, rare_key, 1),
+                    (winner_id, winner, rare_key),
                 ]
             else:
-                lines = [
-                    f"🏆 @{winner} فاز في لعبة {config['title_ar']}!",
-                    f"💰 الجائزة: {prize_label_ar}." if isinstance(winner_credit, dict) and winner_credit.get("ok")
-                    else f"⚠️ تعذّر اعتماد جائزة {prize_label_ar} للفائز؛ راجع سجل البوت.",
-                ]
-            for player in players:
-                if _norm_user(player) == winner_key:
+                continue
+            for args in attempts:
+                try:
+                    result = method(*args)
+                except TypeError:
                     continue
-                debit = debit_results.get(_norm_user(player), {"ok": False})
-                if language_en:
-                    if isinstance(debit, dict) and debit.get("ok"):
-                        lines.append(f"@{player}: -10,000 points")
-                    else:
-                        lines.append(f"@{player}: the 10,000-point deduction was not applied (insufficient balance or update error).")
-                else:
-                    if isinstance(debit, dict) and debit.get("ok"):
-                        lines.append(f"@{player}: -10,000 نقطة")
-                    else:
-                        lines.append(f"@{player}: لم يُخصم 10,000 نقطة لعدم كفاية الرصيد أو تعذّر التحديث.")
+                except Exception as exc:
+                    self.log("[RARE-DIAMOND] inventory grant failed:", method_name, repr(exc))
+                    break
+                if isinstance(result, dict):
+                    if result.get("ok") or result.get("success") or result.get("item"):
+                        granted = True
+                        awarded_item = result.get("item") if isinstance(result.get("item"), dict) else result
+                        break
+                    # Explicit failure; continue with other supported APIs.
+                    if result.get("error"):
+                        continue
+                    # A non-empty dict without an error is treated as success.
+                    if result:
+                        granted = True
+                        awarded_item = result
+                        break
+                elif result is not False:
+                    # Methods that mutate successfully often return None.
+                    granted = True
+                    break
+            if granted:
+                break
+
+        lines = [f"💎 @{winner} فاز بالتنقيب عن الألماسة النادرة!"]
+        if isinstance(winner_credit, dict) and winner_credit.get("ok"):
+            lines.append("💰 الجائزة: +500,000,000 نقطة (نصف مليار)")
+        else:
+            lines.append("⚠️ تعذر اعتماد جائزة نصف مليار نقطة للفائز؛ راجع سجل البوت.")
+        if granted:
+            item_name = str((awarded_item or {}).get("name") or (MINING_ITEMS.get(rare_key, {}).get("name") if rare_key and isinstance(MINING_ITEMS.get(rare_key), dict) else "الألماسة النادرة"))
+            lines.append(f"💎 أُضيفت {item_name} إلى مخزون الفائز.")
+        else:
+            lines.append("⚠️ لم يستطع مخزون الكنوز تسجيل الألماسة النادرة تلقائيًا؛ تحقق من دالة منح العناصر في treasure_mining.py.")
+
+        for player in players:
+            if _norm_user(player) == _norm_user(winner):
+                continue
+            try:
+                result = _apply_points_delta_once(
+                    player, -10_000, f"{round_id}:loss:{_norm_user(player)}", "rare diamond expedition participation"
+                )
+            except Exception as exc:
+                self.log("[RARE-DIAMOND] loss debit failed:", player, repr(exc))
+                result = {"ok": False}
+            if isinstance(result, dict) and result.get("ok"):
+                lines.append(f"@{player}: -10k نقطة")
+            else:
+                lines.append(f"@{player}: لم يُخصم 10k لعدم كفاية الرصيد أو تعذر تحديثه.")
+
+        for target_room in rooms:
             try:
                 self.send_room_text(target_room, "\n".join(lines))
-                self._send_treasure_game_result_card(target_room, game_key, winner)
+                # Like the million/billion games, personalize the winner card per room.
+                self._send_rare_diamond_winner_card(target_room, winner)
             except Exception as exc:
-                self.log("[TREASURE-CYCLE] result send failed:", target_room, repr(exc))
+                self.log("[RARE-DIAMOND] result broadcast failed:", target_room, repr(exc))
 
     def _resume_pending_mining_redemption(self, room, sender_name, user_id):
         pending = MINING_STORE.pending_redemption(user_id)
@@ -17117,21 +16820,20 @@ class TalkinBot:
         red_code_match = re.fullmatch(r"red(?:\s+(\d+))?", raw, re.I)
         is_diamond_test = low in {"فحص الماس", "فحص الالماس"}
         is_rare_mining_test = low in {"فحص التنقيب", "فحص الماسة النادرة", "فحص الالماسة النادرة"}
-        timed_game_key = TIMED_TREASURE_GAME_ALIASES.get(_normalize_timed_treasure_command(raw))
+        is_rare_event_join = low in {"تنقيب", "نقب", "rare diamond", "rare-diamond"}
         is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining"}
         is_store = low in store_commands
         is_inventory = low in inventory_commands
         is_top = low in top_commands
-        if timed_game_key:
+        if is_rare_event_join:
             try:
-                if self._join_rare_diamond_event(room, sender_name, timed_game_key):
+                if self._join_rare_diamond_event(room, sender_name):
                     return True
             except Exception as exc:
-                self.log("[TREASURE-CYCLE] join failed:", repr(exc))
-            if self._effective_room_language(room) == "en":
-                self.send_room_text(room, "⏳ No round for this game is open right now. Please wait for its next announcement.")
-            else:
-                self.send_room_text(room, "⏳ لم تُفتح جولة لهذه اللعبة الآن. انتظر إعلانها القادم.")
+                self.log("[RARE-DIAMOND] join failed:", repr(exc))
+            # The timed rare expedition is separate from ordinary mining.
+            # If no event is open, never fall through to the iron/normal dig game.
+            self.send_room_text(room, "💎 لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم كل 5 دقائق.")
             return True
         if not (is_store or is_inventory or is_top or redeem_match or red_code_match or is_dig or is_diamond_test or is_rare_mining_test):
             return False
@@ -17448,9 +17150,9 @@ class TalkinBot:
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
-        # Keep the user's original text: English aliases can be normalized for
-        # other game handling, but timed treasure-game commands must preserve
-        # their original spelling so the correct scheduled round is selected.
+        # Keep the user's original mining text: the game normalizer maps "تنقيب"
+        # and "احفر" to "الماس", but only the original "تنقيب" joins the timed
+        # rare-diamond expedition instead of starting an ordinary dig.
         mining_raw = original_raw
         mining_low = mining_raw.casefold().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
         mining_commands = {
@@ -17460,7 +17162,7 @@ class TalkinBot:
             "treasure shop", "store treasures", "توب الماس", "توب الالماس",
             "top diamonds", "top gems", "اغنى المنقبين", "red",
         }
-        if (mining_low in mining_commands or _normalize_timed_treasure_command(mining_raw) in TIMED_TREASURE_GAME_ALIASES or re.fullmatch(r"(?:r|rdem)\s+.+", mining_raw, re.I) or re.fullmatch(r"red(?:\s+\d+)?", mining_raw, re.I)):
+        if mining_low in mining_commands or re.fullmatch(r"(?:r|rdem)\s+.+", mining_raw, re.I) or re.fullmatch(r"red(?:\s+\d+)?", mining_raw, re.I):
             normalized_sender = _norm_user(sender_name)
             user_id = ("name:" + normalized_sender) if normalized_sender else (
                 str(sender_name).strip() if str(sender_name).strip().isdigit() else ""
