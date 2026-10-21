@@ -4980,7 +4980,7 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
             '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
-            '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — بعد دقيقة؛ ربح أو خسارة 1–20%. بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
+            '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — استثمار تلقائي بالذهب بعد التحذير؛ بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
             '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
@@ -14440,13 +14440,12 @@ class TalkinBot:
             else:
                 outcome = str(row.get("outcome") or "profit")
                 change = int(row.get("change", row.get("profit", 0)) or 0)
-                percent = int(row.get("change_percent", row.get("profit_percent", 0)) or 0)
                 is_profit = outcome == "profit"
                 label = (("Profit" if is_profit else "Loss") if english
                          else ("ربح" if is_profit else "خسارة"))
                 sign = "+" if is_profit else "-"
                 line = (f"{when} | {asset.get('icon', '📈')} {asset_name} | {_fmt_points(amount)} | "
-                        f"{label} {percent}% ({sign}{_fmt_points(change)}) | {room_name}")
+                        f"{label} ({sign}{_fmt_points(change)}) | {room_name}")
             details.append(_transfer_log_safe_field(line, max_bytes=170))
 
         pages = []
@@ -14505,12 +14504,12 @@ class TalkinBot:
             return (
                 "📈 Stock market\n1️⃣ 🥇 Gold  2️⃣ 🥈 Silver  3️⃣ 🛢️ Oil  4️⃣ 🏞️ Land\n"
                 "Send a number then the amount, or type `gold 100000`.\n"
-                "⏱️ Result in 1 minute: 1–20% profit or loss.\n⏳ You can invest again every 2 minutes."
+                "⏱️ Result in 1 minute: gains or losses.\n⏳ You can invest again every 2 minutes."
             )
         return (
             "📈 البورصة\n1️⃣ 🥇 ذهب  2️⃣ 🥈 فضة  3️⃣ 🛢️ نفط  4️⃣ 🏞️ أرض\n"
             "أرسل رقم الخيار ثم المبلغ، أو اكتب `ذهب 100000`.\n"
-            "⏱️ النتيجة بعد دقيقة: ربح أو خسارة من 1% إلى 20%.\n⏳ يمكنك الاستثمار مجدداً كل دقيقتين."
+            "⏱️ النتيجة بعد دقيقة؛ تقلبات السوق قد تحقق ربحاً أو خسارة.\n⏳ يمكنك الاستثمار مجدداً كل دقيقتين."
         )
 
     def _stock_market_is_open(self, now=None):
@@ -14709,7 +14708,7 @@ class TalkinBot:
                 f"📈 Stock-market result — {label}\n"
                 f"👤 Investor: @{display_user}\n"
                 f"{data.get('icon', '📈')} {data.get('en', 'Market')} | Invested: {_fmt_points(amount)} points\n"
-                f"📊 {label}: {int(change_percent)}% ({sign}{_fmt_points(change)})"
+                f"📊 {label}: ({sign}{_fmt_points(change)})"
             )
         else:
             label = "ربح" if is_profit else "خسارة"
@@ -14717,7 +14716,7 @@ class TalkinBot:
                 f"📈 نتيجة البورصة — {label}\n"
                 f"👤 المستثمر: @{display_user}\n"
                 f"{data.get('icon', '📈')} {data.get('ar', 'البورصة')} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
-                f"📊 {label}: {int(change_percent)}% ({sign}{_fmt_points(change)})"
+                f"📊 {label}: ({sign}{_fmt_points(change)})"
             )
         try:
             self.send_room_text(target_room, text)
@@ -14770,8 +14769,8 @@ class TalkinBot:
                 continue
             if status != "paying":
                 outcome = "loss" if secrets.randbelow(2) else "profit"
-                change_percent = secrets.randbelow(20) + 1
-                change = max(1, amount * change_percent // 100)
+                change_percent = secrets.randbelow(101)
+                change = amount * change_percent // 100
                 with self._stock_market_lock:
                     for item in self.stock_investments:
                         if item.get("id") == investment_id:
@@ -14784,10 +14783,11 @@ class TalkinBot:
                             break
             else:
                 outcome = str(row.get("outcome") or "profit")
-                stored_percent = int(row.get("change_percent", row.get("profit_percent", 10)) or 10)
-                change_percent = max(1, min(20, stored_percent))
+                stored_percent_value = row.get("change_percent", row.get("profit_percent", 10))
+                stored_percent = int(10 if stored_percent_value in (None, "") else stored_percent_value)
+                change_percent = max(0, min(100, stored_percent))
                 if change_percent != stored_percent:
-                    change = max(1, amount * change_percent // 100)
+                    change = amount * change_percent // 100
                     with self._stock_market_lock:
                         for item in self.stock_investments:
                             if item.get("id") == investment_id:
@@ -14798,7 +14798,7 @@ class TalkinBot:
                                 row = dict(item)
                                 break
                 else:
-                    change = int(row.get("change", row.get("profit", max(1, amount * change_percent // 100))) or 0)
+                    change = int(row.get("change", row.get("profit", amount * change_percent // 100)) or 0)
             try:
                 self._save_stock_investments()
             except Exception as exc:
@@ -14833,7 +14833,7 @@ class TalkinBot:
                 result_text = (
                     f"📈 Your stock-market result — {result_label}\n👤 Investor: @{display_user}\n"
                     f"{data['icon']} {data['en']} | Invested: {_fmt_points(amount)} points\n"
-                    f"📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
+                    f"📊 {result_label}: ({result_sign}{_fmt_points(change)})\n"
                     f"💳 Balance: {_fmt_points(credit['balance'])}"
                 )
             else:
@@ -14841,7 +14841,7 @@ class TalkinBot:
                 result_text = (
                     f"📈 نتيجتك في البورصة — {result_label}\n👤 المستثمر: @{display_user}\n"
                     f"{data['icon']} {data['ar']} | مبلغ الاستثمار: {_fmt_points(amount)} نقطة\n"
-                    f"📊 {result_label}: {change_percent}% ({result_sign}{_fmt_points(change)})\n"
+                    f"📊 {result_label}: ({result_sign}{_fmt_points(change)})\n"
                     f"💳 الرصيد: {_fmt_points(credit['balance'])}"
                 )
             try:
@@ -17331,8 +17331,8 @@ class TalkinBot:
 
     def handle_game_command(self, room, text, sender_name):
         original_raw = str(text or "").strip()
-        auto_gold = original_raw.casefold() in {"بورصة ذهب", "بورصة الذهب", "gold auto"}
-        confirm_gold = original_raw.casefold() in {"تأكيد ذهب", "تأكيد الذهب", "confirm gold"}
+        auto_gold = original_raw.casefold() in {"بورصة", "بورصه", "stock", "market", "بورصة ذهب", "بورصة الذهب", "gold auto"}
+        confirm_gold = original_raw.casefold() in {"تأكيد", "موافق", "أوافق", "قبول", "تأكيد ذهب", "تأكيد الذهب", "confirm", "join", "confirm gold"}
         stock_order = _parse_stock_market_order(text)
         raw=_normalize_game_command_text(text)
         raw_digits = raw.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
@@ -17340,6 +17340,12 @@ class TalkinBot:
             raw = "بورصة"
         if not raw or not sender_name: return False
         if auto_gold:
+            if not _is_verified_user(sender_name):
+                self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
+                return True
+            if not _games_enabled_for_room(room):
+                self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
+                return True
             amount = min(max(0, _get_points(sender_name)), 1_000_000_000)
             if amount < 10:
                 self.send_room_text(room, "❌ رصيدك أقل من الحد الأدنى 10 نقاط.")
@@ -17347,13 +17353,23 @@ class TalkinBot:
             pending = getattr(self, "_stock_auto_gold_pending", {})
             pending[(_norm_room(room), _norm_user(sender_name))] = {"amount": amount, "created": time.time()}
             self._stock_auto_gold_pending = pending
-            self.send_room_text(room, f"⚠️ تحذير: الذهب قد يهبط وقد تخسر حتى 20%. سيُستثمر {_fmt_points(amount)} نقطة تلقائياً، بحد أقصى مليار. للتأكيد أرسل: تأكيد ذهب (خلال دقيقة).")
+            if self._configured_room_language(room) == "en":
+                notice = f"⚠️ Investment risk: gold can fall and you could lose the full amount. Your current balance ({_fmt_points(amount)} points) will be invested automatically, capped at 1 billion. To accept, type: confirm (within 1 minute)."
+            else:
+                notice = f"⚠️ تحذير استثماري: سعر الذهب قد يهبط وقد تخسر كامل المبلغ. سيُستثمر رصيدك الحالي تلقائياً ({_fmt_points(amount)} نقطة)، وبحد أقصى مليار. إذا كنت موافقاً أرسل: موافق (خلال دقيقة)."
+            self.send_room_text(room, notice)
             return True
         if confirm_gold:
+            if not _is_verified_user(sender_name):
+                self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
+                return True
+            if not _games_enabled_for_room(room):
+                self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
+                return True
             pending = getattr(self, "_stock_auto_gold_pending", {})
             order = pending.pop((_norm_room(room), _norm_user(sender_name)), None)
             if not order or time.time() - float(order.get("created", 0)) > 60:
-                self.send_room_text(room, "⌛ انتهت مهلة التأكيد؛ أرسل بورصة ذهب لعرض التحذير من جديد.")
+                self.send_room_text(room, "⌛ انتهت مهلة التأكيد؛ أرسل بورصة لعرض التحذير من جديد.")
                 return True
             amount = min(int(order.get("amount", 0)), max(0, _get_points(sender_name)), 1_000_000_000)
             if amount < 10:

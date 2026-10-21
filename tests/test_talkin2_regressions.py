@@ -4205,73 +4205,54 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertIn("50 نقطة", messages[-1][1])
         self.assertNotIn("Player", bot._stock_market_user_cooldowns)
 
-    def test_stock_investment_settles_profit_or_loss_after_one_minute(self):
+    def test_stock_investment_settles_profit_or_loss_after_one_minute_without_showing_percent(self):
         cases = (
-            (0, 0, "profit", 1), (0, 19, "profit", 20),
-            (1, 0, "loss", 1), (1, 19, "loss", 20),
+            (0, 0, "profit", 0), (0, 100, "profit", 100),
+            (1, 0, "loss", 0), (1, 100, "loss", 100),
         )
         for outcome_draw, percent_draw, outcome, expected_percent in cases:
             with self.subTest(outcome=outcome, expected_percent=expected_percent):
                 bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
                 bot._stock_market_lock = threading.RLock()
-                bot.stock_market_round = {"id": 7, "started_at": 900.0, "ends_at": 2_000.0}
-                bot._stock_market_seen = set()
-                bot.stock_investments = []
+                bot.stock_investments = [{
+                    "id": "market-test", "username": "Player", "asset": 1,
+                    "amount": 100_000, "due_at": 900.0, "room": "ArabicHall",
+                    "status": "active",
+                }]
                 bot.stock_market_history = []
-                bot._active_rooms = lambda: ["ArabicHall", "EnglishHall"]
                 bot._configured_room_language = lambda active_room: "en" if active_room == "EnglishHall" else "ar"
                 bot._save_stock_investments = lambda: None
-                messages = []
-                private_messages = []
+                bot.log = lambda *_args: None
+                messages, private_messages, point_ops = [], [], []
                 bot.send_room_text = lambda room, text: messages.append((room, text))
                 bot.send_private_text = lambda user, text: private_messages.append((user, text))
-                point_ops = []
 
                 def apply_once(username, delta, transaction_id, reason, **kwargs):
                     point_ops.append((username, delta, transaction_id, reason))
-                    return {"ok": True, "balance": delta if delta > 0 else 0}
+                    return {"ok": True, "balance": delta}
 
-                with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), patch.object(
-                    bot_module.time, "time", return_value=1_000.0
-                ), patch.object(bot_module, "_get_points", return_value=1_000_000):
-                    bot._stock_market_invest("ArabicHall", "Player", 1, 100_000, expected_round_id=7)
-                    bot._stock_market_invest("ArabicHall", "Player", 1, 100_000, expected_round_id=7)
-                self.assertEqual(point_ops, [])
-                self.assertEqual(len(bot.stock_investments), 1)
-                self.assertEqual(bot.stock_investments[0]["due_at"], 1_060.0)
-                self.assertEqual(bot.stock_investments[0]["balance_mode"], "deferred")
+                with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), \
+                     patch.object(bot_module.secrets, "randbelow", side_effect=[outcome_draw, percent_draw]), \
+                     patch.object(bot_module, "_record_game", return_value=None), \
+                     patch.object(bot_module, "_save_local_json", return_value=None):
+                    self.assertEqual(bot._process_stock_market_investments(now=1_000.0), 1)
 
-                # Simulate the pending record being loaded after a restart:
-                # it must remain untouched until its one-minute result time.
-                with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once):
-                    self.assertEqual(bot._process_stock_market_investments(now=1_030.0), 0)
-                self.assertEqual(point_ops, [])
-                self.assertEqual(bot.stock_investments[0]["status"], "pending_settlement")
-
-                with patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), patch.object(
-                    bot_module.secrets, "randbelow", side_effect=[outcome_draw, percent_draw]
-                ), patch.object(bot_module, "_record_game", return_value=None), patch.object(
-                    bot_module, "_save_local_json", return_value=None
-                ):
-                    self.assertEqual(bot._process_stock_market_investments(now=1_300.0), 1)
-                self.assertEqual(len(point_ops), 1)
                 change = 100_000 * expected_percent // 100
-                expected_delta = -change if outcome == "loss" else change
-                self.assertEqual(point_ops[0][1], expected_delta)
-                self.assertTrue(point_ops[0][2].startswith("stock-market-settlement:"))
+                expected_payout = 100_000 + change if outcome == "profit" else 100_000 - change
+                self.assertEqual(point_ops[0][1], expected_payout)
+                self.assertEqual(bot.stock_market_history[0]["change_percent"], expected_percent)
+                self.assertEqual(bot.stock_market_history[0]["change"], change)
                 self.assertFalse(bot.stock_investments)
                 result_by_room = dict(messages)
                 self.assertEqual(set(result_by_room), {"ArabicHall"})
                 self.assertIn("نتيجة البورصة", result_by_room["ArabicHall"])
                 result = private_messages[0][1]
-                self.assertIn(f"{expected_percent}%", result)
+                self.assertNotIn("%", result)
+                self.assertNotIn("%", result_by_room["ArabicHall"])
                 self.assertIn("الخسارة" if outcome == "loss" else "الربح", result)
-                self.assertIn("-" if outcome == "loss" else "+", result)
-                self.assertIn("المستثمر: @Player", result)
                 self.assertEqual(len(private_messages), 1)
                 self.assertEqual(private_messages[0][0], "Player")
-                self.assertIn("غرفة الاستثمار: ArabicHall", private_messages[0][1])
-                self.assertIn("الخسارة" if outcome == "loss" else "الربح", private_messages[0][1])
+                self.assertIn("غرفة الاستثمار: ArabicHall", result)
 
     def test_stock_history_is_private_paginated_and_ns_from_room_continues_it(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -4293,6 +4274,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertTrue(bot._stock_history_command("Hall", "Player"))
         self.assertEqual(private[0][0], "Player")
         self.assertIn("سجل بورصتي", private[0][1])
+        self.assertNotIn("%", private[0][1])
         self.assertEqual(len(bot._result_pages[("chat_message", "", "Player")]["pages"]), 3)
         self.assertTrue(bot._handle_management_command_impl("Hall", "ns", "Player", is_private=False))
         self.assertEqual(packets[-1][0], "chat_message")
@@ -4312,14 +4294,14 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0][0], bot_module.STOCK_MARKET_HISTORY_FILE)
 
-    def test_recovered_old_stock_settlement_is_clamped_to_twenty_percent(self):
+    def test_recovered_stock_settlement_accepts_the_full_zero_to_one_hundred_range(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._stock_market_lock = threading.RLock()
         bot.stock_market_history = []
         bot.stock_investments = [{
             "id": "old-market", "username": "Player", "asset": 1, "amount": 100_000,
             "due_at": 0, "room": "Hall", "status": "paying", "outcome": "profit",
-            "change_percent": 50, "change": 50_000,
+            "change_percent": 100, "change": 100_000,
         }]
         bot._save_stock_investments = lambda: None
         bot._active_rooms = lambda: ["Hall"]
@@ -4331,9 +4313,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             bot_module, "_save_local_json", return_value=None
         ), patch.object(bot_module, "_record_game", return_value=None):
             self.assertEqual(bot._process_stock_market_investments(now=100), 1)
-        self.assertEqual(apply.call_args.args[1], 120_000)
-        self.assertEqual(bot.stock_market_history[0]["change_percent"], 20)
-        self.assertEqual(bot.stock_market_history[0]["change"], 20_000)
+        self.assertEqual(apply.call_args.args[1], 200_000)
+        self.assertEqual(bot.stock_market_history[0]["change_percent"], 100)
+        self.assertEqual(bot.stock_market_history[0]["change"], 100_000)
 
     def test_plus_mf_accepts_unicode_word_persists_and_confirms_privately(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

@@ -81,3 +81,23 @@ def test_sf_toggle_is_room_scoped_for_owner_and_rejects_admin():
         assert bot._handle_management_command_impl("Hall", "sf@off", "Admin") is True
         assert control["results_disabled_rooms"] == ["Hall"]
         save.assert_not_called()
+
+
+def test_each_of_the_nine_timed_games_opens_and_accepts_its_join_command():
+    for game_key, config in bot_module.TIMED_TREASURE_GAMES.items():
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = {"Hall"}
+        bot._rare_diamond_lock = threading.RLock()
+        bot._doctor_ban_lock = threading.RLock()
+        bot._rare_diamond_event = None
+        bot._rare_diamond_round_seq = 0
+        bot._doctor_ban_once = {}
+        bot.send_room_text = lambda *_args: None
+        bot._effective_room_language = lambda _room: "ar"
+
+        assert bot._start_rare_diamond_event(game_key) is True, game_key
+        command_key = bot_module._normalize_timed_treasure_command(config["join_ar"])
+        assert bot_module.TIMED_TREASURE_GAME_ALIASES[command_key] == game_key, game_key
+        assert bot._join_rare_diamond_event("Hall", "Tester", game_key) is True, game_key
+        assert bot._rare_diamond_event["game_key"] == game_key
+        assert bot._rare_diamond_event["players"][bot_module._norm_user("Tester")]["name"] == "Tester"
