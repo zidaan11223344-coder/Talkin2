@@ -18039,8 +18039,9 @@ class TalkinBot:
         shop_command_text = str(body or "").strip()
         shop_command_digits = shop_command_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
         member_shop_command = bool(
-            shop_command_text.casefold() in {"متجر", "shop", "store", "story"}
+            shop_command_text.casefold() in {"متجر", "shop", "store", "story", "ترحيب_صورة", "welcome_image"}
             or re.fullmatch(r"(?:sby|buy|purchase|شراء|اشتر|اشتري)(?:\s*@?\s*)[1-6]", shop_command_digits, re.I)
+            or re.fullmatch(r"(?:ترحيب|welcome)@.+", shop_command_text, re.I | re.S)
         )
         points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
         master_points_transfer_command = bool(re.fullmatch(r"msb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
@@ -20261,7 +20262,18 @@ class TalkinBot:
             denied = "🔒 bl@ مخصص للماستر فقط."
             self.send_private_text(sender, denied) if is_private else self.send_room_text(room, denied)
             return True
-        if not _is_master_name(sender) and not (_is_mvip_master(sender) and _is_verification_manager_command(text)):
+        shop_command_text = str(text or "").strip()
+        shop_command_digits = shop_command_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        public_shop_command = bool(
+            shop_command_text.casefold() in {"متجر", "shop", "store", "story"}
+            or re.fullmatch(r"(?:sby|buy|purchase|شراء|اشتر|اشتري)(?:\s*@?\s*)[1-6]", shop_command_digits, re.I)
+        )
+        public_welcome_command = bool(
+            re.fullmatch(r"(?:ترحيب|welcome)@.+", shop_command_text, re.I | re.S)
+            or shop_command_text.casefold() in {"ترحيب_صورة", "welcome_image"}
+        )
+        verified_shop_action = _is_verified_user(sender) and (public_shop_command or public_welcome_command)
+        if not _is_master_name(sender) and not (_is_mvip_master(sender) and _is_verification_manager_command(text)) and not verified_shop_action:
             if _looks_like_admin_command(text):
                 self.send_private_text(sender, "🚫 هذا الأمر مخصص للماستر والإدارة فقط.")
             return False
@@ -20984,7 +20996,7 @@ class TalkinBot:
                 extra = "\n⏱️ تنتهي الحماية بعد ساعة."
             self.send_private_text(sender, f"✅ تم شراء {item['icon']} {item['name']} مقابل {item['cost']:,} نقطة.{extra}")
             return True
-        custom_welcome = re.fullmatch(r"ترحيب@(.+)", text, re.S)
+        custom_welcome = re.fullmatch(r"(?:ترحيب|welcome)@(.+)", text, re.I | re.S)
         if custom_welcome:
             if not member_shop.active(
                     "custom_welcome", username=sender,
@@ -21388,6 +21400,65 @@ class TalkinBot:
         prompt = "🎁 Send the gift image now." if english else "🎁 أرسل صورة الهدية الآن"
         self.send_private_text(private_to, prompt) if private_to else self.send_room_text(room, prompt)
         return True
+
+    def _try_custom_welcome_image_media(self, room, media_url, candidates=()):
+        """Save a verified user's pending welcome image URL to their profile."""
+        media_url = str(media_url or "").strip()
+        if not media_url.startswith(("http://", "https://")):
+            return False
+        pending_map = getattr(self, "custom_welcome_image_pending", {})
+        if not isinstance(pending_map, dict) or not pending_map:
+            return False
+        for candidate in candidates:
+            sender_key = _norm_user(candidate)
+            if not sender_key:
+                continue
+            request = pending_map.get(sender_key)
+            if not isinstance(request, dict):
+                continue
+            if time.time() - float(request.get("created_at") or 0) > 120:
+                pending_map.pop(sender_key, None)
+                continue
+            username = str(request.get("username") or candidate).strip().lstrip("@")
+            if not member_shop.active(
+                "image_welcome", username=username,
+                user_id=_stored_user_id(username, room),
+                aliases=_stored_user_aliases(username, room),
+            ):
+                pending_map.pop(sender_key, None)
+                self.send_private_text(username, "🔒 ميزة الترحيب بالصورة غير مفعّلة لهذا الحساب؛ اشترِها من المتجر أولًا.")
+                return True
+            welcomes = getattr(self, "custom_welcomes", None)
+            if not isinstance(welcomes, dict):
+                welcomes = self.custom_welcomes = {}
+            entry = welcomes.get(sender_key)
+            if not isinstance(entry, dict):
+                entry = {"username": username}
+            entry["username"] = username
+            entry["image_url"] = media_url
+            entry["image_updated_at"] = time.time()
+            welcomes[sender_key] = entry
+            pending_map.pop(sender_key, None)
+            self.custom_welcome_enabled = True
+            self._save_social_features()
+            self.send_private_text(username, "✅ تم حفظ صورة الترحيب. ستظهر عند دخولك الجديد للغرفة.")
+            return True
+        return False
+
+    def _send_saved_custom_welcome_image(self, room, username, custom_welcome, *, fresh_join):
+        """Send a saved personal welcome image only on a genuinely new join."""
+        if not fresh_join or not isinstance(custom_welcome, dict):
+            return False
+        if _norm_user(username) in {_norm_user(BOT_MASTER), _norm_user(BOT_ID)}:
+            return False
+        image_url = str(custom_welcome.get("image_url") or "").strip()
+        if not image_url.startswith(("http://", "https://")):
+            return False
+        try:
+            return self.send_room_media(room, image_url, "image") is not False
+        except Exception as exc:
+            self.log("[WELCOME] custom image send failed:", username, repr(exc))
+            return False
 
     def _try_custom_gift_media(self, room, media_url, candidates=()):
         media_url = str(media_url or "").strip()
@@ -21823,6 +21894,7 @@ class TalkinBot:
                 self.master_last_seen = time.time()
             # Welcome the master using the exact configured BOT_MASTER account.
             welcome = None
+            cw = None
             if _norm_user(username) == _norm_user(BOT_MASTER):
                 welcome = f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}"
             elif username and _norm_user(username) != _norm_user(BOT_ID):
@@ -21835,8 +21907,12 @@ class TalkinBot:
                 else:
                     hunter_welcome = f"🐉 أهلاً بعودة صائد التنين @{username}!"
                 welcome = f"{welcome}\n{hunter_welcome}" if welcome else hunter_welcome
-            if welcome and not already_present and reconnected.casefold() not in {"1", "true", "yes", "on"}:
+            is_fresh_join = not already_present and reconnected.casefold() not in {"1", "true", "yes", "on"}
+            if welcome and is_fresh_join:
                 self.send_room_text(room, welcome)
+            self._send_saved_custom_welcome_image(
+                room, username, cw, fresh_join=is_fresh_join,
+            )
         if event_type in ("you_joined", "you_rejoined"):
             if room:
                 entry_room = _norm_room(room)
@@ -22123,6 +22199,12 @@ class TalkinBot:
             candidate = str(candidate or "").strip()
             if candidate and candidate not in media_senders and _norm_user(candidate) != _norm_user(BOT_ID):
                 media_senders.append(candidate)
+
+        # A purchased personal welcome-image request owns the next image from
+        # its sender and takes precedence over generic publishing.
+        if media_url and getattr(self, "custom_welcome_image_pending", {}):
+            if self._try_custom_welcome_image_media(room, media_url, media_senders):
+                return
 
         # sav@ owns the next image from the same sender and has priority over
         # the generic public-image publisher.
@@ -22874,8 +22956,12 @@ class TalkinBot:
                     message_room = str(cm.get(4, "") or cm.get(13, "") or "").strip()
                     tracked_rooms = {_norm_room(r) for r in self._active_rooms()}
                     media_room = message_room if _norm_room(message_room) in tracked_rooms else self.room
+                    private_media_candidates = [frm, cm.get(22, ""), cm.get("sender", ""), cm.get("username", "")]
+                    if media_url and getattr(self, "custom_welcome_image_pending", {}):
+                        if self._try_custom_welcome_image_media(media_room, media_url, private_media_candidates):
+                            return
                     if media_url and getattr(self, "custom_gift_pending", {}):
-                        if self._try_custom_gift_media(media_room, media_url, [frm, cm.get(22, ""), cm.get("sender", "")]):
+                        if self._try_custom_gift_media(media_room, media_url, private_media_candidates):
                             return
                     if media_url and getattr(self, "publish_pending", {}):
                         media_candidates = [frm, cm.get(22, ""), cm.get("sender", ""), cm.get("username", "")]
