@@ -35,3 +35,29 @@ def test_stock_command_warns_and_requires_confirmation_instead_of_old_choice_men
         assert bot.handle_game_command("Hall", "موافق", "Player") is True
     assert messages[-1][1] == "INVEST:1:1000000000"
     assert key not in bot._stock_auto_gold_pending
+
+
+def test_room_message_router_forwards_confirmation_when_only_auto_gold_is_pending():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    key = bot_module._game_choice_key("Hall", "Player")
+    bot.stock_pending = {}
+    bot._stock_auto_gold_pending = {key: {"amount": 1000, "created": 1000.0}}
+    bot._pending_bomb_targets = {}
+    bot.ludo_games = {}
+    bot.pending_bot_choices = {}
+    bot._capture_room_response_language = lambda *_args: None
+    bot._localized_room_worker = lambda _room, _language, worker: worker
+    bot._remember_bot_action = lambda *_args, **_kwargs: None
+    received = []
+    bot.handle_game_command = lambda room, text, sender: received.append((room, text, sender))
+
+    class InlineThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    with patch.object(bot_module.threading, "Thread", InlineThread):
+        assert bot._run_game_command_async("Hall", "موافق", "Player") is True
+    assert received == [("Hall", "موافق", "Player")]

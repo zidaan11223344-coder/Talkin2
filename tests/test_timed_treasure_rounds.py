@@ -94,10 +94,33 @@ def test_each_of_the_nine_timed_games_opens_and_accepts_its_join_command():
         bot._doctor_ban_once = {}
         bot.send_room_text = lambda *_args: None
         bot._effective_room_language = lambda _room: "ar"
+        bot.stock_pending = {}
+        bot._pending_bomb_targets = {}
+        bot.ludo_games = {}
+        bot.pending_bot_choices = {}
+        bot._snake_command = lambda *_args: False
+        bot._ludo_command = lambda *_args: False
+        bot._handle_pending_bot_choice = lambda *_args: False
+        bot._capture_room_response_language = lambda *_args: None
+        bot._localized_room_worker = lambda _room, _language, worker: worker
+        bot._remember_bot_action = lambda *_args, **_kwargs: None
 
         assert bot._start_rare_diamond_event(game_key) is True, game_key
-        command_key = bot_module._normalize_timed_treasure_command(config["join_ar"])
-        assert bot_module.TIMED_TREASURE_GAME_ALIASES[command_key] == game_key, game_key
-        assert bot._join_rare_diamond_event("Hall", "Tester", game_key) is True, game_key
+        for command in (*config["aliases"], config["join_ar"], config["join_en"]):
+            command_key = bot_module._normalize_timed_treasure_command(command)
+            assert bot_module.TIMED_TREASURE_GAME_ALIASES[command_key] == game_key, (game_key, command)
+            assert bot_module._looks_like_bot_command(command), (game_key, command)
+
+        class InlineThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch.object(bot_module, "_is_verified_user", return_value=True), \
+             patch.object(bot_module, "_games_enabled_for_room", return_value=True), \
+             patch.object(bot_module.threading, "Thread", InlineThread):
+            assert bot._run_game_command_async("Hall", config["join_ar"], "Tester") is True, game_key
         assert bot._rare_diamond_event["game_key"] == game_key
         assert bot._rare_diamond_event["players"][bot_module._norm_user("Tester")]["name"] == "Tester"

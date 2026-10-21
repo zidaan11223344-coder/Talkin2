@@ -3043,6 +3043,7 @@ def _looks_like_bot_command(text):
     low = _normalize_game_command_text(text).strip().casefold()
     if not low:
         return False
+    timed_game_command = _normalize_timed_treasure_command(text) in TIMED_TREASURE_GAME_ALIASES
     prefixes = (
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
@@ -3080,6 +3081,7 @@ def _looks_like_bot_command(text):
         or normalized_low in normalized_games
         or low in mining_exact
         or normalized_low in mining_normalized
+        or timed_game_command
         or low.startswith(("rdem ", "r ", "red "))
     )
 
@@ -15675,7 +15677,10 @@ class TalkinBot:
             has_pending_bomb = pending_key in getattr(self, "_pending_bomb_targets", {})
             ludo_game = getattr(self, "ludo_games", {}).get(f"ludo:{_norm_room(room)}")
             has_pending_choice = pending_key in getattr(self, "pending_bot_choices", {})
-            has_pending_stock = pending_key in getattr(self, "stock_pending", {})
+            has_pending_stock = (
+                pending_key in getattr(self, "stock_pending", {})
+                or pending_key in getattr(self, "_stock_auto_gold_pending", {})
+            )
             is_ludo_choice = raw in {"1", "2", "3", "4", "١", "٢", "٣", "٤"} and bool(ludo_game)
             if not (has_pending_bomb or has_pending_choice or has_pending_stock or is_ludo_choice):
                 return False
