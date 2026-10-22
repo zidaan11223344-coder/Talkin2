@@ -3703,6 +3703,36 @@ class FollowupFeatureRegressions(unittest.TestCase):
         self.assertIn("Farm room: Farm Room", self.private_sent[0][1])
         self.assertFalse(bot.crop_plots)
 
+    def test_farm_check_is_primary_master_only_and_cycles_without_awarding_points(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        sent = []
+        bot.send_private_text = lambda user, text: sent.append((user, text))
+        bot._game_award = lambda *_args: self.fail("farm check must not award points")
+        bot._master_reply_local = threading.local()
+        bot._remember_bot_action = lambda *_args, **_kwargs: None
+        with patch.object(bot_module, "BOT_MASTER", "MainMaster"), patch.object(
+            bot_module, "_get_points", return_value=12_345
+        ):
+            self.assertTrue(bot_module._looks_like_bot_command("فحص زرع"))
+            self.assertTrue(bot_module._looks_like_bot_command("farm check"))
+            for _ in range(24):
+                self.assertTrue(bot._handle_management_command("Hall", "فحص زرع", "MainMaster", is_private=True))
+            self.assertTrue(bot._handle_management_command("Hall", "فحص زرع", "mainmaster", is_private=True))
+            self.assertFalse(bot._handle_management_command("Hall", "فحص زرع", "OtherUser", is_private=True))
+
+        self.assertEqual(len(sent), 25)
+        self.assertEqual(sent[0][0], "MainMaster")
+        self.assertIn("المحصول 1/24", sent[0][1])
+        self.assertIn("🍎", sent[0][1])
+        self.assertIn("المحصول 2/24", sent[1][1])
+        self.assertIn("🍐", sent[1][1])
+        self.assertIn("المحصول 24/24", sent[23][1])
+        self.assertIn("🌳", sent[23][1])
+        self.assertIn("انتهت قائمة المحاصيل", sent[23][1])
+        self.assertIn("المحصول 1/24", sent[24][1])
+        self.assertIn("لم تتم زراعة محصول ولم يتغير رصيدك", sent[0][1])
+        self.assertTrue(all(user == "MainMaster" for user, _message in sent))
+
     def test_english_shot_catches_dragon_first_then_regular_animals(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.stock_pending = {}

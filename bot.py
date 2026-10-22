@@ -3072,7 +3072,8 @@ def _looks_like_bot_command(text):
         "sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag",
         "متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures",
         "توب الماس", "توب الالماس", "top diamonds", "top gems", "اغنى المنقبين",
-        "فحص الماس", "فحص الالماس", "red", "احفر", "تنقيب", "نقب",
+        "فحص الماس", "فحص الالماس", "فحص زرع", "فحص الزرع", "farm check", "check farm",
+        "red", "احفر", "تنقيب", "نقب",
     }
     mining_normalized = {value.replace("ة", "ه") for value in mining_exact}
     return (
@@ -13788,6 +13789,65 @@ class TalkinBot:
                 self.log("[CROP] harvest credited; private result could not be delivered:", username, repr(exc))
         return len(ready)
 
+    def _crop_options(self):
+        return {
+            "🍎":(5,50_000), "🍐":(10,75_000), "🍊":(15,100_000), "🍋":(20,150_000),
+            "🍇":(25,200_000), "🍉":(30,250_000), "🍓":(35,300_000), "🥕":(40,350_000),
+            "🌽":(45,400_000), "🥭":(50,450_000), "🍍":(55,500_000), "🍌":(60,600_000),
+            "🥥":(60,700_000), "🥑":(60,850_000), "🥔":(60,1_000_000),
+            "🍒":(60,2_000_000), "🍈":(60,5_000_000), "🫐":(60,10_000_000),
+            "🍅":(60,25_000_000), "🥒":(60,50_000_000), "🧄":(60,100_000_000),
+            "🌻":(60,200_000_000), "🌾":(60,300_000_000), "🌳":(60,500_000_000),
+        }
+
+    def _farm_check_command(self, sender, english=False):
+        if not BOT_MASTER or _norm_user(sender) != _norm_user(BOT_MASTER):
+            self.send_private_text(
+                sender,
+                "🔒 أمر فحص زرع مخصص للماستر الأساسي فقط."
+                if not english else "🔒 Farm check is reserved for the primary master only.",
+            )
+            return True
+        crops = list(self._crop_options().items())
+        if not hasattr(self, "_farm_check_lock"):
+            self._farm_check_lock = threading.Lock()
+        with self._farm_check_lock:
+            index = int(getattr(self, "_farm_check_index", 0) or 0)
+            if index < 0 or index >= len(crops):
+                index = 0
+            crop, (minutes, reward) = crops[index]
+            self._farm_check_index = (index + 1) % len(crops)
+        try:
+            current_balance = _get_points(BOT_MASTER)
+        except Exception:
+            current_balance = 0
+        if english:
+            lines = [
+                f"🧪 Farm check — simulated crop {index + 1}/{len(crops)}",
+                f"🌱 Crop: {crop}", f"⏱️ Growing time: {minutes} minutes",
+                f"🎁 Expected harvest: +{_fmt_points(reward)} points",
+                f"💳 Simulated balance after harvest: {_fmt_points(current_balance + reward)}",
+                "⚠️ Preview only: no crop was planted and no points were changed.",
+            ]
+            lines.append(
+                "✅ End of crop list; the next check starts again from the first crop."
+                if index == len(crops) - 1 else "📩 Send farm check again for the next crop."
+            )
+        else:
+            lines = [
+                f"🧪 فحص زرع — محاكاة المحصول {index + 1}/{len(crops)}",
+                f"🌱 المحصول: {crop}", f"⏱️ مدة الزراعة: {minutes} دقيقة",
+                f"🎁 المكافأة المتوقعة: +{_fmt_points(reward)} نقطة",
+                f"💳 الرصيد الافتراضي بعد الحصاد: {_fmt_points(current_balance + reward)}",
+                "⚠️ معاينة فقط: لم تتم زراعة محصول ولم يتغير رصيدك.",
+            ]
+            lines.append(
+                "✅ انتهت قائمة المحاصيل؛ يبدأ الفحص التالي من أول محصول."
+                if index == len(crops) - 1 else "📩 أرسل «فحص زرع» للمحصول التالي."
+            )
+        self.send_private_text(BOT_MASTER, "\n".join(lines))
+        return True
+
     def _crop_worker(self):
         while not self.stop_event.is_set():
             try:
@@ -13797,15 +13857,7 @@ class TalkinBot:
             self.stop_event.wait(2.0)
 
     def _crop_command(self, room, sender, raw):
-        crops={
-            "🍎":(5,50_000), "🍐":(10,75_000), "🍊":(15,100_000), "🍋":(20,150_000),
-            "🍇":(25,200_000), "🍉":(30,250_000), "🍓":(35,300_000), "🥕":(40,350_000),
-            "🌽":(45,400_000), "🥭":(50,450_000), "🍍":(55,500_000), "🍌":(60,600_000),
-            "🥥":(60,700_000), "🥑":(60,850_000), "🥔":(60,1_000_000),
-            "🍒":(60,2_000_000), "🍈":(60,5_000_000), "🫐":(60,10_000_000),
-            "🍅":(60,25_000_000), "🥒":(60,50_000_000), "🧄":(60,100_000_000),
-            "🌻":(60,200_000_000), "🌾":(60,300_000_000), "🌳":(60,500_000_000),
-        }
+        crops = self._crop_options()
         english = self._effective_room_language(room) == "en"
         if raw.casefold()=="زرع":
             crop_lines = [
@@ -19283,6 +19335,9 @@ class TalkinBot:
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
+
+        if low in {"فحص زرع", "فحص الزرع", "farm check", "check farm"}:
+            return self._farm_check_command(sender, english=low in {"farm check", "check farm"})
 
         pending_text = getattr(self, "custom_welcome_text_pending", {})
         pending_key = _norm_user(sender)
