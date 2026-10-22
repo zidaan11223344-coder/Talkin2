@@ -83,9 +83,9 @@ def test_any_stock_asset_above_30b_is_rejected_without_debit():
 def test_oil_outcome_and_percentage_are_randomly_set_by_the_market():
     cases = (
         # stake, market outcome draw, market percentage draw, outcome, percent, payout
-        (1_000, 0, 25, "profit", 25, 1_250),
-        (10_000_000_000, 1, 70, "loss", 70, 3_000_000_000),
-        (10_000_000_000, 1, 100, "loss", 100, 0),
+        (1_000, 0, 24, "profit", 25, 1_250),
+        (10_000_000_000, 1, 49, "loss", 50, 5_000_000_000),
+        (10_000_000_000, 1, 0, "loss", 1, 9_900_000_000),
     )
     for amount, outcome_draw, percent_draw, expected_outcome, expected_percent, expected_payout in cases:
         bot = _market_bot()
@@ -116,8 +116,10 @@ def test_oil_outcome_and_percentage_are_randomly_set_by_the_market():
         assert result["change_percent"] == expected_percent, amount
         assert result["payout"] == expected_payout, amount
         assert random_draw.call_count == 2
+        assert random_draw.call_args_list[1].args == (50,)
         assert not bot.stock_investments
         assert all("فخ" not in text for _, text in room_messages + private_messages)
+        assert all(f"{expected_percent}%" not in text for _, text in room_messages + private_messages)
         if expected_payout == 0:
             assert point_ops == []
         else:

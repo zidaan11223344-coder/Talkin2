@@ -3667,11 +3667,18 @@ class FollowupFeatureRegressions(unittest.TestCase):
         self.assertTrue(bot._crop_command("Farm", "Tester", "زرع"))
         self.assertIn("Crop menu", self.messages[-1][1])
         self.assertIn("farm@🍎", self.messages[-1][1])
+        crop_durations = [
+            int(line.split("m=", 1)[0].rsplit(" ", 1)[1])
+            for line in self.messages[-1][1].splitlines() if "m=" in line
+        ]
+        self.assertTrue(crop_durations)
+        self.assertLessEqual(max(crop_durations), 60)
+        self.assertEqual(max(crop_durations), 60)
         self.assertTrue(bot._crop_command("Farm", "Tester", "زرع@🍎"))
         self.assertIn("Planted 🍎 successfully", self.messages[-1][1])
-        self.assertIn("not in a private message", self.messages[-1][1])
+        self.assertIn("sent to your private messages", self.messages[-1][1])
 
-    def test_harvest_result_is_delivered_to_room_and_player_private(self):
+    def test_harvest_result_is_delivered_only_to_player_private(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.game_lock = threading.Lock()
         bot.crop_plots = {
@@ -3690,10 +3697,7 @@ class FollowupFeatureRegressions(unittest.TestCase):
         self.sent, self.private_sent = [], []
         with patch.object(bot_module, "_record_game", lambda *_args: None):
             self.assertEqual(bot._process_due_crop_plots(now=1), 1)
-        self.assertEqual(len(self.sent), 1)
-        self.assertEqual(self.sent[0][0], "Farm Room")
-        self.assertIn("Your harvest is ready", self.sent[0][1])
-        self.assertIn("@𓆩DecoratedName𓆪", self.sent[0][1])
+        self.assertEqual(self.sent, [])
         self.assertEqual(self.private_sent[0][0], "𓆩DecoratedName𓆪")
         self.assertIn("Your harvest is ready", self.private_sent[0][1])
         self.assertIn("Farm room: Farm Room", self.private_sent[0][1])
@@ -4207,8 +4211,8 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
 
     def test_stock_investment_settles_profit_or_loss_after_one_minute_without_showing_percent(self):
         cases = (
-            (0, 0, "profit", 0), (0, 100, "profit", 100),
-            (1, 0, "loss", 0), (1, 100, "loss", 100),
+            (0, 0, "profit", 1), (0, 49, "profit", 50),
+            (1, 0, "loss", 1), (1, 49, "loss", 50),
         )
         for outcome_draw, percent_draw, outcome, expected_percent in cases:
             with self.subTest(outcome=outcome, expected_percent=expected_percent):
@@ -4243,6 +4247,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                     self.assertEqual(point_ops, [])
                 else:
                     self.assertEqual(point_ops[0][1], expected_payout)
+                    self.assertNotIn("%", point_ops[0][3])
                 self.assertEqual(bot.stock_market_history[0]["change_percent"], expected_percent)
                 self.assertEqual(bot.stock_market_history[0]["change"], change)
                 self.assertFalse(bot.stock_investments)
@@ -4369,7 +4374,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             self.assertTrue(bot._crop_command("Hall", "Player", "زرع@🌳"))
         plot = next(iter(bot.crop_plots.values()))
         self.assertEqual(plot["reward"], 500_000_000)
-        self.assertEqual(plot["minutes"], 90)
+        self.assertEqual(plot["minutes"], 60)
 
     def test_gift_help_shows_thirty_items_in_one_compact_list_and_ns_reports_end(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

@@ -7977,22 +7977,62 @@ class TalkinBot:
             self._auto_rejoin_pending = set()
         if not hasattr(self, "_auto_rejoin_state"):
             self._auto_rejoin_state = {}
+        if not hasattr(self, "_auto_rejoin_paused"):
+            self._auto_rejoin_paused = set()
         now = time.monotonic()
+        notify_master = False
         with self._auto_rejoin_lock:
             if room_key in self._auto_rejoin_pending:
                 return
-            state = self._auto_rejoin_state.setdefault(room_key, {"attempts": [], "joined_at": 0.0})
+            if room_key in self._auto_rejoin_paused:
+                return
+            state = self._auto_rejoin_state.setdefault(
+                room_key, {"attempts": [], "joined_at": 0.0, "rapid_losses": 0}
+            )
+            joined_at = float(state.get("joined_at", 0.0) or 0.0)
             if state.get("joined_at") and now - float(state["joined_at"]) >= 120.0:
                 state["attempts"] = []
-            recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
-            if len(recent_attempts) >= 5:
-                state["attempts"] = recent_attempts
-                self.log(f"[AUTO_REJOIN] stopping after 5 attempts in 15 minutes: {room}")
-                return
-            state["attempts"] = recent_attempts + [now]
-            delay = max(float(delay), min(60.0, 1.2 * (2 ** len(recent_attempts))))
-            generation = int(getattr(self, "_connection_generation", 0))
-            self._auto_rejoin_pending.add(room_key)
+                state["rapid_losses"] = 0
+            elif joined_at and now - joined_at < 120.0:
+                state["rapid_losses"] = int(state.get("rapid_losses", 0) or 0) + 1
+                if state["rapid_losses"] >= 3:
+                    self._auto_rejoin_paused.add(room_key)
+                    state["attempts"] = []
+                    notify_master = True
+            if notify_master:
+                generation = int(getattr(self, "_connection_generation", 0))
+            else:
+                recent_attempts = [t for t in state.get("attempts", []) if now - float(t) < 900.0]
+                if len(recent_attempts) >= 5:
+                    state["attempts"] = recent_attempts
+                    self.log(f"[AUTO_REJOIN] stopping after 5 attempts in 15 minutes: {room}")
+                    return
+                state["attempts"] = recent_attempts + [now]
+                delay = max(float(delay), min(60.0, 1.2 * (2 ** len(recent_attempts))))
+                generation = int(getattr(self, "_connection_generation", 0))
+                self._auto_rejoin_pending.add(room_key)
+        if notify_master:
+            if BOT_MASTER:
+                try:
+                    is_en = self._effective_room_language(room) == "en"
+                except Exception:
+                    is_en = False
+                if is_en:
+                    notice = (
+                        f"⏸️ Automatic rejoin to {room} paused after three rapid departures. "
+                        "To resume, send: دخول@اسم_الغرفة"
+                    )
+                else:
+                    notice = (
+                        f"⏸️ أوقفت إعادة الدخول التلقائية إلى {room} بعد ثلاث مغادرات سريعة. "
+                        "لاستئنافها أرسل: دخول@اسم_الغرفة"
+                    )
+                try:
+                    self.send_private_text(BOT_MASTER, notice)
+                except Exception as exc:
+                    self.log("[AUTO_REJOIN] pause notice failed:", type(exc).__name__)
+            self.log(f"[AUTO_REJOIN] paused after three rapid departures: {room}")
+            return
         def _rejoin_worker():
             try:
                 time.sleep(delay)
@@ -8053,6 +8093,11 @@ class TalkinBot:
                 except Exception:
                     pass
         if requested_by:
+            getattr(self, "_auto_rejoin_paused", set()).discard(room_norm)
+            rejoin_state = getattr(self, "_auto_rejoin_state", {}).get(room_norm)
+            if isinstance(rejoin_state, dict):
+                rejoin_state["rapid_losses"] = 0
+                rejoin_state["attempts"] = []
             getattr(self, "_intentional_leaves", set()).discard(room_norm)
             self.blocked_rooms.discard(room_norm)
             getattr(self, "_blocked_room_reasons", {}).pop(room_norm, None)
@@ -8972,8 +9017,9 @@ class TalkinBot:
         try:
             _save_local_json(DATA_DIR / "last_action.json", action)
         except Exception as exc:
-            self.log("[UNDO] save last action failed:", repr(exc))
-        self.log(f"[UNDO] last action saved: {text!r} room={room!r} sender={sender!r}")
+            self.log("[UNDO] save last action failed:", type(exc).__name__)
+        if LOG_ROOM_MESSAGES:
+            self.log("[UNDO] last action saved (room-message logging enabled)")
 
     def _cleanup_memory_state(self):
         """Prune bounded runtime caches and force Python GC without touching persistent data."""
@@ -13732,11 +13778,6 @@ class TalkinBot:
                     f"💰 المكافأة: +{_fmt_points(reward)} نقطة\n💸 الخسارة: 0 نقطة\n"
                     f"💳 رصيدك الآن: {_fmt_points(balance)}\n🌟 ازرع من جديد متى شئت!"
                 )
-            if room:
-                if self.send_room_text(room, result_text) is False:
-                    self.log("[CROP] harvest credited; room result could not be delivered:", room, username)
-            else:
-                self.log("[CROP] harvest credited but no room is available for the result:", username)
             try:
                 private_text = result_text + (
                     f"\n🏠 غرفة الزراعة: {room}" if self._configured_room_language(room) != "en"
@@ -13760,10 +13801,10 @@ class TalkinBot:
             "🍎":(5,50_000), "🍐":(10,75_000), "🍊":(15,100_000), "🍋":(20,150_000),
             "🍇":(25,200_000), "🍉":(30,250_000), "🍓":(35,300_000), "🥕":(40,350_000),
             "🌽":(45,400_000), "🥭":(50,450_000), "🍍":(55,500_000), "🍌":(60,600_000),
-            "🥥":(65,700_000), "🥑":(70,850_000), "🥔":(75,1_000_000),
-            "🍒":(78,2_000_000), "🍈":(82,5_000_000), "🫐":(84,10_000_000),
-            "🍅":(86,25_000_000), "🥒":(87,50_000_000), "🧄":(88,100_000_000),
-            "🌻":(89,200_000_000), "🌾":(90,300_000_000), "🌳":(90,500_000_000),
+            "🥥":(60,700_000), "🥑":(60,850_000), "🥔":(60,1_000_000),
+            "🍒":(60,2_000_000), "🍈":(60,5_000_000), "🫐":(60,10_000_000),
+            "🍅":(60,25_000_000), "🥒":(60,50_000_000), "🧄":(60,100_000_000),
+            "🌻":(60,200_000_000), "🌾":(60,300_000_000), "🌳":(60,500_000_000),
         }
         english = self._effective_room_language(room) == "en"
         if raw.casefold()=="زرع":
@@ -13850,12 +13891,12 @@ class TalkinBot:
         if english:
             message = (
                 f"🌱 Planted {crop} successfully!\n⏱️ Growing time: {minutes} minutes\n"
-                f"🎁 Reward: {reward:,} points\n📢 The result will appear in this room, not in a private message."
+                f"🎁 Reward: {reward:,} points\n📩 The harvest result will be sent to your private messages when ready."
             )
         else:
             message = (
                 f"🌱 تم زرع {crop} بنجاح!\n⏱️ الانتظار: {minutes} دقيقة\n"
-                f"🎁 المكافأة: {reward} نقطة\n📢 عند اكتمالها ستظهر النتيجة في هذه الغرفة، ولن تصلك رسالة خاصة."
+                f"🎁 المكافأة: {reward} نقطة\n📩 عند اكتمالها ستصلك النتيجة في الخاص."
             )
         self.send_room_text(room, message)
         return True
@@ -14910,7 +14951,7 @@ class TalkinBot:
                 continue
             if status != "paying":
                 outcome = "loss" if secrets.randbelow(2) else "profit"
-                change_percent = secrets.randbelow(101)
+                change_percent = secrets.randbelow(50) + 1
                 change = amount * change_percent // 100
                 with self._stock_market_lock:
                     for item in self.stock_investments:
@@ -14926,7 +14967,7 @@ class TalkinBot:
                 outcome = str(row.get("outcome") or "profit")
                 stored_percent_value = row.get("change_percent", row.get("profit_percent", 10))
                 stored_percent = int(10 if stored_percent_value in (None, "") else stored_percent_value)
-                change_percent = max(0, min(100, stored_percent))
+                change_percent = max(1, min(50, stored_percent))
                 if change_percent != stored_percent:
                     change = amount * change_percent // 100
                     with self._stock_market_lock:
@@ -14954,7 +14995,7 @@ class TalkinBot:
             else:
                 credit = _apply_points_delta_once(
                     username, payout, f"stock-market-payout:{investment_id}",
-                    f"stock market {outcome} {change_percent}% settlement",
+                    f"stock market {outcome} settlement",
                 )
             if not credit.get("ok"):
                 self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, credit.get("error"))
