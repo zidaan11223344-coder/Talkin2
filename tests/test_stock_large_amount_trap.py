@@ -27,11 +27,11 @@ def _market_bot():
     return bot
 
 
-def test_all_manual_assets_accept_10b_and_keep_their_amount():
+def test_all_manual_assets_accept_30b_and_keep_their_amount():
     commands = (
-        ("ذهب 10b", 1), ("gold 10b", 1),
-        ("نفط 10b", 3), ("النفط 10b", 3), ("oil 10b", 3),
-        ("أرض 10b", 4), ("الأرض 10b", 4), ("land 10b", 4),
+        ("ذهب 30b", 1), ("gold 30b", 1),
+        ("نفط 30b", 3), ("النفط 30b", 3), ("oil 30b", 3),
+        ("أرض 30b", 4), ("الأرض 30b", 4), ("land 30b", 4),
     )
     for command, expected_asset in commands:
         bot = _market_bot()
@@ -51,15 +51,15 @@ def test_all_manual_assets_accept_10b_and_keep_their_amount():
         assert len(bot.stock_investments) == 1, command
         row = bot.stock_investments[0]
         assert row["asset"] == expected_asset, command
-        assert row["amount"] == 10_000_000_000, command
+        assert row["amount"] == 30_000_000_000, command
         assert "trap" not in row, command
-        assert point_updates[0][1] == -10_000_000_000, command
+        assert point_updates[0][1] == -30_000_000_000, command
         assert any("تم قبول الاستثمار" in text and "ربح أو خسارة" in text for _, text in messages), command
         assert all("فخ" not in text for _, text in messages), command
 
 
-def test_any_stock_asset_above_10b_is_rejected_without_debit():
-    commands = ("ذهب 10.1b", "فضة 11b", "نفط 50b", "أرض 12b")
+def test_any_stock_asset_above_30b_is_rejected_without_debit():
+    commands = ("ذهب 30.1b", "فضة 31b", "نفط 50b", "أرض 32b")
     for command in commands:
         bot = _market_bot()
         messages, debits = [], []
@@ -77,7 +77,7 @@ def test_any_stock_asset_above_10b_is_rejected_without_debit():
 
         assert not debits, command
         assert not bot.stock_investments, command
-        assert any("10b" in text and "سقف" in text for _, text in messages), command
+        assert any("30b" in text and "سقف" in text for _, text in messages), command
 
 
 def test_oil_outcome_and_percentage_are_randomly_set_by_the_market():

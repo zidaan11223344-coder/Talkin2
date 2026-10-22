@@ -486,7 +486,7 @@ STOCK_MARKET_ASSETS = {
     3: {"icon": "🛢️", "ar": "النفط", "en": "Oil"},
     4: {"icon": "🏞️", "ar": "الأرض", "en": "Land"},
 }
-STOCK_MARKET_MAX_INVESTMENT = 10_000_000_000
+STOCK_MARKET_MAX_INVESTMENT = 30_000_000_000
 
 def _parse_compact_amount(value):
     """Convert plain or compact stakes (1k/1m/1b) to whole points."""
@@ -559,9 +559,11 @@ PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL", "").strip() or os.getenv("RAVEN_
 GIFT_PUBLIC_BASE_URL = os.getenv("GIFT_PUBLIC_BASE_URL", "").strip().rstrip("/")
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
 RAVEN_PUBLIC_DOMAIN = os.getenv("RAVEN_PUBLIC_DOMAIN", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
 
 def _public_base_url():
-    domain = RAVEN_PUBLIC_DOMAIN or RAILWAY_PUBLIC_DOMAIN
+    domain = RAVEN_PUBLIC_DOMAIN or RAILWAY_PUBLIC_DOMAIN or RENDER_EXTERNAL_URL or RENDER_EXTERNAL_HOSTNAME
     if domain:
         if not domain.startswith(("http://", "https://")):
             domain = "https://" + domain
@@ -9384,6 +9386,36 @@ class TalkinBot:
             "chat_message", text, to=username, notify_oversize=not exempt
         )
 
+    def _deliver_user_private_message(self, sender, target, message_text):
+        """Deliver a user's message privately and keep both sides out of rooms."""
+        sender = str(sender or "").strip().lstrip("@")
+        target = str(target or "").strip().lstrip("@")
+        message_text = str(message_text or "").strip()
+        if not sender or not target or not message_text:
+            return False
+        payload = f"📩 لديك رسالة من @{sender}\n{message_text}"
+        try:
+            sent = bool(self.send_private_text(target, payload))
+        except Exception as exc:
+            self.log("[DIRECT-MESSAGE] failed", target, repr(exc))
+            sent = False
+        reply_context = getattr(self, "_master_reply_local", None)
+        old_rerouting = getattr(reply_context, "rerouting", False)
+        try:
+            if reply_context is not None:
+                reply_context.rerouting = True
+            self.send_private_text(
+                sender,
+                f"✅ تم إرسال الرسالة إلى @{target} بنجاح." if sent
+                else f"❌ فشل إرسال الرسالة إلى @{target}.",
+            )
+        except Exception as exc:
+            self.log("[DIRECT-MESSAGE] sender confirmation failed", repr(exc))
+        finally:
+            if reply_context is not None:
+                reply_context.rerouting = old_rerouting
+        return sent
+
     def send_private_media(self, username: str, media_url: str, media_type: str, duration: int = 0):
         """Send media to a private chat using the same Query media fields as rooms.
 
@@ -14673,9 +14705,9 @@ class TalkinBot:
             return True
         if amount > STOCK_MARKET_MAX_INVESTMENT:
             text = (
-                "❌ أعلى سقف للاستثمار في البورصة هو 10b (10 مليارات نقطة)."
+                "❌ أعلى سقف للاستثمار في البورصة هو 30b (30 مليار نقطة)."
                 if language != "en" else
-                "❌ The maximum stock-market investment is 10b (10 billion points)."
+                "❌ The maximum stock-market investment is 30b (30 billion points)."
             )
             self.send_room_text(room, text)
             return True
@@ -16814,14 +16846,14 @@ class TalkinBot:
         return True
 
     def _rare_diamond_event_worker(self):
-        """Run timed treasure games in a fixed sequence, starting with mining."""
+        """Run one round at a time; always pause three minutes after it closes."""
         sequence = list(TIMED_TREASURE_GAMES)
-        next_index = 0
+        next_index = int(getattr(self, "_treasure_cycle_index", 0) or 0) % len(sequence)
         next_start = float(getattr(self, "_rare_diamond_next_due", time.time()))
         while not self.stop_event.wait(1.0):
             now = time.time()
             if next_start == float("inf"):
-                next_start = float(getattr(self, "_rare_diamond_next_due", now + 300.0))
+                next_start = float(getattr(self, "_rare_diamond_next_due", now + 180.0))
             with self._rare_diamond_lock:
                 event = self._rare_diamond_event
                 expired = isinstance(event, dict) and now >= float(event.get("ends_at", 0) or 0)
@@ -16829,13 +16861,20 @@ class TalkinBot:
                 with self._rare_diamond_lock:
                     if self._rare_diamond_event is event:
                         self._rare_diamond_event = None
+                        self._rare_diamond_next_due = time.time() + 180.0
                 required = int(event.get("required_players", 5))
                 for target_room in event.get("rooms", [event.get("room", "")]):
                     try:
-                        self.send_room_text(target_room, f"⌛ انتهى وقت {event.get('game_title_ar', 'اللعبة')} ولم يكتمل العدد ({required})؛ أُغلقت الجولة.")
+                        game_key = str(event.get("game_key", "rare_diamond"))
+                        config = TIMED_TREASURE_GAMES.get(game_key, TIMED_TREASURE_GAMES["rare_diamond"])
+                        if self._effective_room_language(target_room) == "en":
+                            notice = f"⌛ {config['title_en']} round closed: the player limit ({required}) was not reached. Next game announcement in 3 minutes."
+                        else:
+                            notice = f"⌛ أُغلقت جولة {config['title_ar']} لعدم اكتمال العدد ({required}). الإعلان التالي بعد 3 دقائق."
+                        self.send_room_text(target_room, notice)
                     except Exception as exc:
                         self.log("[TREASURE-CYCLE] timeout notice failed:", target_room, repr(exc))
-                next_start = time.time() + 300.0
+                next_start = float(getattr(self, "_rare_diamond_next_due", time.time() + 180.0))
             with self._rare_diamond_lock:
                 active = isinstance(self._rare_diamond_event, dict) and now < float(self._rare_diamond_event.get("ends_at", 0) or 0)
             if active or now < next_start:
@@ -16844,7 +16883,8 @@ class TalkinBot:
             try:
                 if self._start_rare_diamond_event(game_key):
                     next_index = (next_index + 1) % len(sequence)
-                    next_start = float("inf")  # resolving/timeout schedules the five-minute pause
+                    self._treasure_cycle_index = next_index
+                    next_start = float("inf")  # resolver/timeout schedules the three-minute pause
                 else:
                     next_start = time.time() + 10.0
             except Exception as exc:
@@ -16852,7 +16892,7 @@ class TalkinBot:
                 next_start = time.time() + 10.0
 
     def _start_rare_diamond_event(self, game=None):
-        """Open a timed round and localize the announcement separately for each room."""
+        """Open one timed round and localize an engaging announcement per room."""
         game_key = str(game or "rare_diamond")
         config = TIMED_TREASURE_GAMES.get(game_key)
         if not config:
@@ -16891,21 +16931,21 @@ class TalkinBot:
             try:
                 if self._effective_room_language(target_room) == "en":
                     announcement = (
-                        f"✨ {config['title_en']} — ROUND OPEN! ✨\n"
-                        f"{config['story_en']}\n"
+                        f"🌟 THE ADVENTURE IS ON! 🌟\n"
+                        f"{config['title_en']}\n{config['story_en']}\n"
                         f"🎮 Join by typing: {config['join_en']}\n"
-                        f"👥 {config['players']} players are needed.\n"
-                        f"🏆 Prize: {prize} points.\n"
-                        "⏳ Join within 3 minutes!"
+                        f"👥 Gather {config['players']} brave players to unlock the grand finale.\n"
+                        f"🏆 A prize of {prize} points is waiting!\n"
+                        "⏳ You have 3 minutes — will you claim the win?"
                     )
                 else:
                     announcement = (
-                        f"✨ بدأت جولة {config['title_ar']}! ✨\n"
-                        f"{config['story_ar']}\n"
+                        f"🌟 المغامرة بدأت! 🌟\n"
+                        f"{config['title_ar']}\n{config['story_ar']}\n"
                         f"🎮 للانضمام إلى الجولة، اكتب في الغرفة: {config['join_ar']}\n"
-                        f"👥 نحتاج إلى {config['players']} لاعبين لاكتمال الجولة.\n"
-                        f"🏆 الجائزة: {prize} نقطة.\n"
-                        "⏳ تنتهي فرصة المشاركة بعد 3 دقائق!"
+                        f"👥 اجمعوا {config['players']} مغامرين لاكتمال التحدي.\n"
+                        f"🏆 جائزة كبرى بانتظار الفائز: {prize} نقطة!\n"
+                        "⏳ أمامكم 3 دقائق — من سيخطف الفوز؟"
                     )
                 self.send_room_text(target_room, announcement)
             except Exception as exc:
@@ -17045,7 +17085,7 @@ class TalkinBot:
             return False
 
     def _resolve_rare_diamond_event(self, round_id):
-        """Resolve a round, then start the five-minute inter-game pause."""
+        """Resolve a completed round, then start the three-minute inter-game pause."""
         try:
             return self._resolve_rare_diamond_event_impl(round_id)
         finally:
@@ -17054,7 +17094,7 @@ class TalkinBot:
                 with lock:
                     if (getattr(self, "_rare_diamond_event", None) is None
                             and float(getattr(self, "_rare_diamond_next_due", 0) or 0) == float("inf")):
-                        self._rare_diamond_next_due = time.time() + 300.0
+                        self._rare_diamond_next_due = time.time() + 180.0
 
     def _resolve_rare_diamond_event_impl(self, round_id):
         """Resolve one round. Results go only to rooms where its players joined."""
@@ -17244,7 +17284,7 @@ class TalkinBot:
                 self.log("[RARE-DIAMOND] join failed:", repr(exc))
             # The timed rare expedition is separate from ordinary mining.
             # If no event is open, never fall through to the iron/normal dig game.
-            self.send_room_text(room, "💎 لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم كل 5 دقائق.")
+            self.send_room_text(room, "💎 لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم بعد 3 دقائق.")
             return True
         if not (is_store or is_inventory or is_top or redeem_match or red_code_match or is_dig or is_diamond_test or is_rare_mining_test):
             return False
@@ -17486,9 +17526,9 @@ class TalkinBot:
             pending[(_norm_room(room), _norm_user(sender_name))] = {"amount": amount, "created": time.time()}
             self._stock_auto_gold_pending = pending
             if self._configured_room_language(room) == "en":
-                notice = f"⚠️ Investment risk: gold can fall and you could lose the full amount. Your current balance ({_fmt_points(amount)} points) will be invested automatically, capped at 10 billion. To accept, type: confirm (within 1 minute)."
+                notice = f"⚠️ Investment risk: gold can fall and you could lose the full amount. Your current balance ({_fmt_points(amount)} points) will be invested automatically, capped at 30 billion (30b). To accept, type: confirm (within 1 minute)."
             else:
-                notice = f"⚠️ تحذير استثماري: سعر الذهب قد يهبط وقد تخسر كامل المبلغ. سيُستثمر رصيدك الحالي تلقائياً ({_fmt_points(amount)} نقطة)، وبحد أقصى 10 مليارات (10b). إذا كنت موافقاً أرسل: موافق (خلال دقيقة)."
+                notice = f"⚠️ تحذير استثماري: سعر الذهب قد يهبط وقد تخسر كامل المبلغ. سيُستثمر رصيدك الحالي تلقائياً ({_fmt_points(amount)} نقطة)، وبحد أقصى 30 مليار (30b). إذا كنت موافقاً أرسل: موافق (خلال دقيقة)."
             self.send_room_text(room, notice)
             return True
         if confirm_gold:
@@ -19478,28 +19518,7 @@ class TalkinBot:
             if not target or not message_text:
                 return True
 
-            private_payload = (
-                f"📩 لديك رسالة خاصة من @{sender}\n"
-                f"🏠 الغرفة: {str(room or 'غير محددة').strip()}\n"
-                f"📝 نص الرسالة: {message_text}"
-            )
-            try:
-                sent = bool(self.send_private_text(target, private_payload))
-            except Exception as exc:
-                sent = False
-                self.log("[PRIVATE-MSG] failed", repr(exc))
-
-            # Do not let the normal command-response router publish this
-            # confirmation in the room. It must reach the requester privately.
-            old_rerouting = getattr(self._master_reply_local, "rerouting", False)
-            try:
-                self._master_reply_local.rerouting = True
-                if sent:
-                    self.send_private_text(sender, f"✅ تم إرسال الرسالة إلى @{target} بنجاح.")
-                else:
-                    self.send_private_text(sender, f"❌ فشل إرسال الرسالة إلى @{target}.")
-            finally:
-                self._master_reply_local.rerouting = old_rerouting
+            self._deliver_user_private_message(sender, target, message_text)
             return True
 
         # Master-only private broadcast: خاص@النص / رسالة@النص / broadcast@النص.
@@ -22465,10 +22484,7 @@ class TalkinBot:
             target = m_direct_public.group(1).strip()
             message_text = m_direct_public.group(2).strip()
             if target and message_text:
-                try:
-                    self.send_private_text(target, message_text)
-                except Exception as exc:
-                    self.log("[DIRECT-MESSAGE] failed", target, repr(exc))
+                self._deliver_user_private_message(frm, target, message_text)
                 return
 
         # Personal bot ban: silently ignore subsequent traffic except for a
@@ -23202,10 +23218,7 @@ class TalkinBot:
                         target = m_direct_private.group(1).strip()
                         message_text = m_direct_private.group(2).strip()
                         if target and message_text:
-                            try:
-                                self.send_private_text(target, message_text)
-                            except Exception as exc:
-                                self.log("[DIRECT-MESSAGE] failed", target, repr(exc))
+                            self._deliver_user_private_message(frm, target, message_text)
                             return
 
                     _private_event_id = str(cm.get(41, "") or result.get("uid", "") or "")

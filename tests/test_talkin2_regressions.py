@@ -5247,7 +5247,7 @@ class MessageBackgroundDeliveryRegressions(unittest.TestCase):
 
         self.assertTrue(bot._deliver_user_private_message("Sender", "Target", "hello"))
         self.assertEqual(sent[0][0], "Target")
-        self.assertIn("📩 لديك رسالة من Sender", sent[0][1])
+        self.assertIn("📩 لديك رسالة من @Sender", sent[0][1])
         self.assertIn("hello", sent[0][1])
         self.assertEqual(sent[1][0], "Sender")
         self.assertIn("✅ تم إرسال الرسالة", sent[1][1])

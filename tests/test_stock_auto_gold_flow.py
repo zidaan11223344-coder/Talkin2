@@ -13,15 +13,15 @@ def test_stock_command_warns_and_requires_confirmation_instead_of_old_choice_men
 
     with patch.object(bot_module, "_is_verified_user", return_value=True), \
          patch.object(bot_module, "_games_enabled_for_room", return_value=True), \
-         patch.object(bot_module, "_get_points", return_value=20_000_000_000), \
+         patch.object(bot_module, "_get_points", return_value=40_000_000_000), \
          patch.object(bot_module.time, "time", return_value=1000.0):
         assert bot.handle_game_command("Hall", "بورصة", "Player") is True
 
     key = (bot_module._norm_room("Hall"), bot_module._norm_user("Player"))
-    assert bot._stock_auto_gold_pending[key]["amount"] == 10_000_000_000
+    assert bot._stock_auto_gold_pending[key]["amount"] == 30_000_000_000
     warning = messages[-1][1]
     assert "قد تخسر كامل المبلغ" in warning
-    assert "بحد أقصى 10 مليارات" in warning
+    assert "بحد أقصى 30 مليار" in warning
     assert "موافق" in warning
     assert "أرسل رقم الخيار" not in warning
 
@@ -30,10 +30,10 @@ def test_stock_command_warns_and_requires_confirmation_instead_of_old_choice_men
     bot._stock_market_invest = lambda room, sender, asset, amount: messages.append((room, f"INVEST:{asset}:{amount}")) or True
     with patch.object(bot_module, "_is_verified_user", return_value=True), \
          patch.object(bot_module, "_games_enabled_for_room", return_value=True), \
-         patch.object(bot_module, "_get_points", return_value=20_000_000_000), \
+         patch.object(bot_module, "_get_points", return_value=40_000_000_000), \
          patch.object(bot_module.time, "time", return_value=1010.0):
         assert bot.handle_game_command("Hall", "موافق", "Player") is True
-    assert messages[-1][1] == "INVEST:1:10000000000"
+    assert messages[-1][1] == "INVEST:1:30000000000"
     assert key not in bot._stock_auto_gold_pending
 
 
