@@ -4302,7 +4302,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0][0], bot_module.STOCK_MARKET_HISTORY_FILE)
 
-    def test_recovered_stock_settlement_accepts_the_full_zero_to_one_hundred_range(self):
+    def test_recovered_stock_settlement_clamps_legacy_percent_to_fifty(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot._stock_market_lock = threading.RLock()
         bot.stock_market_history = []
@@ -4321,9 +4321,9 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
             bot_module, "_save_local_json", return_value=None
         ), patch.object(bot_module, "_record_game", return_value=None):
             self.assertEqual(bot._process_stock_market_investments(now=100), 1)
-        self.assertEqual(apply.call_args.args[1], 200_000)
-        self.assertEqual(bot.stock_market_history[0]["change_percent"], 100)
-        self.assertEqual(bot.stock_market_history[0]["change"], 100_000)
+        self.assertEqual(apply.call_args.args[1], 150_000)
+        self.assertEqual(bot.stock_market_history[0]["change_percent"], 50)
+        self.assertEqual(bot.stock_market_history[0]["change"], 50_000)
 
     def test_plus_mf_accepts_unicode_word_persists_and_confirms_privately(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -4439,7 +4439,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertEqual(len(crop_rows), 24)
         self.assertLessEqual(len(crop_rows), 30)
         self.assertIn("🍎 5د=", packets[0][1])
-        self.assertIn("🌳 90د=", packets[0][1])
+        self.assertIn("🌳 60د=", packets[0][1])
         self.assertNotRegex(packets[0][1], r"(?:120|180|240|360|480|600|720)د=")
         self.assertIn("500m", packets[0][1])
         self.assertIn("اكتب ns", packets[0][1])
