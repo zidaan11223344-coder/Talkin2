@@ -365,6 +365,34 @@ class CommandLanguageAndReconnectRegressions(unittest.TestCase):
         self.assertEqual(bot._auto_rejoin_waiting_ack, {"hall"})
         self.assertEqual(bot.known_rooms, {"Hall"})
 
+    def test_manual_join_of_connected_room_leaves_then_waits_and_rejoins_once(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.connected_rooms = {"Hall"}
+        bot._pending_room_joins = {}
+        bot._pending_room_leaves = {}
+        bot._room_restore_candidates = set()
+        bot._room_bulk_lock = threading.RLock()
+        bot.log = lambda *_args: None
+        calls = []
+
+        def leave(room):
+            calls.append(("leave", room))
+            bot.connected_rooms.discard(room)
+            bot._pending_room_leaves[bot_module._norm_room(room)].set()
+            return True
+
+        def join(room, **_kwargs):
+            calls.append(("join", room))
+            bot.connected_rooms.add(room)
+            return True
+
+        bot.leave_room = leave
+        bot.join_room = join
+        with patch.dict(bot_module.os.environ, {"MANUAL_REJOIN_DELAY_SECONDS": "0"}):
+            bot._join_rooms_serially(["Hall"], sender="Master")
+        self.assertEqual(calls, [("leave", "Hall"), ("join", "Hall")])
+        self.assertEqual(bot.connected_rooms, {"Hall"})
+
     def test_server_join_ack_clears_one_request_wait_state(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room = ""
@@ -562,24 +590,36 @@ class RoomExclusionRegressions(unittest.TestCase):
             bot._process_room_list([{"name": "Forbidden"}, {"name": "Other"}])
         self.assertEqual(bot.known_rooms, {"Other"})
 
-    def test_manual_join_reports_a_room_already_listed_as_connected(self):
+    def test_manual_join_refreshes_a_room_already_listed_as_connected(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.connected_rooms = {"RoomA"}
         bot._pending_room_joins = {}
+        bot._pending_room_leaves = {}
+        bot._room_restore_candidates = set()
         bot._room_bulk_lock = threading.RLock()
         bot.log = lambda *_args: None
         calls = []
 
         def join(room, force=False, requested_by=""):
-            calls.append(("join", room, force, requested_by))
+            calls.append(("join", room))
+            bot.connected_rooms.add(room)
+            return True
+
+        def leave(room):
+            calls.append(("leave", room))
+            bot.connected_rooms.discard(room)
+            bot._pending_room_leaves[bot_module._norm_room(room)].set()
             return True
 
         bot.join_room = join
+        bot.leave_room = leave
         bot.send_private_text = lambda *_args: None
-        with patch.object(bot_module.time, "sleep"):
+        with patch.dict(bot_module.os.environ, {"MANUAL_REJOIN_DELAY_SECONDS": "0"}), patch.object(
+            bot_module.time, "sleep"
+        ):
             result = bot._join_rooms_serially(["RoomA"], sender="Master")
-        self.assertEqual(result, {"sent": 0, "skipped": 1})
-        self.assertEqual(calls, [])
+        self.assertEqual(result, {"sent": 1, "skipped": 0})
+        self.assertEqual(calls, [("leave", "RoomA"), ("join", "RoomA")])
 
     def test_occupants_response_alone_does_not_mark_room_connected(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -3406,7 +3446,43 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         self.assertIn("removed by room admin", private_notices[0][1])
         self.assertIn("RoomAdmin", private_notices[0][1])
 
-    def test_explicit_role_change_of_bot_still_triggers_rejoin_recovery(self):
+    def test_bot_user_left_without_explicit_kick_does_not_schedule_rejoin(self):
+        bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+        bot.room = ""
+        bot.room_users = {"North": {"test-bot": "owner"}}
+        bot.known_rooms = {"North"}
+        bot.blocked_rooms = set()
+        bot._blocked_room_notices = set()
+        bot.connected_rooms = {"North"}
+        bot._master_online_rooms = set()
+        bot._room_entry_times = {}
+        bot._room_entry_users = {}
+        bot._intentional_leaves = set()
+        bot.custom_welcome_enabled = False
+        bot.custom_welcomes = {}
+        bot.pending_admin_lock = threading.Lock()
+        bot.pending_admin_actions = {}
+        bot.last_admin_actions = {}
+        bot._remember_inflight_command = lambda *_args, **_kwargs: None
+        bot._report_monitored_event = lambda *_args, **_kwargs: None
+        bot._complete_pending_room_list_text = lambda *_args, **_kwargs: False
+        bot._is_duplicate_incoming = lambda *_args, **_kwargs: False
+        bot._schedule_auto_rejoin = lambda *_args, **_kwargs: self.fail(
+            "ambiguous user_left must not start an automatic rejoin"
+        )
+        bot.send_room_text = lambda *_args: None
+        bot.log = lambda *_args: None
+        with patch.object(bot_module, "BOT_ID", "test-bot"), patch.object(
+            bot_module, "_room_protection_cfg", return_value={}
+        ), patch.object(bot_module, "_save_persistent_rooms"), patch.object(
+            bot_module, "_remember_roster"
+        ):
+            bot._handle_room_event_impl({"room_event": {
+                1: "user_left", 13: "North", 17: "test-bot",
+            }})
+        self.assertNotIn("North", bot.connected_rooms)
+
+    def test_explicit_kick_of_bot_triggers_rejoin_recovery(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.room = ""
         bot.room_users = {"North": {}}
@@ -3434,13 +3510,12 @@ class PointsAndPublishingHardeningRegressions(unittest.TestCase):
         ):
             bot._handle_room_event_impl({"room_event": {
                 1: "role_changed", 13: "North", 17: "test-bot",
-                31: "outcast",
+                31: "kicked",
             }})
 
         self.assertNotIn("North", bot.connected_rooms)
         self.assertEqual(scheduled, ["North"])
-        self.assertEqual(private_notices[0][0], "Master")
-        self.assertIn("outcast", private_notices[0][1])
+        self.assertEqual(private_notices, [])
 
     def test_telegram_poll_loop_is_inert_when_this_process_is_not_the_owner(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -3915,6 +3990,8 @@ class FollowupFeatureRegressions(unittest.TestCase):
     def test_myrooms_paginates_thirty_rooms_and_ns_shows_final_page(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.connected_rooms = {f"Room {i:02d}" for i in range(1, 32)}
+        bot.known_rooms = {"SavedOnly"}
+        bot.room_users = {"StaleRoom": {}}
         bot._result_pages = {}
         bot._transfer_log_pages = {}
         bot._transfer_log_languages = {}
@@ -3931,8 +4008,10 @@ class FollowupFeatureRegressions(unittest.TestCase):
             self.assertTrue(bot._handle_management_command_impl("", "myrooms", "Master", is_private=True))
             self.assertTrue(bot._handle_management_command_impl("", "ns", "Master", is_private=True))
         self.assertEqual(len(private_sent), 1)
-        self.assertIn("Complete bot rooms (31) — server", private_sent[0])
+        self.assertIn("Rooms currently connected (31)", private_sent[0])
         self.assertIn("Type ns for the next list", private_sent[0])
+        self.assertNotIn("SavedOnly", private_sent[0])
+        self.assertNotIn("StaleRoom", private_sent[0])
         self.assertEqual(len(self.sent), 1)
         self.assertIn("📄 List 2/2", self.sent[0][1])
         self.assertIn("Room 31", self.sent[0][1])

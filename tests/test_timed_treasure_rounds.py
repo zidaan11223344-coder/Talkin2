@@ -49,6 +49,18 @@ def test_next_timed_game_is_due_three_minutes_after_round_resolution_finishes():
     assert bot._rare_diamond_next_due == 1_425.0
 
 
+def test_direct_timed_game_start_cannot_bypass_three_minute_cooldown():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot._rare_diamond_lock = threading.RLock()
+    bot._rare_diamond_next_due = 101.0
+    bot.connected_rooms = {"Hall"}
+    bot._rare_diamond_event = None
+    bot.log = lambda *_args: None
+    with patch.object(bot_module.time, "time", return_value=100.0):
+        assert bot._start_rare_diamond_event("rare_diamond") is False
+    assert bot._rare_diamond_event is None
+
+
 def test_timed_round_timeout_closes_once_and_waits_three_minutes_before_next_game():
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
     bot._rare_diamond_lock = threading.RLock()

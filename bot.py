@@ -3069,11 +3069,11 @@ def _looks_like_bot_command(text):
     normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
     normalized_games = {str(x).casefold().replace("ة", "ه") for x in (*GAME_COMMANDS, *GAME_COMMANDS.values())}
     mining_exact = {
-        "sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag",
-        "متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures",
+        "sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag", "sv inventory", "sv bag",
+        "متجر الكنوز", "سوق الكنوز", "treasure shop", "treasure store", "store treasures",
         "توب الماس", "توب الالماس", "top diamonds", "top gems", "اغنى المنقبين",
         "فحص الماس", "فحص الالماس", "فحص زرع", "فحص الزرع", "farm check", "check farm",
-        "red", "احفر", "تنقيب", "نقب",
+        "red", "احفر", "تنقيب", "نقب", "diamond", "diamonds",
     }
     mining_normalized = {value.replace("ة", "ه") for value in mining_exact}
     return (
@@ -7946,6 +7946,12 @@ class TalkinBot:
             if requester:
                 self.send_private_text(requester, f"✅ تم دخول البوت إلى الغرفة: {room}")
             return
+        if (not requester and any(
+                _norm_room(saved).casefold() == _norm_room(room).casefold()
+                for saved in getattr(self, "_auto_rejoin_waiting_ack", set())
+        )):
+            self.log("[AUTO_REJOIN] join acknowledgement timed out; no retry:", room)
+            return
         self.known_rooms = {r for r in self.known_rooms if _norm_room(r) != _norm_room(room)}
         self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != _norm_room(room)}
         _save_persistent_rooms(self.known_rooms)
@@ -7957,7 +7963,35 @@ class TalkinBot:
                 "انتهت مهلة التأكيد ولم يظهر اتصال البوت بها؛ تحقق من صلاحياته ثم أعد المحاولة.",
             )
 
-    def _schedule_auto_rejoin(self, room: str, delay: float = 1.2):
+    def _send_master_room_departure_notice(self, room, event_type, reason="", actor=""):
+        """Rate-limit private notices for unexpected room departures."""
+        master = str(BOT_MASTER or "").strip().lstrip("@")
+        if not master:
+            return False
+        now = time.monotonic()
+        room_key = _norm_room(room).casefold()
+        last = getattr(self, "_room_departure_notice_last", None)
+        if not isinstance(last, dict):
+            last = self._room_departure_notice_last = {}
+        previous = float(last.get(room_key, 0) or 0)
+        if previous and now - previous < 60.0:
+            return False
+        last[room_key] = now
+        notice = (
+            f"⚠️ خرج البوت من الغرفة: {room}\n"
+            f"📌 الحالة/السبب: {str(reason or event_type or 'غير معروف').strip()}\n"
+            f"👤 الفاعل: {str(actor or 'غير معروف').strip()}\n"
+            "إذا تكرر الخروج سريعًا فسيوقف المحاولات تلقائيًا. "
+            "حدث user_left وحده لا يطلق إعادة الدخول التلقائية."
+        )
+        try:
+            redact = getattr(self, "_redact_connection_secrets", lambda value: value)
+            return self.send_private_text(master, redact(notice)) is not False
+        except Exception as exc:
+            self.log("[ROOM] departure notice failed:", type(exc).__name__)
+            return False
+
+    def _schedule_auto_rejoin(self, room: str, delay: float = 3.0):
         """Rejoin after a departure with bounded attempts and exponential backoff."""
         if not room:
             return
@@ -7965,6 +7999,15 @@ class TalkinBot:
         if room_key in getattr(self, "blocked_rooms", set()):
             return
         if room_key in getattr(self, "_intentional_leaves", set()):
+            return
+        restore_started = float(getattr(self, "_room_restore_started_at", 0.0) or 0.0)
+        if (
+            restore_started
+            and time.monotonic() - restore_started < 45.0
+            and any(_norm_room(saved).casefold() == room_key.casefold()
+                    for saved in getattr(self, "_room_restore_candidates", set()))
+        ):
+            self.log(f"[AUTO_REJOIN] startup restore owns this room; skip duplicate: {room}")
             return
         pending_join = getattr(self, "_pending_room_joins", {}).get(room_key)
         if pending_join:
@@ -7980,6 +8023,11 @@ class TalkinBot:
             self._auto_rejoin_state = {}
         if not hasattr(self, "_auto_rejoin_paused"):
             self._auto_rejoin_paused = set()
+        if not hasattr(self, "_auto_rejoin_waiting_ack"):
+            self._auto_rejoin_waiting_ack = set()
+        if any(_norm_room(saved).casefold() == room_key.casefold() for saved in self._auto_rejoin_waiting_ack):
+            self.log(f"[AUTO_REJOIN] waiting for server acknowledgement; skip {room}")
+            return
         now = time.monotonic()
         notify_master = False
         with self._auto_rejoin_lock:
@@ -8009,7 +8057,7 @@ class TalkinBot:
                     self.log(f"[AUTO_REJOIN] stopping after 5 attempts in 15 minutes: {room}")
                     return
                 state["attempts"] = recent_attempts + [now]
-                delay = max(float(delay), min(60.0, 1.2 * (2 ** len(recent_attempts))))
+                delay = max(2.0, float(delay), min(60.0, 1.2 * (2 ** len(recent_attempts))))
                 generation = int(getattr(self, "_connection_generation", 0))
                 self._auto_rejoin_pending.add(room_key)
         if notify_master:
@@ -8020,19 +8068,19 @@ class TalkinBot:
                     is_en = False
                 if is_en:
                     notice = (
-                        f"⏸️ Automatic rejoin to {room} paused after three rapid departures. "
+                        f"⏸️ Automatic rejoin to {room} paused after repeated rapid departures. "
                         "To resume, send: دخول@اسم_الغرفة"
                     )
                 else:
                     notice = (
-                        f"⏸️ أوقفت إعادة الدخول التلقائية إلى {room} بعد ثلاث مغادرات سريعة. "
+                        f"⏸️ أوقفت إعادة الدخول التلقائية إلى {room} بعد تكرر الخروج بسرعة. "
                         "لاستئنافها أرسل: دخول@اسم_الغرفة"
                     )
                 try:
                     self.send_private_text(BOT_MASTER, notice)
                 except Exception as exc:
                     self.log("[AUTO_REJOIN] pause notice failed:", type(exc).__name__)
-            self.log(f"[AUTO_REJOIN] paused after three rapid departures: {room}")
+            self.log(f"[AUTO_REJOIN] paused after repeated rapid departures: {room}")
             return
         def _rejoin_worker():
             try:
@@ -8051,8 +8099,12 @@ class TalkinBot:
                     if generation != int(getattr(self, "_connection_generation", 0)):
                         self.log(f"[AUTO_REJOIN] connection changed before join; cancel {room}")
                         return
-                    self.join_room(room, force=True)
+                    self._auto_rejoin_waiting_ack.add(room_key)
+                    accepted = self.join_room(room, force=True)
+                    if accepted is False:
+                        self._auto_rejoin_waiting_ack.discard(room_key)
             except Exception as e:
+                getattr(self, "_auto_rejoin_waiting_ack", set()).discard(room_key)
                 self.log(f"[AUTO_REJOIN] Rejoin failed for {room}:", repr(e))
             finally:
                 with self._auto_rejoin_lock:
@@ -8627,7 +8679,9 @@ class TalkinBot:
                     ("👥 الهجوم — ", "👥 Attack — "), ("👥 الدفاع — ", "👥 Defense — "),
                     ("🤖 الهجوم — ", "🤖 Attack — "), ("🤖 الدفاع — ", "🤖 Defense — "),
                     (" لاعبين): ", " players): "), (" لاعبان): ", " players): "),
-                    ("لاعبون قيد الانضمام", "players joining"), ("الفريق", "team"),
+                    ("لاعبون قيد الانضمام", "players joining"),
+                    ("الفريق الأول", "the first team"), ("الفريق الثاني", "the second team"),
+                    ("الفريق", "team"),
                 ):
                     line = line.replace(arabic, english)
                 return line.replace("، ", ", ")
@@ -8834,6 +8888,271 @@ class TalkinBot:
         replacements = cached
         for ar, en in replacements.items():
             value = value.replace(ar, en)
+        # Mining and Cricket responses are also delivered through this central
+        # path, so English rooms receive localized command output regardless
+        # of whether the user sent the Arabic or English command alias.
+        mining_and_cricket_replacements = {
+            "⛏️ متجر الكنوز — الأسعار بالنقاط": "⛏️ Treasure shop — prices in points",
+            "للتنقيب: احفر": "To mine: dig",
+            "للمخزون: sv": "For inventory: sv or inventory",
+            "لاستبدال أي كنز من المتجر:": "To redeem any treasure:",
+            "لاستبدال الألماسة النادرة RED:": "To redeem the rare RED diamond:",
+            "🎒 مخزون @": "🎒 Inventory for @",
+            "🔴 ألماسة نادرة RED:": "🔴 Rare RED diamond:",
+            "— الاستبدال:": "— redemption:",
+            "⚠️ رمز RED غير مرتبط بألماسة نادرة في كتالوج الكنوز.": "⚠️ RED is not linked to a rare diamond in the treasure catalog.",
+            "لا توجد كنوز بعد؛ جرّب أمر احفر أو شارك في تنقيب الألماسة النادرة.": "No treasures yet. Type dig or join the rare diamond expedition.",
+            "💎 إجمالي الألماس الذي عثرت عليه:": "💎 Total diamonds found:",
+            "🔁 للاستبدال:": "🔁 To redeem:",
+            "🔴 للألماسة النادرة RED:": "🔴 For the rare RED diamond:",
+            "💎 توب المنقبين": "💎 Diamond leaderboard",
+            "لا توجد اكتشافات ألماس بعد.": "No diamonds have been found yet.",
+            "ألماس ملكي": "Royal diamond", "الألماس الملكي": "Royal diamonds",
+            "الألماس البنفسجي": "Purple diamonds", "الألماس الأزرق": "Blue diamonds",
+            "الألماس الأحمر": "Red diamonds", "الألماس الأسود": "Black diamonds",
+            "الألماس العادي": "Clear diamonds", "ألماسة نادرة": "rare diamond",
+            "ألماسة": "diamond", "ألماس": "diamonds", "الياقوت": "Ruby",
+            "النحاس": "Copper", "الحديد": "Iron", "أُضيفت ": "Added ",
+            "أُضيف إلى مخزونك": "Added to your inventory", "عثرت على:": "found:",
+            "لم يعثر على شيء هذه المرة. حظًا أوفر في التنقيب القادم.": "found nothing this time. Better luck on the next dig.",
+            "يمكنك التنقيب مرة كل دقيقة. تبقّى ": "you can mine once per minute. Time left: ",
+            "لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم بعد 3 دقائق.": "No rare diamond round is open. Wait for the next announcement in 3 minutes.",
+            "🏏 إعداد مباراة الكريكيت": "🏏 Cricket match setup",
+            "🏏 إعداد مباراة ضد البوت": "🏏 Set up a match against the bot",
+            "اختر عدد اللاعبين داخل هذه الغرفة فقط:": "Choose the player count for this room only:",
+            "اختر عدد اللاعبين:": "Choose the number of players:",
+            "اختر عدد اللاعبين في كل غرفة من 1 إلى 4.": "Choose 1–4 players per room.",
+            "بعد اختيار العدد، يرسل كل لاعب Join من هذه الغرفة فقط.": "After choosing, each player types Join in this room only.",
+            "Choose عدد Playerين:": "Choose the number of players:",
+            "الخصم هو بوت ": "The opponent is the bot ",
+            "أرسل Join من كل لاعب؛ بعد اكتمال العدد تبدأ المباراة ضد البوت.": "Each player types Join; the match against the bot starts when the roster is full.",
+            "أرسل الرقم فقط (العدد لكل غرفة). بعد اكتمال الفريق الأول، ترسل الغرفة الثانية Join.": "Send only the number (players per room). Once the first team is full, the second room types Join.",
+            "بعد اكتمال الفريق الأول، ترسل الغرفة الثانية Join.": "After the first team is full, the second room types Join.",
+            "عند تعدد قوائم الانتظار، يُقرن Join بأقدم فريق أول مكتمل.": "If several lobbies are waiting, Join is paired with the oldest full first team.",
+            "لا يمكن إكمال الفريقين من الغرفة نفسها.": "Both teams cannot be completed from the same room.",
+            "اختر دورك: 1 للهجوم أو 2 للدفاع؛ وال": "Choose your role: 1 to bat or 2 to bowl; the ",
+            "يختار: 1 هجوم أو 2 دفاع.": "chooses: 1 to bat or 2 to bowl.",
+            "أرسل 0 إلى 6": "Send a number from 0 to 6",
+            "دورك يا @": "Your turn, @",
+            "🏏 الهجوم": "🏏 Batting",
+            "🛡️ الدفاع": "🛡️ Bowling",
+            "🏏 انتهت مباراة الكريكيت": "🏏 Cricket match ended",
+            "🏏 بدأت لعبة الكريكيت في غرفة ": "🏏 Cricket started in room ",
+            "🏏 فُتحت مباراة الكريكيت في ": "🏏 Cricket match opened in ",
+            "🏏 بدأت مباراة الكريكيت": "🏏 Cricket match started",
+            "👥 عدد الفريق:": "👥 Team size:",
+            "🔗 للانضمام أرسل Join.": "🔗 Type Join to participate.",
+            "✅ اكتمل الفريقان:": "✅ Both teams are full:",
+            "👥 المطلوب ": "👥 Required: ",
+            " لاعبين في كل غرفة.": " players per room.",
+            "الفريق الأول يختار: 1 هجوم أو 2 دفاع.": "The first team chooses: 1 to bat or 2 to bowl.",
+            "الفريق الثاني يُحدد تلقائيًا.": "The second team's role is assigned automatically.",
+            "لا توجد مباراة مكتملة تنتظر الانضمام الآن.": "No full match is waiting for players right now.",
+            "لا توجد قائمة لاعبين مفتوحة لهذه المباراة الآن.": "There is no open player lobby for this match.",
+            "انتظر اختيار عدد اللاعبين أولاً.": "Wait for the player count to be selected first.",
+            "لا يمكن للحساب نفسه المشاركة في مباراتين كركيت متزامنتين.": "The same account cannot join two simultaneous Cricket matches.",
+            "⏳ هذه الغرفة مشاركة في مباراة مفتوحة بالفعل؛ أكملها أو أوقفها قبل بدء مباراة أخرى.": "⏳ This room is already in an open match. Finish or stop it before starting another.",
+            "✅ انضم @": "✅ Joined @",
+            "مسجل بالفعل في المباراة.": "is already registered for this match.",
+            "اكتمل عدد اللاعبين (": "The player limit is reached (",
+            "اكتمل الفريق الأول ": "The first team needs ",
+            " لاعبين أولاً.": " players first.",
+            "أرسل Join من لاعبي هذه الغرفة.": "Players in this room should type Join.",
+            "أرسل Join من لاعبي الغرفة الأولى.": "Players in the first room should type Join.",
+            "⏳ بانتظار اكتمال لاعبي الغرفة الأخرى.": "⏳ Waiting for the other room's players to finish joining.",
+            "⏳ بانتظار انضمام الفريق الثاني.": "⏳ Waiting for the second team to join.",
+            "⏳ بدأت المباراة بالفعل.": "⏳ The match has already started.",
+            "📭 لا توجد مباراة.": "📭 There is no match.",
+            "📭 اللعبة لا تنتظر اختيار الهجوم أو الدفاع.": "📭 The game is not waiting for a batting/bowling choice.",
+            "❌ اختر 0 إلى 6.": "❌ Choose a number from 0 to 6.",
+            "🏆 انتهت مباراة الكريكيت": "🏆 Cricket match ended",
+            "النتيجة: ": "Result: ",
+            "🏁 الشوط الأول انتهى": "🏁 First innings ended",
+            "🎯 الهدف: ": "🎯 Target: ",
+            "الكرة ": "Ball ",
+            " لهذا الشوط": " this innings",
+            "نقطة • الكرة": "points • ball",
+            "تم تسجيل ضربة @": "Shot recorded for @",
+            "🦆 بطّة": "🦆 Duck",
+            "🔥 هاتريك — @": "🔥 Hat trick — @",
+            "🔄 استؤنفت مباراة الكريكيت بعد إعادة تشغيل البوت.\n": "🔄 Cricket match resumed after bot restart.\n",
+            "🔄 استؤنف إعداد مباراة الكريكيت. Choose عدد Playerين من 1 to 4.": "🔄 Cricket setup resumed. Choose the number of players from 1 to 4.",
+            "🔄 استؤنفت مباراة الكريكيت. ترسل غرفة الإعداد 1 للهجوم or 2 للدفاع؛ ويُعيّن Turn: الغرفة الseconds تلقائيًا.": "🔄 Cricket match resumed. The setup room chooses 1 to bat or 2 to bowl; the second room's role is assigned automatically.",
+            "✅ حُفظ اختيار الهجوم لهذه الكرة؛ انتظر رد فريق الدفاع.": "✅ Batting choice saved for this ball; wait for the bowling team's response.",
+            "🏆 Ended مباراة الكريكيت": "🏆 Cricket match ended",
+            "مباراة الكريكيت": "Cricket match",
+            "⛔ أوقفت غرفة ": "⛔ Room ",
+            " اللعبة؛ أُلغيت المباراة.": " match stopped; the match was cancelled.",
+            "🏏 كركيت | مباراة ضد البوت — المطلوب ": "🏏 Cricket | vs bot — required ",
+            "🏏 كركيت | ": "🏏 Cricket | ",
+            " لاعب(ين) في هذه الغرفة.": " players in this room.",
+            " لاعب(ين) في كل غرفة": " players per room",
+            "لاعب(ين) في كل غرفة": "players per room",
+            " — المطلوب ": " — required ",
+            " لاعب(ين).": " players.",
+            "لاعب(ين) في كل غرفة\n": "players per room\n",
+            "، ": ", ",
+            "🤖 انضم بوت ": "🤖 Bot ",
+            " خصمًا لك. Choose دورك: 1 للهجوم or 2 للدفاع؛ والبوت يأخذ الTurn: الآخر تلقائيًا.": " joined as your opponent. Choose: 1 to bat or 2 to bowl; the bot takes the other role automatically.",
+            " لاعبين أولاً.": " players first.",
+            "🔗 انضمت غرفة ": "🔗 Room ",
+            " to المباراة.": " joined the match.",
+            "👥 المطلوب ": "👥 Required: ",
+            "⏳ Turn: المهاجم @": "⏳ Batter's turn: @",
+            "⏳ Turn: المدافع @": "⏳ Bowler's turn: @",
+            "⛔ أُلغيت المباراة السابقة لبدء مباراة ضد البوت.": "⛔ The previous match was cancelled to start a bot match.",
+            "⛔ أُلغيت المباراة المفتوحة من غرفة ": "⛔ The open match in room ",
+            " لإعداد مباراة جديدة.": " was cancelled to set up a new match.",
+            "👤 كل Playerين ينضمون من هذه الغرفة فقط بإرسال Join.": "👤 All players join from this room only by typing Join.",
+            "🤖 عند اكتمال العدد تبدأ المباراة تلقائيًا ضد ": "🤖 When the roster is full, the match against the bot starts automatically: ",
+            "🔗 بعد اكتمال الفريق الأول، ترسل الغرفة الseconds Join؛ وعند تعدد القوائم يُقرن بأقدم فريق مكتمل. or أكمل العدد هنا للعب ضد ": "🔗 After the first team is full, the second room types Join. If several lobbies are waiting, the oldest full team is paired first. Or fill this roster to play against ",
+            " لاعبين لكل غرفة\n": " players per room\n",
+            "🏏 اكتمل الفريقان: ": "🏏 Both teams are full: ",
+            " players لكل غرفة": " players per room",
+            " ضد ": " vs ",
+            "🎯 الفريق الأول chooses: 1 to bat or 2 to bowl.": "🎯 The first team chooses: 1 to bat or 2 to bowl.",
+            " لاعب في الغرفة.\n": " players in the room.\n",
+            "🔄 استؤنفت قائمة الكريكيت؛ المطلوب ": "🔄 Cricket lobby resumed; required ",
+            " لاعب(ين) في كل غرفة. تنضم الغرفة الثانية بإرسال Join؛ وعند تعدد القوائم يُقرن الطلب بأقدم فريق مكتمل.": " players per room. The second room types Join; if several lobbies are waiting, the oldest full team is paired first.",
+            "🏏 تم الانضمام to ": "🏏 Joined ",
+            " يا @": " — @",
+            "🛡️ استؤنفت الكرة؛ Your turn, @": "🛡️ Ball resumed; your turn, @",
+            ". أرسل 0 إلى 6": ". Send a number from 0 to 6",
+            "الفريق الأول": "the first team",
+            "الفريق الثاني": "the second team",
+            "الغرفة الseconds": "the second room",
+            "الفريق الseconds": "the second team",
+            "الseconds": "the second",
+            "المدافع": "bowler",
+            "المهاجم": "batter",
+            "دورك": "your turn",
+            "الهجوم": "batting",
+            "الدفاع": "bowling",
+            "الفريق البشري": "human team",
+            "تعادل": "tie",
+            "الفريق": "team",
+            " لاعبين ": " players ",
+            "عدد اللاعبين": "number of players",
+            "يا @": " — @",
+            "خصمًا لك": "as your opponent",
+            "للماستر المحدد في متغيرات السيرفر": "for the configured server master",
+            "🏏 إعداد مباراة الكركيت": "🏏 Cricket match setup",
+            "Choose عدد Playerين داخل هذه الغرفة فقط:": "Choose the player count for this room only:",
+            "1️⃣ لاعب واحد\n2️⃣ لاعبان\n3️⃣ ثلاثة players\n4️⃣ أربعة players": "1️⃣ One player\n2️⃣ Two players\n3️⃣ Three players\n4️⃣ Four players",
+            "Send the number only (العدد لكل غرفة).": "Send only the number (players per room).",
+            "📢 سيعلن البوت اسم الغرف وعدد اللاعبين وأسماءهم عند اكتمال الفريقين.": "📢 The bot will announce the room names, player count and player names when both teams are full.",
+            "❌ عدد Playerين في كل غرفة يجب أن يكون من 1 to 4.": "❌ Each room must have 1–4 players.",
+            "❌ اكتب عدد Playerين في كل غرفة من 1 to 4.": "❌ Enter 1–4 players per room.",
+            "❌ Could not تحديد اسم Player؛ أرسل Join من حسابك داخل الغرفة.": "❌ Could not identify the player; type Join from your account in the room.",
+            "❌ Could not تحديد اسم Player.": "❌ Could not identify the player.",
+            "📭 لا توجد لعبة تنتظر اختيار عدد Playerين.": "📭 No game is waiting for a player count.",
+            "🔒 اختيار عدد Playerين متاح في غرفة بدء اللعبة فقط.": "🔒 Player count can only be selected in the game-start room.",
+            "⏳ انتظر اختيار عدد Playerين أولاً.": "⏳ Wait for the player count to be selected first.",
+            "⛔ اكتمل عدد Playerين (": "⛔ Player limit reached (",
+            "⛔ اللعبة غير مفعّلة؛ فعّل اللعبة أولاً (فعّلها) من خاص الماستر: تشغيل لعبه الكريكيت.": "⛔ Cricket is disabled. Ask the master to enable it in private chat.",
+            "🤖 اللعب against the bot متاح عند اختيار لاعب واحد لكل فريق فقط.": "🤖 Playing against the bot is available only with one player per team.",
+            "⛔ خصم البوت متاح في غرفة بدء المباراة قبل انضمام غرفة أخرى.": "⛔ The bot opponent is available only in the match-start room before another room joins.",
+            "⛔ يوجد لاعب مسجل بالفعل؛ أرسل Join بحسابه or انتظر الغرفة الأخرى.": "⛔ A player is already registered. Type Join from that account or wait for the other room.",
+            "⛔ هذه الغرفة ليست في المباراة.": "⛔ This room is not in the match.",
+            "⛔ أرسل Join أولاً.": "⛔ Type Join first.",
+            "⛔ اكتملت غرفتا المباراة.": "⛔ Both match rooms are full.",
+            "🤖 بوت ": "🤖 Bot ",
+            "🎯 يبدأ batting: ": "🎯 Batting starts: ",
+            ". لكل لاعب 6 كرات في كل دور.": ". Each player has 6 balls per innings.",
+            "لاعبون قيد الانضمام": "Players joining",
+            " لاعب(ين) في كل غرفة).\nتختار كل غرفة دورها: 1 للهجوم أو 2 للدفاع. يجب أن يكون هناك فريق من كل نوع.": " players per room).\nEach room chooses a role: 1 to bat or 2 to bowl. Both roles must be represented.",
+            "👥 بعد اكتمال the first team, أرسل لاعبو the second room Join. عند تعدد قوائم الانتظار, يُختار أقدم فريق مكتمل.": "👥 Once the first team is full, players in the second room type Join. If several lobbies are waiting, the oldest full team is chosen.",
+            " as your opponent. Choose your turn: 1 للهجوم or 2 للدفاع؛ والبوت يأخذ الTurn: الآخر تلقائيًا.": " as your opponent. Choose: 1 to bat or 2 to bowl; the bot takes the other role automatically.",
+            " players in the room.\n🔗 بعد اكتمال the first team, ترسل the second room Join؛ وعند تعدد القوائم يُقرن بأقدم فريق مكتمل. or أكمل العدد هنا للعب vs ": " players in the room.\n🔗 After the first team is full, the second room types Join. If several lobbies are waiting, the oldest full team is paired first. Or fill this roster to play against ",
+            "🔄 استؤنفت مباراة الكريكيت بعد إعادة تشغيل البوت.\n": "🔄 Cricket match resumed after the bot restarted.\n",
+            "🔄 استؤنف إعداد مباراة الكريكيت. Choose عدد Playerين من 1 to 4.": "🔄 Cricket setup resumed. Choose 1–4 players.",
+            "🔄 استؤنفت مباراة الكريكيت. ترسل غرفة الإعداد 1 للهجوم or 2 للدفاع؛ ويُعيّن Turn: the second room تلقائيًا.": "🔄 Cricket match resumed. The setup room chooses 1 to bat or 2 to bowl; the second room's role is assigned automatically.",
+            "🔄 استؤنفت قائمة الكريكيت؛ المطلوب ": "🔄 Cricket lobby resumed; required ",
+            " players per room. تنضم the second room بإرسال Join؛ وعند تعدد القوائم يُقرن الطلب بأقدم فريق مكتمل.": " players per room. The second room types Join; the oldest full team is paired first when multiple lobbies are waiting.",
+            " — أرسل 0 to 6.\n🛡️ بعده Turn: @": " — send 0 to 6.\n🛡️ Then the turn passes to @",
+            "❌ اسم الغرفة غير صالح.": "❌ Invalid room name.",
+            "📭 لا توجد قائمة players مفتوحة لهذه المباراة الآن.": "📭 No player lobby is open for this match right now.",
+            "⛔ يوجد لاعب مسجل بالفعل؛ أرسل Join بحسابه or انتظر الغرفة الأخرى.": "⛔ A player is already registered. Type Join from that account or wait for the other room.",
+            " players per room).\nتختار كل غرفة دورها: 1 للهجوم or 2 للدفاع. يجب أن يكون هناك فريق من كل نوع.": " players per room).\nEach room chooses its role: 1 to bat or 2 to bowl. Both roles must be represented.",
+            "بعد اكتمالها, ترسل the second room Join.": "once it is full, the second room types Join.",
+            " عند تعدد قوائم الانتظار, يُقرن Join بأقدم فريق أول مكتمل.": " When multiple lobbies are waiting, Join is paired with the oldest full first team.",
+            "🏏 فُتحت مباراة الكركيت في ": "🏏 Cricket match opened in ",
+            "as your opponent. Choose your turn: 1 للهجوم or 2 للدفاع؛ والبوت يأخذ الTurn: الآخر تلقائيًا.": "as your opponent. Choose: 1 to bat or 2 to bowl; the bot takes the other role automatically.",
+            " players in the room.\n🔗 بعد اكتمال the first team, ترسل the second room Join؛ وعند تعدد القوائم يُقرن بأقدم فريق مكتمل. or أكمل العدد هنا للعب vs ": " players in the room.\n🔗 After the first team is full, the second room types Join. The oldest full team is paired first. Or fill this roster to play against ",
+            " لاعب في هذه الغرفة.\n⏳ Waiting for the other room's players to finish joining.": " players in this room.\n⏳ Waiting for the other room's players to finish joining.",
+            "🔄 استؤنفت": "🔄 Resumed",
+            "🔄 استؤنف": "🔄 Resumed",
+            "مباراة الكريكيت": "Cricket match",
+            "مباراة الكركيت": "Cricket match",
+            "إعداد مباراة": "match setup",
+            "الكريكيت": "Cricket",
+            "الكركيت": "Cricket",
+            "إعادة تشغيل البوت": "bot restart",
+            "من 1 إلى 4": "from 1 to 4",
+            "عدد Playerين": "player count",
+            "ترسل غرفة الإعداد": "the setup room sends",
+            "1 للهجوم": "1 to bat",
+            "2 للدفاع": "2 to bowl",
+            "ويُعيّن Turn: ": "and the role is assigned to ",
+            "تلقائيًا": "automatically",
+            "انتظر": "wait",
+            "اسم الغرفة غير صالح": "invalid room name",
+            "أرسل Join بحسابه": "type Join from that account",
+            "انتظر الغرفة الأخرى": "wait for the other room",
+            "تختار كل غرفة دورها": "each room chooses its role",
+            "يجب أن يكون هناك فريق من كل نوع": "both roles must be represented",
+            "بعد اكتمالها": "once it is full",
+            "ترسل the second room Join": "the second room types Join",
+            "وعند تعدد القوائم يُقرن بأقدم فريق مكتمل": "and the oldest full team is paired first when several lobbies are waiting",
+            "لاعب في هذه الغرفة": "players in this room",
+            "انتظار": "waiting",
+            "الغرفة الأخرى": "the other room",
+            ") في هذه الغرفة.": ") players in this room.",
+            "بعد اكتمال the first team": "After the first team is full",
+            "؛ وعند تعدد القوائم يُقرن بأقدم فريق مكتمل.": "; the oldest full team is paired first when several lobbies are waiting.",
+            "؛ والبوت يأخذ الTurn: الآخر automatically.": "; the bot takes the other role automatically.",
+            "⛔ تم إيقاف لعبة Cricket وإلغاء المباراة المفتوحة.": "⛔ Cricket was disabled and the open match was cancelled.",
+            "✅ تم تشغيل ملفات لعبة Cricket. أرسل .cr 1 داخل الغرفة لفتح إعداد المباراة للأعضاء.": "✅ Cricket is enabled. Type .cr 1 in the room to open match setup for members.",
+            "✅ ملفات لعبة Cricket مفعّلة؛ المباراة المفتوحة مستمرة دون تغيير.": "✅ Cricket is enabled; the open match continues unchanged.",
+            "🔒 لعبة Cricket متاحة للأعضاء الموثقين فقط.": "🔒 Cricket is available to verified members only.",
+            "📌 افتح مباراة cricket 1..4 داخل الغرفة, وليس في الخاص.": "📌 Start cricket 1–4 inside a room, not in private chat.",
+            "🔄 Resumed Cricket match بعد bot restart.\n": "🔄 Cricket match resumed after bot restart.\n",
+            "🔄 Resumed إعداد Cricket match. Choose player count من 1 to 4.": "🔄 Cricket setup resumed. Choose 1–4 players.",
+            "🔄 Resumed Cricket match. the setup room sends 1 to bat or 2 to bowl؛ and the role is assigned to the second room automatically.": "🔄 Cricket match resumed. The setup room chooses to bat or bowl; the second room's role is assigned automatically.",
+            "🔄 Resumed قائمة Cricket؛ المطلوب ": "🔄 Cricket lobby resumed; required ",
+            " players per room. تنضم the second room بإرسال Join؛ وعند تعدد القوائم يُقرن الطلب بأقدم فريق مكتمل.": " players per room. The second room types Join; the oldest full team is paired first when several lobbies are waiting.",
+            "⛔ يوجد لاعب مسجل بالفعل؛ type Join from that account or wait the other room.": "⛔ A player is already registered. Type Join from that account or wait for the other room.",
+            "؛ and the oldest full team is paired first when several lobbies are waiting.": "; the oldest full team is paired first when several lobbies are waiting.",
+            " or أكمل العدد هنا للعب vs ": " or complete this roster to play against ",
+            "🔄 Resumed Cricket match. the setup room sends 1 to bat or 2 to bowl؛ and the role is assigned to the second room automatically.": "🔄 Cricket match resumed. The setup room chooses 1 to bat or 2 to bowl; the second room's role is assigned automatically.",
+            "cricket is enabled": "Cricket is enabled",
+            "diamond نادرة RED:": "rare RED diamond:",
+            "diamond Rare RED:": "Rare RED diamond:",
+            "للْقطعة": "per item", "للقطعة": "per item",
+            "رمز أو اسم أي كنز العدد — مثال: ": "<item name or icon> <quantity> — example: ",
+            "نادرة RED:": "rare RED diamond:",
+            " أو ": " or ",
+        }
+        # Longer Arabic item names must be replaced before shorter fragments.
+        for ar, en in mining_and_cricket_replacements.items():
+            value = value.replace(ar, en)
+        final_cricket_fixes = {
+            "⛏️ متجر الكنوز — الأسعار بالpoints": "⛏️ Treasure shop — prices in points",
+            "team الأول": "the first team",
+            "team الثاني": "the second team",
+            "⛔ يوجد لاعب مسجل بالفعل؛ type Join from that account or wait the other room.":
+                "⛔ A player is already registered. Type Join from that account or wait for the other room.",
+            "لاعب في الغرفة.\n🔗 After the first team is full, the second room types Join؛ the oldest full team is paired first when several lobbies are waiting. or أكمل العدد هنا للعب vs ":
+                "Players in the room.\n🔗 After the first team is full, the second room types Join. The oldest full team is paired first when several lobbies are waiting. Or complete this roster to play against ",
+            "لاعب في الغرفة.\n🔗 After the first team is full, the second room types Join؛ and the oldest full team is paired first when several lobbies are waiting. or أكمل العدد هنا للعب vs ":
+                "Players in the room.\n🔗 After the first team is full, the second room types Join. The oldest full team is paired first when several lobbies are waiting. Or complete this roster to play against ",
+            "لاعب في الغرفة.\n🔗 After the first team is full, the second room types Join; the oldest full team is paired first when several lobbies are waiting. or أكمل العدد هنا للعب vs ":
+                "Players in the room.\n🔗 After the first team is full, the second room types Join. The oldest full team is paired first when several lobbies are waiting. Or complete this roster to play against ",
+            "🔄 Resumed Cricket match. the setup room sends 1 to bat or 2 to bowl؛ and the role is assigned to the second room automatically.":
+                "🔄 Cricket match resumed. The setup room chooses 1 to bat or 2 to bowl; the second room's role is assigned automatically.",
+        }
+        for old, new in final_cricket_fixes.items():
+            value = value.replace(old, new)
         return value
 
     def _active_room_language_override(self, room):
@@ -17002,6 +17321,10 @@ class TalkinBot:
             return False
         now = time.time()
         with self._rare_diamond_lock:
+            next_due = float(getattr(self, "_rare_diamond_next_due", 0) or 0)
+            if now < next_due:
+                self.log("[TREASURE-CYCLE] start suppressed until cooldown expires", game_key, next_due)
+                return False
             current = self._rare_diamond_event
             if isinstance(current, dict) and now < float(current.get("ends_at", 0) or 0):
                 return False
@@ -17357,15 +17680,15 @@ class TalkinBot:
         low = raw.casefold()
         low = low.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
         low = low.replace("ى", "ي")
-        store_commands = {"متجر الكنوز", "سوق الكنوز", "treasure shop", "store treasures"}
-        inventory_commands = {"sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag"}
+        store_commands = {"متجر الكنوز", "سوق الكنوز", "treasure shop", "treasure store", "store treasures"}
+        inventory_commands = {"sv", "مخزني", "مخزون", "مخزون الكنوز", "inventory", "my inventory", "bag", "sv inventory", "sv bag"}
         top_commands = {"توب الماس", "توب الالماس", "top diamonds", "top gems", "أغنى المنقبين", "اغنى المنقبين"}
         redeem_match = re.fullmatch(r"(?:r|rdem)\s+(.+)", raw, re.I)
         red_code_match = re.fullmatch(r"red(?:\s+(.+))?", raw, re.I)
         is_diamond_test = low in {"فحص الماس", "فحص الالماس"}
         is_rare_mining_test = low in {"فحص التنقيب", "فحص الماسة النادرة", "فحص الالماسة النادرة"}
         is_rare_event_join = low in {"تنقيب", "نقب", "rare diamond", "rare-diamond"}
-        is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining"}
+        is_dig = low in {"الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining", "diamond", "diamonds"}
         is_store = low in store_commands
         is_inventory = low in inventory_commands
         is_top = low in top_commands
@@ -17396,11 +17719,8 @@ class TalkinBot:
             return True
 
         if is_diamond_test:
-            role, role_known = _room_role(self, room, sender_name)
-            role_key = re.sub(r"[\s_-]+", "", role.casefold())
-            owner_role = role_known and role_key in {"owner", "creator", "roomowner", "roomcreator", "host", "مالك", "صانع", "صانعي", "صانعالغرفة", "صانعالغرفه"}
-            if not (_is_primary_master(sender_name) or _is_room_creator(room, sender_name) or owner_role):
-                self.send_room_text(room, "🔒 فحص الماس متاح للماستر الأساسي أو مالك/صانع هذه الغرفة فقط.")
+            if not _is_configured_master_account(sender_name):
+                self.send_room_text(room, "🔒 فحص الماس مخصص للماستر المحدد في متغيرات السيرفر فقط.")
                 return True
             if not room:
                 self.send_private_text(sender_name, "📌 أرسل أمر فحص الماس داخل الغرفة ليظهر الرد والصورة فيها.")
@@ -17553,13 +17873,19 @@ class TalkinBot:
         if is_dig:
             mining_key = _norm_user(sender_name)
             now = time.time()
-            with self._mining_cooldown_lock:
-                last_dig = float(self._mining_last_dig.get(mining_key, 0) or 0)
+            cooldown_lock = getattr(self, "_mining_cooldown_lock", None)
+            if cooldown_lock is None:
+                cooldown_lock = self._mining_cooldown_lock = threading.RLock()
+            last_dig_data = getattr(self, "_mining_last_dig", None)
+            if not isinstance(last_dig_data, dict):
+                last_dig_data = self._mining_last_dig = {}
+            with cooldown_lock:
+                last_dig = float(last_dig_data.get(mining_key, 0) or 0)
                 remaining_gate = 60.0 - (now - last_dig)
                 if remaining_gate > 0:
                     self.send_room_text(room, f"⌛ {sender_name} يمكنك التنقيب مرة كل دقيقة. تبقّى {format_cooldown(int(remaining_gate) + 1)}.")
                     return True
-                self._mining_last_dig[mining_key] = now
+                last_dig_data[mining_key] = now
             outcome = MINING_STORE.dig(user_id, sender_name)
             if not outcome.get("ok"):
                 if outcome.get("error") == "cooldown":
@@ -17760,10 +18086,10 @@ class TalkinBot:
             return True
         mining_low = mining_raw.casefold().replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
         mining_commands = {
-            "الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining",
+            "الماس", "تنقيب", "نقب", "احفر", "dig", "mine", "mining", "diamond", "diamonds",
             "فحص الماس", "فحص الالماس", "فحص التنقيب", "فحص الماسة النادرة", "فحص الالماسة النادرة", "sv", "مخزني", "مخزون", "مخزون الكنوز",
-            "inventory", "my inventory", "bag", "متجر الكنوز", "سوق الكنوز",
-            "treasure shop", "store treasures", "توب الماس", "توب الالماس",
+            "inventory", "my inventory", "bag", "sv inventory", "sv bag", "متجر الكنوز", "سوق الكنوز",
+            "treasure shop", "treasure store", "store treasures", "توب الماس", "توب الالماس",
             "top diamonds", "top gems", "اغنى المنقبين", "red",
         }
         if mining_low in mining_commands or re.fullmatch(r"(?:r|rdem)\s+.+", mining_raw, re.I) or re.fullmatch(r"red(?:\s+.+)?", mining_raw, re.I):
@@ -18565,7 +18891,11 @@ class TalkinBot:
         with self._room_bulk_lock:
             for target in cleaned:
                 key=_norm_room(target)
-                if any(_norm_room(r)==key for r in getattr(self, "connected_rooms", set())):
+                connected = any(
+                    _norm_room(r).casefold() == key.casefold()
+                    for r in getattr(self, "connected_rooms", set())
+                )
+                if connected and fast_restore:
                     # The server already confirmed this room in the current
                     # session. Never leave/rejoin it just because the master
                     # requested the saved-room list; that race used to produce
@@ -18579,7 +18909,10 @@ class TalkinBot:
                     if sync_id:
                         self._record_room_sync_result(sync_id, target, True, "موجودة ومتصل بها البوت")
                     continue
-                if sender and key in getattr(self, "_room_restore_candidates", set()):
+                if fast_restore and sender and any(
+                    _norm_room(saved).casefold() == key.casefold()
+                    for saved in getattr(self, "_room_restore_candidates", set())
+                ):
                     try:
                         self.send_private_text(sender, f"✅ البوت موجود داخل الغرفة: {target}")
                     except Exception as exc:
@@ -18588,6 +18921,39 @@ class TalkinBot:
                     if sync_id:
                         self._record_room_sync_result(sync_id, target, True, "تمت استعادتها عند تشغيل البوت")
                     continue
+                if not fast_restore:
+                    restore_candidates = getattr(self, "_room_restore_candidates", set())
+                    for saved in tuple(restore_candidates):
+                        if _norm_room(saved).casefold() == key.casefold():
+                            restore_candidates.discard(saved)
+                if connected:
+                    # A manual دخول@ request is an explicit refresh: leave
+                    # first, wait briefly for the server's user_left ACK, then
+                    # issue exactly one join even if that ACK never arrives.
+                    pending_leaves = getattr(self, "_pending_room_leaves", None)
+                    if not isinstance(pending_leaves, dict):
+                        pending_leaves = self._pending_room_leaves = {}
+                    leave_ack = threading.Event()
+                    pending_leaves[key] = leave_ack
+                    leave_sent = False
+                    try:
+                        leave_sent = self.leave_room(target) is not False
+                    except Exception as exc:
+                        self.log("[ROOM] manual leave before rejoin failed:", target, repr(exc))
+                    leave_timeout = max(
+                        0.2, float(os.getenv("ROOM_LEAVE_ACK_TIMEOUT_SECONDS", "3.0") or 3.0)
+                    )
+                    if leave_sent:
+                        if leave_ack.wait(leave_timeout):
+                            self.log("[ROOM] server confirmed leave before rejoin:", target)
+                        else:
+                            self.log("[ROOM] leave ACK timed out; continuing with one manual join:", target)
+                    pending_leaves.pop(key, None)
+                    rejoin_gap = max(
+                        0.0, float(os.getenv("MANUAL_REJOIN_DELAY_SECONDS", "1.0") or 1.0)
+                    )
+                    if rejoin_gap:
+                        time.sleep(rejoin_gap)
                 try:
                     if self.join_room(target, force=bool(fast_restore), requested_by=sender):
                         sent += 1
@@ -20657,18 +21023,15 @@ class TalkinBot:
         if low in ("غرفي", "غرفيّ", "myrooms", "my rooms"):
             blocked = getattr(self, "blocked_rooms", set())
             live = sorted({
-                str(r).strip() for r in (
-                    list(getattr(self, "connected_rooms", set()))
-                    + list(getattr(self, "room_users", {}).keys())
-                    + list(_persistent_rooms())
-                )
+                str(r).strip() for r in getattr(self, "connected_rooms", set())
                 if str(r).strip() and _norm_room(r) not in blocked
             }, key=str.casefold)
             if not is_private:
-                self.send_room_text(room, "📡 أعرض كامل غرف البوت المستعادة والمؤكدة.")
+                language = self._effective_room_language(room)
+                self.send_room_text(room, "📡 أعرض الغرف المتصلة الآن فعليًا." if language == "ar" else "📡 Showing rooms currently connected to this session.")
             self._send_room_names_pages(
-                sender, room, live, from_server=True,
-                language=_detect_text_language(text) or self._effective_room_language(room),
+                sender, room, live, live_only=True,
+                language=self._effective_room_language(room) if room else (_detect_text_language(text) or self._effective_room_language(room)),
             )
             return True
 
@@ -22259,11 +22622,24 @@ class TalkinBot:
                     connected for connected in self.connected_rooms
                     if _norm_room(connected) != _norm_room(room)
                 }
+                pending_leaves = getattr(self, "_pending_room_leaves", {})
+                for pending_room, leave_ack in tuple(pending_leaves.items()):
+                    if _norm_room(pending_room).casefold() == _norm_room(room).casefold():
+                        pending_leaves.pop(pending_room, None)
+                        leave_ack.set()
+                        break
                 if getattr(self, "_intentional_leaves", None) and _norm_room(room) in self._intentional_leaves:
                     self.log(f"[USER_LEFT_DETECTED] Bot left {room} intentionally; skipping auto-rejoin.")
                 else:
-                    self.log(f"[USER_LEFT_DETECTED] Bot left {room}; rejoining automatically...")
-                    self._schedule_auto_rejoin(room)
+                    # A user_left event can be echoed during a reconnect or after
+                    # a bot-issued leave. Only an explicit kick event below may
+                    # schedule the automatic leave/wait/rejoin cycle.
+                    self.log(f"[USER_LEFT_DETECTED] Bot left {room} without a confirmed kick; no auto-rejoin.")
+                    self._send_master_room_departure_notice(
+                        room, event_type,
+                        str(event.get("reason", "") or event.get("message", "") or ""),
+                        str(event.get(22, "") or event.get("actor", "") or ""),
+                    )
             if _norm_user(username) == _norm_user(BOT_MASTER):
                 self._master_online_rooms.discard(_norm_room(room))
                 self.master_online = bool(self._master_online_rooms)
@@ -22317,8 +22693,9 @@ class TalkinBot:
                             connected for connected in self.connected_rooms
                             if _norm_room(connected) != _norm_room(room)
                         }
-                        self.log(f"[KICK_DETECTED] Bot was removed from {room}; rejoining automatically...")
-                        self._schedule_auto_rejoin(room)
+                        if changed_role == "kicked":
+                            self.log(f"[KICK_DETECTED] Bot was kicked from {room}; rejoining automatically...")
+                            self._schedule_auto_rejoin(room)
                 else:
                     self.room_users.setdefault(room, {})[changed_user] = changed_role
                 key = (room.casefold(), changed_user.casefold(), changed_role)
@@ -22391,6 +22768,12 @@ class TalkinBot:
                 self.connected_rooms.add(room)
             self.last_joined_room = room
             rnorm = _norm_room(room)
+            waiting_ack = getattr(self, "_auto_rejoin_waiting_ack", None)
+            if waiting_ack is not None:
+                waiting_ack.difference_update(
+                    item for item in tuple(waiting_ack)
+                    if _norm_room(item).casefold() == rnorm.casefold()
+                )
             rejoin_state = getattr(self, "_auto_rejoin_state", {}).get(rnorm)
             if rejoin_state is not None:
                 rejoin_state["joined_at"] = time.monotonic()
@@ -22970,18 +23353,24 @@ class TalkinBot:
         return self.send_room_text(room, message)
 
 
-    def _send_room_names_pages(self, sender, room, rooms, from_server=False, language=None):
+    def _send_room_names_pages(self, sender, room, rooms, from_server=False, language=None, live_only=False):
         """Display all room names with safe pagination."""
         names = sorted({str(item).strip() for item in rooms or [] if str(item).strip()}, key=str.casefold)
         language = language or self._effective_room_language(room)
         if not names:
-            text = "📭 لم تصل قائمة غرف من السيرفر ولا توجد غرف في الملف." if language == "ar" else "📭 The server returned no rooms and the rooms file is empty."
+            if live_only:
+                text = "📭 لا توجد غرف متصلة فعليًا بهذه الجلسة الآن." if language == "ar" else "📭 No rooms are currently connected to this session."
+            else:
+                text = "📭 لم تصل قائمة غرف من السيرفر ولا توجد غرف في الملف." if language == "ar" else "📭 The server returned no rooms and the rooms file is empty."
             if getattr(self, "ws", None):
                 self._send_text_packets("chat_message", text, to=str(sender or ""))
             else:
                 self.send_private_text(sender, text)
             return
-        title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else f"🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else f"🏠 Bot rooms — rooms file")
+        if live_only:
+            title = f"📡 الغرف المتصلة الآن فعليًا ({len(names)})" if language == "ar" else f"📡 Rooms currently connected ({len(names)})"
+        else:
+            title = (f"🏠 غرف البوت الكاملة ({len(names)}) — من السيرفر" if from_server else f"🏠 غرف البوت — من ملف الغرف") if language == "ar" else (f"🏠 Complete bot rooms ({len(names)}) — server" if from_server else f"🏠 Bot rooms — rooms file")
         reserve = "\n📄 القائمة 999/999\n\n📌 اكتب ns للقائمة التالية." if language == "ar" else "\n📄 List 999/999\n\n📌 Type ns for the next list."
 
         def fits(body):
@@ -23571,6 +23960,7 @@ class TalkinBot:
         pending.clear()
         auto_pending = getattr(self, "_auto_rejoin_pending", None)
         lock = getattr(self, "_auto_rejoin_lock", None)
+        getattr(self, "_auto_rejoin_waiting_ack", set()).clear()
         if auto_pending is not None:
             if lock is None:
                 auto_pending.clear()

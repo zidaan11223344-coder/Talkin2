@@ -81,6 +81,23 @@ def test_mining_commands_use_stable_id_and_redeem_inventory_idempotently(tmp_pat
     assert len(packet) <= 1008
 
 
+def test_mining_aliases_and_cricket_messages_follow_saved_room_language():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot._effective_room_language = lambda room: "en" if room == "EnglishHall" else "ar"
+    for command in ("diamond", "diamonds", "treasure store", "sv inventory", "top diamonds"):
+        assert bot_module._looks_like_bot_command(command), command
+
+    samples = (
+        "⛏️ متجر الكنوز — الأسعار بالنقاط\nللتنقيب: احفر\nللمخزون: sv\n💎 إجمالي الألماس الذي عثرت عليه: 1",
+        "🏏 بدأت مباراة الكريكيت\n👥 الفريق الأول (2 لاعبين): Alice, Bob\n👥 الفريق الثاني (2 لاعبين): Jane, Sue\n🎯 يبدأ الهجوم: الهجوم. لكل لاعب 6 كرات في كل دور.",
+        "🏏 إعداد مباراة الكريكيت\nاختر عدد اللاعبين: 1 إلى 4\nبعد اختيار العدد، يرسل كل لاعب Join من هذه الغرفة فقط.",
+    )
+    for original in samples:
+        english = bot._localize_room_text("EnglishHall", original)
+        assert not any("\u0600" <= char <= "\u06ff" for char in english), english
+        assert bot._localize_room_text("ArabicHall", original) == original
+
+
 def test_compressed_treasure_asset_is_served_as_jpeg():
     handler = bot_module._MediaHandler.__new__(bot_module._MediaHandler)
     compressed_jpeg = Path(bot_module.ASSETS_DIR) / "treasures" / "diamond_clear.jpg"
