@@ -51,6 +51,7 @@ _ROOM_COMMANDS = {
     "join": {"مزايده", "مزايده للمزاد", "انضم للمزاد", "join auction"},
     "start": {"ابدا المزاد", "ابدأ المزاد", "start auction"},
     "bid": {"زايد", "زايد للمزاد", "bid", "raise bid"},
+    "pass": {"تمرير", "مرر", "تمرير الدور", "pass", "skip"},
     "close": {"اقفل المزاد", "اغلق المزاد", "انهاء المزاد", "close auction"},
     "cancel": {"الغاء المزاد", "الغ المزاد", "cancel auction"},
 }
@@ -63,6 +64,43 @@ def parse_room_command(text: str) -> str | None:
     for action, aliases in _ROOM_COMMANDS.items():
         if normalized in {normalize_command(alias) for alias in aliases}:
             return action
+    if any(normalized.startswith(normalize_command(alias) + " ") for alias in _ROOM_COMMANDS["bid"]):
+        return "bid"
+    return None
+
+
+def parse_bid_amount(text: str) -> int | None:
+    """Parse an explicit bid amount from Arabic or English bid commands."""
+    digits = "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹"
+    ascii_digits = "01234567890123456789"
+    normalized = normalize_command(str(text or "").translate(str.maketrans(digits, ascii_digits)))
+    for alias in sorted(_ROOM_COMMANDS["bid"], key=len, reverse=True):
+        prefix = normalize_command(alias)
+        if not normalized.startswith(prefix + " "):
+            continue
+        raw_amount = normalized[len(prefix):].strip()
+        compact = re.sub(r"[\s,_،٬]", "", raw_amount)
+        suffix_terms = list(re.finditer(r"(\d+(?:\.\d+)?)([mb])", compact, flags=re.I))
+        if suffix_terms and "".join(match.group(0) for match in suffix_terms) == compact:
+            amount = 0
+            for match in suffix_terms:
+                value, suffix = match.groups()
+                multiplier = 1_000_000 if suffix.casefold() == "m" else 1_000_000_000
+                whole, dot, fraction = value.partition(".")
+                amount += int(whole) * multiplier
+                if dot and fraction:
+                    fractional_value = int(fraction) * multiplier
+                    divisor = 10 ** len(fraction)
+                    if fractional_value % divisor:
+                        return None
+                    amount += fractional_value // divisor
+            return amount if amount > 0 else None
+        if compact.isdigit():
+            try:
+                amount = int(compact)
+            except ValueError:
+                return None
+            return amount if amount > 0 else None
     return None
 
 
@@ -148,6 +186,60 @@ class AuctionGame:
         started_at = float(now)
         active["started_at"] = started_at
         active["deadline_at"] = started_at + BIDDING_DURATION_SECONDS
+        active["passed_since_bid"] = []
+        AuctionGame._set_turn(active, 0)
+
+    @staticmethod
+    def _set_turn(active: dict, index: int) -> dict | None:
+        participants = active.get("participants") or []
+        if not participants:
+            active["turn_index"] = 0
+            active["turn_user_id"] = ""
+            active["turn_username"] = ""
+            return None
+        index = int(index) % len(participants)
+        player = participants[index]
+        active["turn_index"] = index
+        active["turn_user_id"] = str(player.get("user_id") or "")
+        active["turn_username"] = str(player.get("username") or "")
+        return player
+
+    @classmethod
+    def _ensure_turn_state(cls, active: dict) -> bool:
+        participants = active.get("participants") or []
+        ids = [str(player.get("user_id") or "") for player in participants if isinstance(player, dict)]
+        passed = active.get("passed_since_bid")
+        changed = False
+        if not isinstance(passed, list):
+            active["passed_since_bid"] = []
+            changed = True
+        else:
+            normalized_passes = [str(user_id) for user_id in passed if str(user_id) in ids]
+            if normalized_passes != passed:
+                active["passed_since_bid"] = normalized_passes
+                changed = True
+        try:
+            index = int(active.get("turn_index", -1))
+        except (TypeError, ValueError):
+            index = -1
+        turn_id = str(active.get("turn_user_id") or "")
+        if not ids or index < 0 or index >= len(ids) or ids[index] != turn_id:
+            cls._set_turn(active, 0)
+            changed = True
+        return changed
+
+    @classmethod
+    def _advance_turn(cls, active: dict, current_index: int, *, skip_passed: bool) -> dict | None:
+        participants = active.get("participants") or []
+        if not participants:
+            return cls._set_turn(active, 0)
+        passed = set(str(user_id) for user_id in active.get("passed_since_bid", [])) if skip_passed else set()
+        for offset in range(1, len(participants) + 1):
+            index = (int(current_index) + offset) % len(participants)
+            user_id = str(participants[index].get("user_id") or "")
+            if user_id not in passed:
+                return cls._set_turn(active, index)
+        return None
 
     def enabled(self) -> bool:
         with self.lock:
@@ -171,8 +263,14 @@ class AuctionGame:
 
     def active(self) -> dict | None:
         with self.lock:
-            value = self._read().get("active")
-            return copy.deepcopy(value) if isinstance(value, dict) else None
+            state = self._read()
+            value = state.get("active")
+            if not isinstance(value, dict):
+                return None
+            if value.get("phase") == "bidding" and self._ensure_turn_state(value):
+                state["active"] = value
+                self._write(state)
+            return copy.deepcopy(value)
 
     def open_auction(self, opener_id: str, opener_name: str, room: str) -> dict:
         uid = self._user_key(opener_id, opener_name)
@@ -260,7 +358,7 @@ class AuctionGame:
             self._write(state)
             return {"ok": True, "auction": copy.deepcopy(active)}
 
-    def bid(self, user_id: str, username: str, balance: int) -> dict:
+    def bid(self, user_id: str, username: str, amount: int, balance: int) -> dict:
         uid = self._user_key(user_id, username)
         name = str(username or "").strip().lstrip("@")
         if not uid or not name:
@@ -278,13 +376,22 @@ class AuctionGame:
             participants = active.get("participants") or []
             if not any(str(player.get("user_id") or "") == uid for player in participants if isinstance(player, dict)):
                 return {"ok": False, "error": "not_participant"}
+            self._ensure_turn_state(active)
+            if uid != str(active.get("turn_user_id") or ""):
+                return {"ok": False, "error": "not_your_turn", "turn_username": active.get("turn_username", ""), "auction": copy.deepcopy(active)}
             item = active.get("item") if isinstance(active.get("item"), dict) else {}
             try:
                 starting_price = max(0, int(item.get("starting_price", 100_000_000) or 0))
             except (TypeError, ValueError):
                 starting_price = 100_000_000
             current_bid = int(active.get("current_bid", 0) or 0)
-            bid_amount = max(starting_price, current_bid + BID_INCREMENT)
+            required_bid = starting_price if current_bid <= 0 else current_bid + BID_INCREMENT
+            try:
+                bid_amount = int(amount)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_amount", "required": required_bid}
+            if bid_amount < required_bid:
+                return {"ok": False, "error": "bid_too_low", "required": required_bid, "amount": bid_amount}
             try:
                 balance = int(balance)
             except (TypeError, ValueError):
@@ -295,15 +402,58 @@ class AuctionGame:
             active["highest_bidder_id"] = uid
             active["highest_bidder_name"] = name
             active["bid_count"] = int(active.get("bid_count", 0) or 0) + 1
+            active["passed_since_bid"] = []
             history = active.setdefault("bid_history", [])
             history.append({"user_id": uid, "username": name, "amount": bid_amount, "at": int(self.clock())})
             del history[:-200]
+            current_index = int(active.get("turn_index", 0) or 0)
+            self._advance_turn(active, current_index, skip_passed=False)
             state["active"] = active
             self._write(state)
             return {
                 "ok": True, "amount": bid_amount, "bid_count": active["bid_count"],
-                "auction": copy.deepcopy(active),
+                "next_turn_username": active.get("turn_username", ""), "auction": copy.deepcopy(active),
             }
+
+    def pass_turn(self, user_id: str, username: str, *, apply_delta: Callable | None = None) -> dict:
+        uid = self._user_key(user_id, username)
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict):
+                return {"ok": False, "error": "no_auction"}
+            if active.get("phase") != "bidding":
+                return {"ok": False, "error": "not_bidding"}
+            deadline_at = float(active.get("deadline_at") or (float(active.get("started_at", 0) or 0) + BIDDING_DURATION_SECONDS))
+            if float(self.clock()) >= deadline_at:
+                return {"ok": False, "error": "expired", "deadline_at": deadline_at}
+            participants = active.get("participants") or []
+            if not any(str(player.get("user_id") or "") == uid for player in participants if isinstance(player, dict)):
+                return {"ok": False, "error": "not_participant"}
+            self._ensure_turn_state(active)
+            if uid != str(active.get("turn_user_id") or ""):
+                return {"ok": False, "error": "not_your_turn", "turn_username": active.get("turn_username", ""), "auction": copy.deepcopy(active)}
+            current_index = int(active.get("turn_index", 0) or 0)
+            passed = set(str(user_id) for user_id in active.get("passed_since_bid", []))
+            passed.add(uid)
+            active["passed_since_bid"] = sorted(passed)
+            opener_id = str(active.get("opener_id") or "")
+            opener_name = str(active.get("opener_name") or "")
+            if len(passed) >= len(participants):
+                state["active"] = active
+                self._write(state)
+            else:
+                self._advance_turn(active, current_index, skip_passed=True)
+                state["active"] = active
+                self._write(state)
+                return {
+                    "ok": True, "status": "passed", "passed_username": str(username or "").strip().lstrip("@"),
+                    "next_turn_username": active.get("turn_username", ""),
+                    "passed_count": len(passed), "auction": copy.deepcopy(active),
+                }
+        result = self.close(opener_id, opener_name, apply_delta=apply_delta)
+        result["auto_closed"] = True
+        return result
 
     def close(self, user_id: str, username: str, *, is_master: bool = False, apply_delta: Callable | None = None) -> dict:
         uid = self._user_key(user_id, username)
