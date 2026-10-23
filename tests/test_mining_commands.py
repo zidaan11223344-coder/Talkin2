@@ -1,4 +1,5 @@
 import copy
+import threading
 from pathlib import Path
 
 import bot as bot_module
@@ -20,6 +21,8 @@ def test_mining_commands_use_stable_id_and_redeem_inventory_idempotently(tmp_pat
         clock=lambda: 1_000.0,
     )
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot._mining_cooldown_lock = threading.RLock()
+    bot._mining_last_dig = {}
     sent = []
     media = []
     transactions = []

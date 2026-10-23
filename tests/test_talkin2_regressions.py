@@ -514,6 +514,8 @@ class RoomExclusionRegressions(unittest.TestCase):
             saved_room_lists = []
 
             with patch.object(bot_module, "BLOCKED_ROOMS_FILE", blocked_file), patch.object(
+                bot_module, "_persistent_rooms", return_value=[],
+            ), patch.object(
                 bot_module, "_save_persistent_rooms",
                 side_effect=lambda rooms: saved_room_lists.append(set(rooms)),
             ):
@@ -3927,7 +3929,9 @@ class FollowupFeatureRegressions(unittest.TestCase):
         private_sent = []
         bot.send_private_text = lambda _user, text: private_sent.append(text)
         self.sent = []
-        with patch.object(bot_module, "_is_master_name", return_value=True):
+        with patch.object(bot_module, "_is_master_name", return_value=True), patch.object(
+            bot_module, "_persistent_rooms", return_value=[],
+        ):
             self.assertTrue(bot._handle_management_command_impl("", "myrooms", "Master", is_private=True))
             self.assertTrue(bot._handle_management_command_impl("", "ns", "Master", is_private=True))
         self.assertEqual(len(private_sent), 1)
@@ -4147,7 +4151,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         self.assertEqual(bot_module._parse_stock_market_order("land 50000"), (4, 50000))
         self.assertIsNone(bot_module._parse_stock_market_order("market tomorrow"))
 
-    def test_manual_stock_command_opens_immediately_for_ten_minutes(self):
+    def test_stock_command_warns_then_confirms_auto_gold_investment(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         bot.stock_pending = {}
         bot.stock_investments = []
@@ -4156,30 +4160,42 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
         bot._stock_market_round_seq = 0
         bot._stock_market_seen = set()
         bot._stock_market_next_announcement = 0
+        bot._stock_auto_gold_pending = {}
         bot.connected_rooms = {"ArabicHall", "EnglishHall"}
         bot._active_rooms = lambda: ["ArabicHall", "EnglishHall"]
         bot._configured_room_language = lambda room: "en" if room == "EnglishHall" else "ar"
         bot._queue_stock_market_round_broadcast = lambda _rooms: None
+        bot._stock_market_is_open = lambda: False
+        bot._start_stock_market_round = lambda **_kwargs: {"id": 1}
         bot._snake_command = lambda *_args: False
         bot._ludo_command = lambda *_args: False
         bot._handle_pending_bot_choice = lambda *_args: False
         bot._game_cooldown_notice = lambda *_args: True
         sent = []
         bot.send_room_text = lambda room, text: sent.append((room, text))
-        bot._save_stock_investments = lambda: None
+        investments = []
+        bot._stock_market_invest = lambda room, sender, asset, amount: investments.append((room, sender, asset, amount)) or True
         with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
             bot_module, "_games_enabled_for_room", return_value=True
         ), patch.object(bot_module, "_looks_like_bot_command", return_value=True), patch.object(
+            bot_module, "_get_points", return_value=40_000_000_000
+        ), patch.object(
             bot_module.time, "time", return_value=1_000.0
         ):
             self.assertTrue(bot.handle_game_command("ArabicHall", "بورصة", "Player"))
         self.assertEqual(len(sent), 1)
-        for asset in ("ذهب", "فضة", "نفط", "أرض"):
-            self.assertIn(asset, sent[0][1])
-        self.assertIn("100000", sent[0][1])
-        self.assertEqual(bot.stock_market_round["ends_at"], 1_600.0)
-        self.assertEqual(bot._stock_market_next_announcement, 1_600.0)
-        self.assertEqual(bot.stock_pending[(bot_module._norm_room("ArabicHall"), bot_module._norm_user("Player"))]["kind"], "market_choice")
+        self.assertIn("قد تخسر كامل المبلغ", sent[0][1])
+        self.assertIn("موافق", sent[0][1])
+        pending_key = (bot_module._norm_room("ArabicHall"), bot_module._norm_user("Player"))
+        self.assertEqual(bot._stock_auto_gold_pending[pending_key]["amount"], 30_000_000_000)
+        with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
+            bot_module, "_games_enabled_for_room", return_value=True
+        ), patch.object(bot_module, "_looks_like_bot_command", return_value=True), patch.object(
+            bot_module, "_get_points", return_value=40_000_000_000
+        ), patch.object(bot_module.time, "time", return_value=1_010.0):
+            self.assertTrue(bot.handle_game_command("ArabicHall", "موافق", "Player"))
+        self.assertEqual(investments, [("ArabicHall", "Player", 1, 30_000_000_000)])
+        self.assertNotIn(pending_key, bot._stock_auto_gold_pending)
 
     def test_stock_investment_has_two_minute_cooldown_and_repeats_within_round(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
@@ -4209,7 +4225,7 @@ class NewMarketAndModerationRegressions(unittest.TestCase):
                 bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=1)
             with patch.object(bot_module.time, "time", return_value=1_240.0):
                 bot._stock_market_invest("Market", "Player", 2, 100, expected_round_id=1)
-        self.assertEqual(point_ops, [])
+        self.assertEqual(len(point_ops), 3)
         self.assertEqual(len(bot.stock_investments), 3)
         self.assertTrue(any("2-minute cooldown" in text for _, text in messages))
 

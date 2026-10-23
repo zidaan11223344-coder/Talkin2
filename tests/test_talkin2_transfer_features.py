@@ -73,7 +73,7 @@ def test_master_diamond_check_rotates_inventory_item_and_sends_room_image(tmp_pa
     bot._game_public_image = lambda path, route="games": f"https://assets.example/{route}/{path.name}"
     bot.log = lambda *_args, **_kwargs: None
     monkeypatch.setattr(bot_module, "MINING_STORE", store)
-    monkeypatch.setattr(bot_module, "_is_master_name", lambda name: name == "Master")
+    monkeypatch.setattr(bot_module, "_is_primary_master", lambda name: name == "Master")
 
     assert bot_module._looks_like_bot_command("فحص الماس")
     assert bot._execute_mining_command_with_id("North", "فحص الماس", "Master", "88")
@@ -86,7 +86,7 @@ def test_master_diamond_check_rotates_inventory_item_and_sends_room_image(tmp_pa
     assert media[1] == ("North", "https://assets.example/assets/treasures/diamond_blue.jpg", "image")
     assert all("قيمة الاستبدال:" in text for _room, text in sent)
 
-    monkeypatch.setattr(bot_module, "_is_master_name", lambda _name: False)
+    monkeypatch.setattr(bot_module, "_is_primary_master", lambda _name: False)
     assert bot._execute_mining_command_with_id("North", "فحص الماس", "Player", "99")
     assert "مخصص للماستر فقط" in sent[-1][1]
     assert "99" not in state["players"]
