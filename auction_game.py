@@ -1,0 +1,487 @@
+"""Persistent world-auction game engine for Talkin2.
+
+The bot owns network delivery and authorization; this module owns the auction
+state machine, winning-bid settlement, collectible inventory, and redemption
+journal. Point changes are delegated through an idempotent callback.
+"""
+from __future__ import annotations
+
+import copy
+import random
+import re
+import threading
+import time
+import unicodedata
+import uuid
+from pathlib import Path
+from typing import Callable
+
+BID_INCREMENT = 10_000_000
+MAX_PARTICIPANTS = 5
+MIN_PARTICIPANTS_TO_START_EARLY = 3
+REDEMPTION_BONUS_PERCENT = 30
+MAX_IMAGE_BYTES = 50_000
+
+# These existing Talkin2 treasure images are already below MAX_IMAGE_BYTES.
+# Each image represents a rare auction collectible; auction goods are separate
+# from the ordinary mining-store catalog and carry their own cost basis.
+AUCTION_ITEMS = (
+    {"key": "royal", "name_ar": "الألماسة الملكية النادرة", "name_en": "Rare Royal Diamond", "icon": "👑", "image": "diamond_royal.jpg"},
+    {"key": "black", "name_ar": "الألماسة السوداء النادرة", "name_en": "Rare Black Diamond", "icon": "◆", "image": "diamond_black.jpg"},
+    {"key": "purple", "name_ar": "الألماسة البنفسجية النادرة", "name_en": "Rare Purple Diamond", "icon": "💠", "image": "diamond_purple.jpg"},
+    {"key": "red", "name_ar": "الألماسة الحمراء النادرة", "name_en": "Rare Red Diamond", "icon": "♦️", "image": "diamond_red.jpg"},
+    {"key": "blue", "name_ar": "الألماسة الزرقاء النادرة", "name_en": "Rare Blue Diamond", "icon": "🔷", "image": "diamond_blue.jpg"},
+    {"key": "clear", "name_ar": "الألماسة الصافية النادرة", "name_en": "Rare Clear Diamond", "icon": "💎", "image": "diamond_clear.jpg"},
+)
+_ITEM_BY_KEY = {item["key"]: item for item in AUCTION_ITEMS}
+
+
+def normalize_command(value: str) -> str:
+    """Normalize Arabic command spelling and whitespace for exact matching."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    text = text.replace("ة", "ه").replace("ى", "ي")
+    return " ".join(text.split())
+
+
+_ROOM_COMMANDS = {
+    "open": {"افتح مزاد", "افتح المزاد", "افتح لعبه مزاد", "ابي افتح لعبه مزاد", "open auction"},
+    "join": {"مزايده", "مزايده للمزاد", "انضم للمزاد", "join auction"},
+    "start": {"ابدا المزاد", "ابدأ المزاد", "start auction"},
+    "bid": {"زايد", "زايد للمزاد", "bid", "raise bid"},
+    "close": {"اقفل المزاد", "اغلق المزاد", "انهاء المزاد", "close auction"},
+    "cancel": {"الغاء المزاد", "الغ المزاد", "cancel auction"},
+}
+_TOGGLE_ON = {"شغل لعبه مزاد", "شغل لعبة مزاد", "تشغيل لعبة مزاد", "تشغيل لعبة المزاد", "auction on"}
+_TOGGLE_OFF = {"اوقف لعبه مزاد", "اوقف لعبة مزاد", "وقف لعبة مزاد", "ايقاف لعبة مزاد", "ايقاف لعبه مزاد", "auction off"}
+
+
+def parse_room_command(text: str) -> str | None:
+    normalized = normalize_command(text)
+    for action, aliases in _ROOM_COMMANDS.items():
+        if normalized in {normalize_command(alias) for alias in aliases}:
+            return action
+    return None
+
+
+def parse_toggle_command(text: str) -> bool | None:
+    normalized = normalize_command(text)
+    if normalized in {normalize_command(alias) for alias in _TOGGLE_ON}:
+        return True
+    if normalized in {normalize_command(alias) for alias in _TOGGLE_OFF}:
+        return False
+    return None
+
+
+class AuctionGame:
+    """Thread-safe persistent auction engine with idempotent point settlement."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        load_json: Callable | None = None,
+        save_json: Callable | None = None,
+        *,
+        chooser: Callable[[tuple[dict, ...]], dict] | None = None,
+        clock: Callable[[], float] = time.time,
+    ):
+        self.path = Path(path)
+        self.load_json = load_json or self._load_file
+        self.save_json = save_json or self._save_file
+        self.chooser = chooser or random.choice
+        self.clock = clock
+        self.lock = threading.RLock()
+
+    @staticmethod
+    def _load_file(path, default):
+        import json
+        try:
+            value = json.loads(Path(path).read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else copy.deepcopy(default)
+        except (OSError, ValueError, TypeError):
+            return copy.deepcopy(default)
+
+    @staticmethod
+    def _save_file(path, data):
+        import json
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _empty_state() -> dict:
+        return {"version": 1, "enabled": False, "active": None, "inventory": {}, "last_result": None}
+
+    def _read(self) -> dict:
+        raw = self.load_json(self.path, self._empty_state())
+        if not isinstance(raw, dict):
+            raw = self._empty_state()
+        state = self._empty_state()
+        state.update(raw)
+        state["version"] = 1
+        state["enabled"] = bool(state.get("enabled", False))
+        state["active"] = state.get("active") if isinstance(state.get("active"), dict) else None
+        state["inventory"] = state.get("inventory") if isinstance(state.get("inventory"), dict) else {}
+        return state
+
+    def _write(self, state: dict) -> None:
+        self.save_json(self.path, state)
+
+    @staticmethod
+    def _user_key(user_id: str, username: str) -> str:
+        key = str(user_id or "").strip()
+        if key:
+            return key
+        normalized = normalize_command(username).replace(" ", "")
+        return "name:" + normalized if normalized else ""
+
+    def enabled(self) -> bool:
+        with self.lock:
+            return bool(self._read().get("enabled"))
+
+    def set_enabled(self, enabled: bool) -> dict:
+        with self.lock:
+            state = self._read()
+            state["enabled"] = bool(enabled)
+            cancelled = False
+            active = state.get("active")
+            if not enabled and isinstance(active, dict) and active.get("phase") != "settling":
+                state["last_result"] = {
+                    "status": "cancelled", "auction_id": active.get("id"),
+                    "reason": "feature_disabled", "at": int(self.clock()),
+                }
+                state["active"] = None
+                cancelled = True
+            self._write(state)
+            return {"ok": True, "enabled": bool(enabled), "cancelled_active": cancelled}
+
+    def active(self) -> dict | None:
+        with self.lock:
+            value = self._read().get("active")
+            return copy.deepcopy(value) if isinstance(value, dict) else None
+
+    def open_auction(self, opener_id: str, opener_name: str, room: str) -> dict:
+        uid = self._user_key(opener_id, opener_name)
+        name = str(opener_name or "").strip().lstrip("@")
+        if not uid or not name:
+            return {"ok": False, "error": "invalid_player"}
+        with self.lock:
+            state = self._read()
+            if not state.get("enabled"):
+                return {"ok": False, "error": "disabled"}
+            if isinstance(state.get("active"), dict):
+                return {"ok": False, "error": "already_open", "active": copy.deepcopy(state["active"])}
+            item = copy.deepcopy(self.chooser(AUCTION_ITEMS))
+            if item.get("key") not in _ITEM_BY_KEY:
+                item = copy.deepcopy(AUCTION_ITEMS[0])
+            active = {
+                "id": uuid.uuid4().hex,
+                "phase": "registration",
+                "opened_at": int(self.clock()),
+                "room": str(room or "").strip(),
+                "opener_id": uid,
+                "opener_name": name,
+                "item": item,
+                "participants": [],
+                "current_bid": 0,
+                "highest_bidder_id": "",
+                "highest_bidder_name": "",
+                "bid_count": 0,
+                "bid_history": [],
+            }
+            state["active"] = active
+            state["last_result"] = None
+            self._write(state)
+            return {"ok": True, "auction": copy.deepcopy(active)}
+
+    def join(self, user_id: str, username: str) -> dict:
+        uid = self._user_key(user_id, username)
+        name = str(username or "").strip().lstrip("@")
+        if not uid or not name:
+            return {"ok": False, "error": "invalid_player"}
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict):
+                return {"ok": False, "error": "no_auction"}
+            if active.get("phase") != "registration":
+                return {"ok": False, "error": "registration_closed", "auction": copy.deepcopy(active)}
+            participants = active.setdefault("participants", [])
+            if any(str(player.get("user_id") or "") == uid for player in participants if isinstance(player, dict)):
+                return {"ok": True, "already_joined": True, "auction": copy.deepcopy(active)}
+            if len(participants) >= MAX_PARTICIPANTS:
+                return {"ok": False, "error": "full", "auction": copy.deepcopy(active)}
+            participants.append({"user_id": uid, "username": name, "joined_at": int(self.clock())})
+            auto_started = len(participants) >= MAX_PARTICIPANTS
+            if auto_started:
+                active["phase"] = "bidding"
+                active["started_at"] = int(self.clock())
+            state["active"] = active
+            self._write(state)
+            return {
+                "ok": True, "already_joined": False,
+                "auto_started": auto_started,
+                "participant_count": len(participants),
+                "auction": copy.deepcopy(active),
+            }
+
+    def start(self, user_id: str, username: str, *, is_master: bool = False) -> dict:
+        uid = self._user_key(user_id, username)
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict):
+                return {"ok": False, "error": "no_auction"}
+            if active.get("phase") != "registration":
+                return {"ok": False, "error": "not_registering", "auction": copy.deepcopy(active)}
+            if not is_master and uid != str(active.get("opener_id") or ""):
+                return {"ok": False, "error": "not_opener"}
+            count = len(active.get("participants") or [])
+            if count < MIN_PARTICIPANTS_TO_START_EARLY:
+                return {"ok": False, "error": "not_enough_players", "participant_count": count}
+            active["phase"] = "bidding"
+            active["started_at"] = int(self.clock())
+            state["active"] = active
+            self._write(state)
+            return {"ok": True, "auction": copy.deepcopy(active)}
+
+    def bid(self, user_id: str, username: str, balance: int) -> dict:
+        uid = self._user_key(user_id, username)
+        name = str(username or "").strip().lstrip("@")
+        if not uid or not name:
+            return {"ok": False, "error": "invalid_player"}
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict):
+                return {"ok": False, "error": "no_auction"}
+            if active.get("phase") != "bidding":
+                return {"ok": False, "error": "not_bidding"}
+            if not any(str(player.get("user_id") or "") == uid for player in (active.get("participants") or []) if isinstance(player, dict)):
+                return {"ok": False, "error": "not_participant"}
+            bid_amount = max(BID_INCREMENT, int(active.get("current_bid", 0) or 0) + BID_INCREMENT)
+            try:
+                balance = int(balance)
+            except (TypeError, ValueError):
+                balance = 0
+            if balance < bid_amount:
+                return {"ok": False, "error": "insufficient", "required": bid_amount, "balance": balance}
+            active["current_bid"] = bid_amount
+            active["highest_bidder_id"] = uid
+            active["highest_bidder_name"] = name
+            active["bid_count"] = int(active.get("bid_count", 0) or 0) + 1
+            history = active.setdefault("bid_history", [])
+            history.append({"user_id": uid, "username": name, "amount": bid_amount, "at": int(self.clock())})
+            del history[:-200]
+            state["active"] = active
+            self._write(state)
+            return {"ok": True, "amount": bid_amount, "bid_count": active["bid_count"], "auction": copy.deepcopy(active)}
+
+    def close(self, user_id: str, username: str, *, is_master: bool = False, apply_delta: Callable | None = None) -> dict:
+        uid = self._user_key(user_id, username)
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict):
+                return {"ok": False, "error": "no_auction"}
+            if not is_master and uid != str(active.get("opener_id") or ""):
+                return {"ok": False, "error": "not_opener"}
+            if active.get("phase") == "settling":
+                pass
+            elif active.get("phase") != "bidding":
+                return {"ok": False, "error": "not_bidding"}
+            elif not str(active.get("highest_bidder_id") or ""):
+                result = {"status": "no_bids", "auction_id": active.get("id"), "item": active.get("item"), "at": int(self.clock())}
+                state["last_result"] = result
+                state["active"] = None
+                self._write(state)
+                return {"ok": True, "status": "no_bids", "result": result}
+            else:
+                active["phase"] = "settling"
+                active["settlement"] = {
+                    "auction_id": str(active.get("id") or ""),
+                    "winner_id": str(active.get("highest_bidder_id") or ""),
+                    "winner_name": str(active.get("highest_bidder_name") or ""),
+                    "bid": int(active.get("current_bid", 0) or 0),
+                    "item": copy.deepcopy(active.get("item") or {}),
+                    "transaction_id": f"auction:{active.get('id')}:winning-bid",
+                }
+                state["active"] = active
+                try:
+                    self._write(state)
+                except Exception:
+                    return {"ok": False, "error": "persistence_failed", "pending": False}
+        if apply_delta is None:
+            return {"ok": False, "error": "settlement_callback_required", "pending": True}
+        return self._finish_pending_settlement(apply_delta)
+
+    def _finish_pending_settlement(self, apply_delta: Callable) -> dict:
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict) or active.get("phase") != "settling":
+                return {"ok": False, "error": "no_pending_settlement"}
+            settlement = copy.deepcopy(active.get("settlement") or {})
+        result = apply_delta(
+            settlement.get("winner_name"),
+            -int(settlement.get("bid", 0) or 0),
+            settlement.get("transaction_id"),
+            "world auction winning bid",
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            error = result.get("error") if isinstance(result, dict) else "persistence_failed"
+            if error == "insufficient":
+                final = None
+                with self.lock:
+                    state = self._read()
+                    active = state.get("active")
+                    if isinstance(active, dict) and active.get("phase") == "settling" and str(active.get("id")) == str(settlement.get("auction_id")):
+                        final = {
+                            "status": "no_sale", "auction_id": settlement.get("auction_id"),
+                            "winner": settlement.get("winner_name"), "bid": settlement.get("bid"),
+                            "reason": "insufficient_at_close", "item": settlement.get("item"),
+                            "at": int(self.clock()),
+                        }
+                        state["last_result"] = final
+                        state["active"] = None
+                        try:
+                            self._write(state)
+                        except Exception:
+                            return {"ok": False, "error": "persistence_failed", "pending": True}
+                if final is not None:
+                    return {"ok": True, "status": "no_sale", "result": final}
+                return {"ok": False, "error": "settlement_state_changed", "pending": True}
+            return {"ok": False, "error": error or "persistence_failed", "pending": True}
+
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict) or active.get("phase") != "settling" or str(active.get("id")) != str(settlement.get("auction_id")):
+                # A retry can see that the debit was already committed. Never
+                # create a second item unless the matching round is settling.
+                return {"ok": False, "error": "settlement_state_changed", "pending": True}
+            winner_id = str(settlement.get("winner_id") or "")
+            item = copy.deepcopy(settlement.get("item") or {})
+            bid_amount = int(settlement.get("bid", 0) or 0)
+            inventory = state.setdefault("inventory", {})
+            player_items = inventory.setdefault(winner_id, [])
+            auction_id = str(settlement.get("auction_id") or "")
+            if not any(isinstance(row, dict) and str(row.get("id") or "") == auction_id for row in player_items):
+                player_items.append({
+                    "id": auction_id,
+                    "item_key": str(item.get("key") or ""),
+                    "item_name_ar": str(item.get("name_ar") or "جائزة المزاد"),
+                    "item_name_en": str(item.get("name_en") or "Auction prize"),
+                    "icon": str(item.get("icon") or "💎"),
+                    "username": str(settlement.get("winner_name") or ""),
+                    "winning_bid": bid_amount,
+                    "redemption_value": (bid_amount * (100 + REDEMPTION_BONUS_PERCENT)) // 100,
+                    "status": "available",
+                    "won_at": int(self.clock()),
+                })
+            final = {
+                "status": "sold", "auction_id": auction_id,
+                "winner_id": winner_id, "winner": str(settlement.get("winner_name") or ""),
+                "bid": bid_amount,
+                "redemption_value": (bid_amount * (100 + REDEMPTION_BONUS_PERCENT)) // 100,
+                "item": item, "at": int(self.clock()),
+            }
+            state["last_result"] = final
+            state["active"] = None
+            try:
+                self._write(state)
+            except Exception:
+                return {"ok": False, "error": "persistence_failed", "pending": True}
+            return {"ok": True, "status": "sold", "result": copy.deepcopy(final)}
+
+    def recover_pending_settlement(self, apply_delta: Callable) -> dict | None:
+        active = self.active()
+        if not isinstance(active, dict) or active.get("phase") != "settling":
+            return None
+        return self._finish_pending_settlement(apply_delta)
+
+    def cancel(self, user_id: str, username: str, *, is_master: bool = False) -> dict:
+        uid = self._user_key(user_id, username)
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict):
+                return {"ok": False, "error": "no_auction"}
+            if not is_master and uid != str(active.get("opener_id") or ""):
+                return {"ok": False, "error": "not_opener"}
+            if active.get("phase") == "settling":
+                return {"ok": False, "error": "settlement_in_progress"}
+            result = {"status": "cancelled", "auction_id": active.get("id"), "item": active.get("item"), "at": int(self.clock())}
+            state["last_result"] = result
+            state["active"] = None
+            self._write(state)
+            return {"ok": True, "status": "cancelled", "result": result}
+
+    def inventory(self, user_id: str, username: str = "") -> list[dict]:
+        uid = self._user_key(user_id, username)
+        with self.lock:
+            state = self._read()
+            rows = state.get("inventory", {}).get(uid, [])
+            rows = [copy.deepcopy(row) for row in rows if isinstance(row, dict) and row.get("status") in {"available", "redeeming"}]
+            rows.sort(key=lambda row: (int(row.get("won_at", 0) or 0), str(row.get("id") or "")))
+            return rows
+
+    def redeem(self, user_id: str, username: str, selector: str, apply_delta: Callable) -> dict:
+        uid = self._user_key(user_id, username)
+        token = str(selector or "").strip()
+        token = re.sub(r"^(?:auction|مزاد)\s*", "", token, flags=re.I).strip().lstrip("#")
+        if not uid or not token:
+            return {"ok": False, "error": "selector_required"}
+        with self.lock:
+            state = self._read()
+            rows = state.setdefault("inventory", {}).setdefault(uid, [])
+            redeemable = [row for row in rows if isinstance(row, dict) and row.get("status") in {"available", "redeeming"}]
+            redeemable.sort(key=lambda row: (int(row.get("won_at", 0) or 0), str(row.get("id") or "")))
+            match = None
+            if token.isdigit():
+                index = int(token) - 1
+                if 0 <= index < len(redeemable):
+                    match = redeemable[index]
+            if match is None:
+                folded = token.casefold()
+                match = next((row for row in redeemable if str(row.get("id") or "").casefold().startswith(folded)), None)
+            if match is None:
+                folded = normalize_command(token)
+                match = next((row for row in redeemable if folded in {normalize_command(row.get("item_name_ar")), normalize_command(row.get("item_name_en")), normalize_command(row.get("item_key"))}), None)
+            if match is None:
+                return {"ok": False, "error": "item_not_found"}
+            if match.get("status") == "available":
+                match["status"] = "redeeming"
+                match["redemption_transaction_id"] = f"auction-redemption:{match.get('id')}"
+                try:
+                    self._write(state)
+                except Exception:
+                    return {"ok": False, "error": "persistence_failed", "pending": False}
+            record = copy.deepcopy(match)
+        result = apply_delta(
+            str(username or record.get("username") or "").strip().lstrip("@"),
+            int(record.get("redemption_value", 0) or 0),
+            str(record.get("redemption_transaction_id") or f"auction-redemption:{record.get('id')}"),
+            "world auction collectible redemption with 30 percent bonus",
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            return {"ok": False, "error": (result.get("error") if isinstance(result, dict) else "persistence_failed"), "pending": True, "item": record}
+        with self.lock:
+            state = self._read()
+            rows = state.setdefault("inventory", {}).setdefault(uid, [])
+            current = next((row for row in rows if isinstance(row, dict) and str(row.get("id") or "") == str(record.get("id") or "")), None)
+            if current and current.get("status") != "redeemed":
+                current["status"] = "redeemed"
+                current["redeemed_at"] = int(self.clock())
+                current["username"] = str(username or current.get("username") or "").strip().lstrip("@")
+                try:
+                    self._write(state)
+                except Exception:
+                    return {"ok": False, "error": "persistence_failed", "pending": True, "item": record}
+        return {"ok": True, "item": record, "points": int(record.get("redemption_value", 0) or 0), "already_applied": bool(result.get("already_applied"))}

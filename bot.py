@@ -48,6 +48,7 @@ try:
 except Exception:
     pymysql = None
 from dotenv import dotenv_values, load_dotenv
+from auction_game import AuctionGame, MAX_IMAGE_BYTES, parse_room_command as _parse_auction_room_command, parse_toggle_command as _parse_auction_toggle_command
 from cricket_integration import CricketIntegration
 import shop as member_shop
 from treasure_mining import DIAMOND_KEYS, ITEMS as MINING_ITEMS, MiningStore, format_cooldown, resolve_item_keys
@@ -4988,7 +4989,7 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📌 اكتب ns للقائمة التالية',
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n📌 الألعاب التشاركية تتطلب لاعبين.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n\n🔨 المزاد العالمي: الماستر في الخاص يرسل شغل لعبة مزاد / أوقف لعبة مزاد.\nافتح مزاد — يختار البوت سلعة نادرة ويرسل صورتها (≤50 KB).\nمزايده — تسجيل؛ عند 3 مشاركين يكتب الفاتح ابدأ المزاد، وعند 5 يبدأ تلقائياً.\nزايد — زيادة 10,000,000 نقطة؛ اقفل المزاد — إغلاق الجولة.\nsv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاستبدال بعد الجولة بربح 30%.',
             '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — استثمار تلقائي بالذهب بعد التحذير؛ بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
             '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
@@ -6765,6 +6766,17 @@ class TalkinBot:
             bot_name=BOT_ID or "Talkin2",
             log=print,
         )
+        self._auction_game = AuctionGame(
+            DATA_DIR / "auction_game.json",
+            load_json=_load_local_json,
+            save_json=_save_local_json,
+        )
+        try:
+            recovered_auction = self._auction_game.recover_pending_settlement(_apply_points_delta_once)
+            if recovered_auction and not recovered_auction.get("ok"):
+                self.log("[AUCTION] pending settlement remains for retry:", recovered_auction.get("error"))
+        except Exception as exc:
+            self.log("[AUCTION] startup settlement recovery failed:", repr(exc))
         self.auth = None
         self.last_error = None
         # The last inbound command being processed when the WebSocket failed.
@@ -9152,6 +9164,20 @@ class TalkinBot:
                 "🔄 Cricket match resumed. The setup room chooses 1 to bat or 2 to bowl; the second room's role is assigned automatically.",
         }
         for old, new in final_cricket_fixes.items():
+            value = value.replace(old, new)
+        auction_help_fixes = {
+            "🔨 المزاد العالمي: الماستر في الخاص يرسل شغل لعبة مزاد / أوقف لعبة مزاد.":
+                "🔨 World auction: the master enables/disables it in private with “auction on” / “auction off”.",
+            "افتح مزاد — يختار البوت سلعة Rare ويرسل صورتها (≤50 KB).":
+                "Open auction — the bot selects a rare item and sends its image (≤50 KB).",
+            "مزايده — تسجيل؛ عند 3 مشاركين يكتب الفاتح Start المزاد, وعند 5 يبدأ تلقائياً.":
+                "Join auction — register; at 3 players the host types “start auction”, or it starts automatically at 5.",
+            "زايد — زيادة 10,000,000 points؛ اقفل المزاد — إغلاق الجولة.":
+                "Bid — raise by 10,000,000 points; close auction — end the round.",
+            "sv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاستبدال بعد الجولة بربح 30%.":
+                "sv — view auction collectibles; red auction <code> — redeem after the round for a 30% profit.",
+        }
+        for old, new in auction_help_fixes.items():
             value = value.replace(old, new)
         return value
 
@@ -14550,9 +14576,212 @@ class TalkinBot:
         for candidate in candidates:
             if self._handle_bomb_wire(room, candidate, text):
                 return True
+        if self._handle_auction_room_command(room, username, text):
+            return True
         if self._route_active_board_game_join(room, username, text):
             return True
         return self._cricket.handle(room, username, text, is_private=False)
+
+    def _auction_connected_rooms(self, fallback_room=""):
+        """Return live room connections only; never broadcast to saved rooms."""
+        candidates = list(getattr(self, "connected_rooms", set()) or ())
+        if fallback_room:
+            candidates.append(str(fallback_room).strip())
+        result, seen = [], set()
+        for candidate in candidates:
+            name = str(candidate or "").strip()
+            key = _norm_room(name).casefold()
+            if not name or not key or key in seen:
+                continue
+            seen.add(key)
+            if _games_enabled_for_room(name):
+                result.append(name)
+        return result
+
+    def _auction_broadcast(self, arabic_text, english_text, fallback_room=""):
+        for target_room in self._auction_connected_rooms(fallback_room):
+            try:
+                language = self._effective_room_language(target_room)
+            except Exception:
+                language = "ar"
+            self.send_room_text(target_room, english_text if language == "en" else arabic_text)
+
+    def _auction_send_item_image(self, item, fallback_room=""):
+        filename = str((item or {}).get("image") or "").strip()
+        image_path = ASSETS_DIR / "treasures" / filename
+        if not filename or not image_path.is_file():
+            self.log("[AUCTION] collectible image is missing:", filename)
+            return False
+        try:
+            if image_path.stat().st_size > MAX_IMAGE_BYTES:
+                self.log("[AUCTION] collectible image exceeds 50 KB:", filename, image_path.stat().st_size)
+                return False
+        except OSError as exc:
+            self.log("[AUCTION] cannot inspect collectible image:", filename, repr(exc))
+            return False
+        image_url = self._game_public_image(image_path, route="assets/treasures")
+        if not image_url:
+            return False
+        sent = False
+        for target_room in self._auction_connected_rooms(fallback_room):
+            try:
+                if self.send_room_media(target_room, image_url, "image") is not False:
+                    sent = True
+            except Exception as exc:
+                self.log("[AUCTION] image delivery failed:", target_room, repr(exc))
+        return sent
+
+    def _handle_auction_toggle(self, sender, text, *, is_private=False, room=""):
+        enabled = _parse_auction_toggle_command(text)
+        if enabled is None:
+            return False
+        if not _is_primary_master(sender):
+            notice = "🔒 تشغيل وإيقاف المزاد العالمي مخصص للماستر الأساسي فقط."
+            if is_private:
+                self.send_private_text(sender, notice)
+            elif room:
+                self.send_room_text(room, notice)
+            return True
+        result = self._auction_game.set_enabled(enabled)
+        if enabled:
+            self.send_private_text(sender, "✅ تم تشغيل لعبة المزاد. اكتب «افتح مزاد» في غرفة متصلة لبدء جولة عالمية.")
+        else:
+            self._auction_broadcast("⛔ أوقف الماستر لعبة المزاد؛ أُلغيت الجولة المفتوحة دون خصم نقاط.", "⛔ The master disabled the auction game; the open round was cancelled without charging points.", room)
+            extra = " أُلغيت الجولة المفتوحة دون خصم." if result.get("cancelled_active") else ""
+            self.send_private_text(sender, f"⛔ تم إيقاف لعبة المزاد.{extra}")
+        return True
+
+    def _handle_auction_private_command(self, sender, text):
+        return self._handle_auction_toggle(sender, text, is_private=True)
+
+    def _handle_auction_room_command(self, room, username, text):
+        if self._handle_auction_toggle(username, text, is_private=False, room=room):
+            return True
+        action = _parse_auction_room_command(text)
+        if not action:
+            return False
+        if action == "bid" and str(text or "").strip().casefold() == "bid":
+            auction_game = getattr(self, "_auction_game", None)
+            if not auction_game or not auction_game.active():
+                return False
+        if not _is_verified_user(username):
+            self.send_room_text(room, f"🔒 @{username} حسابك غير موثق للمشاركة في الألعاب.\n{_verification_notice()}")
+            return True
+        if not _games_enabled_for_room(room):
+            self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
+            return True
+        user_id = "name:" + _norm_user(username)
+        is_master = _is_primary_master(username)
+        if action == "open":
+            result = self._auction_game.open_auction(user_id, username, room)
+            if not result.get("ok"):
+                errors = {
+                    "disabled": ("⛔ لعبة المزاد متوقفة؛ اطلب من الماستر تشغيلها.", "⛔ The auction game is disabled; ask the master to enable it."),
+                    "already_open": ("⌛ توجد جولة مزاد عالمية مفتوحة بالفعل.", "⌛ A world auction is already open."),
+                }
+                ar, en = errors.get(result.get("error"), ("❌ تعذر فتح المزاد.", "❌ The auction could not be opened."))
+                self._auction_broadcast(ar, en, room)
+                return True
+            auction = result["auction"]
+            item = auction["item"]
+            item_ar = f"{item['icon']} {item['name_ar']}"
+            item_en = f"{item['icon']} {item['name_en']}"
+            self._auction_broadcast(
+                f"🔨 بدأ التسجيل في المزاد العالمي!\n🎁 السلعة المختارة: {item_ar}\n👥 الحد الأقصى 5 مشاركين؛ اكتب «مزايده» للتسجيل. عند اكتمال 3 يستطيع فاتح الجولة كتابة «ابدا المزاد»، أو يبدأ تلقائياً عند 5.",
+                f"🔨 Registration is open for the world auction!\n🎁 Selected item: {item_en}\n👥 Up to 5 players; type “join auction” to register. The host may start with 3, or it starts automatically at 5.",
+                room,
+            )
+            if not self._auction_send_item_image(item, room):
+                self._auction_broadcast("⚠️ تعذر إرسال صورة السلعة؛ لم يتجاوز ملفها حد 50 كيلوبايت.", "⚠️ The collectible image could not be sent; the asset must be no larger than 50 KB.", room)
+            return True
+
+        if action == "join":
+            result = self._auction_game.join(user_id, username)
+            if not result.get("ok"):
+                errors = {
+                    "no_auction": ("📭 لا توجد جولة مزاد مفتوحة للتسجيل.", "📭 No auction is open for registration."),
+                    "registration_closed": ("🔒 انتهى التسجيل وبدأت المزايدة.", "🔒 Registration is closed; bidding has started."),
+                    "full": ("👥 اكتمل العدد الأقصى للمشاركين.", "👥 The auction has reached its player limit."),
+                }
+                ar, en = errors.get(result.get("error"), ("❌ تعذر تسجيلك في المزاد.", "❌ Could not register you for the auction."))
+                self._auction_broadcast(ar, en, room)
+                return True
+            if result.get("already_joined"):
+                self._auction_broadcast(f"✅ @{username} مسجل بالفعل في المزاد.", f"✅ @{username} is already registered for the auction.", room)
+            else:
+                count = result.get("participant_count", 0)
+                self._auction_broadcast(f"✅ سُجل @{username} في المزاد ({count}/5 مشاركين).", f"✅ @{username} joined the auction ({count}/5 players).", room)
+            if result.get("auto_started"):
+                self._auction_broadcast("🔔 اكتمل العدد؛ أُغلق التسجيل وبدأت المزايدة. كل زايد يرفع السعر 10,000,000 نقطة. اكتب: زايد", "🔔 Player limit reached; registration is closed and bidding has started. Each bid raises the price by 10,000,000 points. Type: bid", room)
+            return True
+
+        if action == "start":
+            result = self._auction_game.start(user_id, username, is_master=is_master)
+            if not result.get("ok"):
+                errors = {
+                    "no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."),
+                    "not_opener": ("🔒 بدء المزايدة المبكر متاح لفاتح الجولة أو الماستر فقط.", "🔒 Only the host or master can start bidding early."),
+                    "not_enough_players": (f"👥 يلزم تسجيل {result.get('participant_count', 0)}/3 مشاركين على الأقل.", f"👥 At least 3 players must register ({result.get('participant_count', 0)}/3)."),
+                }
+                ar, en = errors.get(result.get("error"), ("🔒 التسجيل مغلق أو بدأت المزايدة بالفعل.", "🔒 Registration is closed or bidding has already started."))
+                self._auction_broadcast(ar, en, room)
+                return True
+            self._auction_broadcast("🔔 أغلق فاتح الجولة التسجيل؛ بدأت المزايدة الآن. أول زايد 10,000,000 نقطة، وكل مزايدة تالية تزيد 10,000,000. اكتب: زايد", "🔔 The host closed registration; bidding starts now. The first bid is 10,000,000 points and each next bid adds 10,000,000. Type: bid", room)
+            return True
+
+        if action == "bid":
+            result = self._auction_game.bid(user_id, username, _get_points(username))
+            if not result.get("ok"):
+                errors = {
+                    "no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."),
+                    "not_bidding": ("⌛ المزايدة لم تبدأ أو انتهت.", "⌛ Bidding has not started or has ended."),
+                    "not_participant": ("🔒 سجّل أولاً أثناء التسجيل بكتابة «مزايده»؛ المشاركة بالمزايدة للمسجلين فقط.", "🔒 Register first by typing “join auction”; only registered players may bid."),
+                    "insufficient": (f"❌ تحتاج {_fmt_points(result.get('required', 0))} نقطة للمزايدة؛ رصيدك {_fmt_points(result.get('balance', 0))}.", f"❌ You need {_fmt_points(result.get('required', 0))} points to bid; your balance is {_fmt_points(result.get('balance', 0))}."),
+                }
+                ar, en = errors.get(result.get("error"), ("❌ تعذرت المزايدة.", "❌ The bid could not be placed."))
+                self._auction_broadcast(ar, en, room)
+                return True
+            amount = _fmt_points(result["amount"])
+            self._auction_broadcast(f"🔨 زايد @{username} إلى {amount} نقطة؛ السعر التالي يزيد 10,000,000. اكتب «زايد» للمزايدة.", f"🔨 @{username} bid {amount} points. The next bid adds 10,000,000; type “bid” to raise.", room)
+            return True
+
+        if action == "close":
+            result = self._auction_game.close(user_id, username, is_master=is_master, apply_delta=_apply_points_delta_once)
+            if result.get("status") == "no_bids":
+                self._auction_broadcast("🔔 أُغلق المزاد دون عروض؛ لم تُخصم نقاط ولم تُمنح السلعة.", "🔔 The auction closed without bids; no points were charged and the item was not awarded.", room)
+            elif result.get("status") == "no_sale":
+                self._auction_broadcast("⚠️ لم يكتمل البيع لأن رصيد أعلى مزايد لم يعد كافياً؛ لم تُخصم نقاط ولم تُمنح السلعة.", "⚠️ The sale could not complete because the highest bidder no longer had enough points; no points were charged and the item was not awarded.", room)
+            elif result.get("status") == "sold":
+                sale = result["result"]
+                item = sale["item"]
+                short_id = str(sale["auction_id"])[:8]
+                self._auction_broadcast(
+                    f"🏆 انتهى المزاد! فاز @{sale['winner']} بـ{item.get('icon', '💎')} {item.get('name_ar', 'الجائزة')} بسعر {_fmt_points(sale['bid'])} نقطة.\n✅ أضيفت لمخزون الألماس؛ الاستبدال بعد الجولة: {_fmt_points(sale['redemption_value'])} نقطة (ربح 30%).\nللمخزون: sv — للاستبدال: red auction {short_id}",
+                    f"🏆 Auction complete! @{sale['winner']} won {item.get('icon', '💎')} {item.get('name_en', 'the prize')} for {_fmt_points(sale['bid'])} points.\n✅ Added to diamond inventory; redemption after the round: {_fmt_points(sale['redemption_value'])} points (30% profit).\nInventory: sv — redeem: red auction {short_id}",
+                    room,
+                )
+            elif result.get("pending"):
+                self._auction_broadcast("⌛ التسوية معلقة مؤقتاً؛ لم يُعلن الفائز بعد. أعد «اقفل المزاد» لاحقاً أو أعد تشغيل البوت للمحاولة بأمان دون خصم مكرر.", "⌛ Settlement is pending; no winner is announced yet. Retry “close auction” later or restart the bot; the transaction ID prevents a duplicate charge.", room)
+            elif not result.get("ok"):
+                errors = {
+                    "no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."),
+                    "not_opener": ("🔒 إغلاق المزاد متاح لفاتح الجولة أو الماستر فقط.", "🔒 Only the host or master may close the auction."),
+                    "not_bidding": ("⌛ المزايدة لم تبدأ بعد.", "⌛ Bidding has not started yet."),
+                }
+                ar, en = errors.get(result.get("error"), ("❌ تعذر إغلاق المزاد.", "❌ The auction could not be closed."))
+                self._auction_broadcast(ar, en, room)
+            return True
+
+        if action == "cancel":
+            result = self._auction_game.cancel(user_id, username, is_master=is_master)
+            if result.get("ok"):
+                self._auction_broadcast("⛔ أُلغيت جولة المزاد دون خصم نقاط.", "⛔ The auction round was cancelled without charging points.", room)
+            else:
+                errors = {"no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."), "not_opener": ("🔒 إلغاء المزاد متاح لفاتح الجولة أو الماستر فقط.", "🔒 Only the host or master may cancel the auction."), "settlement_in_progress": ("⌛ تجري تسوية المزاد ولا يمكن إلغاؤه الآن.", "⌛ Auction settlement is in progress and cannot be cancelled.")}
+                ar, en = errors.get(result.get("error"), ("❌ تعذر إلغاء المزاد.", "❌ The auction could not be cancelled."))
+                self._auction_broadcast(ar, en, room)
+            return True
+        return False
 
     def _payroll_command(self, room, username, command):
         """Require a fresh random job before every salary; persist cooldowns and claims."""
@@ -17768,7 +17997,8 @@ class TalkinBot:
             current_items = inventory.get("inventory", {}) if isinstance(inventory, dict) else {}
             if not isinstance(current_items, dict):
                 current_items = {}
-            lines = [f"🎒 مخزون @{sender_name}"]
+            language_en = self._effective_room_language(room) == "en"
+            lines = [f"🎒 Inventory for @{sender_name}" if language_en else f"🎒 مخزون @{sender_name}"]
             owned = False
             rare_key = _rare_diamond_item_key()
             for key, item in MINING_ITEMS.items():
@@ -17782,15 +18012,38 @@ class TalkinBot:
                 rare_item = rare_item if isinstance(rare_item, dict) else {}
                 rare_count = int(current_items.get(rare_key, 0) or 0)
                 rare_price = int(rare_item.get("price", 0) or 0)
-                lines.append(f"🔴 ألماسة نادرة RED: {rare_count} — الاستبدال: red {rare_count} ({rare_price:,} نقطة للقطعة)")
+                if language_en:
+                    lines.append(f"🔴 Rare RED diamond: {rare_count} — redeem: red {rare_count} ({rare_price:,} points per item)")
+                else:
+                    lines.append(f"🔴 ألماسة نادرة RED: {rare_count} — الاستبدال: red {rare_count} ({rare_price:,} نقطة للقطعة)")
             else:
-                lines.append("⚠️ رمز RED غير مرتبط بألماسة نادرة في كتالوج الكنوز.")
+                lines.append("⚠️ RED is not linked to a rare diamond in the treasure catalog." if language_en else "⚠️ رمز RED غير مرتبط بألماسة نادرة في كتالوج الكنوز.")
+            auction_game = getattr(self, "_auction_game", None)
+            auction_items = auction_game.inventory(user_id, sender_name) if auction_game else []
+            if auction_items:
+                owned = True
+                lines.append("🏺 World auction collectibles in diamond inventory:" if language_en else "🏺 مقتنيات المزاد العالمي ضمن مخزون الألماس:")
+                for number, auction_item in enumerate(auction_items, 1):
+                    if language_en:
+                        item_name = auction_item.get("item_name_en") or auction_item.get("item_name_ar") or "Auction prize"
+                    else:
+                        item_name = auction_item.get("item_name_ar") or auction_item.get("item_name_en") or "جائزة المزاد"
+                    redeem_value = int(auction_item.get("redemption_value", 0) or 0)
+                    short_id = str(auction_item.get("id") or "")[:8]
+                    if auction_item.get("status") == "redeeming":
+                        status_text = "redemption pending" if language_en else "الاستبدال قيد الاعتماد"
+                        lines.append(f"{number}. {auction_item.get('icon', '💎')} {item_name} — {status_text}")
+                    else:
+                        price_text = f"redeem for {redeem_value:,} points" if language_en else f"الاستبدال: {redeem_value:,} نقطة"
+                        command_text = f"   Redeem: red auction {short_id}" if language_en else f"   red auction {short_id}"
+                        lines.append(f"{number}. {auction_item.get('icon', '💎')} {item_name} — {price_text}")
+                        lines.append(command_text)
             if not owned:
-                lines.append("لا توجد كنوز بعد؛ جرّب أمر احفر أو شارك في تنقيب الألماسة النادرة.")
+                lines.append("No treasures yet. Type dig or join the rare diamond expedition." if language_en else "لا توجد كنوز بعد؛ جرّب أمر احفر أو شارك في تنقيب الألماسة النادرة.")
             found = inventory.get("diamonds_found", 0) if isinstance(inventory, dict) else 0
-            lines.append(f"💎 إجمالي الألماس الذي عثرت عليه: {found}")
-            lines.append("🔁 للاستبدال: red رمز أو اسم أي كنز العدد — مثال: red ⚙️ 3 أو red ♦️ 3")
-            lines.append("🔴 للألماسة النادرة RED: red العدد")
+            lines.append(f"💎 Total diamonds found: {found}" if language_en else f"💎 إجمالي الألماس الذي عثرت عليه: {found}")
+            lines.append("🔁 Redeem: red <item name or icon> <quantity> — e.g. red ⚙️ 3 or red ♦️ 3" if language_en else "🔁 للاستبدال: red رمز أو اسم أي كنز العدد — مثال: red ⚙️ 3 أو red ♦️ 3")
+            lines.append("🔴 Rare RED diamond: red <quantity>" if language_en else "🔴 للألماسة النادرة RED: red العدد")
             self.send_room_text(room, "\n".join(lines))
             return True
 
@@ -17809,24 +18062,72 @@ class TalkinBot:
         if redeem_match or red_code_match:
             if red_code_match:
                 argument = str(red_code_match.group(1) or "").strip()
-                quantity_match = re.fullmatch(r"(.+?)\s+(\d+)", argument)
-                if quantity_match:
-                    selection = quantity_match.group(1).strip()
-                    quantity = int(quantity_match.group(2))
-                elif argument.isdigit():
-                    selection = "red"
-                    quantity = int(argument)
+                if re.match(r"^(?:auction|مزاد)\s+", argument, re.I):
+                    selection = argument
+                    quantity = None
                 else:
-                    selection = argument or "red"
-                    quantity = 1
+                    quantity_match = re.fullmatch(r"(.+?)\s+(\d+)", argument)
+                    if quantity_match:
+                        selection = quantity_match.group(1).strip()
+                        quantity = int(quantity_match.group(2))
+                    elif argument.isdigit():
+                        selection = "red"
+                        quantity = int(argument)
+                    else:
+                        selection = argument or "red"
+                        quantity = 1
             else:
                 selection = redeem_match.group(1).strip()
                 selection = selection.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
                 quantity = None
-                quantity_match = re.fullmatch(r"(.+?)\s+(\d+)", selection)
-                if quantity_match:
-                    selection = quantity_match.group(1).strip()
-                    quantity = int(quantity_match.group(2))
+                if not re.match(r"^(?:auction|مزاد)\s+", selection, re.I):
+                    quantity_match = re.fullmatch(r"(.+?)\s+(\d+)", selection)
+                    if quantity_match:
+                        selection = quantity_match.group(1).strip()
+                        quantity = int(quantity_match.group(2))
+            auction_redemption = re.fullmatch(r"(?:auction|مزاد)\s*(.*)", selection, re.I | re.S)
+            if auction_redemption:
+                redeemed = self._auction_game.redeem(
+                    user_id, sender_name, auction_redemption.group(1).strip(), _apply_points_delta_once,
+                )
+                if redeemed.get("ok"):
+                    prize = redeemed.get("item") or {}
+                    language_en = self._effective_room_language(room) == "en"
+                    if language_en:
+                        prize_name = prize.get("item_name_en") or prize.get("item_name_ar") or "Auction prize"
+                        response = (
+                            f"✅ Redeemed {prize.get('icon', '💎')} {prize_name} from the auction.\n"
+                            f"💰 Added {int(redeemed.get('points', 0) or 0):,} points to your balance, including the 30% post-round profit."
+                        )
+                    else:
+                        prize_name = prize.get("item_name_ar") or prize.get("item_name_en") or "جائزة المزاد"
+                        response = (
+                            f"✅ استبدلت {prize.get('icon', '💎')} {prize_name} من المزاد.\n"
+                            f"💰 أضيف إلى رصيدك {int(redeemed.get('points', 0) or 0):,} نقطة، متضمنة ربح 30% بعد الجولة."
+                        )
+                    self.send_room_text(room, response)
+                elif redeemed.get("pending"):
+                    pending_text = (
+                        "⌛ Redemption is saved and waiting for points approval. Retry the same red auction <number/code> command later; it will not credit twice."
+                        if self._effective_room_language(room) == "en"
+                        else "⌛ الاستبدال محفوظ وينتظر اعتماد النقاط؛ أعد الأمر نفسه red auction <رقم/رمز> لاحقاً، ولن تتكرر الإضافة."
+                    )
+                    self.send_room_text(room, pending_text)
+                else:
+                    if self._effective_room_language(room) == "en":
+                        errors = {
+                            "selector_required": "❌ Type the collectible code shown by sv, e.g. red auction 1a2b3c4d.",
+                            "item_not_found": "📭 That collectible is not available to redeem. Type sv to see your inventory.",
+                        }
+                        fallback = "⚠️ The auction collectible could not be redeemed right now."
+                    else:
+                        errors = {
+                            "selector_required": "❌ اكتب رمز السلعة الظاهر في sv، مثال: red auction 1a2b3c4d.",
+                            "item_not_found": "📭 لم أجد هذه السلعة في مقتنيات المزاد القابلة للاستبدال. اكتب sv لعرضها.",
+                        }
+                        fallback = "⚠️ تعذر استبدال سلعة المزاد الآن."
+                    self.send_room_text(room, errors.get(redeemed.get("error"), fallback))
+                return True
             if str(selection).strip().casefold() == "red":
                 rare_key = _rare_diamond_item_key()
                 item_keys = [rare_key] if rare_key else []
@@ -23745,6 +24046,8 @@ class TalkinBot:
                         or getattr(self, "last_joined_room", "")
                         or next(iter(getattr(self, "connected_rooms", set())), "")
                     )
+                    if body and self._handle_auction_private_command(private_command_sender, body):
+                        return
                     if body and self._cricket.handle(cricket_room, private_command_sender, body, is_private=True):
                         return
                     if body and self._monitor_command(frm, body):
