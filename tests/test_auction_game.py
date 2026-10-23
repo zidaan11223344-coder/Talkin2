@@ -43,7 +43,7 @@ def test_command_parsing_and_master_toggle_aliases():
     assert parse_room_command("مزايده") == "join"
     assert parse_room_command("ابدأ المزاد") == "start"
     assert parse_room_command("زايد") == "bid"
-    assert parse_room_command("تمرير") == "pass"
+    assert parse_room_command("تمرير") is None
     assert parse_room_command("اقفل المزاد") == "close"
     assert parse_room_command("حديث عادي") is None
 
@@ -64,6 +64,8 @@ def test_registration_early_start_and_automatic_start_at_five(tmp_path):
     started = game.start("host", "Host")
     assert started["ok"]
     assert started["auction"]["phase"] == "bidding"
+    assert started["auction"]["current_bid"] == 0
+    assert started["auction"]["deadline_at"] - started["auction"]["started_at"] == BIDDING_DURATION_SECONDS
 
     game.cancel("host", "Host")
     game.open_auction("host", "Host", "Hall")
@@ -71,11 +73,10 @@ def test_registration_early_start_and_automatic_start_at_five(tmp_path):
         result = game.join(str(number), f"Player{number}")
     assert result["auto_started"] is True
     assert result["auction"]["phase"] == "bidding"
-    assert result["auction"]["turn_username"] == "Player1"
     assert game.join("6", "Player6")["error"] == "registration_closed"
 
 
-def test_bids_increase_by_ten_million_and_only_participants_can_bid(tmp_path):
+def test_any_registered_player_can_bid_at_any_time_and_each_bid_raises_ten_million(tmp_path):
     game, _ = make_game(tmp_path)
     game.set_enabled(True)
     game.open_auction("host", "Host", "Hall")
@@ -83,59 +84,37 @@ def test_bids_increase_by_ten_million_and_only_participants_can_bid(tmp_path):
     game.start("host", "Host")
 
     assert game.bid("outsider", "Outsider", 100_000_000)["error"] == "not_participant"
-    assert game.bid("2", "Player2", 100_000_000)["error"] == "not_your_turn"
-    assert game.active()["bid_count"] == 0
-    first = game.bid("1", "Player1", 100_000_000)
-    second = game.bid("2", "Player2", 100_000_000)
-    assert first["amount"] == BID_INCREMENT
-    assert first["next_turn_username"] == "Player2"
-    assert second["amount"] == 2 * BID_INCREMENT
-    assert game.bid("3", "Player3", BID_INCREMENT)["error"] == "insufficient"
+    first = game.bid("2", "Player2", 1_000_000_000)
+    second = game.bid("1", "Player1", 1_000_000_000)
+    third = game.bid("2", "Player2", 1_000_000_000)
+    assert first["amount"] == AUCTION_ITEMS[0]["starting_price"] == 100_000_000
+    assert second["amount"] == first["amount"] + BID_INCREMENT
+    assert third["amount"] == second["amount"] + BID_INCREMENT
+    assert game.active()["highest_bidder_name"] == "Player2"
+    assert game.active()["bid_count"] == 3
+    assert game.bid("3", "Player3", third["amount"] + BID_INCREMENT - 1)["error"] == "insufficient"
 
 
-def test_turn_order_passes_skip_players_and_close_after_everyone_passes(tmp_path):
-    game, _ = make_game(tmp_path)
-    game.set_enabled(True)
-    game.open_auction("host", "Host", "Hall")
-    register_players(game, 3)
-    started = game.start("host", "Host")
-    assert started["auction"]["turn_username"] == "Player1"
-
-    first_bid = game.bid("1", "Player1", 100_000_000)
-    assert first_bid["next_turn_username"] == "Player2"
-    assert game.pass_turn("3", "Player3")["error"] == "not_your_turn"
-    assert game.pass_turn("2", "Player2")["next_turn_username"] == "Player3"
-    assert game.pass_turn("3", "Player3")["next_turn_username"] == "Player1"
-
-    charges = []
-
-    def charge(username, delta, txid, reason):
-        charges.append((username, delta, txid, reason))
-        return {"ok": True}
-
-    result = game.pass_turn("1", "Player1", apply_delta=charge)
-    assert result["status"] == "sold"
-    assert result["auto_closed"] is True
-    assert result["result"]["winner"] == "Player1"
-    assert charges[0][1] == -BID_INCREMENT
-    assert game.active() is None
+def test_every_collectible_has_a_distinct_starting_price_between_one_hundred_million_and_one_billion():
+    prices = [item["starting_price"] for item in AUCTION_ITEMS]
+    assert len(set(prices)) == len(AUCTION_ITEMS)
+    assert min(prices) == 100_000_000
+    assert max(prices) == 1_000_000_000
+    assert all(100_000_000 <= price <= 1_000_000_000 for price in prices)
 
 
-def test_pass_every_turn_without_a_bid_closes_without_sale(tmp_path):
-    game, _ = make_game(tmp_path)
+def test_first_bid_uses_the_selected_item_starting_price(tmp_path):
+    chosen = AUCTION_ITEMS[-1]
+    game, _ = make_game(tmp_path, chosen=chosen)
     game.set_enabled(True)
     game.open_auction("host", "Host", "Hall")
     register_players(game, 3)
     game.start("host", "Host")
-
-    assert game.pass_turn("1", "Player1")["status"] == "passed"
-    assert game.pass_turn("2", "Player2")["status"] == "passed"
-    closed = game.pass_turn("3", "Player3")
-    assert closed["status"] == "no_bids"
-    assert game.active() is None
+    bid = game.bid("2", "Player2", 1_000_000_000)
+    assert bid["amount"] == chosen["starting_price"] == 1_000_000_000
 
 
-def test_bidding_expires_after_sixty_seconds_and_rejects_late_bid_or_pass(tmp_path):
+def test_bidding_expires_after_sixty_seconds_and_rejects_late_bids(tmp_path):
     now = {"value": 1_700_000_000.25}
     game, _ = make_game(tmp_path, clock=lambda: now["value"])
     game.set_enabled(True)
@@ -148,7 +127,6 @@ def test_bidding_expires_after_sixty_seconds_and_rejects_late_bid_or_pass(tmp_pa
     assert game.bid("1", "Player1", 100_000_000)["ok"]
     now["value"] = float(started["deadline_at"])
     assert game.bid("2", "Player2", 100_000_000)["error"] == "expired"
-    assert game.pass_turn("2", "Player2")["error"] == "expired"
 
 
 def test_timeout_automatically_settles_top_bid_only_in_participant_rooms(tmp_path, monkeypatch):
@@ -204,7 +182,7 @@ def test_timeout_automatically_settles_top_bid_only_in_participant_rooms(tmp_pat
 
     assert game.active() is None
     assert charges[0][0] == "Player1"
-    assert charges[0][1] == -BID_INCREMENT
+    assert charges[0][1] == -AUCTION_ITEMS[0]["starting_price"]
     assert len(sent) == 1 and sent[0][0] == "Hall"
     assert "60-second bidding window ended" in sent[0][1]
 
@@ -215,8 +193,8 @@ def test_winner_is_charged_once_and_can_redeem_item_for_thirty_percent_profit(tm
     game.open_auction("host", "Host", "Hall")
     register_players(game, 3)
     game.start("host", "Host")
-    game.bid("1", "Player1", 50 * BID_INCREMENT)
-    game.bid("2", "Player2", 50 * BID_INCREMENT)
+    first = game.bid("1", "Player1", 500_000_000)
+    second = game.bid("2", "Player2", 500_000_000)
 
     ledger = {}
 
@@ -229,17 +207,19 @@ def test_winner_is_charged_once_and_can_redeem_item_for_thirty_percent_profit(tm
     assert closed["status"] == "sold"
     award = closed["result"]
     assert award["winner"] == "Player2"
-    assert award["bid"] == 2 * BID_INCREMENT
-    assert award["redemption_value"] == 26_000_000
+    assert first["amount"] == AUCTION_ITEMS[0]["starting_price"]
+    assert second["amount"] == first["amount"] + BID_INCREMENT
+    assert award["bid"] == 110_000_000
+    assert award["redemption_value"] == 143_000_000
     assert len(ledger) == 1
-    assert next(iter(ledger.values()))[1] == -20_000_000
+    assert next(iter(ledger.values()))[1] == -110_000_000
 
     inventory = game.inventory("2", "Player2")
     assert len(inventory) == 1
     assert inventory[0]["status"] == "available"
     redeemed = game.redeem("2", "Player2", inventory[0]["id"][:8], apply_delta)
     assert redeemed["ok"]
-    assert redeemed["points"] == 26_000_000
+    assert redeemed["points"] == 143_000_000
     assert len(ledger) == 2
     assert game.inventory("2", "Player2") == []
     assert game.redeem("2", "Player2", inventory[0]["id"][:8], apply_delta)["error"] == "item_not_found"
@@ -282,7 +262,7 @@ def test_disabling_cancels_an_unsettled_round_without_charging_anyone(tmp_path):
     game.open_auction("host", "Host", "Hall")
     register_players(game, 3)
     game.start("host", "Host")
-    game.bid("1", "Player1", BID_INCREMENT)
+    game.bid("1", "Player1", 1_000_000_000)
     result = game.set_enabled(False)
     assert result["cancelled_active"]
     assert game.active() is None
@@ -326,13 +306,16 @@ def test_room_open_sends_localized_global_announcement_and_small_item_images(tmp
     assert len(sent_text) == 2
     assert any(room == "ArabicHall" and "بدأ التسجيل" in text for room, text in sent_text)
     assert any(room == "EnglishHall" and "Registration is open" in text for room, text in sent_text)
+    assert all("100m" in text for _room, text in sent_text)
+    assert any("بلا أدوار" in text and "يفوز أعلى مزايد" in text for room, text in sent_text if room == "ArabicHall")
+    assert any("bid freely" in text and "highest bidder wins" in text for room, text in sent_text if room == "EnglishHall")
     assert sorted(sent_media) == sorted([
         ("ArabicHall", "https://assets.example/assets/treasures/auction_imperial_jade.jpg", "image"),
         ("EnglishHall", "https://assets.example/assets/treasures/auction_imperial_jade.jpg", "image"),
     ])
 
 
-def test_active_round_replies_locally_to_unregistered_and_out_of_turn_messages(tmp_path, monkeypatch):
+def test_active_round_allows_any_registered_bidder_without_turns(tmp_path, monkeypatch):
     game, _ = make_game(tmp_path, chosen=AUCTION_ITEMS[0])
     game.set_enabled(True)
     game.open_auction("name:host", "Host", "ArabicHall")
@@ -350,7 +333,7 @@ def test_active_round_replies_locally_to_unregistered_and_out_of_turn_messages(t
     monkeypatch.setattr(bot_module, "_is_verified_user", lambda name: name != "Guest")
     monkeypatch.setattr(bot_module, "_games_enabled_for_room", lambda _room: True)
     monkeypatch.setattr(bot_module, "_is_primary_master", lambda _name: False)
-    monkeypatch.setattr(bot_module, "_get_points", lambda _name: 100_000_000)
+    monkeypatch.setattr(bot_module, "_get_points", lambda _name: 1_000_000_000)
 
     assert bot._handle_auction_room_command("EnglishHall", "Guest", "مزايده")
     assert len(sent) == 1 and sent[0][0] == "EnglishHall"
@@ -363,21 +346,28 @@ def test_active_round_replies_locally_to_unregistered_and_out_of_turn_messages(t
 
     sent.clear()
     assert bot._handle_auction_room_command("EnglishHall", "Player2", "bid")
-    assert len(sent) == 1 and sent[0][0] == "EnglishHall"
-    assert "wait for your turn" in sent[0][1]
-    assert game.active()["bid_count"] == 0
+    assert sorted(room for room, _text in sent) == ["ArabicHall", "EnglishHall"]
+    assert any("current high bid" in text for room, text in sent if room == "EnglishHall")
+    assert any("أعلى سعر حالي" in text for room, text in sent if room == "ArabicHall")
+    assert game.active()["highest_bidder_name"] == "Player2"
+    assert game.active()["current_bid"] == AUCTION_ITEMS[0]["starting_price"]
+
+    sent.clear()
+    assert bot._handle_auction_room_command("ArabicHall", "Player1", "زايد")
+    assert sorted(room for room, _text in sent) == ["ArabicHall", "EnglishHall"]
+    assert game.active()["highest_bidder_name"] == "Player1"
+    assert game.active()["current_bid"] == AUCTION_ITEMS[0]["starting_price"] + BID_INCREMENT
+
+    sent.clear()
+    assert bot._handle_auction_room_command("ArabicHall", "Player1", "زايد")
+    assert game.active()["bid_count"] == 3
+    assert game.active()["current_bid"] == AUCTION_ITEMS[0]["starting_price"] + 2 * BID_INCREMENT
 
     sent.clear()
     assert bot._handle_auction_room_command("OtherHall", "Player1", "bid")
     assert len(sent) == 1 and sent[0][0] == "OtherHall"
     assert "المزاد مغلق في هذه الغرفة" in sent[0][1]
-    assert game.active()["bid_count"] == 0
-
-    sent.clear()
-    assert bot._handle_auction_room_command("ArabicHall", "Player1", "زايد")
-    assert sorted(room for room, _text in sent) == ["ArabicHall", "EnglishHall"]
-    assert all("الدور التالي على @Player2" in text for room, text in sent if room == "ArabicHall")
-    assert game.active()["turn_username"] == "Player2"
+    assert game.active()["bid_count"] == 3
 
 
 def test_closed_auction_replies_in_nonparticipant_room_without_global_broadcast(tmp_path, monkeypatch):
@@ -405,7 +395,7 @@ def test_auction_collectible_appears_in_sv_and_redeems_through_red_auction(tmp_p
     for name in ("Player1", "Player2", "Player3"):
         assert game.join("name:" + name.casefold(), name)["ok"]
     game.start("host", "Host")
-    game.bid("name:player1", "Player1", BID_INCREMENT)
+    game.bid("name:player1", "Player1", AUCTION_ITEMS[0]["starting_price"])
     ledger = {}
 
     def apply_delta(username, delta, txid, reason):
@@ -438,8 +428,8 @@ def test_auction_collectible_appears_in_sv_and_redeems_through_red_auction(tmp_p
     english_inventory = sent[-1][1]
     assert not any("\u0600" <= character <= "\u06ff" for character in english_inventory)
     assert bot._execute_mining_command_with_id("Hall", f"red auction {closed['result']['auction_id'][:8]}", "Player1", "name:player1")
-    assert any("post-round profit" in text and "13,000,000" in text for _room, text in sent)
-    assert ledger[f"auction-redemption:{closed['result']['auction_id']}"][1] == 13_000_000
+    assert any("post-round profit" in text and "130,000,000" in text for _room, text in sent)
+    assert ledger[f"auction-redemption:{closed['result']['auction_id']}"][1] == 130_000_000
 
 
 def test_only_primary_master_can_toggle_auction_and_off_cancels_open_round(tmp_path, monkeypatch):
@@ -476,4 +466,8 @@ def test_auction_help_is_localized_for_english_rooms():
     assert "Open auction" in auction_section
     assert "Join auction" in auction_section
     assert "30% profit" in auction_section
+    assert "with no turns" in auction_section
+    assert "100 million to 1 billion" in auction_section
+    assert "highest bidder at the end wins" in auction_section
+    assert "pass" not in auction_section.casefold()
     assert not any("\u0600" <= character <= "\u06ff" for character in auction_section)
