@@ -48,7 +48,7 @@ try:
 except Exception:
     pymysql = None
 from dotenv import dotenv_values, load_dotenv
-from auction_game import AuctionGame, MAX_IMAGE_BYTES, parse_room_command as _parse_auction_room_command, parse_toggle_command as _parse_auction_toggle_command
+from auction_game import AuctionGame, BIDDING_DURATION_SECONDS, MAX_IMAGE_BYTES, parse_room_command as _parse_auction_room_command, parse_toggle_command as _parse_auction_toggle_command
 from cricket_integration import CricketIntegration
 import shop as member_shop
 from treasure_mining import DIAMOND_KEYS, ITEMS as MINING_ITEMS, MiningStore, format_cooldown, resolve_item_keys
@@ -4989,7 +4989,7 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📌 اكتب ns للقائمة التالية',
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n\n🔨 المزاد العالمي: الماستر في الخاص يرسل شغل لعبة مزاد / أوقف لعبة مزاد.\nافتح مزاد — يختار البوت سلعة نادرة ويرسل صورتها (≤50 KB).\nمزايده — تسجيل؛ عند 3 مشاركين يكتب الفاتح ابدأ المزاد، وعند 5 يبدأ تلقائياً.\nزايد — زيادة 10,000,000 نقطة؛ اقفل المزاد — إغلاق الجولة.\nsv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاستبدال بعد الجولة بربح 30%.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n\n🔨 المزاد العالمي: الماستر في الخاص يرسل شغل لعبة مزاد / أوقف لعبة مزاد.\nافتح مزاد — يختار البوت سلعة نادرة ويرسل صورتها (≤50 KB).\nمزايده — تسجيل؛ عند 3 مشاركين يبدأه الفاتح، وعند 5 يبدأ تلقائياً.\nبعد البدء: المزايدة 60 ثانية بالدور حسب ترتيب التسجيل؛ صاحب الدور فقط يكتب «زايد» أو «تمرير»، وكل زايد يزيد 10,000,000 نقطة. عند انتهاء الوقت أو تمرير الجميع، يفوز أعلى مزايد.\nأثناء الجولة، مزايده تعني أن المزاد شغال؛ انتظر انتهاءه. فاتح الجولة أو الماستر يستطيع إقفاله بأمر «اقفل المزاد». بعد الإغلاق: «زايد/مزايده» يرد بأن المزاد مغلق وانتظر جولة أخرى.\nsv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاستبدال بعد الجولة بربح 30%.',
             '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — استثمار تلقائي بالذهب بعد التحذير؛ بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
             '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
@@ -6766,6 +6766,9 @@ class TalkinBot:
             bot_name=BOT_ID or "Talkin2",
             log=print,
         )
+        self._auction_timeout_lock = threading.RLock()
+        self._auction_timer = None
+        self._auction_timer_id = None
         self._auction_game = AuctionGame(
             DATA_DIR / "auction_game.json",
             load_json=_load_local_json,
@@ -6777,6 +6780,12 @@ class TalkinBot:
                 self.log("[AUCTION] pending settlement remains for retry:", recovered_auction.get("error"))
         except Exception as exc:
             self.log("[AUCTION] startup settlement recovery failed:", repr(exc))
+        try:
+            active_auction = self._auction_game.active()
+            if isinstance(active_auction, dict) and active_auction.get("phase") == "bidding":
+                self._schedule_auction_timeout(active_auction)
+        except Exception as exc:
+            self.log("[AUCTION] bidding timer restore failed:", repr(exc))
         self.auth = None
         self.last_error = None
         # The last inbound command being processed when the WebSocket failed.
@@ -9170,14 +9179,24 @@ class TalkinBot:
                 "🔨 World auction: the master enables/disables it in private with “auction on” / “auction off”.",
             "افتح مزاد — يختار البوت سلعة Rare ويرسل صورتها (≤50 KB).":
                 "Open auction — the bot selects a rare item and sends its image (≤50 KB).",
-            "مزايده — تسجيل؛ عند 3 مشاركين يكتب الفاتح Start المزاد, وعند 5 يبدأ تلقائياً.":
-                "Join auction — register; at 3 players the host types “start auction”, or it starts automatically at 5.",
-            "زايد — زيادة 10,000,000 points؛ اقفل المزاد — إغلاق الجولة.":
-                "Bid — raise by 10,000,000 points; close auction — end the round.",
+            "مزايده — تسجيل؛ عند 3 مشاركين يبدأه الفاتح, وعند 5 يبدأ تلقائياً.":
+                "Join auction — register; at 3 players the host may start, or it starts automatically at 5.",
+            "بعد بدء المزايدة: الTurn: حسب ترتيب التسجيل؛ صاحب الTurn: فقط يكتب «زايد» or «تمرير». كل زايد يزيد 10,000,000 points؛ تمرير الجميع ينهي الجولة لأعلى مزايد.":
+                "After bidding starts, turns follow registration order; only the current player may type “bid” or “pass”. Each bid adds 10,000,000 points; when everyone passes, the highest bidder wins.",
+            "أثناء الجولة, مزايده تعني أن المزاد شغال؛ wait انتهاءه. فاتح الجولة or الماستر يستطيع إقفاله بأمر «اقفل المزاد».":
+                "While a round is running, registration is closed; wait until it ends. The host or master may end it with “close auction”.",
             "sv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاستبدال بعد الجولة بربح 30%.":
                 "sv — view auction collectibles; red auction <code> — redeem after the round for a 30% profit.",
         }
         for old, new in auction_help_fixes.items():
+            value = value.replace(old, new)
+        auction_help_final_fixes = {
+            "بعد البدء: المزايدة 60 seconds بالTurn: حسب ترتيب التسجيل؛ صاحب الTurn: فقط يكتب «زايد» or «تمرير», وكل زايد يزيد 10,000,000 points. عند انتهاء الوقت or تمرير الجميع, يفوز أعلى مزايد.":
+                "After bidding starts, the auction lasts 60 seconds. Turns follow registration order; only the current player may type “bid” or “pass”. Each bid adds 10,000,000 points. At the end of 60 seconds or after everyone passes, the highest bidder wins.",
+            "بعد الإغلاق: «زايد/مزايده» يرد بأن المزاد مغلق وwait جولة أخرى.":
+                "After the auction closes, “bid/join auction” gets a local reply: the auction is closed; wait for another round.",
+        }
+        for old, new in auction_help_final_fixes.items():
             value = value.replace(old, new)
         return value
 
@@ -14582,11 +14601,18 @@ class TalkinBot:
             return True
         return self._cricket.handle(room, username, text, is_private=False)
 
-    def _auction_connected_rooms(self, fallback_room=""):
+    def _auction_connected_rooms(self, fallback_room="", *, rooms=None):
         """Return live room connections only; never broadcast to saved rooms."""
-        candidates = list(getattr(self, "connected_rooms", set()) or ())
-        if fallback_room:
-            candidates.append(str(fallback_room).strip())
+        connected = list(getattr(self, "connected_rooms", set()) or ())
+        if rooms is None:
+            candidates = connected[:]
+            if fallback_room:
+                candidates.append(str(fallback_room).strip())
+        else:
+            requested = { _norm_room(name).casefold() for name in rooms if str(name or "").strip() }
+            candidates = [name for name in connected if _norm_room(name).casefold() in requested]
+            if fallback_room and _norm_room(fallback_room).casefold() in requested:
+                candidates.append(str(fallback_room).strip())
         result, seen = [], set()
         for candidate in candidates:
             name = str(candidate or "").strip()
@@ -14598,13 +14624,143 @@ class TalkinBot:
                 result.append(name)
         return result
 
-    def _auction_broadcast(self, arabic_text, english_text, fallback_room=""):
-        for target_room in self._auction_connected_rooms(fallback_room):
+    def _auction_participant_rooms(self, auction=None):
+        if auction is None:
+            auction_game = getattr(self, "_auction_game", None)
+            auction = auction_game.active() if auction_game else None
+        if not isinstance(auction, dict):
+            return []
+        fallback_room = str(auction.get("room") or "").strip()
+        rooms = [str(player.get("room") or fallback_room).strip() for player in auction.get("participants", []) if isinstance(player, dict)]
+        return self._auction_connected_rooms(rooms=rooms)
+
+    @staticmethod
+    def _auction_deadline_at(auction):
+        try:
+            started_at = float(auction.get("started_at") or 0)
+            return float(auction.get("deadline_at") or (started_at + BIDDING_DURATION_SECONDS))
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    def _cancel_auction_timeout(self, auction_id=None):
+        lock = getattr(self, "_auction_timeout_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._auction_timeout_lock = lock
+        with lock:
+            timer = getattr(self, "_auction_timer", None)
+            timer_id = getattr(self, "_auction_timer_id", None)
+            if timer is None or (auction_id is not None and str(timer_id or "") != str(auction_id)):
+                return False
+            self._auction_timer = None
+            self._auction_timer_id = None
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+            return True
+
+    def _schedule_auction_timeout(self, auction=None):
+        game = getattr(self, "_auction_game", None)
+        if auction is None and game is not None:
+            auction = game.active()
+        if not isinstance(auction, dict) or auction.get("phase") != "bidding":
+            self._cancel_auction_timeout()
+            return False
+        auction_id = str(auction.get("id") or "")
+        if not auction_id:
+            return False
+        deadline_at = self._auction_deadline_at(auction)
+        try:
+            now = float(game.clock())
+        except Exception:
+            now = time.time()
+        delay = max(0.0, deadline_at - now)
+        lock = getattr(self, "_auction_timeout_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._auction_timeout_lock = lock
+        timer = threading.Timer(delay, self._expire_auction_round, args=(auction_id,))
+        timer.daemon = True
+        with lock:
+            previous = getattr(self, "_auction_timer", None)
+            if previous is not None:
+                try:
+                    previous.cancel()
+                except Exception:
+                    pass
+            self._auction_timer = timer
+            self._auction_timer_id = auction_id
+            timer.start()
+        return True
+
+    def _expire_auction_round(self, auction_id):
+        game = getattr(self, "_auction_game", None)
+        active = game.active() if game is not None else None
+        if not isinstance(active, dict) or str(active.get("id") or "") != str(auction_id) or active.get("phase") != "bidding":
+            self._cancel_auction_timeout(auction_id)
+            return False
+        deadline_at = self._auction_deadline_at(active)
+        try:
+            now = float(game.clock())
+        except Exception:
+            now = time.time()
+        if now < deadline_at:
+            self._schedule_auction_timeout(active)
+            return False
+        rooms = self._auction_participant_rooms(active)
+        self._cancel_auction_timeout(auction_id)
+        result = game.close(
+            str(active.get("opener_id") or ""),
+            str(active.get("opener_name") or ""),
+            apply_delta=_apply_points_delta_once,
+        )
+        if not self._auction_broadcast_close_result(result, rooms=rooms, expired=True) and result.get("error"):
+            self._auction_broadcast(
+                "⌛ انتهت مدة المزايدة، لكن تعذرت التسوية الآن؛ لم يُعلن فائز.",
+                "⌛ The 60-second bidding window ended, but settlement failed; no winner was announced.",
+                rooms=rooms,
+            )
+        return True
+
+    def _auction_broadcast(self, arabic_text, english_text, fallback_room="", *, rooms=None):
+        target_rooms = self._auction_connected_rooms(fallback_room, rooms=rooms) if rooms is not None else self._auction_connected_rooms(fallback_room)
+        for target_room in target_rooms:
             try:
                 language = self._effective_room_language(target_room)
             except Exception:
                 language = "ar"
             self.send_room_text(target_room, english_text if language == "en" else arabic_text)
+
+    def _auction_room_reply(self, room, arabic_text, english_text):
+        try:
+            language = self._effective_room_language(room)
+        except Exception:
+            language = "ar"
+        return self.send_room_text(room, english_text if language == "en" else arabic_text)
+
+    def _auction_broadcast_close_result(self, result, fallback_room="", *, rooms=None, expired=False):
+        prefix_ar = "⏰ انتهت مدة المزايدة (60 ثانية).\n" if expired else ""
+        prefix_en = "⏰ The 60-second bidding window ended.\n" if expired else ""
+        if result.get("status") == "no_bids":
+            self._auction_broadcast(f"{prefix_ar}🔔 أُغلق المزاد دون عروض؛ لم تُخصم نقاط ولم تُمنح السلعة.", f"{prefix_en}🔔 The auction closed without bids; no points were charged and the item was not awarded.", fallback_room, rooms=rooms)
+        elif result.get("status") == "no_sale":
+            self._auction_broadcast(f"{prefix_ar}⚠️ لم يكتمل البيع لأن رصيد أعلى مزايد لم يعد كافياً؛ لم تُخصم نقاط ولم تُمنح السلعة.", f"{prefix_en}⚠️ The sale could not complete because the highest bidder no longer had enough points; no points were charged and the item was not awarded.", fallback_room, rooms=rooms)
+        elif result.get("status") == "sold":
+            sale = result["result"]
+            item = sale["item"]
+            short_id = str(sale["auction_id"])[:8]
+            self._auction_broadcast(
+                f"{prefix_ar}🏆 انتهى المزاد! فاز @{sale['winner']} بـ{item.get('icon', '💎')} {item.get('name_ar', 'الجائزة')} بسعر {_fmt_points(sale['bid'])} نقطة.\n✅ أضيفت لمخزون الألماس؛ الاستبدال بعد الجولة: {_fmt_points(sale['redemption_value'])} نقطة (ربح 30%).\nللمخزون: sv — للاستبدال: red auction {short_id}",
+                f"{prefix_en}🏆 Auction complete! @{sale['winner']} won {item.get('icon', '💎')} {item.get('name_en', 'the prize')} for {_fmt_points(sale['bid'])} points.\n✅ Added to diamond inventory; redemption after the round: {_fmt_points(sale['redemption_value'])} points (30% profit).\nInventory: sv — redeem: red auction {short_id}",
+                fallback_room,
+                rooms=rooms,
+            )
+        elif result.get("pending"):
+            self._auction_broadcast(f"{prefix_ar}⌛ التسوية معلقة مؤقتاً؛ لم يُعلن الفائز بعد. أعد «اقفل المزاد» لاحقاً أو أعد تشغيل البوت للمحاولة بأمان دون خصم مكرر.", f"{prefix_en}⌛ Settlement is pending; no winner is announced yet. Retry “close auction” later or restart the bot; the transaction ID prevents a duplicate charge.", fallback_room, rooms=rooms)
+        else:
+            return False
+        return True
 
     def _auction_send_item_image(self, item, fallback_room=""):
         filename = str((item or {}).get("image") or "").strip()
@@ -14642,11 +14798,13 @@ class TalkinBot:
             elif room:
                 self.send_room_text(room, notice)
             return True
+        participant_rooms = self._auction_participant_rooms()
         result = self._auction_game.set_enabled(enabled)
         if enabled:
             self.send_private_text(sender, "✅ تم تشغيل لعبة المزاد. اكتب «افتح مزاد» في غرفة متصلة لبدء جولة عالمية.")
         else:
-            self._auction_broadcast("⛔ أوقف الماستر لعبة المزاد؛ أُلغيت الجولة المفتوحة دون خصم نقاط.", "⛔ The master disabled the auction game; the open round was cancelled without charging points.", room)
+            self._cancel_auction_timeout()
+            self._auction_broadcast("⛔ أوقف الماستر لعبة المزاد؛ أُلغيت الجولة المفتوحة دون خصم نقاط.", "⛔ The master disabled the auction game; the open round was cancelled without charging points.", rooms=participant_rooms)
             extra = " أُلغيت الجولة المفتوحة دون خصم." if result.get("cancelled_active") else ""
             self.send_private_text(sender, f"⛔ تم إيقاف لعبة المزاد.{extra}")
         return True
@@ -14660,10 +14818,37 @@ class TalkinBot:
         action = _parse_auction_room_command(text)
         if not action:
             return False
-        if action == "bid" and str(text or "").strip().casefold() == "bid":
-            auction_game = getattr(self, "_auction_game", None)
-            if not auction_game or not auction_game.active():
-                return False
+        auction_game = getattr(self, "_auction_game", None)
+        active_auction = auction_game.active() if auction_game else None
+        if not active_auction and action in {"join", "bid", "pass"}:
+            self._auction_room_reply(room, "📭 المزاد مغلق؛ انتظر بدء جولة أخرى.", "📭 The auction is closed; wait for another round to start.")
+            return True
+        if isinstance(active_auction, dict) and active_auction.get("phase") == "bidding":
+            game_clock = getattr(auction_game, "clock", time.time)
+            if float(game_clock()) >= self._auction_deadline_at(active_auction):
+                participant_rooms = self._auction_participant_rooms(active_auction)
+                source_is_participant = _norm_room(room).casefold() in {_norm_room(name).casefold() for name in participant_rooms}
+                self._expire_auction_round(active_auction.get("id"))
+                if action in {"join", "bid", "pass"} and not source_is_participant:
+                    self._auction_room_reply(room, "📭 المزاد مغلق؛ انتظر بدء جولة أخرى.", "📭 The auction is closed; wait for another round to start.")
+                return True
+            current_user_id = "name:" + _norm_user(username)
+            participants = active_auction.get("participants") or []
+            registered = any(str(player.get("user_id") or "") == current_user_id for player in participants if isinstance(player, dict))
+            participant_rooms = self._auction_participant_rooms(active_auction)
+            if action in {"join", "bid", "pass"} and _norm_room(room).casefold() not in {_norm_room(name).casefold() for name in participant_rooms}:
+                self._auction_room_reply(room, "📭 المزاد مغلق في هذه الغرفة؛ انتظر انتهاء الجولة وبدء جولة أخرى.", "📭 The auction is closed to this room; wait for the current round to end and another round to open.")
+                return True
+            if action == "join":
+                self._auction_room_reply(room, "⌛ يوجد مزاد شغال الآن؛ التسجيل مغلق. انتظر انتهاء الجولة لفتح التسجيل مجددًا.", "⌛ An auction is already running; registration is closed. Wait until the round ends for the next one.")
+                return True
+            if action in {"bid", "pass"} and not registered:
+                self._auction_room_reply(room, "⌛ يوجد مزاد شغال الآن؛ لست مسجلاً في هذه الجولة. انتظر انتهائها للمشاركة في التالية.", "⌛ An auction is already running; you are not registered for this round. Wait until it ends to join the next one.")
+                return True
+            if action in {"bid", "pass"} and current_user_id != str(active_auction.get("turn_user_id") or ""):
+                current_turn = active_auction.get("turn_username") or "المشارك التالي"
+                self._auction_room_reply(room, f"⌛ يوجد مزاد شغال؛ انتظر دورك. الدور الآن على @{current_turn}.", f"⌛ An auction is running; please wait for your turn. It is @{current_turn}'s turn.")
+                return True
         if not _is_verified_user(username):
             self.send_room_text(room, f"🔒 @{username} حسابك غير موثق للمشاركة في الألعاب.\n{_verification_notice()}")
             return True
@@ -14680,15 +14865,15 @@ class TalkinBot:
                     "already_open": ("⌛ توجد جولة مزاد عالمية مفتوحة بالفعل.", "⌛ A world auction is already open."),
                 }
                 ar, en = errors.get(result.get("error"), ("❌ تعذر فتح المزاد.", "❌ The auction could not be opened."))
-                self._auction_broadcast(ar, en, room)
+                self._auction_room_reply(room, ar, en)
                 return True
             auction = result["auction"]
             item = auction["item"]
             item_ar = f"{item['icon']} {item['name_ar']}"
             item_en = f"{item['icon']} {item['name_en']}"
             self._auction_broadcast(
-                f"🔨 بدأ التسجيل في المزاد العالمي!\n🎁 السلعة المختارة: {item_ar}\n👥 الحد الأقصى 5 مشاركين؛ اكتب «مزايده» للتسجيل. عند اكتمال 3 يستطيع فاتح الجولة كتابة «ابدا المزاد»، أو يبدأ تلقائياً عند 5.",
-                f"🔨 Registration is open for the world auction!\n🎁 Selected item: {item_en}\n👥 Up to 5 players; type “join auction” to register. The host may start with 3, or it starts automatically at 5.",
+                f"🔨 بدأ التسجيل في المزاد العالمي!\n🎁 السلعة المختارة: {item_ar}\n👥 الحد الأقصى 5 مشاركين؛ اكتب «مزايده» للتسجيل. عند اكتمال 3 يستطيع فاتح الجولة كتابة «ابدا المزاد»، أو يبدأ تلقائياً عند 5. مدة المزايدة بعد البدء 60 ثانية.",
+                f"🔨 Registration is open for the world auction!\n🎁 Selected item: {item_en}\n👥 Up to 5 players; type “join auction” to register. The host may start with 3, or it starts automatically at 5. Bidding lasts 60 seconds once started.",
                 room,
             )
             if not self._auction_send_item_image(item, room):
@@ -14696,23 +14881,26 @@ class TalkinBot:
             return True
 
         if action == "join":
-            result = self._auction_game.join(user_id, username)
+            result = self._auction_game.join(user_id, username, room=room)
             if not result.get("ok"):
                 errors = {
                     "no_auction": ("📭 لا توجد جولة مزاد مفتوحة للتسجيل.", "📭 No auction is open for registration."),
-                    "registration_closed": ("🔒 انتهى التسجيل وبدأت المزايدة.", "🔒 Registration is closed; bidding has started."),
+                    "registration_closed": ("⌛ يوجد مزاد شغال الآن؛ انتظر انتهاء الجولة لفتح التسجيل مجددًا.", "⌛ An auction is running; wait until the round ends for registration to reopen."),
                     "full": ("👥 اكتمل العدد الأقصى للمشاركين.", "👥 The auction has reached its player limit."),
                 }
                 ar, en = errors.get(result.get("error"), ("❌ تعذر تسجيلك في المزاد.", "❌ Could not register you for the auction."))
-                self._auction_broadcast(ar, en, room)
+                self._auction_room_reply(room, ar, en)
                 return True
+            participant_rooms = self._auction_participant_rooms(result.get("auction"))
             if result.get("already_joined"):
-                self._auction_broadcast(f"✅ @{username} مسجل بالفعل في المزاد.", f"✅ @{username} is already registered for the auction.", room)
+                self._auction_broadcast(f"✅ @{username} مسجل بالفعل في المزاد.", f"✅ @{username} is already registered for the auction.", rooms=participant_rooms)
             else:
                 count = result.get("participant_count", 0)
-                self._auction_broadcast(f"✅ سُجل @{username} في المزاد ({count}/5 مشاركين).", f"✅ @{username} joined the auction ({count}/5 players).", room)
+                self._auction_broadcast(f"✅ سُجل @{username} في المزاد ({count}/5 مشاركين).", f"✅ @{username} joined the auction ({count}/5 players).", rooms=participant_rooms)
             if result.get("auto_started"):
-                self._auction_broadcast("🔔 اكتمل العدد؛ أُغلق التسجيل وبدأت المزايدة. كل زايد يرفع السعر 10,000,000 نقطة. اكتب: زايد", "🔔 Player limit reached; registration is closed and bidding has started. Each bid raises the price by 10,000,000 points. Type: bid", room)
+                self._schedule_auction_timeout(result.get("auction"))
+                first_turn = result["auction"].get("turn_username") or ""
+                self._auction_broadcast(f"🔔 اكتمل العدد وبدأت المزايدة بالدور لمدة 60 ثانية. أول دور على @{first_turn}؛ في دورك اكتب «زايد» لرفع 10,000,000 نقطة أو «تمرير».", f"🔔 Player limit reached; 60-second turn-based bidding has started. First turn: @{first_turn}. On your turn, type “bid” to raise by 10,000,000 points or “pass”.", room)
             return True
 
         if action == "start":
@@ -14724,62 +14912,81 @@ class TalkinBot:
                     "not_enough_players": (f"👥 يلزم تسجيل {result.get('participant_count', 0)}/3 مشاركين على الأقل.", f"👥 At least 3 players must register ({result.get('participant_count', 0)}/3)."),
                 }
                 ar, en = errors.get(result.get("error"), ("🔒 التسجيل مغلق أو بدأت المزايدة بالفعل.", "🔒 Registration is closed or bidding has already started."))
-                self._auction_broadcast(ar, en, room)
+                self._auction_room_reply(room, ar, en)
                 return True
-            self._auction_broadcast("🔔 أغلق فاتح الجولة التسجيل؛ بدأت المزايدة الآن. أول زايد 10,000,000 نقطة، وكل مزايدة تالية تزيد 10,000,000. اكتب: زايد", "🔔 The host closed registration; bidding starts now. The first bid is 10,000,000 points and each next bid adds 10,000,000. Type: bid", room)
+            self._schedule_auction_timeout(result.get("auction"))
+            first_turn = result["auction"].get("turn_username") or ""
+            self._auction_broadcast(f"🔔 أغلق فاتح الجولة التسجيل؛ بدأت المزايدة بالدور لمدة 60 ثانية. أول دور على @{first_turn}؛ في دورك اكتب «زايد» لرفع 10,000,000 نقطة أو «تمرير».", f"🔔 The host closed registration; 60-second turn-based bidding starts now. First turn: @{first_turn}. On your turn, type “bid” to raise by 10,000,000 points or “pass”.", room)
             return True
 
         if action == "bid":
             result = self._auction_game.bid(user_id, username, _get_points(username))
             if not result.get("ok"):
+                if result.get("error") == "expired":
+                    self._expire_auction_round(active_auction.get("id"))
+                    return True
                 errors = {
                     "no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."),
                     "not_bidding": ("⌛ المزايدة لم تبدأ أو انتهت.", "⌛ Bidding has not started or has ended."),
                     "not_participant": ("🔒 سجّل أولاً أثناء التسجيل بكتابة «مزايده»؛ المشاركة بالمزايدة للمسجلين فقط.", "🔒 Register first by typing “join auction”; only registered players may bid."),
+                    "not_your_turn": (f"⌛ ليس دورك الآن؛ الدور على @{result.get('turn_username', '')}. لا تُقبل المزايدة إلا من صاحب الدور.", f"⌛ It is not your turn; @{result.get('turn_username', '')} is up. Only the current player can bid."),
                     "insufficient": (f"❌ تحتاج {_fmt_points(result.get('required', 0))} نقطة للمزايدة؛ رصيدك {_fmt_points(result.get('balance', 0))}.", f"❌ You need {_fmt_points(result.get('required', 0))} points to bid; your balance is {_fmt_points(result.get('balance', 0))}."),
                 }
                 ar, en = errors.get(result.get("error"), ("❌ تعذرت المزايدة.", "❌ The bid could not be placed."))
-                self._auction_broadcast(ar, en, room)
+                self._auction_room_reply(room, ar, en)
                 return True
             amount = _fmt_points(result["amount"])
-            self._auction_broadcast(f"🔨 زايد @{username} إلى {amount} نقطة؛ السعر التالي يزيد 10,000,000. اكتب «زايد» للمزايدة.", f"🔨 @{username} bid {amount} points. The next bid adds 10,000,000; type “bid” to raise.", room)
+            next_turn = result.get("next_turn_username") or ""
+            self._auction_broadcast(f"🔨 زايد @{username} إلى {amount} نقطة. 👉 الدور التالي على @{next_turn}؛ يكتب «زايد» لرفع 10,000,000 أو «تمرير».", f"🔨 @{username} bid {amount} points. 👉 Next turn: @{next_turn}; type “bid” to raise by 10,000,000 or “pass”.", rooms=self._auction_participant_rooms())
+            return True
+
+        if action == "pass":
+            participant_rooms = self._auction_participant_rooms()
+            result = self._auction_game.pass_turn(user_id, username, apply_delta=_apply_points_delta_once)
+            if result.get("error") == "expired":
+                self._expire_auction_round(active_auction.get("id"))
+                return True
+            if result.get("status") == "passed":
+                next_turn = result.get("next_turn_username") or ""
+                self._auction_broadcast(f"⏭️ مرّر @{username} دوره. 👉 الدور التالي على @{next_turn}؛ اكتب «زايد» أو «تمرير».", f"⏭️ @{username} passed. 👉 Next turn: @{next_turn}; type “bid” or “pass”.", rooms=participant_rooms)
+            elif result.get("auto_closed") or result.get("pending") or result.get("status") in {"sold", "no_bids", "no_sale"}:
+                self._cancel_auction_timeout(active_auction.get("id"))
+            if result.get("status") != "passed" and not self._auction_broadcast_close_result(result, room, rooms=participant_rooms):
+                errors = {
+                    "no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."),
+                    "not_bidding": ("⌛ لم يبدأ دور المزايدة بعد.", "⌛ Turn-based bidding has not started."),
+                    "not_participant": ("🔒 التمرير للمشاركين المسجلين فقط.", "🔒 Only registered participants can pass."),
+                    "not_your_turn": (f"⌛ ليس دورك؛ الدور على @{result.get('turn_username', '')}.", f"⌛ It is not your turn; @{result.get('turn_username', '')} is up."),
+                }
+                ar, en = errors.get(result.get("error"), ("❌ تعذر تمرير الدور.", "❌ Could not pass the turn."))
+                self._auction_room_reply(room, ar, en)
             return True
 
         if action == "close":
+            participant_rooms = self._auction_participant_rooms()
             result = self._auction_game.close(user_id, username, is_master=is_master, apply_delta=_apply_points_delta_once)
-            if result.get("status") == "no_bids":
-                self._auction_broadcast("🔔 أُغلق المزاد دون عروض؛ لم تُخصم نقاط ولم تُمنح السلعة.", "🔔 The auction closed without bids; no points were charged and the item was not awarded.", room)
-            elif result.get("status") == "no_sale":
-                self._auction_broadcast("⚠️ لم يكتمل البيع لأن رصيد أعلى مزايد لم يعد كافياً؛ لم تُخصم نقاط ولم تُمنح السلعة.", "⚠️ The sale could not complete because the highest bidder no longer had enough points; no points were charged and the item was not awarded.", room)
-            elif result.get("status") == "sold":
-                sale = result["result"]
-                item = sale["item"]
-                short_id = str(sale["auction_id"])[:8]
-                self._auction_broadcast(
-                    f"🏆 انتهى المزاد! فاز @{sale['winner']} بـ{item.get('icon', '💎')} {item.get('name_ar', 'الجائزة')} بسعر {_fmt_points(sale['bid'])} نقطة.\n✅ أضيفت لمخزون الألماس؛ الاستبدال بعد الجولة: {_fmt_points(sale['redemption_value'])} نقطة (ربح 30%).\nللمخزون: sv — للاستبدال: red auction {short_id}",
-                    f"🏆 Auction complete! @{sale['winner']} won {item.get('icon', '💎')} {item.get('name_en', 'the prize')} for {_fmt_points(sale['bid'])} points.\n✅ Added to diamond inventory; redemption after the round: {_fmt_points(sale['redemption_value'])} points (30% profit).\nInventory: sv — redeem: red auction {short_id}",
-                    room,
-                )
-            elif result.get("pending"):
-                self._auction_broadcast("⌛ التسوية معلقة مؤقتاً؛ لم يُعلن الفائز بعد. أعد «اقفل المزاد» لاحقاً أو أعد تشغيل البوت للمحاولة بأمان دون خصم مكرر.", "⌛ Settlement is pending; no winner is announced yet. Retry “close auction” later or restart the bot; the transaction ID prevents a duplicate charge.", room)
-            elif not result.get("ok"):
+            if result.get("ok") or result.get("pending") or result.get("status"):
+                self._cancel_auction_timeout(active_auction.get("id") if active_auction else None)
+            if not self._auction_broadcast_close_result(result, room, rooms=participant_rooms) and not result.get("ok"):
                 errors = {
                     "no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."),
                     "not_opener": ("🔒 إغلاق المزاد متاح لفاتح الجولة أو الماستر فقط.", "🔒 Only the host or master may close the auction."),
                     "not_bidding": ("⌛ المزايدة لم تبدأ بعد.", "⌛ Bidding has not started yet."),
                 }
                 ar, en = errors.get(result.get("error"), ("❌ تعذر إغلاق المزاد.", "❌ The auction could not be closed."))
-                self._auction_broadcast(ar, en, room)
+                self._auction_room_reply(room, ar, en)
             return True
 
         if action == "cancel":
+            participant_rooms = self._auction_participant_rooms()
             result = self._auction_game.cancel(user_id, username, is_master=is_master)
             if result.get("ok"):
-                self._auction_broadcast("⛔ أُلغيت جولة المزاد دون خصم نقاط.", "⛔ The auction round was cancelled without charging points.", room)
+                self._cancel_auction_timeout(active_auction.get("id") if active_auction else None)
+                self._auction_broadcast("⛔ أُلغيت جولة المزاد دون خصم نقاط.", "⛔ The auction round was cancelled without charging points.", rooms=participant_rooms)
             else:
                 errors = {"no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."), "not_opener": ("🔒 إلغاء المزاد متاح لفاتح الجولة أو الماستر فقط.", "🔒 Only the host or master may cancel the auction."), "settlement_in_progress": ("⌛ تجري تسوية المزاد ولا يمكن إلغاؤه الآن.", "⌛ Auction settlement is in progress and cannot be cancelled.")}
                 ar, en = errors.get(result.get("error"), ("❌ تعذر إلغاء المزاد.", "❌ The auction could not be cancelled."))
-                self._auction_broadcast(ar, en, room)
+                self._auction_room_reply(room, ar, en)
             return True
         return False
 

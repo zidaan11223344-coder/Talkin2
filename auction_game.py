@@ -19,6 +19,7 @@ from typing import Callable
 BID_INCREMENT = 10_000_000
 MAX_PARTICIPANTS = 5
 MIN_PARTICIPANTS_TO_START_EARLY = 3
+BIDDING_DURATION_SECONDS = 60
 REDEMPTION_BONUS_PERCENT = 30
 MAX_IMAGE_BYTES = 50_000
 
@@ -26,12 +27,12 @@ MAX_IMAGE_BYTES = 50_000
 # Each image represents a rare auction collectible; auction goods are separate
 # from the ordinary mining-store catalog and carry their own cost basis.
 AUCTION_ITEMS = (
-    {"key": "royal", "name_ar": "الألماسة الملكية النادرة", "name_en": "Rare Royal Diamond", "icon": "👑", "image": "diamond_royal.jpg"},
-    {"key": "black", "name_ar": "الألماسة السوداء النادرة", "name_en": "Rare Black Diamond", "icon": "◆", "image": "diamond_black.jpg"},
-    {"key": "purple", "name_ar": "الألماسة البنفسجية النادرة", "name_en": "Rare Purple Diamond", "icon": "💠", "image": "diamond_purple.jpg"},
-    {"key": "red", "name_ar": "الألماسة الحمراء النادرة", "name_en": "Rare Red Diamond", "icon": "♦️", "image": "diamond_red.jpg"},
-    {"key": "blue", "name_ar": "الألماسة الزرقاء النادرة", "name_en": "Rare Blue Diamond", "icon": "🔷", "image": "diamond_blue.jpg"},
-    {"key": "clear", "name_ar": "الألماسة الصافية النادرة", "name_en": "Rare Clear Diamond", "icon": "💎", "image": "diamond_clear.jpg"},
+    {"key": "jade_seal", "name_ar": "ختم اليشم الإمبراطوري", "name_en": "Imperial Jade Seal", "icon": "🐉", "image": "auction_imperial_jade.jpg"},
+    {"key": "king_crown", "name_ar": "تاج الملك المرصع", "name_en": "Jeweled King's Crown", "icon": "👑", "image": "auction_king_crown.jpg"},
+    {"key": "royal_scepter", "name_ar": "الصولجان الملكي الزمردي", "name_en": "Emerald Royal Scepter", "icon": "🪄", "image": "auction_royal_scepter.jpg"},
+    {"key": "phoenix_amulet", "name_ar": "تميمة العنقاء الذهبية", "name_en": "Golden Phoenix Amulet", "icon": "🔥", "image": "auction_phoenix_amulet.jpg"},
+    {"key": "royal_chalice", "name_ar": "الكأس الملكي العتيق", "name_en": "Ancient Royal Chalice", "icon": "🏆", "image": "auction_royal_chalice.jpg"},
+    {"key": "amber_orb", "name_ar": "كرة العنبر الإمبراطورية", "name_en": "Imperial Sunfire Amber Orb", "icon": "🟠", "image": "auction_sunfire_amber_orb.jpg"},
 )
 _ITEM_BY_KEY = {item["key"]: item for item in AUCTION_ITEMS}
 
@@ -50,6 +51,7 @@ _ROOM_COMMANDS = {
     "join": {"مزايده", "مزايده للمزاد", "انضم للمزاد", "join auction"},
     "start": {"ابدا المزاد", "ابدأ المزاد", "start auction"},
     "bid": {"زايد", "زايد للمزاد", "bid", "raise bid"},
+    "pass": {"تمرير", "مرر", "تمرير الدور", "pass", "skip"},
     "close": {"اقفل المزاد", "اغلق المزاد", "انهاء المزاد", "close auction"},
     "cancel": {"الغاء المزاد", "الغ المزاد", "cancel auction"},
 }
@@ -141,6 +143,67 @@ class AuctionGame:
         normalized = normalize_command(username).replace(" ", "")
         return "name:" + normalized if normalized else ""
 
+    @staticmethod
+    def _set_turn(active: dict, index: int) -> dict | None:
+        participants = active.get("participants") or []
+        if not participants:
+            active["turn_index"] = 0
+            active["turn_user_id"] = ""
+            active["turn_username"] = ""
+            return None
+        index = int(index) % len(participants)
+        player = participants[index]
+        active["turn_index"] = index
+        active["turn_user_id"] = str(player.get("user_id") or "")
+        active["turn_username"] = str(player.get("username") or "")
+        return player
+
+    @classmethod
+    def _begin_bidding(cls, active: dict, now: float) -> dict | None:
+        active["phase"] = "bidding"
+        started_at = float(now)
+        active["started_at"] = started_at
+        active["deadline_at"] = started_at + BIDDING_DURATION_SECONDS
+        active["passed_since_bid"] = []
+        return cls._set_turn(active, 0)
+
+    @classmethod
+    def _ensure_turn_state(cls, active: dict) -> bool:
+        participants = active.get("participants") or []
+        participant_ids = [str(player.get("user_id") or "") for player in participants if isinstance(player, dict)]
+        passed = active.get("passed_since_bid")
+        changed = False
+        if not isinstance(passed, list):
+            active["passed_since_bid"] = []
+            changed = True
+        else:
+            normalized_passes = [str(user_id) for user_id in passed if str(user_id) in participant_ids]
+            if normalized_passes != passed:
+                active["passed_since_bid"] = normalized_passes
+                changed = True
+        current_id = str(active.get("turn_user_id") or "")
+        try:
+            current_index = int(active.get("turn_index", -1))
+        except (TypeError, ValueError):
+            current_index = -1
+        if current_index < 0 or current_index >= len(participants) or not participant_ids or participant_ids[current_index] != current_id:
+            cls._set_turn(active, 0)
+            changed = True
+        return changed
+
+    @classmethod
+    def _advance_turn(cls, active: dict, current_index: int, *, skip_passed: bool) -> dict | None:
+        participants = active.get("participants") or []
+        if not participants:
+            return cls._set_turn(active, 0)
+        passed = set(str(user_id) for user_id in active.get("passed_since_bid", [])) if skip_passed else set()
+        for offset in range(1, len(participants) + 1):
+            index = (int(current_index) + offset) % len(participants)
+            user_id = str(participants[index].get("user_id") or "")
+            if user_id not in passed:
+                return cls._set_turn(active, index)
+        return None
+
     def enabled(self) -> bool:
         with self.lock:
             return bool(self._read().get("enabled"))
@@ -200,7 +263,7 @@ class AuctionGame:
             self._write(state)
             return {"ok": True, "auction": copy.deepcopy(active)}
 
-    def join(self, user_id: str, username: str) -> dict:
+    def join(self, user_id: str, username: str, room: str = "") -> dict:
         uid = self._user_key(user_id, username)
         name = str(username or "").strip().lstrip("@")
         if not uid or not name:
@@ -217,11 +280,13 @@ class AuctionGame:
                 return {"ok": True, "already_joined": True, "auction": copy.deepcopy(active)}
             if len(participants) >= MAX_PARTICIPANTS:
                 return {"ok": False, "error": "full", "auction": copy.deepcopy(active)}
-            participants.append({"user_id": uid, "username": name, "joined_at": int(self.clock())})
+            participants.append({
+                "user_id": uid, "username": name, "joined_at": int(self.clock()),
+                "room": str(room or active.get("room") or "").strip(),
+            })
             auto_started = len(participants) >= MAX_PARTICIPANTS
             if auto_started:
-                active["phase"] = "bidding"
-                active["started_at"] = int(self.clock())
+                self._begin_bidding(active, float(self.clock()))
             state["active"] = active
             self._write(state)
             return {
@@ -245,8 +310,7 @@ class AuctionGame:
             count = len(active.get("participants") or [])
             if count < MIN_PARTICIPANTS_TO_START_EARLY:
                 return {"ok": False, "error": "not_enough_players", "participant_count": count}
-            active["phase"] = "bidding"
-            active["started_at"] = int(self.clock())
+            self._begin_bidding(active, float(self.clock()))
             state["active"] = active
             self._write(state)
             return {"ok": True, "auction": copy.deepcopy(active)}
@@ -263,8 +327,15 @@ class AuctionGame:
                 return {"ok": False, "error": "no_auction"}
             if active.get("phase") != "bidding":
                 return {"ok": False, "error": "not_bidding"}
-            if not any(str(player.get("user_id") or "") == uid for player in (active.get("participants") or []) if isinstance(player, dict)):
+            deadline_at = float(active.get("deadline_at") or (float(active.get("started_at", 0) or 0) + BIDDING_DURATION_SECONDS))
+            if float(self.clock()) >= deadline_at:
+                return {"ok": False, "error": "expired", "deadline_at": deadline_at}
+            participants = active.get("participants") or []
+            if not any(str(player.get("user_id") or "") == uid for player in participants if isinstance(player, dict)):
                 return {"ok": False, "error": "not_participant"}
+            self._ensure_turn_state(active)
+            if uid != str(active.get("turn_user_id") or ""):
+                return {"ok": False, "error": "not_your_turn", "turn_username": active.get("turn_username", ""), "auction": copy.deepcopy(active)}
             bid_amount = max(BID_INCREMENT, int(active.get("current_bid", 0) or 0) + BID_INCREMENT)
             try:
                 balance = int(balance)
@@ -279,9 +350,55 @@ class AuctionGame:
             history = active.setdefault("bid_history", [])
             history.append({"user_id": uid, "username": name, "amount": bid_amount, "at": int(self.clock())})
             del history[:-200]
+            active["passed_since_bid"] = []
+            self._advance_turn(active, int(active.get("turn_index", 0) or 0), skip_passed=False)
             state["active"] = active
             self._write(state)
-            return {"ok": True, "amount": bid_amount, "bid_count": active["bid_count"], "auction": copy.deepcopy(active)}
+            return {
+                "ok": True, "amount": bid_amount, "bid_count": active["bid_count"],
+                "next_turn_username": active.get("turn_username", ""),
+                "auction": copy.deepcopy(active),
+            }
+
+    def pass_turn(self, user_id: str, username: str, *, apply_delta: Callable | None = None) -> dict:
+        uid = self._user_key(user_id, username)
+        with self.lock:
+            state = self._read()
+            active = state.get("active")
+            if not isinstance(active, dict):
+                return {"ok": False, "error": "no_auction"}
+            if active.get("phase") != "bidding":
+                return {"ok": False, "error": "not_bidding"}
+            deadline_at = float(active.get("deadline_at") or (float(active.get("started_at", 0) or 0) + BIDDING_DURATION_SECONDS))
+            if float(self.clock()) >= deadline_at:
+                return {"ok": False, "error": "expired", "deadline_at": deadline_at}
+            participants = active.get("participants") or []
+            if not any(str(player.get("user_id") or "") == uid for player in participants if isinstance(player, dict)):
+                return {"ok": False, "error": "not_participant"}
+            self._ensure_turn_state(active)
+            if uid != str(active.get("turn_user_id") or ""):
+                return {"ok": False, "error": "not_your_turn", "turn_username": active.get("turn_username", ""), "auction": copy.deepcopy(active)}
+            current_index = int(active.get("turn_index", 0) or 0)
+            passed = set(str(user_id) for user_id in active.get("passed_since_bid", []))
+            passed.add(uid)
+            active["passed_since_bid"] = sorted(passed)
+            if len(passed) >= len(participants):
+                opener_id = str(active.get("opener_id") or "")
+                opener_name = str(active.get("opener_name") or "")
+                state["active"] = active
+                self._write(state)
+            else:
+                self._advance_turn(active, current_index, skip_passed=True)
+                state["active"] = active
+                self._write(state)
+                return {
+                    "ok": True, "status": "passed", "passed_username": str(username or "").strip().lstrip("@"),
+                    "next_turn_username": active.get("turn_username", ""),
+                    "passed_count": len(passed), "auction": copy.deepcopy(active),
+                }
+        result = self.close(opener_id, opener_name, apply_delta=apply_delta)
+        result["auto_closed"] = True
+        return result
 
     def close(self, user_id: str, username: str, *, is_master: bool = False, apply_delta: Callable | None = None) -> dict:
         uid = self._user_key(user_id, username)
