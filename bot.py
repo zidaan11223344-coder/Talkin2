@@ -5984,7 +5984,7 @@ def _rare_diamond_asset_path():
     return None
 
 
-def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_path=None):
+def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_path=None, title=None):
     """Overlay the winner name on the rare-diamond artwork, like money-game cards.
 
     The base rare-diamond image is expected to be supplied in the assets tree;
@@ -6024,7 +6024,7 @@ def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_pat
     center_x = (text_left + text_right) / 2
     _draw_centered(
         draw, (center_x, panel_box[1] + (panel_box[3] - panel_box[1]) * .32),
-        "💎 الفائز بالألماسة النادرة", max(27, int(h * .038)),
+        str(title or "💎 الفائز بالألماسة النادرة"), max(27, int(h * .038)),
         (115, 225, 255, 255), max(80, text_right - text_left),
     )
     _draw_name_centered(

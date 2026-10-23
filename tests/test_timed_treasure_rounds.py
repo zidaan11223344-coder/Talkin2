@@ -302,7 +302,7 @@ def test_all_nine_timed_games_complete_and_emit_one_result_when_rosters_fill():
             assert bot_module._norm_user("Player0") not in bot._doctor_ban_once
 
 
-def test_result_card_for_every_timed_game_uses_public_image_delivery():
+def test_result_card_for_every_timed_game_uses_its_own_art_and_is_delivered(tmp_path):
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
     bot.user_photos = {}
     bot._lookup_profile_photo = lambda _username: ""
@@ -311,16 +311,32 @@ def test_result_card_for_every_timed_game_uses_public_image_delivery():
     sent = []
     bot.send_room_media = lambda room, url, kind: sent.append((room, url, kind)) or True
     bot._verify_public_media_url = lambda _url, _kind: True
+    rendered = []
+    real_render = bot_module.render_rare_diamond_winner_card
 
-    class Card:
-        name = "winner-card.jpg"
+    def track_render(winner_name, winner_photo_url="", source_path=None, title=None):
+        rendered.append((source_path.name, title))
+        return real_render(winner_name, winner_photo_url, source_path=source_path, title=title)
 
     with patch.object(bot_module, "_public_base_url", return_value="https://bot.example"), \
-         patch.object(bot_module, "render_rare_diamond_winner_card", return_value=Card()):
+         patch.object(bot_module, "BASE_DIR", tmp_path), \
+         patch.object(bot_module, "render_rare_diamond_winner_card", side_effect=track_render):
         for game_key in bot_module.TIMED_TREASURE_GAMES:
             assert bot._send_treasure_game_result_card("Hall", game_key, "Winner") is True
 
-    assert sent == [
-        ("Hall", "https://bot.example/games/winner-card.jpg", "image")
-        for _ in bot_module.TIMED_TREASURE_GAMES
-    ]
+    expected = []
+    treasure_assets = bot_module.ASSETS_DIR / "treasures"
+    for config in bot_module.TIMED_TREASURE_GAMES.values():
+        source = treasure_assets / config["image"]
+        if not source.is_file():
+            source = next(
+                treasure_assets / f"{source.stem}.{extension}"
+                for extension in ("png", "jpg", "jpeg")
+                if (treasure_assets / f"{source.stem}.{extension}").is_file()
+            )
+        expected.append((source.name, config["winner_ar"]))
+    assert rendered == expected
+    assert len(sent) == len(bot_module.TIMED_TREASURE_GAMES)
+    assert all(room == "Hall" and kind == "image" for room, _url, kind in sent)
+    assert all(url.startswith("https://bot.example/games/") for _room, url, _kind in sent)
+    assert all((tmp_path / "generated_games" / url.rsplit("/", 1)[-1]).is_file() for _room, url, _kind in sent)
