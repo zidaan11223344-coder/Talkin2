@@ -44,7 +44,6 @@ def test_all_manual_assets_accept_30b_and_keep_their_amount():
 
         with patch.object(bot_module, "_is_verified_user", return_value=True), \
              patch.object(bot_module, "_games_enabled_for_room", return_value=True), \
-             patch.object(bot_module, "_get_points", return_value=40_000_000_000), \
              patch.object(bot_module, "_apply_points_delta_once", side_effect=apply_once), \
              patch.object(bot_module.time, "time", return_value=1000.0):
             assert bot.handle_game_command("Hall", command, "Player") is True, command

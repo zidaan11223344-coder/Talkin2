@@ -53,7 +53,6 @@ def test_welcome_symbol_count_matches_level():
         expected_symbol = bot_module.GAME_LEVEL_CATEGORIES[category_index][1]
         assert level == count
         assert symbol == expected_symbol
-        assert welcome is not None
         assert welcome.endswith(expected_symbol * count)
         assert f"🏅 مستوى الألعاب: {count}" in welcome
 
