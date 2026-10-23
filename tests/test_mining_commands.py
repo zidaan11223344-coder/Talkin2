@@ -26,6 +26,7 @@ def test_mining_commands_use_stable_id_and_redeem_inventory_idempotently(tmp_pat
     bot.send_room_text = lambda room, text: sent.append((room, text))
     bot.send_room_media = lambda room, url, media_type: media.append((room, url, media_type))
     bot._game_public_image = lambda path, route="games": f"https://assets.example/{route}/{path.name}"
+    bot._effective_room_language = lambda _room: "ar"
     bot.log = lambda *args, **kwargs: None
 
     monkeypatch.setattr(bot_module, "MINING_STORE", store)
@@ -79,6 +80,47 @@ def test_mining_commands_use_stable_id_and_redeem_inventory_idempotently(tmp_pat
     catalog = sent[-1][1]
     packet = bot_module.encode_query("room_message", room="Hall", body=catalog)
     assert len(packet) <= 1008
+
+
+def test_sv_splits_large_inventory_into_safe_room_messages(monkeypatch):
+    class Store:
+        def pending_redemption(self, _user_id):
+            return None
+
+        def inventory(self, _user_id, _username):
+            return {"inventory": {}, "diamonds_found": 0}
+
+    class AuctionInventory:
+        def inventory(self, _user_id, _username):
+            return [
+                {
+                    "id": f"collectible-{index:03}",
+                    "item_name_ar": f"قطعة نادرة رقم {index:03} " + ("ياقوت ملكي " * 7),
+                    "redemption_value": 30_000_000 + index,
+                    "status": "available",
+                    "icon": "🏺",
+                }
+                for index in range(32)
+            ]
+
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    sent = []
+    bot.send_room_text = lambda room, text: sent.append((room, text)) or True
+    bot._effective_room_language = lambda _room: "ar"
+    bot._auction_game = AuctionInventory()
+    bot.log = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(bot_module, "MINING_STORE", Store())
+
+    assert bot._execute_mining_command_with_id("Hall", "sv", "Ahmed", "12345")
+    assert len(sent) > 1
+    assert all(room == "Hall" for room, _text in sent)
+    assert all(
+        len(bot_module.encode_query("room_message", type_="text", room=room, body=text))
+        <= min(bot_module._ws_payload_limit(), bot_module.SAFE_COMMAND_REPLY_BYTES)
+        for room, text in sent
+    )
+    assert "🏺 مقتنيات المزاد العالمي" in sent[0][1]
+    assert "قطعة نادرة رقم 031" in "\n".join(text for _room, text in sent)
 
 
 def test_mining_aliases_and_cricket_messages_follow_saved_room_language():

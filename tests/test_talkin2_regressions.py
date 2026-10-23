@@ -2492,11 +2492,17 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         )
 
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
-            self.assertFalse(bot._send_text_packets("room_message", text, room="North"))
+            self.assertFalse(bot._send_text_packets(
+                "room_message", text, room="North", oversize_notice_user="Ahmed",
+            ))
 
         self.assertEqual(len(packets), 1)
         notice_fields = bot_module.decode_message(packets[0])
-        self.assertIn("تم تجاهل رسالتك بسبب حجم كبير", bot_module.as_text(notice_fields[5][0]))
+        self.assertEqual(
+            bot_module.as_text(notice_fields[5][0]),
+            "👤 @Ahmed منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل.",
+        )
+        self.assertEqual(bot_module.as_text(notice_fields[6][0]), "North")
         self.assertEqual(telegram, [])
 
     def test_send_query_hard_caps_payload_at_1008_and_drops_text_locally(self):
@@ -2533,7 +2539,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(bot_module.as_text(notice_fields[4][0]), username)
         self.assertEqual(
             bot_module.as_text(notice_fields[5][0]),
-            f"👤 @{username} تم تجاهل رسالتك بسبب حجم كبير.",
+            f"👤 @{username} منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل.",
         )
 
     def test_oversized_notice_uses_the_command_executor_name(self):
@@ -2550,7 +2556,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         notice_fields = bot_module.decode_message(sent[0])
         self.assertEqual(
             bot_module.as_text(notice_fields[5][0]),
-            f"👤 @{decorated_master} تم تجاهل رسالتك بسبب حجم كبير.",
+            f"👤 @{decorated_master} منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل.",
         )
 
     def test_lower_configured_limit_drops_without_1008_notice(self):
@@ -2583,7 +2589,7 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertEqual(len(sent[0]), 1008)
         self.assertNotIn(exactly_1009, bot_module.as_text(bot_module.decode_message(sent[1])[5][0]))
-        self.assertIn("تم تجاهل رسالتك بسبب حجم كبير", bot_module.as_text(bot_module.decode_message(sent[1])[5][0]))
+        self.assertIn("منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل", bot_module.as_text(bot_module.decode_message(sent[1])[5][0]))
 
     def test_games_command_opens_the_a3_catalog_and_sets_ns_navigation(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

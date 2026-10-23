@@ -7819,9 +7819,9 @@ class TalkinBot:
         room = str(room or "").strip()
         username = str(username or target or "").strip().lstrip("@")
         notice = (
-            f"👤 @{username} تم تجاهل رسالتك بسبب حجم كبير."
+            f"👤 @{username} منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل."
             if username
-            else "👤 اسم المستخدم تم تجاهل رسالتك بسبب حجم كبير."
+            else "👤 منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل."
         )
         if packet_type == "chat_message" and target:
             payload = encode_query("chat_message", type_="text", to=target, body=notice)
@@ -9354,6 +9354,44 @@ class TalkinBot:
             if line is not None:
                 self.send_room_text(room, str(line))
         return True
+
+    def send_room_text_chunks(self, room: str, text: str):
+        """Send a long room response as complete, size-safe text messages."""
+        room = str(room or "").strip()
+        text = self._localize_room_text(room, str(text or ""))
+        if not text:
+            return True
+        limit = min(_ws_payload_limit(), SAFE_COMMAND_REPLY_BYTES)
+
+        def fits(value):
+            return len(encode_query("room_message", type_="text", room=room, body=value)) <= limit
+
+        chunks = []
+        current = ""
+        for line in text.splitlines() or [text]:
+            pieces = [line]
+            if not fits(line):
+                pieces = []
+                piece = ""
+                for char in line:
+                    if piece and not fits(piece + char):
+                        pieces.append(piece)
+                        piece = char
+                    else:
+                        piece += char
+                if piece:
+                    pieces.append(piece)
+            for piece in pieces:
+                candidate = f"{current}\n{piece}" if current else piece
+                if current and not fits(candidate):
+                    chunks.append(current)
+                    current = piece
+                else:
+                    current = candidate
+        if current:
+            chunks.append(current)
+
+        return all(self.send_room_text(room, chunk) for chunk in chunks)
 
     def _remember_bot_action(self, room, body, sender, is_private=False):
         """Remember the last command the bot actually dispatched.
@@ -18251,7 +18289,7 @@ class TalkinBot:
             lines.append(f"💎 Total diamonds found: {found}" if language_en else f"💎 إجمالي الألماس الذي عثرت عليه: {found}")
             lines.append("🔁 Redeem: red <item name or icon> <quantity> — e.g. red ⚙️ 3 or red ♦️ 3" if language_en else "🔁 للاستبدال: red رمز أو اسم أي كنز العدد — مثال: red ⚙️ 3 أو red ♦️ 3")
             lines.append("🔴 Rare RED diamond: red <quantity>" if language_en else "🔴 للألماسة النادرة RED: red العدد")
-            self.send_room_text(room, "\n".join(lines))
+            self.send_room_text_chunks(room, "\n".join(lines))
             return True
 
         if is_top:
