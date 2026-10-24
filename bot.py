@@ -2954,10 +2954,21 @@ def _game_control_data():
         rooms = []
     data["disabled_rooms"] = [str(r).strip() for r in rooms if str(r).strip()]
     data["global_enabled"] = bool(data.get("global_enabled", True))
+    result_rooms = data.get("results_disabled_rooms", [])
+    if not isinstance(result_rooms, list):
+        result_rooms = []
+    data["results_disabled_rooms"] = [str(r).strip() for r in result_rooms if str(r).strip()]
     return data
 
 def _save_game_control(data):
     _save_local_json(GAME_CONTROL_FILE, data)
+
+def _game_results_disabled_for_room(room):
+    key = _norm_room(room)
+    if not key:
+        return False
+    disabled = {_norm_room(value) for value in _game_control_data().get("results_disabled_rooms", [])}
+    return key in disabled
 
 def _games_enabled_for_room(room):
     data = _game_control_data()
@@ -6428,8 +6439,178 @@ def _download_lookalike_image(image_url, target_name):
         return None
 
 # ------------------------- Runtime resource/cleanup -----------------
-def _runtime_resource_status():
-    """Return lightweight host metrics without psutil or blocking probes."""
+def _decode_mountinfo_path(value):
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), str(value or ""))
+
+
+def _cgroup_memberships():
+    memberships = {}
+    try:
+        for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines():
+            _hierarchy, controllers, group_path = line.split(":", 2)
+            if controllers:
+                for controller in controllers.split(","):
+                    memberships[controller] = group_path
+            else:
+                memberships["unified"] = group_path
+    except Exception:
+        pass
+    return memberships
+
+
+def _cgroup_candidate_dirs(controller):
+    """Return this process's cgroup and ancestors, deepest first."""
+    memberships = _cgroup_memberships()
+    group_path = memberships.get(controller)
+    if group_path is None:
+        return []
+    candidates = []
+    seen = set()
+
+    def add_ancestors(mountpoint, relative_path):
+        parts = tuple(part for part in str(relative_path or "").split("/") if part and part != ".")
+        for depth in range(len(parts), -1, -1):
+            path = Path(mountpoint).joinpath(*parts[:depth])
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(path)
+
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines()
+    except Exception:
+        mountinfo = []
+    for line in mountinfo:
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            continue
+        before, after = left.split(), right.split()
+        if len(before) < 6 or len(after) < 3:
+            continue
+        fs_type = after[0]
+        if controller == "unified":
+            if fs_type != "cgroup2":
+                continue
+        else:
+            if fs_type != "cgroup":
+                continue
+            mounted_controllers = set(after[2].split(",")) | set(before[5].split(","))
+            if controller not in mounted_controllers:
+                continue
+        mount_root = os.path.normpath(_decode_mountinfo_path(before[3]))
+        mountpoint = _decode_mountinfo_path(before[4])
+        process_path = os.path.normpath(str(group_path))
+        if mount_root == "/":
+            relative_path = process_path.lstrip("/")
+        elif process_path == mount_root:
+            relative_path = ""
+        elif process_path.startswith(mount_root.rstrip("/") + "/"):
+            relative_path = process_path[len(mount_root):].lstrip("/")
+        else:
+            continue
+        add_ancestors(mountpoint, relative_path)
+
+    # Common cgroup mounts, used when mountinfo is restricted by a container.
+    root = Path("/sys/fs/cgroup")
+    relative = str(group_path).lstrip("/")
+    if controller == "unified":
+        add_ancestors(root, relative)
+    else:
+        add_ancestors(root / controller, relative)
+    return candidates
+
+
+def _read_cgroup_integer(path):
+    try:
+        raw = Path(path).read_text(encoding="ascii").strip()
+        if not raw or raw.casefold() in {"max", "-1"}:
+            return None
+        value = int(raw.split()[0])
+        return value if value >= 0 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _read_cgroup_memory_limit_usage():
+    for controller, limit_name, usage_name in (
+        ("unified", "memory.max", "memory.current"),
+        ("memory", "memory.limit_in_bytes", "memory.usage_in_bytes"),
+    ):
+        candidates = []
+        for depth, directory in enumerate(_cgroup_candidate_dirs(controller)):
+            limit = _read_cgroup_integer(directory / limit_name)
+            usage = _read_cgroup_integer(directory / usage_name)
+            # v1 uses a very large integer to represent an unlimited limit.
+            if limit is None or usage is None or limit <= 0 or limit >= (1 << 60):
+                continue
+            candidates.append((limit, depth, usage))
+        if candidates:
+            limit, _depth, usage = min(candidates, key=lambda row: (row[0], row[1]))
+            return limit, usage
+    return None, None
+
+
+def _parse_cgroup_cpu_set(value):
+    cpus = set()
+    try:
+        for entry in str(value or "").strip().split(","):
+            if not entry:
+                continue
+            if "-" in entry:
+                first, last = (int(part) for part in entry.split("-", 1))
+                if first < 0 or last < first or last - first > 65535:
+                    return None
+                cpus.update(range(first, last + 1))
+            else:
+                cpu = int(entry)
+                if cpu < 0:
+                    return None
+                cpus.add(cpu)
+    except (TypeError, ValueError):
+        return None
+    return len(cpus) or None
+
+
+def _read_cgroup_cpu_limits():
+    quota_cores = None
+    quota_candidates = []
+    for controller in ("unified", "cpu"):
+        for depth, directory in enumerate(_cgroup_candidate_dirs(controller)):
+            if controller == "unified":
+                try:
+                    quota_text = (directory / "cpu.max").read_text(encoding="ascii").split()
+                    if len(quota_text) != 2 or quota_text[0] == "max":
+                        continue
+                    quota, period = int(quota_text[0]), int(quota_text[1])
+                except (OSError, ValueError, IndexError):
+                    continue
+            else:
+                quota = _read_cgroup_integer(directory / "cpu.cfs_quota_us")
+                period = _read_cgroup_integer(directory / "cpu.cfs_period_us")
+                if quota is None or quota <= 0 or period is None or period <= 0:
+                    continue
+            if quota > 0 and period > 0:
+                quota_candidates.append((quota / period, depth))
+        if quota_candidates:
+            quota_cores = min(quota_candidates, key=lambda row: (row[0], row[1]))[0]
+            break
+
+    cpuset_count = None
+    for controller, filename in (("unified", "cpuset.cpus.effective"), ("cpuset", "cpuset.cpus")):
+        for directory in _cgroup_candidate_dirs(controller):
+            try:
+                raw = (directory / filename).read_text(encoding="ascii").strip()
+            except OSError:
+                continue
+            cpuset_count = _parse_cgroup_cpu_set(raw)
+            if cpuset_count:
+                break
+        if cpuset_count:
+            break
+    return quota_cores, cpuset_count
+
+
+def _read_host_memory_kb():
     total_kb = available_kb = 0
     try:
         for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
@@ -6440,23 +6621,48 @@ def _runtime_resource_status():
                 available_kb = int(value.strip().split()[0])
     except Exception:
         pass
+    return total_kb, available_kb
+
+
+def _runtime_resource_status():
+    """Return container limits when cgroups expose them; otherwise host metrics."""
+    memory_limit_bytes, memory_used_bytes = _read_cgroup_memory_limit_usage()
+    if memory_limit_bytes and memory_used_bytes is not None:
+        total_kb = memory_limit_bytes / 1024.0
+        used_kb = memory_used_bytes / 1024.0
+        available_kb = max(0.0, total_kb - used_kb)
+        ram_scope = "container"
+    else:
+        total_kb, available_kb = _read_host_memory_kb()
+        used_kb = max(0, total_kb - available_kb) if total_kb else 0
+        ram_scope = "host"
     used_kb = max(0, total_kb - available_kb) if total_kb else 0
     used_pct = (used_kb * 100.0 / total_kb) if total_kb else 0.0
     try:
         load_1, load_5, load_15 = os.getloadavg()
     except (AttributeError, OSError):
         load_1 = load_5 = load_15 = 0.0
-    cpu_count = max(1, int(os.cpu_count() or 1))
+    host_cpu_count = max(1, int(os.cpu_count() or 1))
+    cpu_quota_cores, cpuset_count = _read_cgroup_cpu_limits()
+    cpu_limits = [float(host_cpu_count)]
+    if cpu_quota_cores and cpu_quota_cores > 0:
+        cpu_limits.append(float(cpu_quota_cores))
+    if cpuset_count and cpuset_count > 0:
+        cpu_limits.append(float(cpuset_count))
+    cpu_count = min(cpu_limits)
     return {
         "ram_total_mb": total_kb / 1024.0,
         "ram_used_mb": used_kb / 1024.0,
         "ram_available_mb": available_kb / 1024.0,
         "ram_used_pct": used_pct,
         "cpu_count": cpu_count,
+        "ram_scope": ram_scope,
+        "cpu_scope": "container" if cpu_quota_cores or cpuset_count else "host",
+        "host_cpu_count": host_cpu_count,
         "load_1": load_1,
         "load_5": load_5,
         "load_15": load_15,
-        "load_pct_per_core": load_1 * 100.0 / cpu_count,
+        "load_pct_per_core": load_1 * 100.0 / host_cpu_count,
     }
 
 # ------------------------- Runtime cleanup -------------------------
@@ -8594,9 +8800,9 @@ class TalkinBot:
 
     def broadcast_game_rooms(self, text: str, first_room: str = ""):
         """Quickly announce a game, delivering to its initiating room first."""
-        rooms = self._active_rooms()
+        rooms = [room for room in self._active_rooms() if not _game_results_disabled_for_room(room)]
         first_room = str(first_room or "").strip()
-        if first_room:
+        if first_room and not _game_results_disabled_for_room(first_room):
             rooms = [first_room] + [
                 room for room in rooms if _norm_room(room) != _norm_room(first_room)
             ]
@@ -13605,6 +13811,8 @@ class TalkinBot:
 
     def _send_game_result(self, room, text, game_key, winner_name="", target_rooms=None):
         """Send the text result and, when the game has artwork, its winner card."""
+        if _game_results_disabled_for_room(room):
+            return False
         self.send_room_text(room, text)
         if winner_name and game_key:
             self._send_game_winner_card(game_key, winner_name, target_rooms or [room])
@@ -13616,6 +13824,12 @@ class TalkinBot:
         of media packets that can trigger the TalkinChat server to close the
         WebSocket. Existing callers keep the original zero-delay behaviour.
         """
+        target_rooms = [
+            str(room or "").strip() for room in (target_rooms or [])
+            if str(room or "").strip() and not _game_results_disabled_for_room(room)
+        ]
+        if not target_rooms:
+            return False
         base = _public_base_url()
         if not base:
             self.log("[GAME] winner card skipped: public media URL is not configured")
@@ -15156,7 +15370,10 @@ class TalkinBot:
         except Exception:
             rooms = {str(item).strip() for item in getattr(self, "connected_rooms", set()) if str(item).strip()}
         rooms.add(str(room or "").strip())
-        target_rooms = sorted({item for item in rooms if item}, key=str.casefold)
+        target_rooms = sorted(
+            {item for item in rooms if item and not _game_results_disabled_for_room(item)},
+            key=str.casefold,
+        )
 
         def announce(target_room):
             room_language = self._configured_room_language(target_room)
@@ -15208,6 +15425,7 @@ class TalkinBot:
             rooms = self._active_rooms()
         except Exception:
             rooms = sorted({str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}, key=str.casefold)
+        rooms = [target_room for target_room in rooms if not _game_results_disabled_for_room(target_room)]
         def announce_open(target_room):
             if self._configured_room_language(target_room) == "en":
                 announcement = (
@@ -15508,6 +15726,8 @@ class TalkinBot:
     def _broadcast_stock_market_round(self, rooms):
         # A round belongs to one room; never announce it across all rooms.
         for target_room in list(rooms)[:1]:
+            if _game_results_disabled_for_room(target_room):
+                continue
             language = self._configured_room_language(target_room)
             try:
                 self.send_room_text(target_room, self._stock_market_announcement(language))
@@ -15568,7 +15788,13 @@ class TalkinBot:
             active_rooms = {str(room).strip() for room in self._active_rooms() if str(room).strip()}
         except Exception:
             active_rooms = {str(room).strip() for room in getattr(self, "connected_rooms", set()) if str(room).strip()}
-        ordered_rooms = [str(first_room).strip()] if first_room else sorted(active_rooms, key=str.casefold)[:1]
+        if first_room:
+            ordered_rooms = [str(first_room).strip()]
+        else:
+            ordered_rooms = sorted(
+                (room for room in active_rooms if not _game_results_disabled_for_room(room)),
+                key=str.casefold,
+            )[:1]
         self._queue_stock_market_round_broadcast(ordered_rooms)
         return event
 
@@ -15728,7 +15954,7 @@ class TalkinBot:
         if not STOCK_MARKET_ROOM_ANNOUNCEMENTS_ENABLED:
             return
         target_room = str(source_room or "").strip()
-        if not target_room:
+        if not target_room or _game_results_disabled_for_room(target_room):
             return
         data = STOCK_MARKET_ASSETS.get(int(asset), {})
         is_profit = str(outcome) == "profit"
@@ -16783,20 +17009,18 @@ class TalkinBot:
 
     def _broadcast_game_start(self, title, game):
         for r in self._active_rooms():
+            if _game_results_disabled_for_room(r):
+                continue
             try:
                 self.send_room_text(r, title)
             except Exception:
                 pass
 
     def _broadcast_game_result_all_rooms(self, text, image_path=None, winner_photo_url=""):
-        control = _game_control_data()
-        if not bool(control.get("all_room_results_enabled", True)):
-            return 0
-        disabled = {_norm_room(value) for value in control.get("results_disabled_rooms", [])}
         url = self._game_public_image(image_path) if image_path else ""
         sent = 0
         for r in self._active_rooms():
-            if _norm_room(r) in disabled:
+            if _game_results_disabled_for_room(r):
                 continue
             try:
                 if winner_photo_url:
@@ -16973,6 +17197,8 @@ class TalkinBot:
             # The opening cover is part of the game start, so it is announced
             # to every active room just like the start message.
             for r in self._active_rooms():
+                if _game_results_disabled_for_room(r):
+                    continue
                 self.send_room_media(r, url, "image")
         except Exception as exc:
             self.log("[GAME] cover send failed:", repr(exc))
@@ -17759,6 +17985,8 @@ class TalkinBot:
                     try:
                         game_key = str(event.get("game_key", "rare_diamond"))
                         config = TIMED_TREASURE_GAMES.get(game_key, TIMED_TREASURE_GAMES["rare_diamond"])
+                        if _game_results_disabled_for_room(target_room):
+                            continue
                         if self._effective_room_language(target_room) == "en":
                             notice = f"⌛ {config['title_en']} round closed: the player limit ({required}) was not reached. Next game announcement in 3 minutes."
                         else:
@@ -17825,6 +18053,8 @@ class TalkinBot:
         prize = f"{config['prize']:,}"
         for target_room in rooms:
             try:
+                if _game_results_disabled_for_room(target_room):
+                    continue
                 if self._effective_room_language(target_room) == "en":
                     announcement = (
                         f"🌟 THE ADVENTURE IS ON! 🌟\n"
@@ -17949,6 +18179,8 @@ class TalkinBot:
 
     def _send_treasure_game_result_card(self, room, game_key, winner_name):
         """Send a personalized game result card only to rooms containing participants."""
+        if _game_results_disabled_for_room(room):
+            return False
         base = _public_base_url()
         if not base:
             self.log("[TREASURE-CYCLE] result image skipped: public media URL is not configured")
@@ -18049,6 +18281,8 @@ class TalkinBot:
                 except Exception as exc:
                     self.log("[TREASURE-CYCLE] doctor loss debit failed:", player, repr(exc))
             for target_room in rooms:
+                if _game_results_disabled_for_room(target_room):
+                    continue
                 language_en = self._effective_room_language(target_room) == "en"
                 if language_en:
                     result_text = (
@@ -18089,6 +18323,8 @@ class TalkinBot:
                 debit_results[_norm_user(player)] = {"ok": False}
 
         for target_room in rooms:
+            if _game_results_disabled_for_room(target_room):
+                continue
             language_en = self._effective_room_language(target_room) == "en"
             if language_en:
                 lines = [
@@ -20294,33 +20530,35 @@ class TalkinBot:
 
         result_toggle = re.fullmatch(r"sf@(on|off)", text, re.I)
         if result_toggle:
-            enabled = result_toggle.group(1).casefold() == "on"
+            disable_results = result_toggle.group(1).casefold() == "on"
             role, role_known = _room_role(self, room, sender)
             role_key = re.sub(r"[\s_-]+", "", role.casefold())
             owner_role = role_known and role_key in {"owner", "creator", "roomowner", "roomcreator", "host", "مالك", "صانع", "صانعي", "صانعالغرفة", "صانعالغرفه"}
             is_creator = bool(room and _is_room_creator(room, sender))
-            if _is_primary_master(sender):
-                data = _game_control_data()
-                data["all_room_results_enabled"] = enabled
-                _save_game_control(data)
-                response = "✅ أُعيد بث نتائج الألعاب في جميع الغرف." if enabled else "⛔ أُوقف بث نتائج الألعاب في جميع الغرف."
-                self.send_private_text(sender, response)
-                return True
-            if not (room and (is_creator or owner_role)):
+            is_primary_master = _is_primary_master(sender)
+            if not room:
                 if is_private:
-                    self.send_private_text(sender, "🔒 نفّذ sf@off أو sf@on داخل غرفتك؛ الأمر لمالك الغرفة أو صانعها أو الماستر الأساسي.")
-                elif room:
-                    self.send_room_text(room, "🔒 الأمر لمالك الغرفة أو صانعها أو الماستر الأساسي فقط.")
+                    self.send_private_text(sender, "📍 نفّذ sf@on أو sf@off داخل الغرفة المطلوبة؛ الإعداد خاص بكل غرفة فقط.")
+                return True
+            if not (is_primary_master or is_creator or owner_role):
+                self.send_room_text(room, "🔒 الأمر لمالك الغرفة أو صانعها أو الماستر الأساسي فقط.")
                 return True
             data = _game_control_data()
             disabled = [str(value).strip() for value in data.get("results_disabled_rooms", []) if str(value).strip()]
-            if enabled:
+            if disable_results:
+                if all(_norm_room(value) != _norm_room(room) for value in disabled):
+                    disabled.append(str(room).strip())
+            else:
                 disabled = [value for value in disabled if _norm_room(value) != _norm_room(room)]
-            elif all(_norm_room(value) != _norm_room(room) for value in disabled):
-                disabled.append(str(room).strip())
             data["results_disabled_rooms"] = disabled
+            # Clear the legacy global switch; result controls are room-scoped.
+            data["all_room_results_enabled"] = True
             _save_game_control(data)
-            self.send_room_text(room, "✅ أُعيد بث نتائج الألعاب العامة في هذه الغرفة." if enabled else "⛔ أُوقف بث نتائج الألعاب العامة في هذه الغرفة.")
+            if disable_results:
+                response = "⛔ أُوقفت إعلانات وصور نتائج الألعاب في هذه الغرفة فقط."
+            else:
+                response = "✅ أُعيدت إعلانات وصور نتائج الألعاب في هذه الغرفة فقط."
+            self.send_room_text(room, response)
             return True
 
         if low in ("مستويات", "مستوياتي"):
@@ -20491,15 +20729,17 @@ class TalkinBot:
 
         if low in ("رام", "ram", "cpu", "الموارد", "حالة الموارد", "حاله الموارد", "resource status"):
             metrics = _runtime_resource_status()
+            ram_scope = "حد الحاوية" if metrics["ram_scope"] == "container" else "المضيف؛ حد الحاوية غير متاح"
+            cpu_scope = "حد الحاوية" if metrics["cpu_scope"] == "container" else "الأنوية الظاهرة للنظام"
             self.send_private_text(
                 sender,
-                "🖥️ موارد المنصة\n"
-                f"• RAM الكلية: {metrics['ram_total_mb']:.0f} MB\n"
+                "🖥️ موارد بيئة تشغيل البوت\n"
+                f"• RAM الكلية ({ram_scope}): {metrics['ram_total_mb']:.0f} MB\n"
                 f"• RAM المستخدمة: {metrics['ram_used_mb']:.0f} MB ({metrics['ram_used_pct']:.1f}%)\n"
                 f"• RAM المتاحة: {metrics['ram_available_mb']:.0f} MB\n"
-                f"• CPU: {metrics['cpu_count']} نواة\n"
-                f"• الحمل الحالي: {metrics['load_1']:.2f} / {metrics['load_5']:.2f} / {metrics['load_15']:.2f}\n"
-                f"• الحمل لكل نواة: {metrics['load_pct_per_core']:.1f}%\n"
+                f"• CPU المتاح ({cpu_scope}): {metrics['cpu_count']:g} نواة\n"
+                f"• حمل المضيف (1/5/15 دقيقة): {metrics['load_1']:.2f} / {metrics['load_5']:.2f} / {metrics['load_15']:.2f}\n"
+                f"• حمل المضيف لكل نواة: {metrics['load_pct_per_core']:.1f}%\n"
                 f"• CPU داخل البوت: {getattr(self, '_cpu_last_percent', 0.0):.1f}%\n"
                 f"• التبريد التلقائي: {'🟡 فعّال' if getattr(self, '_cpu_cooling', False) else '🟢 جاهز'}\n"
                 f"• رسائل السجل المخفّضة: {getattr(self, '_cpu_log_suppressed', 0)}"

@@ -136,22 +136,124 @@ def test_doctor_loser_is_not_blocked_from_other_timed_games():
 def test_sf_toggle_is_room_scoped_for_owner_and_rejects_admin():
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
     bot.room_users = {"Hall": {"Owner": "owner", "Admin": "admin"}}
-    bot.send_room_text = lambda *_args: None
+    room_messages = []
+    bot.send_room_text = lambda room, text: room_messages.append((room, text))
     bot.send_private_text = lambda *_args: None
-    control = {"disabled_rooms": [], "global_enabled": True, "results_disabled_rooms": []}
+    control = {"disabled_rooms": [], "global_enabled": True, "all_room_results_enabled": False, "results_disabled_rooms": []}
 
     with patch.object(bot_module, "_is_primary_master", return_value=False), \
          patch.object(bot_module, "_is_room_creator", return_value=False), \
          patch.object(bot_module, "_game_control_data", return_value=control), \
          patch.object(bot_module, "_save_game_control") as save:
-        assert bot._handle_management_command_impl("Hall", "sf@off", "Owner") is True
+        assert bot._handle_management_command_impl("Hall", "sf@on", "Owner") is True
         assert control["results_disabled_rooms"] == ["Hall"]
+        assert control["all_room_results_enabled"] is True
+        assert "في هذه الغرفة فقط" in room_messages[-1][1]
         save.assert_called_once_with(control)
 
         save.reset_mock()
-        assert bot._handle_management_command_impl("Hall", "sf@off", "Admin") is True
-        assert control["results_disabled_rooms"] == ["Hall"]
+        assert bot._handle_management_command_impl("Hall", "sf@off", "Owner") is True
+        assert control["results_disabled_rooms"] == []
+        assert "في هذه الغرفة فقط" in room_messages[-1][1]
+        save.assert_called_once_with(control)
+
+        save.reset_mock()
+        assert bot._handle_management_command_impl("Hall", "sf@on", "Admin") is True
+        assert control["results_disabled_rooms"] == []
+        assert "مالك الغرفة" in room_messages[-1][1]
         save.assert_not_called()
+
+
+def test_primary_master_sf_on_changes_only_the_room_where_command_was_run():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot.room_users = {}
+    bot.send_room_text = lambda *_args: None
+    bot.send_private_text = lambda *_args: None
+    control = {"all_room_results_enabled": True, "results_disabled_rooms": []}
+
+    with patch.object(bot_module, "_is_primary_master", return_value=True), \
+         patch.object(bot_module, "_is_room_creator", return_value=False), \
+         patch.object(bot_module, "_game_control_data", return_value=control), \
+         patch.object(bot_module, "_save_game_control"):
+        assert bot._handle_management_command_impl("Hall", "sf@on", "Master") is True
+        assert control["results_disabled_rooms"] == ["Hall"]
+        assert control["all_room_results_enabled"] is True
+
+        assert bot._handle_management_command_impl("Lobby", "sf@on", "Master") is True
+        assert set(control["results_disabled_rooms"]) == {"Hall", "Lobby"}
+
+        assert bot._handle_management_command_impl("Hall", "sf@off", "Master") is True
+        assert control["results_disabled_rooms"] == ["Lobby"]
+
+
+def test_sf_filters_game_start_and_result_media_per_room_even_with_legacy_global_off():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot._active_rooms = lambda: ["Muted", "Live"]
+    room_texts = []
+    room_media = []
+    bot.send_room_text = lambda room, text: room_texts.append((room, text))
+    bot.send_room_media = lambda room, url, kind: room_media.append((room, url, kind))
+    bot._game_public_image = lambda *_args, **_kwargs: "https://cdn.example/result.jpg"
+    control = {"all_room_results_enabled": False, "results_disabled_rooms": ["Muted"]}
+
+    with patch.object(bot_module, "_game_control_data", return_value=control):
+        bot._broadcast_game_start("game started", {})
+        sent = bot._broadcast_game_result_all_rooms(
+            "winner result", image_path="winner.jpg", winner_photo_url="https://cdn.example/photo.jpg"
+        )
+        assert bot._send_game_winner_card("unused", "Winner", ["Muted"]) is False
+        assert bot._send_treasure_game_result_card("Muted", "rare_diamond", "Winner") is False
+
+    assert sent == 1
+    assert room_texts == [("Live", "game started"), ("Live", "winner result")]
+    assert room_media == [
+        ("Live", "https://cdn.example/photo.jpg", "image"),
+        ("Live", "https://cdn.example/result.jpg", "image"),
+    ]
+
+
+def test_sf_mutes_timed_result_text_and_image_but_keeps_points_settlement():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot._rare_diamond_lock = threading.RLock()
+    bot._doctor_ban_lock = threading.RLock()
+    bot._rare_diamond_event = {
+        "id": "muted-round",
+        "game_key": "rare_diamond",
+        "players": {
+            "winner": {"name": "Winner", "room": "Muted"},
+            "player1": {"name": "Player1", "room": "Live"},
+            "player2": {"name": "Player2", "room": "Muted"},
+            "player3": {"name": "Player3", "room": "Live"},
+            "player4": {"name": "Player4", "room": "Live"},
+        },
+    }
+    bot._rare_diamond_next_due = float("inf")
+    bot._doctor_ban_once = {}
+    bot.log = lambda *_args: None
+    bot._effective_room_language = lambda _room: "ar"
+    room_texts = []
+    cards = []
+    point_updates = []
+    bot.send_room_text = lambda room, text: room_texts.append((room, text))
+    bot._send_treasure_game_result_card = lambda room, game, winner: cards.append((room, game, winner)) or True
+
+    def fake_point_update(username, delta, transaction_id, reason, **_kwargs):
+        point_updates.append((username, delta, transaction_id, reason))
+        return {"ok": True, "balance": max(0, int(delta))}
+
+    control = {"all_room_results_enabled": False, "results_disabled_rooms": ["Muted"]}
+    with patch.object(bot_module, "_apply_points_delta_once", side_effect=fake_point_update), \
+         patch.object(bot_module, "_record_game", return_value=None), \
+         patch.object(bot_module.secrets, "choice", return_value="Winner"), \
+         patch.object(bot_module.time, "sleep", return_value=None), \
+         patch.object(bot_module, "_game_control_data", return_value=control):
+        bot._resolve_rare_diamond_event_impl("muted-round")
+
+    assert bot._rare_diamond_event is None
+    assert [room for room, _text in room_texts] == ["Live"]
+    assert cards == [("Live", "rare_diamond", "Winner")]
+    assert ("Winner", bot_module.TIMED_TREASURE_GAMES["rare_diamond"]["prize"]) == (point_updates[0][0], point_updates[0][1])
+    assert sum(1 for _name, delta, *_rest in point_updates if delta == -10_000) == 4
 
 
 def test_each_of_the_nine_timed_games_opens_and_accepts_its_join_command():
@@ -176,7 +278,8 @@ def test_each_of_the_nine_timed_games_opens_and_accepts_its_join_command():
         bot._localized_room_worker = lambda _room, _language, worker: worker
         bot._remember_bot_action = lambda *_args, **_kwargs: None
 
-        assert bot._start_rare_diamond_event(game_key) is True, game_key
+        with patch.object(bot_module, "_game_control_data", return_value={"results_disabled_rooms": []}):
+            assert bot._start_rare_diamond_event(game_key) is True, game_key
         for command in (*config["aliases"], config["join_ar"], config["join_en"]):
             command_key = bot_module._normalize_timed_treasure_command(command)
             assert bot_module.TIMED_TREASURE_GAME_ALIASES[command_key] == game_key, (game_key, command)
@@ -225,7 +328,8 @@ def test_every_timed_game_alias_reaches_join_handler_from_room_receive_path():
         commands = tuple(dict.fromkeys((*config["aliases"], config["join_ar"], config["join_en"])))
         for index, command in enumerate(commands):
             with patch.object(bot_module, "_is_verified_user", return_value=True), \
-                 patch.object(bot_module, "_games_enabled_for_room", return_value=True):
+                 patch.object(bot_module, "_games_enabled_for_room", return_value=True), \
+                 patch.object(bot_module, "_game_control_data", return_value={"results_disabled_rooms": []}):
                 bot = _make_timed_game_test_bot()
                 bot.send_room_text = lambda *_args: None
                 assert bot._start_rare_diamond_event(game_key) is True
@@ -248,7 +352,8 @@ def test_all_nine_timed_games_complete_and_emit_one_result_when_rosters_fill():
         bot = _make_timed_game_test_bot()
         room_messages = []
         bot.send_room_text = lambda room, text: room_messages.append((room, text))
-        assert bot._start_rare_diamond_event(game_key) is True
+        with patch.object(bot_module, "_game_control_data", return_value={"results_disabled_rooms": []}):
+            assert bot._start_rare_diamond_event(game_key) is True
         announcement = room_messages[0][1]
         assert config["join_ar"] in announcement
 
@@ -286,7 +391,8 @@ def test_all_nine_timed_games_complete_and_emit_one_result_when_rosters_fill():
         with patch.object(bot_module, "_apply_points_delta_once", side_effect=fake_point_update), \
              patch.object(bot_module, "_record_game", return_value=None), \
              patch.object(bot_module.secrets, "choice", return_value="Player0"), \
-             patch.object(bot_module.time, "sleep", return_value=None):
+             patch.object(bot_module.time, "sleep", return_value=None), \
+             patch.object(bot_module, "_game_control_data", return_value={"results_disabled_rooms": []}):
             resolver, args = queued_resolvers[0]
             resolver(*args)
 
