@@ -1,4 +1,5 @@
 import re
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -169,20 +170,24 @@ def test_explicit_id_update_requests_server_roster_and_notifies_privately():
     bot._pending_room_lists = {}
     queries = []
     replies = []
+    completed = threading.Event()
     bot.send_query = lambda query: queries.append(query)
     bot.send_room_text = lambda room, text: replies.append((room, text))
-    bot.send_private_text = lambda user, text: replies.append((user, text))
+    bot.send_private_text = lambda user, text: (replies.append((user, text)), completed.set())
     bot._extract_room_list_users = lambda _result: [
         {"username": "Ahmed", "user_id": "3456782", "role": "member"}
     ]
 
-    with patch.object(bot_module, "_remember_roster"):
+    with patch.object(bot_module, "_remember_roster"), patch.object(
+        bot_module, "_persist_identity_to_points", return_value=0
+    ), patch.object(bot_module, "_persist_identity_to_levels", return_value=False):
         assert bot._room_list_commands("Hall", "حدث ايدي", "Ahmed", is_private=False)
         pending = bot._pending_room_lists[bot_module._norm_room("Hall")]
         assert pending["code"] == "identity_update"
         assert pending["request_type"] == "members_list"
         assert bot._complete_pending_room_list({"_occupants_room": "Hall"})
 
+    assert completed.wait(2)
     assert len(queries) == 1
     assert replies[-1][0] == "Ahmed"
     assert "تم تحديث هويتك بنجاح" in replies[-1][1]

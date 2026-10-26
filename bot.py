@@ -3438,6 +3438,7 @@ def _is_vip_user(name):
 
 
 _GAME_STATE_LOCK = threading.RLock()
+_IDENTITY_METADATA_LOCK = threading.RLock()
 _GAME_STATS_CACHE = None
 _GAME_STATS_MIGRATION_DONE = False
 _GAME_SNAPSHOT_LOCK = threading.RLock()
@@ -3868,6 +3869,9 @@ def _save_game_levels_snapshot():
                 "plays": plays,
                 "star_rank": ranks.get(canonical),
             }
+            user_id = _stored_user_id(username)
+            if user_id:
+                players[canonical]["user_id"] = user_id
     _queue_local_json_save(GAME_LEVELS_FILE, {"version": 1, "players": players})
 
 
@@ -4148,6 +4152,72 @@ def _mutate_points_state(updater):
         _save_local_json(POINTS_FILE, payload, persist_state_db=False)
         _POINTS_CACHE, _POINTS_TRANSFER_CACHE = _decode_points_payload(payload)
         return result
+
+def _persist_identity_to_points(username, user_id, preferred_room=""):
+    """Attach a Talkin ID to existing points rows without touching balances/history."""
+    user_id = str(user_id or "").strip()
+    if not user_id.isdigit():
+        return 0
+    wanted = _norm_user(username)
+
+    def update(accounts, history):
+        changed = 0
+        for key, item in list(accounts.items()):
+            if not isinstance(item, dict):
+                continue
+            stored_id = str(item.get("user_id") or "").strip()
+            exact_name = _norm_user(key) == wanted or _norm_user(item.get("username")) == wanted
+            same_identity = (
+                stored_id == user_id
+                or _stored_user_id(item.get("username") or key, preferred_room) == user_id
+            )
+            if not (exact_name or same_identity) or (stored_id and stored_id != user_id):
+                continue
+            if stored_id != user_id:
+                updated = dict(item)
+                updated["user_id"] = user_id
+                accounts[key] = updated
+                changed += 1
+        return {"ok": True, "updated": changed}, bool(changed)
+
+    try:
+        result = _mutate_points_state(update)
+        return int(result.get("updated", 0)) if isinstance(result, dict) else 0
+    except Exception as exc:
+        print(f"[IDENTITY] points metadata save failed: {type(exc).__name__}", flush=True)
+        return 0
+
+
+def _persist_identity_to_levels(username, user_id, preferred_room=""):
+    """Annotate an existing level row with ID metadata; preserve all play counts."""
+    user_id = str(user_id or "").strip()
+    if not user_id.isdigit():
+        return False
+    payload = _load_local_json(GAME_LEVELS_FILE, {})
+    players = payload.get("players", {}) if isinstance(payload, dict) else {}
+    if not isinstance(players, dict):
+        return False
+    wanted = _norm_user(username)
+    changed = False
+    for key, item in players.items():
+        if not isinstance(item, dict):
+            continue
+        stored_id = str(item.get("user_id") or "").strip()
+        name = str(item.get("username") or key).strip().lstrip("@")
+        if not (
+            _norm_user(name) == wanted
+            or stored_id == user_id
+            or _stored_user_id(name, preferred_room) == user_id
+        ):
+            continue
+        if stored_id and stored_id != user_id:
+            continue
+        if stored_id != user_id:
+            item["user_id"] = user_id
+            changed = True
+    if changed:
+        _save_local_json(GAME_LEVELS_FILE, payload)
+    return changed
 
 
 class PointsInsufficientError(RuntimeError):
@@ -7390,6 +7460,7 @@ class TalkinBot:
         self.auto_replies = {}
         self.custom_welcome_enabled = True
         self.custom_welcomes = {}
+        self.welcome_identities = {}
         self._load_social_features()
         self._load_departure_replies()
         threading.Thread(target=self._crop_worker, name="crop-worker", daemon=True).start()
@@ -7431,15 +7502,42 @@ class TalkinBot:
             self.custom_welcome_enabled = bool(data.get("enabled", True))
             raw = data.get("welcomes", {})
             self.custom_welcomes = raw if isinstance(raw, dict) else {}
+            identities = data.get("identities", {})
+            self.welcome_identities = identities if isinstance(identities, dict) else {}
         except Exception:
             self.custom_welcome_enabled, self.custom_welcomes = True, {}
+            self.welcome_identities = {}
 
     def _save_social_features(self):
         data = _ensure_replies_file()
         data["auto_replies_enabled"] = bool(self.auto_replies_enabled)
         data["auto_replies"] = self.auto_replies
         _save_local_json(self.auto_replies_file, data)
-        _save_local_json(self.custom_welcomes_file, {"enabled": self.custom_welcome_enabled, "welcomes": self.custom_welcomes})
+        _save_local_json(self.custom_welcomes_file, {
+            "enabled": self.custom_welcome_enabled,
+            "welcomes": self.custom_welcomes,
+            "identities": getattr(self, "welcome_identities", {}),
+        })
+
+    def _custom_welcome_for_identity(self, username, room=""):
+        welcomes = getattr(self, "custom_welcomes", {})
+        if not isinstance(welcomes, dict):
+            return None
+        exact = welcomes.get(_norm_user(username))
+        if exact is not None:
+            return exact
+        user_id = _stored_user_id(username, room)
+        if not user_id:
+            return None
+        matches = []
+        for key, value in welcomes.items():
+            if not isinstance(value, dict):
+                continue
+            stored_id = str(value.get("user_id") or "").strip()
+            stored_name = value.get("username") or key
+            if stored_id == user_id or _stored_user_id(stored_name, room) == user_id:
+                matches.append(value)
+        return matches[0] if len(matches) == 1 else None
 
     def _load_departure_replies(self):
         """Load departure-trigger replies from their own file, separate from auto replies."""
@@ -20312,6 +20410,40 @@ class TalkinBot:
             self.send_private_text(sender, "⚠️ تعذر طلب قائمة الأعضاء من السيرفر؛ حاول مجددًا.")
         return True
 
+    def _finish_identity_update(self, room, senders, users):
+        """Persist a completed identity update away from the WebSocket event worker."""
+        notifications = []
+        try:
+            with _IDENTITY_METADATA_LOCK:
+                _remember_roster(room, users)
+                for sender in senders:
+                    sender = str(sender or "").strip().lstrip("@")
+                    user_id = _room_roster_id_for_name(users, sender)
+                    if not user_id:
+                        notifications.append((sender, "⚠️ لم يصل ID واضح لحسابك؛ لم تُحدّث الهوية."))
+                        continue
+                    _persist_identity_to_points(sender, user_id, room)
+                    _persist_identity_to_levels(sender, user_id, room)
+                    identities = getattr(self, "welcome_identities", None)
+                    if isinstance(identities, dict):
+                        identities[user_id] = {"username": sender, "user_id": user_id}
+                        try:
+                            self._save_social_features()
+                        except Exception as exc:
+                            self.log("[IDENTITY] welcome metadata save failed:", type(exc).__name__)
+                    notifications.append((sender, "✅ تم تحديث هويتك بنجاح وحفظها داخليًا."))
+        except Exception as exc:
+            self.log("[IDENTITY] background persistence failed:", type(exc).__name__)
+            notifications = [
+                (str(sender or "").strip().lstrip("@"), "⚠️ تعذر حفظ الهوية الآن؛ حاول «حدث ايدي» مرة أخرى.")
+                for sender in senders
+            ]
+        for sender, message in notifications:
+            try:
+                self.send_private_text(sender, message)
+            except Exception as exc:
+                self.log("[IDENTITY] private completion notice failed:", type(exc).__name__)
+
     def _request_mining_identity_lookup(self, room, sender, text):
         """Wait for the native roster response before running ID-based mining."""
         room = str(room or "").strip()
@@ -20365,6 +20497,25 @@ class TalkinBot:
         code = str(pending.get("code") or "").lower()
         if code in {"id_sync", "identity_update", "mine_uid"}:
             users = self._extract_room_list_users(result)
+            if code == "identity_update":
+                senders = pending.get("identity_senders") or ([pending.get("sender")] if pending.get("sender") else [])
+                valid_senders = []
+                for sender_name in senders:
+                    sender_name = str(sender_name or "").strip().lstrip("@")
+                    if _room_roster_id_for_name(users, sender_name):
+                        valid_senders.append(sender_name)
+                    else:
+                        self.send_private_text(sender_name, "⚠️ لم يصل ID واضح لحسابك؛ لم تُحدّث الهوية.")
+                if valid_senders:
+                    worker = threading.Thread(
+                        target=self._finish_identity_update,
+                        args=(source_room, valid_senders, users),
+                        name="identity-update-worker",
+                        daemon=True,
+                    )
+                    worker.start()
+                return True
+
             _remember_roster(source_room, users)
             room_users = getattr(self, "room_users", None)
             if isinstance(room_users, dict):
@@ -20382,14 +20533,6 @@ class TalkinBot:
                         )
                     else:
                         self.send_room_text(source_room, f"⚠️ لم يصل معرّف حساب @{sender_name} من السيرفر.")
-            elif code == "identity_update":
-                senders = pending.get("identity_senders") or ([pending.get("sender")] if pending.get("sender") else [])
-                for sender_name in senders:
-                    user_id = _room_roster_id_for_name(users, sender_name)
-                    if user_id:
-                        self.send_private_text(sender_name, "✅ تم تحديث هويتك بنجاح وحفظها داخليًا.")
-                    else:
-                        self.send_private_text(sender_name, "⚠️ لم يصل ID واضح لحسابك من السيرفر؛ لم تُحدّث الهوية.")
             return True
 
         # INV roster collection: each category is fetched separately. The
@@ -23724,7 +23867,7 @@ class TalkinBot:
                 welcome = f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}"
             elif username and _norm_user(username) != _norm_user(BOT_ID):
                 welcomes_enabled = bool(getattr(self, "custom_welcome_enabled", True))
-                cw = getattr(self, "custom_welcomes", {}).get(_norm_user(username)) if welcomes_enabled else None
+                cw = self._custom_welcome_for_identity(username, room) if welcomes_enabled else None
                 welcome = _join_welcome_message(username, room, welcomes_enabled, cw)
             if username and _norm_user(username) != _norm_user(BOT_ID) and self._is_dragon_hunter(username):
                 if self._configured_room_language(room) == "en":

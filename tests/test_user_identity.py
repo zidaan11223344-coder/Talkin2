@@ -1,4 +1,5 @@
 import copy
+import json
 import threading
 
 import bot as bot_module
@@ -51,6 +52,52 @@ def test_legacy_game_and_points_records_resolve_through_numeric_id(monkeypatch):
 
     # Existing verification records also follow the same Talkin account ID.
     assert bot_module._saved_identity_matches({"OldName": True}, "NewName")
+
+
+def test_identity_metadata_persistence_preserves_points_history_and_level_counts(monkeypatch, tmp_path):
+    accounts = {"oldname": {"username": "OldName", "points": 1234}}
+    history = [{"from": "OldName", "to": "Other", "amount": 50}]
+    original_history = copy.deepcopy(history)
+    id_by_name = {"OldName": "7654321", "NewName": "7654321"}
+    monkeypatch.setattr(
+        bot_module,
+        "_stored_user_id",
+        lambda value, preferred_room="": id_by_name.get(str(value or "").lstrip("@"), ""),
+    )
+
+    def mutate_points(updater):
+        result, _changed = updater(accounts, history)
+        return result
+
+    monkeypatch.setattr(bot_module, "_mutate_points_state", mutate_points)
+    assert bot_module._persist_identity_to_points("NewName", "7654321", "Hall") == 1
+    assert accounts["oldname"]["points"] == 1234
+    assert accounts["oldname"]["user_id"] == "7654321"
+    assert history == original_history
+
+    levels_path = tmp_path / "game_levels.json"
+    levels_path.write_text(json.dumps({
+        "version": 1,
+        "players": {"oldname": {"username": "OldName", "plays": 27, "level": 3}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(bot_module, "GAME_LEVELS_FILE", levels_path)
+    assert bot_module._persist_identity_to_levels("NewName", "7654321", "Hall")
+    player = json.loads(levels_path.read_text(encoding="utf-8"))["players"]["oldname"]
+    assert player["user_id"] == "7654321"
+    assert player["plays"] == 27
+    assert player["level"] == 3
+
+
+def test_custom_welcome_resolves_by_saved_talkin_id_after_rename(monkeypatch):
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot.custom_welcomes = {"oldname": {"username": "OldName", "message": "Welcome"}}
+    id_by_name = {"OldName": "7654321", "NewName": "7654321"}
+    monkeypatch.setattr(
+        bot_module,
+        "_stored_user_id",
+        lambda value, preferred_room="": id_by_name.get(str(value or "").lstrip("@"), ""),
+    )
+    assert bot._custom_welcome_for_identity("NewName", "Hall") == bot.custom_welcomes["oldname"]
 
 
 def test_ambiguous_same_name_requires_room_context(monkeypatch):
