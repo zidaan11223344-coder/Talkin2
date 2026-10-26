@@ -163,7 +163,7 @@ def test_new_commands_are_classified_before_verification_gate():
     assert bot_module._looks_like_bot_command("id@Ahmed")
 
 
-def test_id_command_queries_server_and_returns_numeric_user_id():
+def test_explicit_id_update_requests_server_roster_and_notifies_privately():
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
     bot.ws = object()
     bot._pending_room_lists = {}
@@ -176,19 +176,17 @@ def test_id_command_queries_server_and_returns_numeric_user_id():
         {"username": "Ahmed", "user_id": "3456782", "role": "member"}
     ]
 
-    with patch.object(bot_module, "_stored_user_id", return_value=""), patch.object(
-        bot_module, "_remember_roster"
-    ):
-        assert bot._room_list_commands("Hall", "ايدي@Ahmed", "Requester", is_private=False)
+    with patch.object(bot_module, "_remember_roster"):
+        assert bot._room_list_commands("Hall", "حدث ايدي", "Ahmed", is_private=False)
         pending = bot._pending_room_lists[bot_module._norm_room("Hall")]
-        assert pending["code"] == "uid"
-        assert pending["target"] == "Ahmed"
+        assert pending["code"] == "identity_update"
         assert pending["request_type"] == "members_list"
         assert bot._complete_pending_room_list({"_occupants_room": "Hall"})
 
     assert len(queries) == 1
-    assert replies[-1][0] == "Hall"
-    assert replies[-1][1] == "3456782"
+    assert replies[-1][0] == "Ahmed"
+    assert "تم تحديث هويتك بنجاح" in replies[-1][1]
+    assert "3456782" not in replies[-1][1]
 
 
 def test_id_command_returns_cached_id_as_plain_number():
@@ -198,6 +196,19 @@ def test_id_command_returns_cached_id_as_plain_number():
     with patch.object(bot_module, "_stored_user_id", return_value="3456782"):
         assert bot._room_list_commands("Hall", "ايدي", "Ahmed", is_private=False)
     assert replies == [("Hall", "3456782")]
+
+
+def test_id_display_does_not_fetch_when_identity_is_not_cached():
+    bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
+    bot._pending_room_lists = {}
+    queries = []
+    replies = []
+    bot.send_query = lambda query: queries.append(query)
+    bot.send_room_text = lambda room, text: replies.append((room, text))
+    with patch.object(bot_module, "_stored_user_id", return_value=""):
+        assert bot._room_list_commands("Hall", "ايدي", "Ahmed", is_private=False)
+    assert queries == []
+    assert replies and "حدث ايدي" in replies[0][1]
 
 
 def test_id_command_is_routed_before_master_only_management_gate():

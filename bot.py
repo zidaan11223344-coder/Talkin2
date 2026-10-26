@@ -2749,6 +2749,22 @@ def _persistent_rosters():
     data = _load_local_json(ROOM_USERS_FILE, {})
     return data if isinstance(data, dict) else {}
 
+_IDENTITY_CONTEXT = threading.local()
+
+def _set_identity_context(username, room):
+    previous = getattr(_IDENTITY_CONTEXT, "value", None)
+    _IDENTITY_CONTEXT.value = (_norm_user(username), str(room or "").strip())
+    return previous
+
+def _restore_identity_context(previous):
+    if previous is None:
+        try:
+            del _IDENTITY_CONTEXT.value
+        except AttributeError:
+            pass
+    else:
+        _IDENTITY_CONTEXT.value = previous
+
 def _stored_user_id(username, preferred_room=""):
     """Resolve a username to a previously stored native Talkin user ID."""
     raw = str(username or "").strip().lstrip("@")
@@ -2757,6 +2773,10 @@ def _stored_user_id(username, preferred_room=""):
     wanted = _norm_user(raw)
     if not wanted:
         return ""
+    if not preferred_room:
+        context = getattr(_IDENTITY_CONTEXT, "value", None)
+        if isinstance(context, tuple) and len(context) == 2 and context[0] == wanted:
+            preferred_room = context[1]
     data = _persistent_rosters()
     rooms = data.get("rooms", data) if isinstance(data, dict) else {}
     if not isinstance(rooms, dict):
@@ -2787,6 +2807,33 @@ def _stored_user_id(username, preferred_room=""):
         candidates = set(candidates)
         return next(iter(candidates)) if len(candidates) == 1 else ""
     return unique(exact) or unique(decorated)
+
+def _stored_username_for_id(user_id, preferred_room=""):
+    wanted = str(user_id or "").strip()
+    if not wanted.isdigit():
+        return ""
+    data = _persistent_rosters()
+    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
+    if not isinstance(rooms, dict):
+        return ""
+    room_names = list(rooms)
+    preferred = _norm_room(preferred_room)
+    room_names.sort(key=lambda name: 0 if preferred and _norm_room(name) == preferred else 1)
+    for room_name in room_names:
+        roster = rooms.get(room_name)
+        if not isinstance(roster, dict):
+            continue
+        for key, value in roster.items():
+            if not isinstance(value, dict):
+                continue
+            saved_id = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
+            if saved_id == wanted:
+                return str(value.get("username") or "").strip().lstrip("@")
+    return ""
+
+def _user_identity_key(username, preferred_room=""):
+    # Keep live command keys name-based; stable Talkin IDs are compatibility metadata.
+    return _norm_user(username)
 
 
 def _stored_user_aliases(username, preferred_room=""):
@@ -2930,19 +2977,79 @@ def _remember_roster(room, users):
     for user in users or []:
         if not isinstance(user, dict):
             continue
-        username = str(user.get("username") or "").strip()
+        username = str(user.get("username") or "").strip().lstrip("@")
         if not username or _norm_user(username) == _norm_user(BOT_ID):
             continue
-        current[_norm_user(username)] = {
+        user_id = str(user.get("user_id") or "").strip()
+        if not user_id.isdigit():
+            user_id = ""
+        normalized_name = _norm_user(username)
+        existing_key = ""
+        existing_id = ""
+        aliases = []
+        for old_key, old_value in list(current.items()):
+            if not isinstance(old_value, dict):
+                continue
+            old_name = str(old_value.get("username") or old_key).strip().lstrip("@")
+            old_id = str(old_value.get("user_id") or (old_key if str(old_key).isdigit() else "")).strip()
+            if (user_id and old_id == user_id) or (not user_id and normalized_name == _norm_user(old_name)):
+                existing_key, existing_id = str(old_key), old_id
+                old_aliases = old_value.get("aliases", [])
+                if isinstance(old_aliases, list):
+                    aliases.extend(str(alias).strip().lstrip("@") for alias in old_aliases if str(alias).strip())
+                if _norm_user(old_name) != normalized_name:
+                    aliases.append(old_name)
+                if user_id and old_id == user_id:
+                    break
+        if user_id:
+            for old_key, old_value in list(current.items()):
+                if not isinstance(old_value, dict):
+                    continue
+                old_id = str(old_value.get("user_id") or (old_key if str(old_key).isdigit() else "")).strip()
+                old_name = str(old_value.get("username") or old_key).strip().lstrip("@")
+                if old_id == user_id or (not old_id and normalized_name == _norm_user(old_name)):
+                    current.pop(old_key, None)
+            storage_key = user_id
+        else:
+            user_id = existing_id if existing_id.isdigit() else ""
+            storage_key = existing_key or normalized_name
+        aliases = list(dict.fromkeys(
+            alias for alias in aliases if alias and _norm_user(alias) != normalized_name
+        ))
+        current[storage_key] = {
             "username": username,
+            "aliases": aliases,
             "role": str(user.get("role") or "none").strip().lower() or "none",
-            "user_id": str(user.get("user_id") or ""),
+            "user_id": user_id,
             "online": user.get("online", user.get("is_present")),
             "is_present": user.get("is_present", user.get("online")),
             "last_seen": now,
         }
     rosters[room] = current
     _save_persistent_rosters(rosters)
+
+def _room_roster_id_for_name(users, username):
+    wanted = _norm_user(username)
+    if not wanted:
+        return ""
+    valid = [
+        (str(item.get("username") or "").strip().lstrip("@"), str(item.get("user_id") or "").strip())
+        for item in (users or [])
+        if isinstance(item, dict) and str(item.get("user_id") or "").strip().isdigit()
+    ]
+    exact_ids = {user_id for name, user_id in valid if _norm_user(name) == wanted}
+    if len(exact_ids) == 1:
+        return next(iter(exact_ids))
+    if exact_ids:
+        return ""
+    decorated_key = _game_name_key(username)
+    if not decorated_key:
+        return ""
+    decorated_ids = {
+        user_id for name, user_id in valid
+        if _game_name_key(name) == decorated_key
+    }
+    return next(iter(decorated_ids)) if len(decorated_ids) == 1 else ""
 
 
 def _game_control_data():
@@ -3058,6 +3165,11 @@ def _looks_like_bot_command(text):
     low = _normalize_game_command_text(text).strip().casefold()
     if not low:
         return False
+    if (low.startswith("la@")
+            or low in {"ايدي", "أيدي", "id"}
+            or re.fullmatch(r"(?:ايدي|أيدي|id)@.+", low, re.I)
+            or re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", low, re.I)):
+        return True
     timed_game_command = _normalize_timed_treasure_command(text) in TIMED_TREASURE_GAME_ALIASES
     prefixes = (
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
@@ -3270,7 +3382,20 @@ def _saved_identity_groups_match(groups, name):
 
 
 def _saved_identity_matches(data, name):
-    return _saved_identity_groups_match(_saved_identity_groups(data), name)
+    groups = _saved_identity_groups(data)
+    if _saved_identity_groups_match(groups, name):
+        return True
+    target_id = _stored_user_id(name)
+    if not target_id:
+        return False
+    for group in groups:
+        saved_ids = {
+            user_id for candidate in group
+            if (user_id := _stored_user_id(candidate))
+        }
+        if saved_ids == {target_id}:
+            return True
+    return False
 
 def _is_verified_user(name):
     # When verification is disabled, treat users as passing the verification
@@ -3501,9 +3626,17 @@ def _game_record_matches(data, username):
     if not isinstance(data, dict):
         return []
     wanted = _game_name_key(username)
+    matches = [(str(key), candidate) for key, candidate in data.items()
+               if isinstance(candidate, dict)
+               and _game_name_key(candidate.get("username") or key) == wanted]
+    if matches:
+        return matches
+    target_id = _stored_user_id(username)
+    if not target_id:
+        return []
     return [(str(key), candidate) for key, candidate in data.items()
             if isinstance(candidate, dict)
-            and _game_name_key(candidate.get("username") or key) == wanted]
+            and _stored_user_id(candidate.get("username") or key) == target_id]
 
 
 def _merged_game_item(data, username):
@@ -3937,6 +4070,15 @@ def _points_account_candidates(data, username, *, exact_only=False):
             exact.append((str(key), item))
     if exact or exact_only:
         return exact
+    target_id = _stored_user_id(username)
+    if target_id:
+        id_matches = [
+            (str(key), item) for key, item in data.items()
+            if isinstance(item, dict)
+            and _stored_user_id(item.get("username") or key) == target_id
+        ]
+        if id_matches:
+            return id_matches
     canonical = _game_name_key(username)
     if not canonical:
         return []
@@ -19244,6 +19386,10 @@ class TalkinBot:
                 self.send_room_text(room, reply)
             return True
 
+        if (re.fullmatch(r"(?:ايدي|أيدي|id)(?:@.+)?", _body_text, re.I)
+                or re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", _body_text, re.I)):
+            return self._room_list_commands(room, _body_text, sender, is_private)
+
         if _body_low in ("اوامر", "الاوامر", "help", "مساعدة"):
             menu = _command_menu_for(_is_primary_master(sender), is_private=is_private)
             if room and not is_private and self._effective_room_language(room) == "en":
@@ -20061,6 +20207,147 @@ class TalkinBot:
             self.log("[ROOM-LIST] text response diagnostic failed:", repr(exc))
         return True
 
+    def _send_room_id_sync_request(self, room, room_key, request_id):
+        try:
+            packet = encode_query(
+                "room_admin", type_="members_list", room=room, to=BOT_ID,
+                value="none", id_=request_id,
+            )
+            return self.send_query(packet)
+        except Exception as exc:
+            self.log("[ROOM-ID] members-list request failed:", type(exc).__name__)
+            return False
+
+    def _room_list_response_timeout(self, room_key, request_id):
+        pending_lists = getattr(self, "_pending_room_lists", {})
+        pending = pending_lists.get(room_key)
+        if not isinstance(pending, dict) or str(pending.get("request_id") or "") != str(request_id or ""):
+            return False
+        pending_lists.pop(room_key, None)
+        message = "⌛ لم يصل رد المتواجدين من السيرفر؛ لم يتم حفظ الهوية. أعد المحاولة لاحقًا."
+        senders = pending.get("identity_senders") or ([pending.get("sender")] if pending.get("sender") else [])
+        if pending.get("code") == "identity_update" and senders:
+            for sender in senders:
+                self.send_private_text(sender, message)
+        elif pending.get("private_response"):
+            self.send_private_text(pending.get("sender"), message)
+        else:
+            self.send_room_text(pending.get("response_room") or pending.get("room"), message)
+        return True
+
+    def _schedule_room_id_sync(self, room):
+        """Request one room roster at a time; the server response arrives asynchronously."""
+        room = str(room or "").strip()
+        room_key = _norm_room(room)
+        if not room or not room_key or getattr(self, "ws", None) is None:
+            return False
+        lock = getattr(self, "_room_id_sync_lock", None)
+        if lock is None:
+            lock = self._room_id_sync_lock = threading.RLock()
+        pending_lists = getattr(self, "_pending_room_lists", None)
+        if not isinstance(pending_lists, dict):
+            pending_lists = self._pending_room_lists = {}
+        with lock:
+            now = time.time()
+            last = getattr(self, "_room_id_sync_last", {})
+            if now - float(last.get(room_key, 0) or 0) < 60 or room_key in pending_lists:
+                return False
+            request_id = secrets.token_urlsafe(15)[:20]
+            pending = {
+                "room": room, "code": "id_sync", "request_type": "members_list",
+                "request_id": request_id, "requested_at": now,
+            }
+            timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
+            timer.daemon = True
+            pending["timer"] = timer
+            pending_lists[room_key] = pending
+            last[room_key] = now
+            self._room_id_sync_last = last
+            timer.start()
+        if self._send_room_id_sync_request(room, room_key, request_id) is False:
+            pending_lists.pop(room_key, None)
+            timer.cancel()
+            return False
+        return True
+
+    def _request_identity_update(self, room, sender):
+        """Start an explicit, non-blocking identity refresh for one user."""
+        room = str(room or "").strip()
+        sender = str(sender or "").strip().lstrip("@")
+        room_key = _norm_room(room)
+        if not room_key or getattr(self, "ws", None) is None:
+            self.send_private_text(sender, "⚠️ نفّذ «حدث ايدي» داخل غرفة متصلة حتى أطلب هويتك من السيرفر.")
+            return True
+        pending_lists = getattr(self, "_pending_room_lists", None)
+        if not isinstance(pending_lists, dict):
+            pending_lists = self._pending_room_lists = {}
+        lock = getattr(self, "_room_id_sync_lock", None)
+        if lock is None:
+            lock = self._room_id_sync_lock = threading.RLock()
+        with lock:
+            pending = pending_lists.get(room_key)
+            if isinstance(pending, dict):
+                if pending.get("code") in {"id_sync", "identity_update"}:
+                    senders = pending.setdefault("identity_senders", [])
+                    if not any(_norm_user(item) == _norm_user(sender) for item in senders):
+                        senders.append(sender)
+                    pending["code"] = "identity_update"
+                    return True
+                self.send_private_text(sender, "⌛ هناك طلب أعضاء آخر جارٍ لهذه الغرفة؛ أعد «حدث ايدي» بعد اكتماله.")
+                return True
+            request_id = secrets.token_urlsafe(15)[:20]
+            pending = {
+                "room": room, "code": "identity_update", "request_type": "members_list",
+                "request_id": request_id, "requested_at": time.time(),
+                "identity_senders": [sender],
+            }
+            timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
+            timer.daemon = True
+            pending["timer"] = timer
+            pending_lists[room_key] = pending
+            timer.start()
+        if self._send_room_id_sync_request(room, room_key, request_id) is False:
+            pending_lists.pop(room_key, None)
+            timer.cancel()
+            self.send_private_text(sender, "⚠️ تعذر طلب قائمة الأعضاء من السيرفر؛ حاول مجددًا.")
+        return True
+
+    def _request_mining_identity_lookup(self, room, sender, text):
+        """Wait for the native roster response before running ID-based mining."""
+        room = str(room or "").strip()
+        room_key = _norm_room(room)
+        if not room_key or getattr(self, "ws", None) is None:
+            self.send_room_text(room, "⚠️ لا أستطيع تحديد معرفك الآن؛ تأكد من اتصال الغرفة.")
+            return True
+        pending_lists = getattr(self, "_pending_room_lists", None)
+        if not isinstance(pending_lists, dict):
+            pending_lists = self._pending_room_lists = {}
+        followup = {"sender": str(sender or "").strip().lstrip("@"), "text": str(text or "")}
+        pending = pending_lists.get(room_key)
+        if isinstance(pending, dict):
+            if pending.get("code") in {"id_sync", "mine_uid"}:
+                pending.setdefault("mine_followups", []).append(followup)
+                return True
+            self.send_room_text(room, "⌛ هناك طلب أعضاء جارٍ لهذه الغرفة؛ أعد أمر التنقيب بعد اكتماله.")
+            return True
+        lock = getattr(self, "_room_id_sync_lock", None)
+        if lock is None:
+            lock = self._room_id_sync_lock = threading.RLock()
+        request_id = secrets.token_urlsafe(15)[:20]
+        pending = {
+            "room": room, "code": "mine_uid", "request_type": "members_list",
+            "request_id": request_id, "requested_at": time.time(), "mine_followups": [followup],
+        }
+        timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
+        timer.daemon = True
+        pending["timer"] = timer
+        with lock:
+            pending_lists[room_key] = pending
+        timer.start()
+        self.send_room_text(room, f"🔄 جارٍ تحديد حساب @{followup['sender']} عبر ID في الخلفية.")
+        self._send_room_id_sync_request(room, room_key, request_id)
+        return True
+
     def _complete_pending_room_list(self, result):
         source_room = str(result.get("_occupants_room") or "").strip()
         if not source_room:
@@ -20068,6 +20355,42 @@ class TalkinBot:
         pending = self._pending_room_lists.pop(_norm_room(source_room), None)
         if not isinstance(pending, dict):
             return False
+        response_timer = pending.get("timer")
+        if response_timer:
+            try:
+                response_timer.cancel()
+            except Exception:
+                pass
+
+        code = str(pending.get("code") or "").lower()
+        if code in {"id_sync", "identity_update", "mine_uid"}:
+            users = self._extract_room_list_users(result)
+            _remember_roster(source_room, users)
+            room_users = getattr(self, "room_users", None)
+            if isinstance(room_users, dict):
+                for user in users:
+                    name = str(user.get("username") or "").strip().lstrip("@")
+                    if name:
+                        room_users.setdefault(source_room, {})[name] = str(user.get("role") or "none")
+            if code == "mine_uid":
+                for followup in pending.get("mine_followups", []):
+                    sender_name = str(followup.get("sender") or "").strip().lstrip("@")
+                    user_id = _room_roster_id_for_name(users, sender_name)
+                    if user_id:
+                        self._execute_mining_command_with_id(
+                            source_room, followup.get("text", ""), sender_name, user_id
+                        )
+                    else:
+                        self.send_room_text(source_room, f"⚠️ لم يصل معرّف حساب @{sender_name} من السيرفر.")
+            elif code == "identity_update":
+                senders = pending.get("identity_senders") or ([pending.get("sender")] if pending.get("sender") else [])
+                for sender_name in senders:
+                    user_id = _room_roster_id_for_name(users, sender_name)
+                    if user_id:
+                        self.send_private_text(sender_name, "✅ تم تحديث هويتك بنجاح وحفظها داخليًا.")
+                    else:
+                        self.send_private_text(sender_name, "⚠️ لم يصل ID واضح لحسابك من السيرفر؛ لم تُحدّث الهوية.")
+            return True
 
         # INV roster collection: each category is fetched separately. The
         # response category is authoritative; then the next category is
@@ -20386,6 +20709,27 @@ class TalkinBot:
         return True
 
     def _room_list_commands(self, room, text, sender, is_private):
+        update_id = re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", str(text or "").strip(), re.I)
+        if update_id:
+            return self._request_identity_update(room, sender)
+
+        id_match = re.fullmatch(r"(?:ايدي|أيدي|id)(?:@(.+))?", str(text or "").strip(), re.I)
+        if id_match:
+            target = (id_match.group(1) or sender).strip().lstrip("@")
+            cached_id = _stored_user_id(target, room)
+            if cached_id:
+                if is_private:
+                    self.send_private_text(sender, cached_id)
+                else:
+                    self.send_room_text(room, cached_id)
+            else:
+                message = "لا توجد هوية محفوظة لهذا المستخدم. اكتب «حدث ايدي» داخل الغرفة لتحديثها أولًا."
+                if is_private:
+                    self.send_private_text(sender, message)
+                else:
+                    self.send_room_text(room, message)
+            return True
+
         match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
         if match:
             if not room:
