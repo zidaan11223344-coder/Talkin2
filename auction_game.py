@@ -20,7 +20,10 @@ BID_INCREMENT = 10_000_000
 MAX_PARTICIPANTS = 5
 MIN_PARTICIPANTS_TO_START_EARLY = 3
 BIDDING_DURATION_SECONDS = 60
-REDEMPTION_BONUS_PERCENT = 30
+TURN_TIMEOUT_SECONDS = 7
+REDEMPTION_PROFIT_BASIS_POINTS = 75
+REDEMPTION_LOSS_BASIS_POINTS = 125
+REDEMPTION_BASIS_POINTS = 10_000
 MAX_IMAGE_BYTES = 50_000
 
 # These existing Talkin2 treasure images are already below MAX_IMAGE_BYTES.
@@ -47,12 +50,12 @@ def normalize_command(value: str) -> str:
 
 
 _ROOM_COMMANDS = {
-    "open": {"افتح مزاد", "افتح المزاد", "افتح لعبه مزاد", "ابي افتح لعبه مزاد", "open auction"},
+    "open": {"افتح مزاد", "افتح المزاد", "فتح المزاد", "افتح لعبه مزاد", "ابي افتح لعبه مزاد", "open auction"},
     "join": {"مزايده", "مزايده للمزاد", "انضم للمزاد", "join auction"},
     "start": {"ابدا المزاد", "ابدأ المزاد", "start auction"},
     "bid": {"زايد", "زايد للمزاد", "bid", "raise bid"},
     "pass": {"تمرير", "مرر", "تمرير الدور", "pass", "skip"},
-    "close": {"اقفل المزاد", "اغلق المزاد", "انهاء المزاد", "close auction"},
+    "close": {"اقفل المزاد", "اغلق المزاد", "اغلاق المزاد", "إغلاق المزاد", "انهاء المزاد", "close auction"},
     "cancel": {"الغاء المزاد", "الغ المزاد", "cancel auction"},
 }
 _TOGGLE_ON = {"شغل لعبه مزاد", "شغل لعبة مزاد", "تشغيل لعبة مزاد", "تشغيل لعبة المزاد", "auction on"}
@@ -60,11 +63,17 @@ _TOGGLE_OFF = {"اوقف لعبه مزاد", "اوقف لعبة مزاد", "وق
 
 
 def parse_room_command(text: str) -> str | None:
-    normalized = normalize_command(text)
+    # Do not translate Arabic letters globally: commands such as «افتح المزاد»
+    # and «مزايده» contain م/ب as ordinary letters. Translate suffixes only
+    # after command aliases have been checked.
+    normalized = normalize_command(str(text or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
     for action, aliases in _ROOM_COMMANDS.items():
         if normalized in {normalize_command(alias) for alias in aliases}:
             return action
     if any(normalized.startswith(normalize_command(alias) + " ") for alias in _ROOM_COMMANDS["bid"]):
+        return "bid"
+    numeric = normalized.translate(str.maketrans({"م": "m", "ب": "b"}))
+    if re.fullmatch(r"[0-9]+(?:[mb])?", numeric, re.I):
         return "bid"
     return None
 
@@ -73,7 +82,12 @@ def parse_bid_amount(text: str) -> int | None:
     """Parse an explicit bid amount from Arabic or English bid commands."""
     digits = "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹"
     ascii_digits = "01234567890123456789"
-    normalized = normalize_command(str(text or "").translate(str.maketrans(digits, ascii_digits)))
+    normalized = normalize_command(str(text or "").translate(str.maketrans(digits, ascii_digits))).translate(str.maketrans({"م": "m", "ب": "b"}))
+    if re.fullmatch(r"[0-9]+(?:[mb])?", normalized, re.I):
+        token = normalized
+        suffix = token[-1:].casefold() if token[-1:].casefold() in {"m", "b"} else ""
+        raw = token[:-1] if suffix else token
+        return int(raw) * ({"": 1, "m": 1_000_000, "b": 1_000_000_000}[suffix])
     for alias in sorted(_ROOM_COMMANDS["bid"], key=len, reverse=True):
         prefix = normalize_command(alias)
         if not normalized.startswith(prefix + " "):
@@ -155,7 +169,13 @@ class AuctionGame:
 
     @staticmethod
     def _empty_state() -> dict:
-        return {"version": 1, "enabled": False, "active": None, "inventory": {}, "last_result": None}
+        return {
+            "version": 1,
+            "enabled": False,
+            "active": None,
+            "inventory": {},
+            "last_result": None,
+        }
 
     def _read(self) -> dict:
         raw = self.load_json(self.path, self._empty_state())
@@ -188,6 +208,7 @@ class AuctionGame:
         active["deadline_at"] = started_at + BIDDING_DURATION_SECONDS
         active["passed_since_bid"] = []
         AuctionGame._set_turn(active, 0)
+        active["turn_deadline_at"] = started_at + TURN_TIMEOUT_SECONDS
 
     @staticmethod
     def _set_turn(active: dict, index: int) -> dict | None:
@@ -379,6 +400,12 @@ class AuctionGame:
             self._ensure_turn_state(active)
             if uid != str(active.get("turn_user_id") or ""):
                 return {"ok": False, "error": "not_your_turn", "turn_username": active.get("turn_username", ""), "auction": copy.deepcopy(active)}
+            try:
+                turn_deadline_at = float(active.get("turn_deadline_at") or (float(active.get("started_at", 0) or 0) + TURN_TIMEOUT_SECONDS))
+            except (TypeError, ValueError):
+                turn_deadline_at = deadline_at
+            if float(self.clock()) >= turn_deadline_at:
+                return {"ok": False, "error": "turn_expired", "turn_deadline_at": turn_deadline_at}
             item = active.get("item") if isinstance(active.get("item"), dict) else {}
             try:
                 starting_price = max(0, int(item.get("starting_price", 100_000_000) or 0))
@@ -408,6 +435,7 @@ class AuctionGame:
             del history[:-200]
             current_index = int(active.get("turn_index", 0) or 0)
             self._advance_turn(active, current_index, skip_passed=False)
+            active["turn_deadline_at"] = float(self.clock()) + TURN_TIMEOUT_SECONDS
             state["active"] = active
             self._write(state)
             return {
@@ -444,6 +472,7 @@ class AuctionGame:
                 self._write(state)
             else:
                 self._advance_turn(active, current_index, skip_passed=True)
+                active["turn_deadline_at"] = float(self.clock()) + TURN_TIMEOUT_SECONDS
                 state["active"] = active
                 self._write(state)
                 return {
@@ -553,7 +582,8 @@ class AuctionGame:
                     "icon": str(item.get("icon") or "💎"),
                     "username": str(settlement.get("winner_name") or ""),
                     "winning_bid": bid_amount,
-                    "redemption_value": (bid_amount * (100 + REDEMPTION_BONUS_PERCENT)) // 100,
+                    # The outcome is intentionally unknown until redemption.
+                    "redemption_value": bid_amount,
                     "status": "available",
                     "won_at": int(self.clock()),
                 })
@@ -561,7 +591,7 @@ class AuctionGame:
                 "status": "sold", "auction_id": auction_id,
                 "winner_id": winner_id, "winner": str(settlement.get("winner_name") or ""),
                 "bid": bid_amount,
-                "redemption_value": (bid_amount * (100 + REDEMPTION_BONUS_PERCENT)) // 100,
+                "redemption_value": bid_amount,
                 "item": item, "at": int(self.clock()),
             }
             state["last_result"] = final
@@ -629,8 +659,17 @@ class AuctionGame:
             if match is None:
                 return {"ok": False, "error": "item_not_found"}
             if match.get("status") == "available":
+                try:
+                    cost_basis = max(0, int(match.get("winning_bid", match.get("redemption_value", 0)) or 0))
+                except (TypeError, ValueError):
+                    cost_basis = max(0, int(match.get("redemption_value", 0) or 0))
+                authentic = random.random() < 0.5
+                adjustment = REDEMPTION_PROFIT_BASIS_POINTS if authentic else -REDEMPTION_LOSS_BASIS_POINTS
+                redemption_value = (cost_basis * (REDEMPTION_BASIS_POINTS + adjustment)) // REDEMPTION_BASIS_POINTS
                 match["status"] = "redeeming"
                 match["redemption_transaction_id"] = f"auction-redemption:{match.get('id')}"
+                match["redemption_outcome"] = "authentic" if authentic else "counterfeit"
+                match["redemption_value"] = redemption_value
                 try:
                     self._write(state)
                 except Exception:
@@ -640,7 +679,7 @@ class AuctionGame:
             str(username or record.get("username") or "").strip().lstrip("@"),
             int(record.get("redemption_value", 0) or 0),
             str(record.get("redemption_transaction_id") or f"auction-redemption:{record.get('id')}"),
-            "world auction collectible redemption with 30 percent bonus",
+            "world auction collectible redemption with random authenticity and +0.75%/-1.25% adjustment",
         )
         if not isinstance(result, dict) or not result.get("ok"):
             return {"ok": False, "error": (result.get("error") if isinstance(result, dict) else "persistence_failed"), "pending": True, "item": record}
@@ -656,4 +695,11 @@ class AuctionGame:
                     self._write(state)
                 except Exception:
                     return {"ok": False, "error": "persistence_failed", "pending": True, "item": record}
-        return {"ok": True, "item": record, "points": int(record.get("redemption_value", 0) or 0), "already_applied": bool(result.get("already_applied"))}
+        return {
+            "ok": True,
+            "item": record,
+            "points": int(record.get("redemption_value", 0) or 0),
+            "outcome": str(record.get("redemption_outcome") or "unknown"),
+            "authentic": record.get("redemption_outcome") == "authentic",
+            "already_applied": bool(result.get("already_applied")),
+        }

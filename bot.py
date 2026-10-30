@@ -48,7 +48,7 @@ try:
 except Exception:
     pymysql = None
 from dotenv import dotenv_values, load_dotenv
-from auction_game import AuctionGame, BIDDING_DURATION_SECONDS, MAX_IMAGE_BYTES, parse_bid_amount as _parse_auction_bid_amount, parse_room_command as _parse_auction_room_command, parse_toggle_command as _parse_auction_toggle_command
+from auction_game import AuctionGame, BIDDING_DURATION_SECONDS, TURN_TIMEOUT_SECONDS, MAX_IMAGE_BYTES, parse_bid_amount as _parse_auction_bid_amount, parse_room_command as _parse_auction_room_command, parse_toggle_command as _parse_auction_toggle_command
 from cricket_integration import CricketIntegration
 import shop as member_shop
 from treasure_mining import DIAMOND_KEYS, ITEMS as MINING_ITEMS, MiningStore, format_cooldown, resolve_item_keys
@@ -56,10 +56,12 @@ from treasure_mining import DIAMOND_KEYS, ITEMS as MINING_ITEMS, MiningStore, fo
 # ignored so required secrets must come from Railway Variables, while an
 # explicitly injected Railway value always wins over the repository defaults.
 _ENV_BASE_DIR = Path(__file__).resolve().parent
+# Load the deployment's local .env before filling missing values from the
+# tracked example. Existing platform variables retain precedence in both cases.
+load_dotenv(dotenv_path=_ENV_BASE_DIR / ".env", override=False)
 for _key, _value in dotenv_values(_ENV_BASE_DIR / ".env.example").items():
     if _key and _value not in (None, "") and _key not in os.environ:
         os.environ[_key] = _value
-load_dotenv(dotenv_path=_ENV_BASE_DIR / ".env", override=False)
 
 
 # ============================================================
@@ -633,6 +635,12 @@ AUTO_JOIN_ALL_ROOMS = (
     or os.getenv("AUTO_JOIN_ROOMS")
     or "on"
 ).strip().casefold() in {"1", "true", "yes", "on", "enable", "enabled"}
+STARTUP_JOIN_ENABLED = os.getenv("STARTUP_JOIN_ENABLED", "1").strip().casefold() not in {
+    "0", "false", "no", "off", "disable", "disabled",
+}
+RESTORE_SAVED_ROOMS_ON_STARTUP = os.getenv(
+    "RESTORE_SAVED_ROOMS_ON_STARTUP", "1"
+).strip().casefold() not in {"0", "false", "no", "off", "disable", "disabled"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -3166,12 +3174,17 @@ def _looks_like_bot_command(text):
     if not low:
         return False
     if (low.startswith("la@")
+            or low.startswith("ts@")
+            or low in {"رتبتك", "رتبتي", "bot rank", "your rank"}
             or low in {"ايدي", "أيدي", "id"}
             or re.fullmatch(r"(?:ايدي|أيدي|id)@.+", low, re.I)
-            or re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", low, re.I)):
+            or re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", low, re.I)
+            or low in VIP_ID_REFRESH_COMMANDS
+            or low in POINTS_ID_REFRESH_COMMANDS):
         return True
     timed_game_command = _normalize_timed_treasure_command(text) in TIMED_TREASURE_GAME_ALIASES
     prefixes = (
+        "ax@", "x@",
         "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
         "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
@@ -3271,7 +3284,9 @@ def _is_room_creator(room, sender):
 
 def _looks_like_admin_command(text):
     low = str(text or "").strip().casefold()
-    if low.startswith("+ds@"):
+    if (low.startswith(("+ds@", "ts@"))
+            or low in VIP_ID_REFRESH_COMMANDS
+            or low in POINTS_ID_REFRESH_COMMANDS):
         return True
     if re.match(r"^(?:إضافة|اضافة|استرجاع|استعادة|زيادة|زود)\s+(?:العاب|ألعاب)@", str(text or "").strip(), re.I):
         return True
@@ -3290,6 +3305,82 @@ def _verified_data():
 def _vip_data():
     data=_load_local_json(VIP_FILE,{})
     return data if isinstance(data,dict) else {}
+
+def _vip_identity_entries(data):
+    """Return (path, username) pairs for the supported VIP JSON layouts."""
+    rows = []
+    identity_keys = ("username", "user_name", "name", "display_name", "nickname")
+    containers = {"users", "vip_users", "records", "accounts", "data", "items", "entries", "members"}
+    metadata = {"version", "schema_version", "format", "updated_at", "created_at", "granted_by"}
+
+    def walk(node, path=()):
+        if isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, path + (index,))
+            return
+        if not isinstance(node, dict):
+            return
+        normalized_keys = {str(key).casefold().replace("-", "_"): key for key in node}
+        for identity_key in identity_keys:
+            original_key = normalized_keys.get(identity_key)
+            value = node.get(original_key) if original_key is not None else None
+            if isinstance(value, str) and value.strip():
+                rows.append((path, value.strip().lstrip("@"), node))
+                return
+        for key, value in node.items():
+            key_norm = str(key).casefold().replace("-", "_")
+            if key_norm in metadata:
+                continue
+            if key_norm in containers:
+                walk(value, path + (key,))
+            elif isinstance(value, dict):
+                name = next((str(value.get(field) or "").strip().lstrip("@") for field in identity_keys
+                             if str(value.get(field) or "").strip()), str(key).strip().lstrip("@"))
+                if name:
+                    rows.append((path + (key,), name, value))
+            elif isinstance(value, list):
+                walk(value, path + (key,))
+            elif str(key).strip():
+                # Legacy files may store a bare username key with a boolean value.
+                rows.append((path + (key,), str(key).strip().lstrip("@"), value))
+
+    walk(data)
+    return rows
+
+def _update_vip_user_id(username, user_id):
+    """Set one exact VIP record's Talkin user ID without replacing its metadata."""
+    target = str(username or "").strip().lstrip("@")
+    uid = str(user_id or "").strip()
+    if not target or not uid.isdigit():
+        return {"ok": False, "error": "invalid_identity"}
+    try:
+        with _LOCAL_JSON_WRITE_LOCK:
+            data = _vip_data()
+            matches = [row for row in _vip_identity_entries(data) if _norm_user(row[1]) == _norm_user(target)]
+            if not matches:
+                return {"ok": False, "error": "target_not_found"}
+            if len(matches) != 1:
+                return {"ok": False, "error": "ambiguous_target"}
+            path, saved_name, saved_record = matches[0]
+            item = dict(saved_record) if isinstance(saved_record, dict) else {"username": saved_name}
+            changed = str(item.get("user_id") or "").strip() != uid
+            if not changed:
+                return {"ok": True, "changed": False, "username": saved_name, "user_id": uid}
+            item["username"] = str(item.get("username") or saved_name)
+            item["user_id"] = uid
+            item["updated_at"] = int(time.time())
+            if path:
+                parent = data
+                for key in path[:-1]:
+                    parent = parent[key]
+                parent[path[-1]] = item
+            else:
+                data = item
+            _save_local_json(VIP_FILE, data)
+            return {"ok": True, "changed": True, "username": saved_name, "user_id": uid}
+    except Exception as exc:
+        print(f"[VIP] user ID update failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
 
 def _saved_identity_groups(data):
     """Build account identity groups once; exclude audit metadata from identities."""
@@ -4024,6 +4115,14 @@ def _game_top(game_key, limit=15):
 
 _POINTS_STATE_VERSION = 2
 _POINT_TRANSFER_HISTORY_LIMIT = 1000
+PROFILE_LOOKUP_TIMEOUT_SECONDS = 18.0
+PROFILE_LOOKUP_UID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHJKLMNOPQRSTUVWXYZ"
+VIP_ID_REFRESH_COMMANDS = frozenset({
+    "تحديث ايدي ملفvip", "تحديث ايدي ملف vip", "تحديث ايديهات ملفvip", "تحديث ايديهات ملف vip",
+})
+POINTS_ID_REFRESH_COMMANDS = frozenset({
+    "حدث ايديهات ملف النقاط", "تحديث ايديهات ملف النقاط", "تحديث ايدي ملف النقاط",
+})
 
 
 def _decode_points_payload(payload):
@@ -4366,8 +4465,127 @@ def _deduct_points(username, amount, *, actor=""):
         return {"ok": False, "error": "persistence_failed"}
 
 
+def _set_points_balance(username, balance, *, actor=""):
+    """Replace one exact saved points balance and audit the adjustment atomically."""
+    try:
+        balance = int(balance)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_amount"}
+    target_name = str(username or "").strip().lstrip("@")
+    actor_name = str(actor or BOT_MASTER).strip().lstrip("@")
+    if balance < 0:
+        return {"ok": False, "error": "invalid_amount"}
+    if not _norm_user(target_name):
+        return {"ok": False, "error": "target_not_found"}
+
+    def update(accounts, history):
+        matches = _points_account_candidates(accounts, target_name, exact_only=True)
+        if not matches:
+            return {"ok": False, "error": "target_not_found"}, False
+        if len(matches) != 1:
+            return {"ok": False, "error": "ambiguous_target"}, False
+        key, saved_item = matches[0]
+        item = dict(saved_item)
+        old_balance = _points_balance(item)
+        if old_balance == balance:
+            return {
+                "ok": True, "changed": False,
+                "username": str(item.get("username") or target_name),
+                "old_balance": old_balance, "balance": balance,
+            }, False
+
+        item["points"] = balance
+        accounts[key] = item
+        increase = balance > old_balance
+        history.append({
+            "id": uuid.uuid4().hex,
+            "timestamp": int(time.time()),
+            "sender": "system" if increase else str(item.get("username") or target_name),
+            "sender_key": "" if increase else key,
+            "recipient": str(item.get("username") or target_name) if increase else "system",
+            "recipient_key": key if increase else "",
+            "amount": abs(balance - old_balance),
+            "sender_balance_after": None if increase else balance,
+            "recipient_balance_after": balance if increase else None,
+            "reason": f"master_balance_set by @{actor_name}: {old_balance} -> {balance}",
+            "actor": actor_name,
+            "old_balance": old_balance,
+            "new_balance": balance,
+        })
+        del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
+        return {
+            "ok": True, "changed": True,
+            "username": str(item.get("username") or target_name),
+            "old_balance": old_balance, "balance": balance,
+        }, True
+
+    try:
+        return _mutate_points_state(update)
+    except Exception as exc:
+        print(f"[POINTS] master balance replacement failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
+
+def _set_points_user_id(username, user_id):
+    """Persist one server-verified Talkin ID on an exact points account."""
+    target_name = str(username or "").strip().lstrip("@")
+    uid = str(user_id or "").strip()
+    if not target_name or not uid.isdigit():
+        return {"ok": False, "error": "invalid_identity"}
+
+    def update(accounts, _history):
+        matches = _points_account_candidates(accounts, target_name, exact_only=True)
+        if not matches:
+            return {"ok": False, "error": "target_not_found"}, False
+        if len(matches) != 1:
+            return {"ok": False, "error": "ambiguous_target"}, False
+        key, saved = matches[0]
+        item = dict(saved)
+        saved_name = str(item.get("username") or key).strip().lstrip("@")
+        if _norm_user(saved_name) != _norm_user(target_name) and _norm_user(key) != _norm_user(target_name):
+            return {"ok": False, "error": "target_not_found"}, False
+        if str(item.get("user_id") or "").strip() == uid:
+            return {"ok": True, "changed": False, "username": saved_name, "user_id": uid}, False
+        item["username"] = str(item.get("username") or target_name)
+        item["user_id"] = uid
+        item["user_id_updated_at"] = int(time.time())
+        accounts[key] = item
+        return {"ok": True, "changed": True, "username": item["username"], "user_id": uid}, True
+
+    try:
+        return _mutate_points_state(update)
+    except Exception as exc:
+        print(f"[POINTS] user ID update failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
+
+def _points_identity_status(username, user_id):
+    """Return whether the exact saved name and its server ID identify one points account."""
+    target_name = str(username or "").strip().lstrip("@")
+    uid = str(user_id or "").strip()
+    matches = _points_account_candidates(_points_data(), target_name, exact_only=True)
+    if not matches:
+        return {"ok": False, "error": "target_not_found"}
+    if len(matches) != 1:
+        return {"ok": False, "error": "ambiguous_target"}
+    key, item = matches[0]
+    saved_name = str(item.get("username") or key).strip().lstrip("@")
+    saved_id = str(item.get("user_id") or "").strip()
+    if _norm_user(saved_name) != _norm_user(target_name):
+        return {"ok": False, "error": "name_mismatch"}
+    if not saved_id.isdigit():
+        return {"ok": False, "error": "id_missing"}
+    if not uid or saved_id != uid:
+        return {"ok": False, "error": "id_mismatch"}
+    id_accounts = [
+        key for key, record in _points_data().items()
+        if isinstance(record, dict) and str(record.get("user_id") or "").strip() == uid
+    ]
+    if len(id_accounts) != 1:
+        return {"ok": False, "error": "ambiguous_user_id"}
+    return {"ok": True, "key": key, "username": saved_name, "user_id": saved_id}
+
 def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_source=True,
-                     require_exact_target=True, create_target_if_missing=False):
+                     require_exact_target=True, create_target_if_missing=False,
+                     expected_sender_id=None, expected_target_id=None):
     """Move points and append the audit entry in the same points.json commit."""
     amount = int(amount)
     if amount <= 0:
@@ -4386,6 +4604,22 @@ def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_s
             return {"ok": False, "error": "sender_not_found"}, False
         source_key, source_item = source
         target_key, target_item = destination
+        if expected_sender_id is not None or expected_target_id is not None:
+            expected_source = str(expected_sender_id or "").strip()
+            expected_target = str(expected_target_id or "").strip()
+            if (_norm_user(source_item.get("username") or source_key) != _norm_user(sender_name)
+                    or _norm_user(target_item.get("username") or target_key) != _norm_user(target_name)):
+                return {"ok": False, "error": "identity_name_mismatch"}, False
+            if expected_source and str(source_item.get("user_id") or "").strip() != expected_source:
+                return {"ok": False, "error": "sender_id_mismatch"}, False
+            if expected_target and str(target_item.get("user_id") or "").strip() != expected_target:
+                return {"ok": False, "error": "target_id_mismatch"}, False
+            for expected_id in (expected_source, expected_target):
+                if expected_id and sum(
+                    1 for record in accounts.values()
+                    if isinstance(record, dict) and str(record.get("user_id") or "").strip() == expected_id
+                ) != 1:
+                    return {"ok": False, "error": "ambiguous_user_id"}, False
         if source_key == target_key:
             return {"ok": False, "error": "same_account"}, False
         source_balance = _points_balance(source_item)
@@ -4425,7 +4659,6 @@ def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_s
     except Exception as exc:
         print(f"[POINTS] transfer commit failed: {exc}", flush=True)
         return {"ok": False, "error": "persistence_failed"}
-
 
 def _get_points(username):
     resolved = _resolve_points_account(_points_data(), username)
@@ -5060,10 +5293,19 @@ def _room_manager(bot, room, sender):
         "صانع", "صانع_الغرفة", "مالك",
     }
 
+def _normalize_room_role(value):
+    role = str(value or "").casefold().strip().replace(" ", "_")
+    return {
+        "o": "owner", "a": "admin", "m": "member",
+        "normal": "member", "user": "member",
+        "roomowner": "room_owner", "roomcreator": "room_creator",
+    }.get(role, role)
+
+
 def _room_role(bot, room, sender, event_role=None):
     """Return a cached/event room role, without guessing when rank data is absent."""
     if event_role is not None and str(event_role).strip():
-        return str(event_role).strip().casefold(), True
+        return _normalize_room_role(event_role), True
     rosters = getattr(bot, "room_users", {}) or {}
     room_key = _norm_room(room)
     for roster_room, users in rosters.items():
@@ -5071,7 +5313,7 @@ def _room_role(bot, room, sender, event_role=None):
             continue
         for username, role in users.items():
             if _norm_user(username) == _norm_user(sender):
-                return str(role or "none").strip().casefold(), True
+                return _normalize_room_role(role or "none"), True
     return "", False
 
 def _auto_ban_candidate(bot, room, sender, event_role=None):
@@ -5212,17 +5454,17 @@ def _default_help_sections():
             '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📌 اكتب ns للقائمة التالية',
             '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n\n🔨 المزاد العالمي: الماستر في الخاص يرسل شغل لعبة مزاد / أوقف لعبة مزاد.\nافتح مزاد — يختار البوت سلعة نادرة ويرسل صورتها (≤50 KB).\nمزايده — تسجيل؛ عند 3 مشاركين يبدأه الفاتح، وعند 5 يبدأ تلقائياً.\nبعد البدء: المزايدة بالدور لمدة 60 ثانية. عند دورك اكتب «زايد <المبلغ>»؛ أول مزايدة لا تقل عن السعر الابتدائي، وكل مزايدة لاحقة أعلى من السعر الحالي بـ10,000,000 نقطة على الأقل، أو اكتب «تمرير». يتجاهل البوت أوامر المزايدة خارج الدور بصمت.\nأثناء الجولة، مزايده تعني أن المزاد شغال؛ انتظر انتهاءه. فاتح الجولة أو الماستر يستطيع إقفاله بأمر «اقفل المزاد». بعد الإغلاق: «زايد/مزايده» يرد بأن المزاد مغلق وانتظر جولة أخرى.\nsv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاستبدال بعد الجولة بربح 30%.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n\n🔨 المزاد: يفعّله الماستر بالخاص: تشغيل/إيقاف لعبة مزاد.\nافتح مزاد — ابدأ؛ مزايده — انضم (3–5 لاعبين).\nبعد البدء: لكل لاعب 7 ثوانٍ للمزايدة أو يمرّ الدور تلقائيًا؛ أقصى جولة 60 ثانية. اكتب «زايد 110m» أو «تمرير».\n⚠️ قد لا تكون القطع أصلية.\nsv — المخزون؛ red auction <الرمز> — استرداد 50/50: أصلي +0.75%، مغشوش -1.25%.',
             '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — استثمار تلقائي بالذهب بعد التحذير؛ بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
             '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا (حتى 30 هدية في القائمة)\ngifts / gv — قائمة الهدايا؛ اكتب ns للتالي\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
-            '📢 النشر — 2\n━━━━━━━━━━━━\nبوست أو انشر — تجهيز ونشر صورة\nبوست@وصف أو انشر@وصف — نشر صورة مع وصف\n📌 الوصف يمر عبر فلتر الكلمات المسيئة، ومن يخالفه يُمنع من النشر حتى mbp@اسم\n\n📌 أرسل الصورة بعد أمر بوست أو انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
+            '📢 النشر — 2\n━━━━━━━━━━━━\nبوست أو انشر — تجهيز ونشر صورة\nax@النص — نشر بطاقة اكسبلور مع الرموز التعبيرية والتفاعلات\nبوست@وصف أو انشر@وصف — نشر صورة مع وصف\n📌 الوصف يمر عبر فلتر الكلمات المسيئة، ومن يخالفه يُمنع من النشر حتى mbp@اسم\n\n📌 أرسل الصورة بعد أمر بوست أو انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
         ],
         5: [
             '💰 النقاط — 1\n━━━━━━━━━━━━\nنقاطي — عرض الرصيد والمستوى وإحصاءات اللعب\npoints — عرض النقاط\nتوب — المتصدرين العام\ntop — المتصدرين العام\n\nتوب رهان — متصدروا الرهان\nتوب مضاربة — متصدروا المضاربة\nتوب حظي — متصدروا حظي\nتوب استثمار — متصدروا الاستثمار',
-            '💸 النقاط — 2: التحويل\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل عادي من رصيد المرسل\nmsb@اسم@عدد — تحويل الماستر من الخاص دون خصم\n\nمثال اللاعب:\nsb@ahmd555@1000\nمثال الماستر في الخاص:\nmsb@ahmd555@1000\n\n📌 sb متاح للموثقين في الغرف والخاص ويخصم من رصيد المرسل.\n📌 msb للماستر المحدد في خاص البوت فقط.\n\nللاطلاع على الرصيد استخدم: نقاطي',
+            '💸 النقاط — 2: التحويل والتسوية\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل؛ يتطلب تطابق الاسم وID المرسل والمستلم مع ملف النقاط\nmsb@اسم@عدد — تحويل الماستر من الخاص دون خصم\nts@اسم@عدد — استبدال رصيد المستخدم (الماستر الأساسي، بالخاص فقط)\n\n📌 sb للموثقين؛ يرفض أي ID غير مطابق ولا يخصم عند الفشل.\n📌 للماستر الأساسي: تحديث ايدي ملفvip / حدث ايديهات ملف النقاط\n\nللاطلاع على الرصيد استخدم: نقاطي',
         ],
         6: [
             '🚪 الغرف — 1\n━━━━━━━━━━━━\nدخول@اسم_الغرفة — دخول غرفة\nدخول غرفي — دخول جميع الغرف المحفوظة بالتتابع\nمثال: دخول@مشاعر\nخروج — الخروج من الغرفة الحالية\nخروج اسم_الغرفة — الخروج من غرفة محددة\nغرفي — عرض الغرف التي يتواجد بها البوت\nmyrooms — نفس الأمر\n\ninv — دعوة أعضاء الغرفة الحالية\ninv اسم_الغرفة — دعوة أعضاء غرفة محددة\nدعوات — نفس أمر inv\ninvite — نفس أمر inv\ninvmsg نص — تغيير رسالة الدعوة\ni@اسم — دعوة مستخدم واحد',
@@ -5638,6 +5880,456 @@ def _fit_crop(im,size):
 
 def _draw_centered(draw,center,raw_text,size,fill,max_width):
     return _draw_name_centered(draw, center, raw_text, size, fill, max_width)
+
+_EMOJI_FONT_PATH = BASE_DIR / "assets" / "NotoColorEmoji.ttf"
+
+_EMOJI_FONT_CACHE = {}
+
+_NAME_BIDI_CONTROLS = frozenset(
+    "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+)
+
+
+def _clean_name_for_image(text):
+    """Strip the mention prefix and invisible bidi overrides from image text."""
+    raw = str(text or "").lstrip("@")
+    return "".join(char for char in raw if char not in _NAME_BIDI_CONTROLS)
+
+
+def _emoji_font():
+    """Load the bundled color emoji font at its supported bitmap strike."""
+    key = str(_EMOJI_FONT_PATH)
+    if key in _EMOJI_FONT_CACHE:
+        return _EMOJI_FONT_CACHE[key]
+    if not _EMOJI_FONT_PATH.is_file():
+        return None
+    try:
+        # NotoColorEmoji exposes a fixed 109px strike; Pillow rejects arbitrary
+        # sizes for this font, so the rendered glyph is resized below.
+        font = ImageFont.truetype(str(_EMOJI_FONT_PATH), 109)
+    except Exception:
+        font = None
+    _EMOJI_FONT_CACHE[key] = font
+    return font
+
+def _is_emoji_base(ch):
+    codepoint = ord(ch)
+    return (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x1FC00 <= codepoint <= 0x1FFFD
+        or codepoint in {
+            0x2600, 0x2601, 0x2602, 0x2603, 0x2604, 0x2614, 0x2615,
+            0x261D, 0x2639, 0x263A, 0x2640, 0x2642, 0x2695, 0x26A7,
+            0x26A1, 0x26C4, 0x26C5, 0x26F5, 0x2705, 0x2708, 0x2709,
+            0x270A, 0x270B, 0x270C, 0x270D, 0x270F, 0x2714, 0x2716,
+            0x2728, 0x2733, 0x2734, 0x2744, 0x2747, 0x274C, 0x274E,
+            0x2753, 0x2754, 0x2755, 0x2757, 0x2763, 0x2764, 0x2795,
+            0x2796, 0x2797, 0x27A1, 0x27B0, 0x27BF, 0x2B50, 0x2B55,
+        }
+    )
+
+def _draw_color_emoji(draw, xy, token, size):
+    """Draw one emoji token without losing color emoji unsupported by TTF fonts."""
+    font = _emoji_font()
+    target = getattr(draw, "_image", None)
+    if font is None or target is None:
+        return None
+    try:
+        bbox = font.getbbox(token)
+        if not bbox or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            return None
+        pad = 12
+        layer = Image.new("RGBA", (bbox[2] - bbox[0] + pad * 2, bbox[3] - bbox[1] + pad * 2), (0, 0, 0, 0))
+        layer_draw = ImageDraw.Draw(layer)
+        layer_draw.text((pad - bbox[0], pad - bbox[1]), token, font=font, embedded_color=True)
+        alpha_box = layer.getchannel("A").getbbox()
+        if not alpha_box:
+            return None
+        layer = layer.crop(alpha_box)
+        wanted_h = max(14, int(size * 1.08))
+        wanted_w = max(14, int(round(layer.width * wanted_h / max(1, layer.height))))
+        layer = layer.resize((wanted_w, wanted_h), Image.Resampling.LANCZOS)
+        x, y = int(xy[0]), int(xy[1] + (size - wanted_h) * 0.08)
+        target.paste(layer, (x, y), layer)
+        return float(wanted_w)
+    except Exception:
+        return None
+
+_EXPLORE_TEXT_COLORS = (
+    (255, 221, 163),  # warm gold
+    (137, 231, 222),  # mint
+    (255, 170, 196),  # rose
+    (176, 199, 255),  # periwinkle
+    (226, 184, 255),  # lavender
+    (255, 193, 139),  # peach
+)
+
+_EXPLORE_TEXT_COLOR_LOCK = threading.Lock()
+
+_EXPLORE_TEXT_COLOR_INDEX = random.randrange(len(_EXPLORE_TEXT_COLORS))
+
+def _next_explore_text_color():
+    """Cycle through refined text colors so consecutive Explore posts differ."""
+    global _EXPLORE_TEXT_COLOR_INDEX
+    with _EXPLORE_TEXT_COLOR_LOCK:
+        color = _EXPLORE_TEXT_COLORS[_EXPLORE_TEXT_COLOR_INDEX]
+        _EXPLORE_TEXT_COLOR_INDEX = (_EXPLORE_TEXT_COLOR_INDEX + 1) % len(_EXPLORE_TEXT_COLORS)
+    return color
+
+def _explore_heart_mask(size, scale=4):
+    """Build a smooth, symmetric heart mask from sampled cubic Bézier curves."""
+    canvas_size = int(size) * int(scale)
+    curves = (
+        ((.50, .94), (.38, .82), (.02, .60), (.02, .35)),
+        ((.02, .35), (.02, .12), (.29, .03), (.50, .16)),
+        ((.50, .16), (.71, .03), (.98, .12), (.98, .35)),
+        ((.98, .35), (.98, .60), (.62, .82), (.50, .94)),
+    )
+    points = []
+    for p0, p1, p2, p3 in curves:
+        for step in range(25):
+            t = step / 24
+            u = 1 - t
+            x = u**3*p0[0] + 3*u*u*t*p1[0] + 3*u*t*t*p2[0] + t**3*p3[0]
+            y = u**3*p0[1] + 3*u*u*t*p1[1] + 3*u*t*t*p2[1] + t**3*p3[1]
+            points.append((round(x * canvas_size), round(y * canvas_size)))
+    mask = Image.new("L", (canvas_size, canvas_size), 0)
+    ImageDraw.Draw(mask).polygon(points, fill=255)
+    return mask.resize((int(size), int(size)), Image.Resampling.LANCZOS)
+
+def _draw_explore_username(draw, center, username, max_width):
+    """Draw decorated Arabic/Latin names and emoji in a polished gradient."""
+    name = _clean_name_for_image(str(username or "").strip().lstrip("@"))[:80]
+    if not name:
+        return
+    base = getattr(draw, "_image", None)
+    if not isinstance(base, Image.Image):
+        _draw_name_centered(draw, center, name, 50, (255, 221, 163, 255), max_width)
+        return
+    name_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    _draw_name_centered(ImageDraw.Draw(name_layer), center, name, 50,
+                        (255, 255, 255, 255), max_width)
+    alpha = name_layer.getchannel("A")
+
+    # Soft shadow keeps the multicolor name readable over both image regions.
+    shadow_alpha = alpha.filter(ImageFilter.GaussianBlur(9)).point(lambda value: int(value * .52))
+    shadow = Image.new("RGBA", base.size, (18, 11, 34, 0))
+    shadow.putalpha(shadow_alpha)
+
+    # A vivid gold → rose → sky gradient gives the username its own
+    # colored tone while the shared name renderer handles Arabic, ornaments,
+    # fallback glyphs, and emoji.
+    stops = ((0.0, (255, 219, 105)), (0.48, (255, 91, 157)), (1.0, (91, 211, 255)))
+    gradient = Image.new("RGB", base.size, (255, 219, 105))
+    gradient_draw = ImageDraw.Draw(gradient)
+    width, height = base.size
+    name_bounds = alpha.getbbox() or (0, 0, width, height)
+    text_left, _text_top, text_right, _text_bottom = name_bounds
+    for x in range(width):
+        position = (x - text_left) / max(1, text_right - text_left - 1)
+        position = min(1.0, max(0.0, position))
+        left, right = stops[0], stops[-1]
+        for index in range(len(stops) - 1):
+            if stops[index][0] <= position <= stops[index + 1][0]:
+                left, right = stops[index], stops[index + 1]
+                break
+        ratio = (position - left[0]) / max(1e-9, right[0] - left[0])
+        color = tuple(round(a + (b - a) * ratio) for a, b in zip(left[1], right[1]))
+        gradient_draw.line((x, 0, x, height), fill=color)
+    gradient.putalpha(alpha)
+
+    composed = base.convert("RGBA")
+    composed.alpha_composite(shadow)
+    composed.alpha_composite(gradient)
+    base.paste(composed.convert(base.mode))
+
+def _explore_emoji_cluster_end(text, start):
+    """Return the end of one Unicode emoji cluster, including modifiers/ZWJ."""
+    if start >= len(text):
+        return start
+    first = text[start]
+    keycap_bases = "#*0123456789"
+    if first in keycap_bases:
+        end = start + 1
+        if end < len(text) and text[end] == "\ufe0f":
+            end += 1
+        return end + 1 if end < len(text) and text[end] == "\u20e3" else start
+    if not _is_emoji_base(first):
+        return start
+
+    end = start + 1
+    first_codepoint = ord(first)
+    if 0x1F1E6 <= first_codepoint <= 0x1F1FF and end < len(text):
+        next_codepoint = ord(text[end])
+        if 0x1F1E6 <= next_codepoint <= 0x1F1FF:
+            end += 1
+    while end < len(text):
+        codepoint = ord(text[end])
+        if (
+            codepoint in {0xFE0E, 0xFE0F, 0x20E3}
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+            or 0xE0020 <= codepoint <= 0xE007F
+            or unicodedata.category(text[end]).startswith("M")
+        ):
+            end += 1
+            continue
+        if codepoint == 0x200D and end + 1 < len(text):
+            end += 2
+            continue
+        break
+    return end
+
+def _explore_visual_tokens(text, font):
+    """Split a post into visually ordered text and complete color-emoji runs."""
+    logical_tokens = []
+    markers = {}
+    buffer = []
+    index = 0
+    while index < len(text):
+        end = _explore_emoji_cluster_end(text, index)
+        if end > index:
+            if buffer:
+                logical_tokens.append(("text", "".join(buffer)))
+                buffer = []
+            marker = chr(0xE000 + len(markers))
+            markers[marker] = text[index:end]
+            logical_tokens.append(("emoji", marker))
+            index = end
+        else:
+            buffer.append(text[index])
+            index += 1
+    if buffer:
+        logical_tokens.append(("text", "".join(buffer)))
+    if not markers:
+        return None
+
+    marked_text = "".join(value if kind == "emoji" else value for kind, value in logical_tokens)
+    # Use bidi's visual ordering with markers standing in for emoji, then draw
+    # Arabic presentation forms with BASIC layout so they are not reordered a
+    # second time when each run is rendered next to a color glyph.
+    draw_font = font
+    draw_mode = "ltr"
+    try:
+        if _has_arabic(marked_text) and arabic_reshaper is not None and get_display is not None:
+            visual = get_display(arabic_reshaper.reshape(marked_text))
+            draw_mode = "visual"
+            font_path = getattr(font, "path", None)
+            font_size = getattr(font, "size", None)
+            if font_path and font_size:
+                draw_font = ImageFont.truetype(
+                    str(font_path), int(font_size), layout_engine=ImageFont.Layout.BASIC
+                )
+        elif not _has_arabic(marked_text):
+            visual = marked_text
+        else:
+            # RAQM can shape a logical Arabic run itself. Approximate bidi at
+            # token boundaries by reversing the mixed run order, while leaving
+            # the letters inside each Arabic run to RAQM.
+            fallback_tokens = [
+                (kind, markers[value] if kind == "emoji" else value)
+                for kind, value in logical_tokens
+            ]
+            return list(reversed(fallback_tokens)), font, "rtl"
+    except Exception:
+        return None
+
+    visual_tokens = []
+    text_run = []
+    for char in visual:
+        if char in markers:
+            if text_run:
+                visual_tokens.append(("text", "".join(text_run)))
+                text_run = []
+            visual_tokens.append(("emoji", markers[char]))
+        else:
+            text_run.append(char)
+    if text_run:
+        visual_tokens.append(("text", "".join(text_run)))
+    return visual_tokens, draw_font, draw_mode
+
+def _explore_visual_text_width(draw, text, font, emoji_size):
+    prepared = _explore_visual_tokens(text, font)
+    if prepared is None:
+        return None
+    tokens, draw_font, draw_mode = prepared
+    width = 0.0
+    for kind, value in tokens:
+        if kind == "emoji":
+            width += emoji_size
+        else:
+            if draw_mode == "rtl":
+                width += draw.textlength(value, font=draw_font, direction="rtl", language="ar")
+            else:
+                width += draw.textlength(value, font=draw_font)
+    return width
+
+def _draw_explore_text_line(draw, center_x, y, text, font, fill, emoji_size):
+    prepared = _explore_visual_tokens(text, font)
+    if prepared is None:
+        return False
+    tokens, draw_font, draw_mode = prepared
+    total_width = sum(
+        emoji_size if kind == "emoji" else (
+            draw.textlength(value, font=draw_font, direction="rtl", language="ar")
+            if draw_mode == "rtl" else draw.textlength(value, font=draw_font)
+        )
+        for kind, value in tokens
+    )
+    cursor = float(center_x) - total_width / 2
+    for kind, value in tokens:
+        if kind == "emoji":
+            drawn_width = _draw_color_emoji(
+                draw, (cursor, y + max(0, (62 - emoji_size) / 2)), value, emoji_size
+            )
+            cursor += drawn_width or emoji_size
+        else:
+            if draw_mode == "rtl":
+                run_width = draw.textlength(value, font=draw_font, direction="rtl", language="ar")
+                draw.text(
+                    (cursor + run_width, y), value, font=draw_font, fill=fill,
+                    anchor="rt", direction="rtl", language="ar",
+                )
+            else:
+                run_width = draw.textlength(value, font=draw_font)
+                draw.text((cursor, y), value, font=draw_font, fill=fill, anchor="lt")
+            cursor += run_width
+    return True
+
+def render_explore_card(text, username, photo_url=""):
+    """Render a polished Explore card with a large heart portrait and glass caption."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير متاح")
+    width, height = 1080, 1500
+    image = Image.new("RGB", (width, height), (16, 20, 43))
+    gradient = ImageDraw.Draw(image)
+    top, bottom = (17, 26, 58), (46, 27, 67)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3))
+        gradient.line((0, y, width, y), fill=color)
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.ellipse((-240, -160, 450, 520), fill=(255, 116, 159, 26))
+    draw.ellipse((710, 110, 1310, 710), fill=(113, 180, 255, 23))
+
+    # Compact portrait near the top: a soft shadow, a warm metallic rim, and
+    # the user's square-cropped profile photo clipped directly to the heart.
+    outer_size, photo_size = 450, 410
+    outer_mask = _explore_heart_mask(outer_size)
+    photo_mask = _explore_heart_mask(photo_size)
+    outer_x, outer_y = (width - outer_size) // 2, 68
+    photo_x, photo_y = (width - photo_size) // 2, outer_y + (outer_size-photo_size)//2
+    shadow_mask = Image.new("L", image.size, 0)
+    shadow_mask.paste(outer_mask, (outer_x, outer_y + 15))
+    shadow_mask = shadow_mask.filter(ImageFilter.GaussianBlur(18))
+    shadow_layer = Image.new("RGBA", image.size, (6, 5, 18, 0))
+    shadow_layer.putalpha(shadow_mask.point(lambda value: int(value * .58)))
+    image = Image.alpha_composite(image.convert("RGBA"), shadow_layer)
+    border_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    border_layer.paste((248, 207, 142, 255), (outer_x, outer_y), outer_mask)
+    image = Image.alpha_composite(image, border_layer)
+
+    avatar = None
+    if photo_url and str(photo_url).startswith(("http://", "https://")):
+        try:
+            response = requests.get(photo_url, headers={"User-Agent": "TalkinBot/22", "Accept": "image/*"}, timeout=(3, 6))
+            if response.status_code == 200 and response.content and len(response.content) <= 8 * 1024 * 1024:
+                source_photo = Image.open(io.BytesIO(response.content)).convert("RGB")
+                scale = max(photo_size / source_photo.width, photo_size / source_photo.height)
+                resized = source_photo.resize(
+                    (max(photo_size, int(source_photo.width * scale)),
+                     max(photo_size, int(source_photo.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+                crop_left = (resized.width - photo_size) // 2
+                # Favor the upper face slightly so eyes and forehead remain
+                # visible beneath the heart's top cleft.
+                crop_top = int((resized.height - photo_size) * .38)
+                avatar = resized.crop(
+                    (crop_left, crop_top, crop_left + photo_size, crop_top + photo_size)
+                ).convert("RGBA")
+        except Exception:
+            avatar = None
+    if avatar is None:
+        avatar = Image.new("RGBA", (photo_size, photo_size), (53, 66, 100, 255))
+        ad = ImageDraw.Draw(avatar)
+        ad.ellipse((photo_size*.34, photo_size*.18, photo_size*.66, photo_size*.50), fill=(221, 230, 245, 255))
+        ad.rounded_rectangle((photo_size*.20, photo_size*.49, photo_size*.80, photo_size*.94),
+                             radius=photo_size*.18, fill=(221, 230, 245, 255))
+    avatar.putalpha(photo_mask)
+    image.paste(avatar, (photo_x, photo_y), avatar)
+    image = image.convert("RGB")
+    draw = ImageDraw.Draw(image, "RGBA")
+
+    # Title, profile heart, and colorful unboxed username form the top stack.
+    title_font_path = ASSETS_DIR / "NotoSansArabic-SemiBold.ttf"
+    try:
+        title_font = ImageFont.truetype(str(title_font_path), 30)
+    except Exception:
+        title_font = ImageFont.load_default()
+    draw.text((width//2, 36), "اكسبلور", font=title_font, fill=(247, 222, 190, 255), anchor="mm")
+    _draw_explore_username(draw, (width//2, 558), username, 920)
+    draw.line((385, 600, 695, 600), fill=(249, 207, 143, 180), width=2)
+    draw.ellipse((width//2-4, 596, width//2+4, 604), fill=(255, 228, 180, 255))
+
+    # Translucent glass-style text panel; each new render takes the next
+    # color from the palette so consecutive posts visibly vary.
+    box = (84, 642, 996, 1270)
+    draw.rounded_rectangle(box, radius=42, fill=(13, 17, 38, 152), outline=(255, 255, 255, 92), width=2)
+    draw.rounded_rectangle((box[0]+10, box[1]+10, box[2]-10, box[3]-10),
+                           radius=34, outline=(255, 255, 255, 30), width=1)
+    try:
+        font_path = ASSETS_DIR / "NotoSansArabic-Regular.ttf"
+        font = ImageFont.truetype(str(font_path), 46) if font_path.exists() else ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+    raw = str(text or "").strip()[:150]
+    words = raw.split() or [raw]
+    lines, current = [], ""
+    for word in words:
+        candidate = (current + " " + word).strip()
+        try:
+            measured = _explore_visual_text_width(draw, candidate, font, 46)
+            if measured is None:
+                measured = draw.textlength(candidate, font=font, direction="rtl", language="ar") if _has_arabic(candidate) else draw.textlength(candidate, font=font)
+        except Exception:
+            measured = draw.textlength(candidate, font=font)
+        if current and measured > 790:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    max_lines = 10
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip("…") + "…"
+    line_height = 62
+    first_y = box[1] + max(42, (box[3]-box[1]-(len(lines)*line_height))//2)
+    text_color = _next_explore_text_color()
+    for line in lines:
+        if _draw_explore_text_line(draw, width//2, first_y, line, font, (*text_color, 255), 46):
+            first_y += line_height
+            continue
+        shown = line if (_has_arabic(line) and PIL_AVAILABLE and features.check("raqm")) else _visual_rtl_text(line)
+        direction = {"direction": "rtl", "language": "ar"} if _has_arabic(line) and PIL_AVAILABLE and features.check("raqm") else {}
+        draw.text((width//2, first_y), shown, font=font, fill=(*text_color, 255), anchor="mt", align="center", **direction)
+        first_y += line_height
+
+    footer_font_path = ASSETS_DIR / "NotoSansArabic-SemiBold.ttf"
+    try:
+        footer_font = ImageFont.truetype(str(footer_font_path), 31)
+    except Exception:
+        footer_font = ImageFont.load_default()
+    draw.text((width//2, 1395), "كوفي بوت", font=footer_font,
+              fill=(245, 225, 199, 245), anchor="mm")
+    draw.line((420, 1350, 660, 1350), fill=(244, 194, 120, 115), width=2)
+
+    out_dir = BASE_DIR / "generated_publish"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"explore_{uuid.uuid4().hex}.jpg"
+    image.save(out, "JPEG", quality=91, optimize=True, progressive=True)
+    return out
 
 def _visual_rtl_text(text):
     """Return logical text unchanged when Pillow/Raqm can shape Arabic.
@@ -8955,12 +9647,12 @@ class TalkinBot:
             return False
 
     def _send_text_packets(self, packet_type: str, text: str, *, oversize_notice_user="", notify_oversize=True, **kwargs):
-        """Send text only when its full protobuf packet fits the hard limit."""
+        """Send text in safe UTF-8 chunks that each fit the full packet limit."""
         text = str(text or "")
         if not text:
             return True
 
-        limit = _ws_payload_limit()
+        limit = min(1008, _ws_payload_limit())
 
         def make_payload(value):
             payload = dict(kwargs)
@@ -8974,8 +9666,98 @@ class TalkinBot:
             self.send_query(packet)
             return True
 
-        # Drop complete oversized messages locally instead of splitting them,
-        # forwarding them to Telegram, or passing them to the WebSocket.
+        def grapheme_units(value):
+            """Keep combining marks, emoji modifiers, flags and ZWJ emoji whole."""
+            units = []
+            current = ""
+            regional_run = 0
+            for char in value:
+                codepoint = ord(char)
+                is_regional = 0x1F1E6 <= codepoint <= 0x1F1FF
+                is_extend = (
+                    unicodedata.category(char).startswith("M")
+                    or 0xFE00 <= codepoint <= 0xFE0F
+                    or 0xE0100 <= codepoint <= 0xE01EF
+                    or 0x1F3FB <= codepoint <= 0x1F3FF
+                    or 0xE0020 <= codepoint <= 0xE007F
+                )
+                if not current:
+                    current = char
+                    regional_run = 1 if is_regional else 0
+                    continue
+                attach = (
+                    is_extend or char == "\u200d" or current.endswith("\u200d")
+                    or (char == "\n" and current.endswith("\r"))
+                    or (is_regional and regional_run % 2 == 1)
+                )
+                if attach:
+                    current += char
+                    if is_regional:
+                        regional_run += 1
+                    elif not is_extend and char != "\u200d":
+                        regional_run = 0
+                else:
+                    units.append(current)
+                    current = char
+                    regional_run = 1 if is_regional else 0
+            if current:
+                units.append(current)
+            return units
+
+        units = grapheme_units(text)
+        chunks = []
+        start = 0
+        while start < len(units):
+            # A UTF-8 code point occupies at least one byte, so no fitting body
+            # can contain more than `limit` grapheme units. Measure the actual
+            # protobuf on every candidate to include routing and field overhead.
+            low = start + 1
+            high = min(len(units), start + limit)
+            best = start
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = "".join(units[start:middle])
+                if len(make_payload(candidate)) <= limit:
+                    best = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best == start:
+                chunks = []
+                break
+
+            if best < len(units):
+                last_newline = 0
+                last_space = 0
+                for index in range(start, best):
+                    unit = units[index]
+                    if "\n" in unit:
+                        last_newline = index + 1
+                    elif unit.isspace():
+                        last_space = index + 1
+                preferred = last_newline or last_space
+                if preferred > start:
+                    best = preferred
+
+            chunks.append("".join(units[start:best]))
+            start = best
+
+        if chunks and "".join(chunks) == text:
+            try:
+                for chunk in chunks:
+                    chunk_packet = make_payload(chunk)
+                    if len(chunk_packet) > limit:
+                        raise ValueError("safe text chunk exceeded packet limit")
+                    if self.send_query(chunk_packet) is False:
+                        raise RuntimeError("WebSocket rejected a text chunk")
+            except Exception as exc:
+                self.log("[WS] safe text chunk delivery failed:", repr(exc))
+                return False
+            self.log("[WS] split oversized text safely:", len(chunks), "packets", len(packet), "bytes")
+            return True
+
+        # If even one whole grapheme cannot fit because of routing metadata or
+        # an unusually large single grapheme, use the existing fallback path.
         self._report_oversize_delivery(
             packet_type,
             str(kwargs.get("to") or ""),
@@ -8983,13 +9765,23 @@ class TalkinBot:
             len(packet),
             f"حزمة النص تجاوزت الحد الصلب ({limit} بايت)؛ أُسقطت محلياً",
         )
-        if len(packet) > 1008 and notify_oversize:
-            self._send_oversize_notice(
-                packet_type,
-                target=str(kwargs.get("to") or ""),
-                room=str(kwargs.get("room") or ""),
-                username=oversize_notice_user,
+        if len(packet) > 1008:
+            telegram_sent = self._send_long_text_to_telegram(
+                text, title=f"رسالة Talkin طويلة ({packet_type}) — {len(packet)} بايت"
             )
+            master = str(BOT_MASTER or "").strip()
+            if master and telegram_sent:
+                try:
+                    self.send_private_text(master, f"📨 تم إرسال الرسالة الطويلة إلى Telegram لتجنب فصل البوت.\n📦 الحجم: {len(packet)} بايت\n📍 الوجهة: {kwargs.get('room') or kwargs.get('to') or 'غير محددة'}")
+                except Exception as exc:
+                    self.log("[TELEGRAM] master notice failed:", repr(exc))
+            elif not telegram_sent:
+                self.log("[TELEGRAM] oversized Talkin response was not forwarded")
+            if notify_oversize:
+                self._send_oversize_notice(
+                    packet_type, target=str(kwargs.get("to") or ""),
+                    room=str(kwargs.get("room") or ""), username=oversize_notice_user,
+                )
         return False
 
     def _send_help_chunks(self, packet_type: str, text: str, limit: int = 320, **kwargs):
@@ -9621,27 +10413,51 @@ class TalkinBot:
         for old, new in final_cricket_fixes.items():
             value = value.replace(old, new)
         auction_help_fixes = {
+            "🔨 المزاد: يفعّله الماستر بالخاص: تشغيل/إيقاف لعبة مزاد.":
+                "🔨 World auction: the master enables/disables it in private with “auction on” / “auction off”.",
+            "افتح مزاد — ابدأ؛ مزايده — انضم (3–5 لاعبين).":
+                "Open auction — start; join auction — register (3–5 players).",
+            "بعد البدء: لكل لاعب 7 ثوانٍ للمزايدة أو يمرّ الدور تلقائيًا؛ أقصى جولة 60 ثانية. اكتب «زايد 110m» أو «تمرير».":
+                "After bidding starts, each player has 7 seconds to bid or the turn passes automatically; a round lasts up to 60 seconds. Enter “bid 110m” or “pass”.",
+            "⚠️ قد لا تكون القطع أصلية.":
+                "⚠️ Some items may be counterfeit.",
+            "sv — المخزون؛ red auction <الرمز> — استرداد 50/50: أصلي +0.75%، مغشوش -1.25%.":
+                "sv — view inventory; red auction <code> — redeem with a 50/50 chance: authentic +0.75%, counterfeit -1.25%.",
             "🔨 المزاد العالمي: الماستر في الخاص يرسل شغل لعبة مزاد / أوقف لعبة مزاد.":
                 "🔨 World auction: the master enables/disables it in private with “auction on” / “auction off”.",
             "افتح مزاد — يختار البوت سلعة Rare ويرسل صورتها (≤50 KB).":
                 "Open auction — the bot selects a rare item and sends its image (≤50 KB).",
             "مزايده — تسجيل؛ عند 3 مشاركين يبدأه الفاتح, وعند 5 يبدأ تلقائياً.":
                 "Join auction — register; at 3 players the host may start, or it starts automatically at 5.",
+            "بعد البدء: المزايدة بالدور لمدة أقصاها 60 ثانية، ولكل لاعب 7 ثوانٍ قبل تمرير الدور تلقائيًا.":
+                "After bidding starts, turns run for up to 60 seconds; each player has 7 seconds before their turn passes automatically.",
             "بعد البدء: المزايدة بالTurn: لمدة 60 seconds. عند your turn اكتب «زايد <المبلغ>»؛ أول مزايدة لا تقل عن السعر الابتدائي, وكل مزايدة لاحقة أعلى من السعر الحالي بـ10,000,000 points على الأقل, or اكتب «تمرير». يتجاهل البوت أوامر المزايدة خارج الTurn: بصمت.":
                 "After bidding starts, turns last 60 seconds. On your turn, enter “bid <amount>”; the first bid must meet the starting price, and each later bid must exceed the current high bid by at least 10,000,000 points. Pass with “pass”. Amounts accept shorthand such as 10m (10 million), 10b or 1b (billions), or combined forms like 10m10b. Out-of-turn bid commands are ignored silently.",
             "أثناء الجولة, مزايده تعني أن المزاد شغال؛ wait انتهاءه. فاتح الجولة or الماستر يستطيع إقفاله بأمر «اقفل المزاد»." :
                 "While a round is running, registration is closed; wait until it ends. The host or master may end it with “close auction”.",
-            "sv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاستبدال بعد الجولة بربح 30%.":
-                "sv — view auction collectibles; red auction <code> — redeem after the round for a 30% profit.",
+            "sv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاسترداد بالحظ 50/50: +0.75% للأصلية أو -1.25% للمغشوشة.":
+                "sv — view auction collectibles; red auction <code> — redeem with a 50/50 chance: +0.75% authentic or -1.25% counterfeit.",
+            "الاسترداد بالحظ 50/50: +0.75% للأصلية أو -1.25% للمغشوشة.":
+                "redemption is a 50/50 chance: +0.75% profit for authentic or -1.25% loss for counterfeit.",
         }
         for old, new in auction_help_fixes.items():
             value = value.replace(old, new)
         auction_help_final_fixes = {
+            "افتح مزاد — Start؛ مزايده — انضم (3–5 players).":
+                "Open auction — start; Join auction — register (3–5 players).",
+            "بعد البدء: لكل لاعب 7 ثوانٍ للمزايدة or يمرّ الTurn: automatically؛ أقصى جولة 60 seconds. اكتب «زايد 110m» or «تمرير».":
+                "After bidding starts, turns last up to 60 seconds, with 7 seconds per player before automatic pass. On your turn enter “bid <amount>”; the first bid must meet the starting price and each later bid must exceed the current high bid by at least 10,000,000 points. Pass with “pass”. Amounts accept shorthand such as 10m (10 million), 10b or 1b (billions), and combined forms like 10m10b. Out-of-turn bid commands are ignored silently.",
+            "sv — المخزون؛ red auction <الرمز> — استرداد 50/50: أصلي +0.75%, مغشوش -1.25%.":
+                "sv — view inventory; red auction <code> — redeem with a 50/50 chance: authentic +0.75% profit, counterfeit -1.25% loss.",
             "بعد الإغلاق: «زايد/مزايده» يرد بأن المزاد مغلق وwait جولة أخرى.":
                 "After the auction closes, “bid/join auction” gets a local reply: the auction is closed; wait for another round.",
         }
         for old, new in auction_help_final_fixes.items():
             value = value.replace(old, new)
+        value = value.replace(
+            "الاسترداد بالحظ 50/50: +0.75% للأصلية or -1.25% للمغشوشة.",
+            "redemption is a 50/50 chance: +0.75% profit for authentic or -1.25% loss for counterfeit.",
+        )
         return value
 
     def _active_room_language_override(self, room):
@@ -12074,12 +12890,193 @@ class TalkinBot:
         room = str(room or "").strip()
         role = str(getattr(self, "bot_room_roles", {}).get(_norm_room(room), "") or "").casefold().strip()
         if role:
-            return role
+            return _normalize_room_role(role)
         live = getattr(self, "room_users", {}).get(room, {}) or {}
         for username, value in live.items():
             if _norm_user(username) == _norm_user(BOT_ID):
-                return str(value or "").casefold().strip()
+                return _normalize_room_role(value)
         return ""
+
+    def _handle_bot_room_role_command(self, room, username, text):
+        """Request current room data once and report only this bot's server role."""
+        command = str(text or "").strip().casefold().rstrip("؟?!.")
+        if command not in {"رتبتك", "رتبتي", "bot rank", "your rank"}:
+            return False
+        room = str(room or "").strip()
+        if not room:
+            return False
+        room_key = _norm_room(room)
+        if not getattr(self, "ws", None):
+            self.send_room_text(room, f"⚠️ لا أستطيع التحقق من رتبة البوت في غرفة «{room}» لأن الاتصال بالخادم غير متاح.")
+            return True
+
+        pending_lists = getattr(self, "_pending_room_lists", {})
+        if room_key in pending_lists:
+            self.send_room_text(room, f"⏳ يوجد طلب قوائم جارٍ في غرفة «{room}». حاول أمر «رتبتك» بعد اكتماله.")
+            return True
+        if not hasattr(self, "_pending_room_lists"):
+            self._pending_room_lists = {}
+        if not hasattr(self, "_pending_bot_room_role_checks"):
+            self._pending_bot_room_role_checks = {}
+        if room_key in self._pending_bot_room_role_checks:
+            self.send_room_text(room, f"⏳ ما زلت أتحقق من رتبتي في غرفة «{room}».")
+            return True
+
+        self._pending_bot_room_role_checks[room_key] = {
+            "room": room,
+            "requester": str(username or "").strip(),
+            "started_at": time.time(),
+            "request_mode": "app",
+        }
+        self.send_room_text(room, f"🔎 أتحقق الآن من الرتبة الفعلية للبوت في غرفة «{room}» من الخادم...")
+        if not self._request_bot_room_role(room_key):
+            if not self._request_bot_room_role(room_key, fallback=True):
+                self._abort_bot_room_role_check(room_key)
+        return True
+
+    def _request_bot_room_role(self, room_key, *, fallback=False):
+        state = getattr(self, "_pending_bot_room_role_checks", {}).get(room_key)
+        if not isinstance(state, dict):
+            return False
+        mode = "legacy" if fallback else "app"
+        request_id = secrets.token_urlsafe(15)[:20]
+        state["request_id"] = request_id
+        state["request_mode"] = mode
+        self._pending_room_lists[room_key] = {
+            "room": state["room"],
+            "code": "bot_role",
+            "sender": state.get("requester", ""),
+            "request_type": "occupants_list",
+            "request_id": request_id,
+            "request_mode": mode,
+            "requested_at": time.time(),
+            "complete_users": True,
+            "bot_role_check": True,
+        }
+        try:
+            # Match the official app's occupants request first. If the response
+            # omits this bot, retry with the former BOT_ID-targeted request.
+            query_args = {
+                "type_": "occupants_list",
+                "room": state["room"],
+                "to": BOT_ID if fallback else "username",
+                "value": "none",
+            }
+            if fallback:
+                query_args["id_"] = request_id
+            sent = self.send_query(encode_query("room_admin", **query_args))
+            if sent is False:
+                raise RuntimeError("room role query was not sent")
+        except Exception as exc:
+            self._pending_room_lists.pop(room_key, None)
+            self.log("[ROOM-ROLE] server query failed", state.get("room"), repr(exc))
+            return False
+
+        old_timer = state.get("timer")
+        if old_timer:
+            try:
+                old_timer.cancel()
+            except Exception:
+                pass
+        timer = threading.Timer(12.0, self._bot_room_role_check_timeout, args=(room_key, request_id))
+        timer.daemon = True
+        state["timer"] = timer
+        timer.start()
+        return True
+
+    def _fallback_bot_room_role_check(self, room_key, request_id):
+        state = getattr(self, "_pending_bot_room_role_checks", {}).get(room_key)
+        if (
+            not isinstance(state, dict)
+            or state.get("request_id") != request_id
+            or state.get("request_mode") != "app"
+        ):
+            return False
+        pending = getattr(self, "_pending_room_lists", {}).get(room_key)
+        if isinstance(pending, dict) and pending.get("request_id") == request_id:
+            self._pending_room_lists.pop(room_key, None)
+        self.log(
+            "[ROOM-ROLE] app-style occupants query had no bot role; retrying legacy BOT_ID query",
+            state.get("room"),
+        )
+        if self._request_bot_room_role(room_key, fallback=True):
+            return True
+        return self._abort_bot_room_role_check(room_key)
+
+    def _abort_bot_room_role_check(self, room_key):
+        state = getattr(self, "_pending_bot_room_role_checks", {}).pop(room_key, None)
+        pending = getattr(self, "_pending_room_lists", {}).get(room_key)
+        if isinstance(pending, dict) and pending.get("bot_role_check"):
+            self._pending_room_lists.pop(room_key, None)
+        if isinstance(state, dict) and state.get("timer"):
+            try:
+                state["timer"].cancel()
+            except Exception:
+                pass
+        if isinstance(state, dict):
+            room = state.get("room", "")
+            self.send_room_text(room, f"❌ تعذر إكمال التحقق من رتبة البوت من الخادم في غرفة «{room}».")
+        return False
+
+    def _bot_room_role_check_timeout(self, room_key, request_id):
+        state = getattr(self, "_pending_bot_room_role_checks", {}).get(room_key)
+        if not isinstance(state, dict) or state.get("request_id") != request_id:
+            return False
+        if state.get("request_mode") == "app":
+            return self._fallback_bot_room_role_check(room_key, request_id)
+        pending = getattr(self, "_pending_room_lists", {}).get(room_key)
+        if isinstance(pending, dict) and pending.get("request_id") == request_id:
+            self._pending_room_lists.pop(room_key, None)
+        self._pending_bot_room_role_checks.pop(room_key, None)
+        self.send_room_text(
+            state.get("room", ""),
+            f"⚠️ لم يصلني ردّ التحقق من الخادم لرتبتي في غرفة «{state.get('room', '')}». لم أعرض رتبة مخزنة قديمة.",
+        )
+        return True
+
+    def _finish_bot_room_role_check(self, room_key, role="", *, missing=False):
+        state = getattr(self, "_pending_bot_room_role_checks", {}).pop(room_key, None)
+        if not isinstance(state, dict):
+            return False
+        timer = state.get("timer")
+        if timer:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        room = state.get("room", "")
+        role = str(role or "").casefold().strip().replace(" ", "_")
+        if missing or not role:
+            getattr(self, "bot_room_roles", {}).pop(room_key, None)
+            self.send_room_text(
+                room,
+                f"⚠️ لم يتضمن رد الخادم رتبة حساب البوت (@{BOT_ID}) في غرفة «{room}»؛ لذلك لا أستطيع تأكيد الرتبة الحالية.",
+            )
+            return True
+        role = {
+            "o": "owner", "a": "admin", "m": "member", "normal": "member", "user": "member",
+            "roomowner": "room_owner", "roomcreator": "room_creator",
+        }.get(role, role)
+        role_labels = {
+            "owner": "أونر (Owner)",
+            "creator": "منشئ الغرفة (Creator)",
+            "room_owner": "أونر (Room Owner)",
+            "room_creator": "منشئ الغرفة (Room Creator)",
+            "host": "مالك الغرفة (Host)",
+            "admin": "مشرف (Admin)",
+            "moderator": "مشرف (Moderator)",
+            "mod": "مشرف (Moderator)",
+            "member": "عضو (Member)",
+        }
+        roles = getattr(self, "bot_room_roles", None)
+        if not isinstance(roles, dict):
+            roles = self.bot_room_roles = {}
+        roles[room_key] = role
+        self.send_room_text(
+            room,
+            f"✅ رتبتي في غرفة «{room}»: {role_labels.get(role, role)}.\n📡 تم التحقق من رتبة حساب البوت مباشرةً من رد الخادم.",
+        )
+        return True
 
     def _bot_is_room_owner(self, room):
         """Return True only when the cached role is an actual room Owner.
@@ -15075,6 +16072,8 @@ class TalkinBot:
 
     def _route_room_game_input(self, room, username, text, username_aliases=()):
         """Route active bomb wires before board-game and Cricket commands."""
+        if self._handle_bot_room_role_command(room, username, text):
+            return True
         candidates, seen = [], set()
         for candidate in (username, *(username_aliases or ())):
             candidate = str(candidate or "").strip().lstrip("@")
@@ -15162,10 +16161,14 @@ class TalkinBot:
             return False
         deadline_at = self._auction_deadline_at(auction)
         try:
+            turn_deadline_at = float(auction.get("turn_deadline_at") or (float(auction.get("started_at") or 0) + TURN_TIMEOUT_SECONDS))
+        except (TypeError, ValueError):
+            turn_deadline_at = deadline_at
+        try:
             now = float(game.clock())
         except Exception:
             now = time.time()
-        delay = max(0.0, deadline_at - now)
+        delay = max(0.0, min(deadline_at, turn_deadline_at) - now)
         lock = getattr(self, "_auction_timeout_lock", None)
         if lock is None:
             lock = threading.RLock()
@@ -15195,23 +16198,59 @@ class TalkinBot:
             now = float(game.clock())
         except Exception:
             now = time.time()
-        if now < deadline_at:
+        rooms = self._auction_participant_rooms(active)
+        if now >= deadline_at:
+            self._cancel_auction_timeout(auction_id)
+            result = game.close(
+                str(active.get("opener_id") or ""),
+                str(active.get("opener_name") or ""),
+                apply_delta=_apply_points_delta_once,
+            )
+            if not self._auction_broadcast_close_result(result, rooms=rooms, expired=True) and result.get("error"):
+                self._auction_broadcast(
+                    "⌛ انتهت مدة المزايدة، لكن تعذرت التسوية الآن؛ لم يُعلن فائز.",
+                    "⌛ The 60-second bidding window ended, but settlement failed; no winner was announced.",
+                    rooms=rooms,
+                )
+            return True
+
+        try:
+            turn_deadline_at = float(active.get("turn_deadline_at") or (float(active.get("started_at") or 0) + TURN_TIMEOUT_SECONDS))
+        except (TypeError, ValueError):
+            turn_deadline_at = deadline_at
+        if now < turn_deadline_at:
             self._schedule_auction_timeout(active)
             return False
-        rooms = self._auction_participant_rooms(active)
-        self._cancel_auction_timeout(auction_id)
-        result = game.close(
-            str(active.get("opener_id") or ""),
-            str(active.get("opener_name") or ""),
+
+        timed_out_user_id = str(active.get("turn_user_id") or "")
+        timed_out_username = str(active.get("turn_username") or "")
+        result = game.pass_turn(
+            timed_out_user_id,
+            timed_out_username,
             apply_delta=_apply_points_delta_once,
         )
-        if not self._auction_broadcast_close_result(result, rooms=rooms, expired=True) and result.get("error"):
+        if result.get("status") == "passed":
+            next_turn = result.get("next_turn_username") or ""
             self._auction_broadcast(
-                "⌛ انتهت مدة المزايدة، لكن تعذرت التسوية الآن؛ لم يُعلن فائز.",
-                "⌛ The 60-second bidding window ended, but settlement failed; no winner was announced.",
+                f"⏱️ انتهت مهلة 7 ثوانٍ دون مزايدة من @{timed_out_username}؛ تم تمرير دوره تلقائيًا. الدور التالي على @{next_turn}.",
+                f"⏱️ @{timed_out_username} did not bid within 7 seconds; the turn was passed automatically. Next turn: @{next_turn}.",
                 rooms=rooms,
             )
-        return True
+            self._schedule_auction_timeout(result.get("auction"))
+            return True
+        if result.get("auto_closed") or result.get("pending") or result.get("status") in {"sold", "no_bids", "no_sale"}:
+            self._cancel_auction_timeout(auction_id)
+            self._auction_broadcast(
+                f"⏱️ انتهت مهلة @{timed_out_username} دون مزايدة؛ تم تمرير دوره تلقائيًا.",
+                f"⏱️ @{timed_out_username} did not bid before the turn timer; the turn passed automatically.",
+                rooms=rooms,
+            )
+            self._auction_broadcast_close_result(result, rooms=rooms)
+            return True
+        latest = game.active()
+        if isinstance(latest, dict) and latest.get("phase") == "bidding":
+            self._schedule_auction_timeout(latest)
+        return False
 
     def _auction_broadcast(self, arabic_text, english_text, fallback_room="", *, rooms=None):
         target_rooms = self._auction_connected_rooms(fallback_room, rooms=rooms) if rooms is not None else self._auction_connected_rooms(fallback_room)
@@ -15241,8 +16280,8 @@ class TalkinBot:
             item = sale["item"]
             short_id = str(sale["auction_id"])[:8]
             self._auction_broadcast(
-                f"{prefix_ar}🏆 انتهى المزاد! فاز @{sale['winner']} بـ{item.get('icon', '💎')} {item.get('name_ar', 'الجائزة')} بسعر {_fmt_points(sale['bid'])} نقطة.\n✅ أضيفت لمخزون الألماس؛ الاستبدال بعد الجولة: {_fmt_points(sale['redemption_value'])} نقطة (ربح 30%).\nللمخزون: sv — للاستبدال: red auction {short_id}",
-                f"{prefix_en}🏆 Auction complete! @{sale['winner']} won {item.get('icon', '💎')} {item.get('name_en', 'the prize')} for {_fmt_points(sale['bid'])} points.\n✅ Added to diamond inventory; redemption after the round: {_fmt_points(sale['redemption_value'])} points (30% profit).\nInventory: sv — redeem: red auction {short_id}",
+                f"{prefix_ar}🏆 انتهى المزاد! فاز @{sale['winner']} بـ{item.get('icon', '💎')} {item.get('name_ar', 'الجائزة')} بسعر {_fmt_points(sale['bid'])} نقطة.\n✅ أضيفت للمخزون؛ الاسترداد بالحظ 50/50: قطعة أصلية (+0.75% ربح) أو مغشوشة (-1.25% خسارة).\nللمخزون: sv — للاسترداد: red auction {short_id}",
+                f"{prefix_en}🏆 Auction complete! @{sale['winner']} won {item.get('icon', '💎')} {item.get('name_en', 'the prize')} for {_fmt_points(sale['bid'])} points.\n✅ Added to inventory; redemption is a 50/50 chance: authentic (+0.75% profit) or counterfeit (-1.25% loss).\nInventory: sv — redeem: red auction {short_id}",
                 fallback_room,
                 rooms=rooms,
             )
@@ -15269,7 +16308,23 @@ class TalkinBot:
         if not image_url:
             return False
         sent = False
+        item_name_ar = str((item or {}).get("name_ar") or (item or {}).get("name_en") or "قطعة المزاد")
+        item_name_en = str((item or {}).get("name_en") or (item or {}).get("name_ar") or "Auction item")
         for target_room in self._auction_connected_rooms(fallback_room):
+            try:
+                if self._effective_room_language(target_room) == "en":
+                    warning = (
+                        f"🔨 Auction item: {item_name_en}\n"
+                        "⚠️ Not every auction item may be authentic. Be careful not to risk your entire fortune."
+                    )
+                else:
+                    warning = (
+                        f"🔨 قطعة المزاد: {item_name_ar}\n"
+                        "⚠️ قد لا تكون كل قطع المزاد أصلية؛ فاحذر أن تغامر بكل ثروتك."
+                    )
+                self.send_room_text(target_room, warning)
+            except Exception as exc:
+                self.log("[AUCTION] item warning delivery failed:", target_room, repr(exc))
             try:
                 if self.send_room_media(target_room, image_url, "image") is not False:
                     sent = True
@@ -15322,6 +16377,14 @@ class TalkinBot:
                 if action in {"join", "bid", "pass"} and not source_is_participant:
                     self._auction_room_reply(room, "📭 المزاد مغلق؛ انتظر بدء جولة أخرى.", "📭 The auction is closed; wait for another round to start.")
                 return True
+            turn_started_at = float(active_auction.get("started_at") or 0)
+            try:
+                turn_deadline_at = float(active_auction.get("turn_deadline_at") or (turn_started_at + TURN_TIMEOUT_SECONDS))
+            except (TypeError, ValueError):
+                turn_deadline_at = self._auction_deadline_at(active_auction)
+            if float(game_clock()) >= turn_deadline_at:
+                self._expire_auction_round(active_auction.get("id"))
+                return True
             current_user_id = "name:" + _norm_user(username)
             participants = active_auction.get("participants") or []
             registered = any(str(player.get("user_id") or "") == current_user_id for player in participants if isinstance(player, dict))
@@ -15358,8 +16421,8 @@ class TalkinBot:
             item_en = f"{item['icon']} {item['name_en']}"
             starting_price = _fmt_points(item.get("starting_price", 100_000_000))
             self._auction_broadcast(
-                f"🔨 بدأ التسجيل في المزاد العالمي!\n🎁 السلعة المختارة: {item_ar}\n💰 السعر الابتدائي: {starting_price} نقطة.\n👥 الحد الأقصى 5 مشاركين؛ اكتب «مزايده» للتسجيل. عند اكتمال 3 يستطيع فاتح الجولة كتابة «ابدا المزاد»، أو يبدأ تلقائياً عند 5. بعد البدء تكون المزايدة بالدور لمدة 60 ثانية؛ صاحب الدور يكتب «زايد <المبلغ>» مثل 110m أو 10b أو «تمرير». لا يرد البوت على أوامر المزايدة خارج الدور لتجنب الإزعاج.",
-                f"🔨 Registration is open for the world auction!\n🎁 Selected item: {item_en}\n💰 Starting price: {starting_price} points.\n👥 Up to 5 players; type “join auction” to register. The host may start with 3, or it starts automatically at 5. After start, bidding runs in turns for 60 seconds; the current player types “bid <amount>” such as 110m or 10b, or “pass”. Out-of-turn bid commands are silently ignored.",
+                f"🔨 بدأ التسجيل في المزاد العالمي!\n🎁 السلعة المختارة: {item_ar}\n💰 السعر الابتدائي: {starting_price} نقطة.\n👥 الحد الأقصى 5 مشاركين؛ اكتب «مزايده» للتسجيل. عند اكتمال 3 يستطيع فاتح الجولة كتابة «ابدا المزاد»، أو يبدأ تلقائياً عند 5. بعد البدء تكون المزايدة بالدور لمدة 60 ثانية؛ لكل لاعب 7 ثوانٍ لإرسال المبلغ قبل انتقال الدور تلقائيًا. في دورك اكتب «زايد <المبلغ>» مثل 110m أو 10b أو «تمرير».",
+                f"🔨 Registration is open for the world auction!\n🎁 Selected item: {item_en}\n💰 Starting price: {starting_price} points.\n👥 Up to 5 players; type “join auction” to register. The host may start with 3, or it starts automatically at 5. After start, bidding runs in turns for up to 60 seconds; each player has 7 seconds to bid before the turn passes automatically. On your turn type “bid <amount>” such as 110m or 10b, or “pass”.",
                 room,
             )
             if not self._auction_send_item_image(item, room):
@@ -15388,7 +16451,7 @@ class TalkinBot:
                 item = result["auction"].get("item") or {}
                 starting_price = _fmt_points(item.get("starting_price", 100_000_000))
                 first_turn = result["auction"].get("turn_username") or ""
-                self._auction_broadcast(f"🔔 اكتمل العدد وبدأت المزايدة بالدور لمدة 60 ثانية. السعر الابتدائي {starting_price} نقطة؛ أول دور على @{first_turn}. في دورك اكتب «زايد <المبلغ>» مثل 110m أو 10b (وأقل مزايدة لاحقة تزيد 10m) أو «تمرير».", f"🔔 Player limit reached; 60-second turn-based bidding has started. Starting price: {starting_price} points. First turn: @{first_turn}. On your turn, type “bid <amount>” such as 110m or 10b; later bids must increase by at least 10m, or type “pass”.", rooms=self._auction_participant_rooms(result.get("auction")))
+                self._auction_broadcast(f"🔔 اكتمل العدد وبدأت المزايدة بالدور لمدة أقصاها 60 ثانية. السعر الابتدائي {starting_price} نقطة؛ أول دور على @{first_turn}. لكل لاعب 7 ثوانٍ للمزايدة قبل انتقال الدور تلقائيًا. اكتب «زايد <المبلغ>» أو «تمرير».", f"🔔 Player limit reached; turn-based bidding has started for up to 60 seconds. Starting price: {starting_price} points. First turn: @{first_turn}. Each player has 7 seconds to bid before their turn passes automatically. Type “bid <amount>” or “pass”.", rooms=self._auction_participant_rooms(result.get("auction")))
             return True
 
         if action == "start":
@@ -15406,7 +16469,7 @@ class TalkinBot:
             item = result["auction"].get("item") or {}
             starting_price = _fmt_points(item.get("starting_price", 100_000_000))
             first_turn = result["auction"].get("turn_username") or ""
-            self._auction_broadcast(f"🔔 أغلق فاتح الجولة التسجيل؛ بدأت المزايدة بالدور لمدة 60 ثانية. السعر الابتدائي {starting_price} نقطة؛ أول دور على @{first_turn}. في دورك اكتب «زايد <المبلغ>» مثل 110m أو 10b (وأقل مزايدة لاحقة تزيد 10m) أو «تمرير».", f"🔔 The host closed registration; 60-second turn-based bidding starts now. Starting price: {starting_price} points. First turn: @{first_turn}. On your turn, type “bid <amount>” such as 110m or 10b; later bids must increase by at least 10m, or type “pass”.", rooms=self._auction_participant_rooms(result.get("auction")))
+            self._auction_broadcast(f"🔔 أغلق فاتح الجولة التسجيل؛ بدأت المزايدة بالدور لمدة أقصاها 60 ثانية. السعر الابتدائي {starting_price} نقطة؛ أول دور على @{first_turn}. لكل لاعب 7 ثوانٍ للمزايدة قبل انتقال الدور تلقائيًا. اكتب «زايد <المبلغ>» أو «تمرير».", f"🔔 The host closed registration; turn-based bidding starts now for up to 60 seconds. Starting price: {starting_price} points. First turn: @{first_turn}. Each player has 7 seconds to bid before their turn passes automatically. Type “bid <amount>” or “pass”.", rooms=self._auction_participant_rooms(result.get("auction")))
             return True
 
         if action == "bid":
@@ -16638,6 +17701,63 @@ class TalkinBot:
                 except Exception: pass
         threading.Thread(target=self._localized_room_worker(room, response_language, worker),
                          name="random-picture-search", daemon=True).start()
+        return True
+
+    def _handle_explore_command(self, room, command, sender):
+        match = re.fullmatch(r"ax@(.+)", str(command or "").strip(), re.I | re.S)
+        if not match:
+            return False
+        text = match.group(1).strip()[:150]
+        if not text:
+            self.send_room_text(room, "استخدم ax@النص لنشر محتوى اكسبلور.")
+            return True
+        if self._find_publish_filter_hit(text):
+            self.send_room_text(room, "تعذر نشر النص لأنه يخالف فلتر النشر.")
+            return True
+        try:
+            key = _norm_user(sender)
+            avatar_url = getattr(self, "user_photos", {}).get(key, "") or self._lookup_profile_photo(sender)
+            card = render_explore_card(text, sender, avatar_url)
+            base = _public_base_url()
+            if not base:
+                raise RuntimeError("رابط الوسائط العام غير مضبوط")
+            media_url = f"{base}/publish/{card.name}"
+            self._verify_public_media_url(media_url, "image")
+            code = uuid.uuid4().hex[:4]
+            # The text already appears inside the Explore image; keep this
+            # accompanying room message focused on the author and reactions.
+            caption = (f"✨ اكسبلور\n👤 @{str(sender or '').lstrip('@')}\n━━━━━━━━━━━━\n"
+                       f"👍 lk@{code}   ❤️ lv@{code}   👎 dl@{code}\n💬 cm@{code} msg   🚨 report@{code} msg\n🔁 x@{code} — إعادة نشر")
+            self.reaction_targets[code] = {"publisher": str(sender), "kind": "explore", "description": text,
+                                            "media_url": media_url, "caption": caption, "created_at": time.time()}
+            rooms = self._active_rooms() or ([str(room)] if room else [])
+            delivered = 0
+            for target in rooms:
+                if self.send_room_media(target, media_url, "image") is not False:
+                    self.send_room_text(target, caption)
+                    delivered += 1
+            self.send_private_text(sender, f"✅ تم نشر اكسبلور في {delivered} غرفة.")
+        except Exception as exc:
+            self.log("[EXPLORE] publish failed:", repr(exc))
+            self.send_private_text(sender, "تعذر تجهيز منشور اكسبلور؛ تحقق من إعداد رابط الوسائط العام.")
+        return True
+
+    def _handle_explore_repost_command(self, room, command, sender):
+        match = re.fullmatch(r"x@([A-Za-z0-9]{4})", str(command or "").strip(), re.I)
+        if not match:
+            return False
+        code = match.group(1).lower()
+        info = getattr(self, "reaction_targets", {}).get(code)
+        if not isinstance(info, dict) or info.get("kind") != "explore":
+            return False
+        if time.time() - float(info.get("created_at", 0) or 0) > 86400:
+            return False
+        media_url = str(info.get("media_url") or "")
+        if not media_url or self.send_room_media(room, media_url, "image") is False:
+            self.send_room_text(room, "تعذر إعادة نشر هذا المنشور الآن.")
+            return True
+        caption = re.sub(r"\n🔁 أعاد النشر:.*$", "", str(info.get("caption") or ""), flags=re.S)
+        self.send_room_text(room, caption + f"\n🔁 أعاد النشر: @{str(sender or '').lstrip('@')}")
         return True
 
     def _handle_lookalike_command(self, room, body, sender):
@@ -18820,17 +19940,22 @@ class TalkinBot:
                 if redeemed.get("ok"):
                     prize = redeemed.get("item") or {}
                     language_en = self._effective_room_language(room) == "en"
+                    authentic = bool(redeemed.get("authentic"))
                     if language_en:
                         prize_name = prize.get("item_name_en") or prize.get("item_name_ar") or "Auction prize"
+                        outcome = "authentic (+0.75% profit)" if authentic else "counterfeit (-1.25% loss)"
                         response = (
                             f"✅ Redeemed {prize.get('icon', '💎')} {prize_name} from the auction.\n"
-                            f"💰 Added {int(redeemed.get('points', 0) or 0):,} points to your balance, including the 30% post-round profit."
+                            f"🎲 Result: {outcome}.\n"
+                            f"💰 Added {int(redeemed.get('points', 0) or 0):,} points to your balance."
                         )
                     else:
                         prize_name = prize.get("item_name_ar") or prize.get("item_name_en") or "جائزة المزاد"
+                        outcome = "أصلية (+0.75% ربح)" if authentic else "مغشوشة (-1.25% خسارة)"
                         response = (
                             f"✅ استبدلت {prize.get('icon', '💎')} {prize_name} من المزاد.\n"
-                            f"💰 أضيف إلى رصيدك {int(redeemed.get('points', 0) or 0):,} نقطة، متضمنة ربح 30% بعد الجولة."
+                            f"🎲 النتيجة: القطعة {outcome}.\n"
+                            f"💰 تمت تسوية {int(redeemed.get('points', 0) or 0):,} نقطة في رصيدك."
                         )
                     self.send_room_text(room, response)
                 elif redeemed.get("pending"):
@@ -20224,6 +21349,9 @@ class TalkinBot:
         pending = self._pending_room_lists.get(_norm_room(room))
         if not isinstance(pending, dict) or pending.get("code") == "is":
             return False
+        if pending.get("bot_role_check"):
+            self.log("[ROOM-ROLE] ignored text preview; waiting for complete server list")
+            return False
 
         # Only consume a response that belongs to the request we sent.
         request_type = str(pending.get("request_type") or "").casefold()
@@ -20493,6 +21621,24 @@ class TalkinBot:
                 response_timer.cancel()
             except Exception:
                 pass
+
+        if pending.get("bot_role_check"):
+            room_key = _norm_room(source_room)
+            state = getattr(self, "_pending_bot_room_role_checks", {}).get(room_key)
+            if not isinstance(state, dict) or state.get("request_id") != pending.get("request_id"):
+                return False
+            users = self._extract_room_list_users(result)
+            bot_user = next(
+                (user for user in users if _norm_user(user.get("username")) == _norm_user(BOT_ID)),
+                None,
+            )
+            if bot_user:
+                reported_role = _normalize_room_role(bot_user.get("role"))
+                if reported_role not in {"", "none", "unknown"}:
+                    return self._finish_bot_room_role_check(room_key, reported_role)
+            if pending.get("request_mode") == "app":
+                return self._fallback_bot_room_role_check(room_key, pending.get("request_id"))
+            return self._finish_bot_room_role_check(room_key, missing=True)
 
         code = str(pending.get("code") or "").lower()
         if code in {"id_sync", "identity_update", "mine_uid"}:
@@ -20851,27 +21997,373 @@ class TalkinBot:
         self.send_query(encode_query("room_admin",type_=types[code],room=state["room"],to=BOT_ID,value="none",id_=rid))
         return True
 
+    def _profile_lookup_runtime(self):
+        lock = getattr(self, "_profile_lookup_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._profile_lookup_lock = lock
+        if not isinstance(getattr(self, "_profile_lookup_queue", None), list):
+            self._profile_lookup_queue = []
+        if not isinstance(getattr(self, "_profile_lookup_by_name", None), dict):
+            self._profile_lookup_by_name = {}
+        if not isinstance(getattr(self, "_id_refresh_jobs", None), dict):
+            self._id_refresh_jobs = {}
+        if not isinstance(getattr(self, "_pending_identity_transfers", None), dict):
+            self._pending_identity_transfers = {}
+        return lock
+
+    def _queue_profile_lookup(self, username, consumer):
+        target = str(username or "").strip().lstrip("@")
+        target_key = _norm_user(target)
+        if not target or not target_key or len(target) > 128:
+            return False
+        lock = self._profile_lookup_runtime()
+        with lock:
+            pending = self._profile_lookup_by_name.get(target_key)
+            if isinstance(pending, dict):
+                pending.setdefault("consumers", []).append(dict(consumer or {}))
+                return True
+            task = {
+                "username": target,
+                "username_key": target_key,
+                "request_id": "".join(secrets.choice(PROFILE_LOOKUP_UID_ALPHABET) for _ in range(20)),
+                "consumers": [dict(consumer or {})],
+                "timer": None,
+            }
+            self._profile_lookup_by_name[target_key] = task
+            self._profile_lookup_queue.append(task)
+            should_dispatch = getattr(self, "_profile_lookup_active", None) is None
+        if should_dispatch:
+            self._dispatch_profile_lookup_queue()
+        return True
+
+    def _dispatch_profile_lookup_queue(self):
+        while True:
+            lock = self._profile_lookup_runtime()
+            with lock:
+                if getattr(self, "_profile_lookup_active", None) is not None:
+                    return True
+                pending_queue = self._profile_lookup_queue
+                if not pending_queue:
+                    return True
+                task = pending_queue.pop(0)
+                self._profile_lookup_active = task
+                timer = threading.Timer(
+                    PROFILE_LOOKUP_TIMEOUT_SECONDS,
+                    self._profile_lookup_timeout,
+                    args=(task["request_id"],),
+                )
+                timer.daemon = True
+                task["timer"] = timer
+            timer.start()
+            try:
+                packet = encode_query(
+                    "profile_other", type_=task["username"], uid=task["request_id"]
+                )
+                if self.send_query(packet) is False:
+                    raise RuntimeError("profile_other request was not sent")
+                self.log("[PROFILE] requested user ID for", task["username"])
+                return True
+            except Exception as exc:
+                self.log("[PROFILE] profile_other request failed:", repr(exc))
+                self._finish_profile_lookup(
+                    task["request_id"], error="send_failed", dispatch_next=False
+                )
+
+    def _profile_lookup_timeout(self, request_id):
+        self._finish_profile_lookup(request_id, error="timeout")
+
+    def _finish_profile_lookup(self, request_id, *, user_id="", profile_name="", error="", dispatch_next=True):
+        lock = self._profile_lookup_runtime()
+        with lock:
+            task = getattr(self, "_profile_lookup_active", None)
+            if not isinstance(task, dict) or task.get("request_id") != request_id:
+                return False
+            self._profile_lookup_active = None
+            self._profile_lookup_by_name.pop(task.get("username_key"), None)
+            timer = task.get("timer")
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+            consumers = list(task.get("consumers") or [])
+            next_pending = bool(self._profile_lookup_queue)
+        for consumer in consumers:
+            try:
+                self._handle_profile_lookup_consumer(
+                    consumer, task.get("username", ""), profile_name or task.get("username", ""),
+                    str(user_id or ""), str(error or ""),
+                )
+            except Exception as exc:
+                self.log("[PROFILE] lookup consumer failed:", repr(exc))
+        if dispatch_next and next_pending:
+            self._dispatch_profile_lookup_queue()
+        return True
+
+    def _handle_profile_other_payload(self, payload):
+        try:
+            data = json.loads(payload) if isinstance(payload, str) else payload
+        except Exception:
+            return False
+        if not isinstance(data, dict) or str(data.get("handler") or "").strip().casefold() != "profile_other":
+            return False
+        lock = self._profile_lookup_runtime()
+        with lock:
+            task = getattr(self, "_profile_lookup_active", None)
+            if not isinstance(task, dict):
+                self.log("[PROFILE] ignored unsolicited profile_other response")
+                return True
+            expected_name = str(task.get("username") or "")
+            request_id = str(task.get("request_id") or "")
+        reported_name = str(data.get("type") or data.get("username") or data.get("user_name") or "").strip().lstrip("@")
+        if not reported_name or _norm_user(reported_name) != _norm_user(expected_name):
+            self.log("[PROFILE] ignored profile_other response with mismatched username", reported_name)
+            return True
+        user_id = str(data.get("user_id") or "").strip()
+        if not user_id.isdigit():
+            self._finish_profile_lookup(
+                request_id, profile_name=reported_name, error="missing_user_id"
+            )
+            return True
+        self._finish_profile_lookup(
+            request_id, user_id=user_id, profile_name=reported_name
+        )
+        return True
+
+    def _start_profile_id_command(self, room, target, requester, is_private=False):
+        target = str(target or "").strip().lstrip("@")
+        if not target or len(target) > 128:
+            message = "❌ الصيغة: id@اسم المستخدم"
+            self.send_private_text(requester, message) if is_private else self.send_room_text(room, message)
+            return True
+        consumer = {
+            "kind": "show_id", "requester": str(requester or ""),
+            "room": str(room or ""), "is_private": bool(is_private),
+        }
+        if not self._queue_profile_lookup(target, consumer):
+            message = "⚠️ تعذر بدء طلب ID. تحقق من اتصال البوت وحاول مجددًا."
+            self.send_private_text(requester, message) if is_private else self.send_room_text(room, message)
+            return True
+        message = f"🔎 أبحث عن ID المستخدم @{target} من الخادم..."
+        self.send_private_text(requester, message) if is_private else self.send_room_text(room, message)
+        return True
+
+    def _profile_refresh_targets(self, kind):
+        rows = []
+        if kind == "vip":
+            for _path, username, _record in _vip_identity_entries(_vip_data()):
+                if _norm_user(username):
+                    rows.append(username)
+        else:
+            for key, item in _points_data().items():
+                if not isinstance(item, dict):
+                    continue
+                username = str(item.get("username") or key or "").strip().lstrip("@")
+                if _norm_user(username):
+                    rows.append(username)
+        groups = defaultdict(list)
+        for name in rows:
+            groups[_norm_user(name)].append(name)
+        unique, ambiguous = [], 0
+        for names in groups.values():
+            if len(names) == 1:
+                unique.append(names[0])
+            else:
+                ambiguous += len(names)
+        return unique, ambiguous, len(rows)
+
+    def _start_user_id_refresh(self, kind, requester, is_private):
+        if not _is_primary_master(requester):
+            self.send_private_text(requester, "🚫 تحديث ملفات IDs مخصص للماستر الأساسي فقط.")
+            return True
+        if not is_private:
+            self.send_private_text(requester, "🚫 أرسل أمر تحديث IDs في خاص البوت فقط.")
+            return True
+        self._profile_lookup_runtime()
+        jobs = self._id_refresh_jobs
+        existing = jobs.get(kind)
+        if isinstance(existing, dict):
+            self.send_private_text(requester, "⏳ يوجد تحديث IDs لهذا الملف قيد التنفيذ بالفعل.")
+            return True
+        targets, ambiguous, total_accounts = self._profile_refresh_targets(kind)
+        job = {
+            "kind": kind, "requester": str(requester or ""),
+            "total_accounts": total_accounts, "request_total": len(targets),
+            "completed": 0, "fetched": 0, "updated": 0,
+            "unchanged": 0, "failed": ambiguous,
+        }
+        jobs[kind] = job
+        label = "VIP" if kind == "vip" else "النقاط"
+        self.send_private_text(
+            requester,
+            f"⏳ بدأت مزامنة IDs لملف {label}. عدد السجلات: {total_accounts}. سأرسل النتيجة عند الاكتمال.",
+        )
+        for username in targets:
+            self._queue_profile_lookup(username, {
+                "kind": "refresh_id", "job_kind": kind,
+            })
+        self._maybe_finish_user_id_refresh(kind)
+        return True
+
+    def _maybe_finish_user_id_refresh(self, kind):
+        job = getattr(self, "_id_refresh_jobs", {}).get(kind)
+        if not isinstance(job, dict) or int(job.get("completed", 0)) < int(job.get("request_total", 0)):
+            return False
+        label = "VIP" if kind == "vip" else "النقاط"
+        message = (
+            f"✅ اكتمل تحديث ملف {label}.\n"
+            f"👤 عدد المستخدمين: {job['total_accounts']}\n"
+            f"🔎 جلبت ID لـ: {job['fetched']} مستخدم\n"
+            f"💾 حدثت ID لـ: {job['updated']} مستخدم\n"
+            f"↔️ كانت IDs محدثة: {job['unchanged']}\n"
+            f"⚠️ تعذر التحقق/التحديث: {job['failed']}"
+        )
+        requester = str(job.get("requester") or BOT_MASTER)
+        getattr(self, "_id_refresh_jobs", {}).pop(kind, None)
+        self.send_private_text(requester, message)
+        return True
+
+    def _handle_profile_lookup_consumer(self, consumer, requested_name, profile_name, user_id, error):
+        kind = str(consumer.get("kind") or "")
+        if kind == "show_id":
+            requester = consumer.get("requester", "")
+            message = (
+                f"🆔 ID المستخدم @{profile_name}: {user_id}"
+                if user_id and not error else
+                f"❌ لم أتمكن من جلب ID لـ@{requested_name} من الخادم ({error or 'رد غير صالح'})."
+            )
+            if consumer.get("is_private"):
+                self.send_private_text(requester, message)
+            else:
+                self.send_room_text(consumer.get("room", ""), message)
+            return
+        if kind == "refresh_id":
+            job_kind = consumer.get("job_kind")
+            job = getattr(self, "_id_refresh_jobs", {}).get(job_kind)
+            if not isinstance(job, dict):
+                return
+            job["completed"] = int(job.get("completed", 0)) + 1
+            if error or not user_id:
+                job["failed"] = int(job.get("failed", 0)) + 1
+            else:
+                job["fetched"] = int(job.get("fetched", 0)) + 1
+                result = (
+                    _update_vip_user_id(profile_name, user_id)
+                    if job_kind == "vip" else _set_points_user_id(profile_name, user_id)
+                )
+                if not result.get("ok"):
+                    job["failed"] = int(job.get("failed", 0)) + 1
+                elif result.get("changed"):
+                    job["updated"] = int(job.get("updated", 0)) + 1
+                else:
+                    job["unchanged"] = int(job.get("unchanged", 0)) + 1
+            self._maybe_finish_user_id_refresh(job_kind)
+            return
+        if kind == "points_transfer_identity":
+            transfer_id = str(consumer.get("transfer_id") or "")
+            state = getattr(self, "_pending_identity_transfers", {}).get(transfer_id)
+            if not isinstance(state, dict) or state.get("completed"):
+                return
+            role = str(consumer.get("role") or "")
+            if error or not user_id:
+                self._finish_identity_checked_transfer(
+                    transfer_id, error=f"تعذر جلب ID لـ@{requested_name} من الخادم."
+                )
+                return
+            state[f"{role}_id"] = user_id
+            if state.get("sender_id") and state.get("target_id"):
+                self._finish_identity_checked_transfer(transfer_id)
+
+    def _start_identity_checked_transfer(self, sender, target, amount):
+        self._profile_lookup_runtime()
+        sender_name = str(sender or "").strip().lstrip("@")
+        target_name = str(target or "").strip().lstrip("@")
+        pending_key = (_norm_user(sender_name), _norm_user(target_name), int(amount))
+        for state in self._pending_identity_transfers.values():
+            if state.get("pending_key") == pending_key:
+                self.send_private_text(sender_name, "⏳ هذا التحويل قيد التحقق بالفعل.")
+                return True
+        transfer_id = secrets.token_hex(12)
+        state = {
+            "sender": sender_name, "target": target_name, "amount": int(amount),
+            "pending_key": pending_key, "completed": False,
+        }
+        self._pending_identity_transfers[transfer_id] = state
+        self.send_private_text(sender_name, "🔎 أتحقق من ID المرسل والمستلم مقابل ملف النقاط قبل التحويل...")
+        for role, username in (("sender", sender_name), ("target", target_name)):
+            self._queue_profile_lookup(username, {
+                "kind": "points_transfer_identity", "transfer_id": transfer_id,
+                "role": role,
+            })
+        return True
+
+    def _finish_identity_checked_transfer(self, transfer_id, error=""):
+        state = getattr(self, "_pending_identity_transfers", {}).get(str(transfer_id))
+        if not isinstance(state, dict) or state.get("completed"):
+            return False
+        state["completed"] = True
+        self._pending_identity_transfers.pop(str(transfer_id), None)
+        sender, target = state["sender"], state["target"]
+        if error:
+            self.send_private_text(sender, f"❌ لم يتم التحويل. {error} لم يتغير أي رصيد.")
+            return True
+        sender_check = _points_identity_status(sender, state.get("sender_id"))
+        target_check = _points_identity_status(target, state.get("target_id"))
+        if not sender_check.get("ok") or not target_check.get("ok"):
+            check = sender_check if not sender_check.get("ok") else target_check
+            label = "حسابك" if check is sender_check else f"حساب @{target}"
+            reason = check.get("error")
+            if reason == "id_missing":
+                detail = f"لا يوجد ID محفوظ في ملف النقاط لـ{label}. اطلب من الماستر تحديث IDs الملف أولًا."
+            elif reason == "id_mismatch":
+                detail = f"ID الخادم لا يطابق ID المحفوظ لـ{label}. لم يتم التحويل."
+            elif reason == "ambiguous_target":
+                detail = f"يوجد أكثر من سجل مطابق لـ{label} في ملف النقاط."
+            elif reason == "ambiguous_user_id":
+                detail = f"ID الخادم مسجل في أكثر من حساب داخل ملف النقاط لـ{label}. اطلب من الماستر إزالة الالتباس أولًا."
+            else:
+                detail = f"الاسم لا يطابق سجل النقاط المحفوظ لـ{label}."
+            self.send_private_text(sender, f"❌ لم يتم التحويل. {detail} لم يتغير أي رصيد.")
+            return True
+        if str(state.get("sender_id")) == str(state.get("target_id")):
+            self.send_private_text(sender, "❌ المرسل والمستلم هما الحساب نفسه حسب ID الخادم. لم يتغير أي رصيد.")
+            return True
+        result = _transfer_points(
+            sender, target, state["amount"], allow_alias_source=False, require_exact_target=True,
+            expected_sender_id=state.get("sender_id"), expected_target_id=state.get("target_id"),
+        )
+        if not result.get("ok"):
+            errors = {
+                "target_not_found": "المستلم غير موجود في ملف النقاط.",
+                "sender_not_found": "حسابك غير موجود في ملف النقاط.",
+                "insufficient": f"رصيدك غير كافٍ؛ رصيدك الحالي {_fmt_points(result.get('sender_balance'))} نقطة.",
+                "same_account": "لا يمكن التحويل إلى الحساب نفسه.",
+                "sender_id_mismatch": "تغير ID حساب المرسل في ملف النقاط أثناء التحقق.",
+                "target_id_mismatch": "تغير ID حساب المستلم في ملف النقاط أثناء التحقق.",
+                "identity_name_mismatch": "تغير الاسم المحفوظ في ملف النقاط أثناء التحقق.",
+                "ambiguous_user_id": "ID أحد الطرفين مكرر في أكثر من حساب.",
+            }
+            self.send_private_text(sender, f"❌ فشل التحويل: {errors.get(result.get('error'), 'تعذر حفظ العملية بأمان.') } لم يتغير أي رصيد.")
+            return True
+        amount = int(state["amount"])
+        recipient = result["recipient"]
+        self.send_private_text(sender, f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{recipient}. رصيدك: {_fmt_points(result['sender_balance'])}")
+        if _norm_user(recipient) != _norm_user(sender):
+            self.send_private_text(recipient, f"💰 استلمت {_fmt_points(amount)} نقطة من @{result['sender']}. رصيدك الحالي: {_fmt_points(result['recipient_balance'])}")
+        return True
+
     def _room_list_commands(self, room, text, sender, is_private):
-        update_id = re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", str(text or "").strip(), re.I)
+        id_text = str(text or "").strip()
+        if id_text.casefold() in {"id", "ايدي", "أيدي"}:
+            return self._start_profile_id_command(room, sender, sender, is_private)
+        id_match = re.fullmatch(r"(?:id|ايدي|أيدي)@(.+)", id_text, re.I)
+        if id_match:
+            return self._start_profile_id_command(room, id_match.group(1), sender, is_private)
+
+        update_id = re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", id_text, re.I)
         if update_id:
             return self._request_identity_update(room, sender)
-
-        id_match = re.fullmatch(r"(?:ايدي|أيدي|id)(?:@(.+))?", str(text or "").strip(), re.I)
-        if id_match:
-            target = (id_match.group(1) or sender).strip().lstrip("@")
-            cached_id = _stored_user_id(target, room)
-            if cached_id:
-                if is_private:
-                    self.send_private_text(sender, cached_id)
-                else:
-                    self.send_room_text(room, cached_id)
-            else:
-                message = "لا توجد هوية محفوظة لهذا المستخدم. اكتب «حدث ايدي» داخل الغرفة لتحديثها أولًا."
-                if is_private:
-                    self.send_private_text(sender, message)
-                else:
-                    self.send_room_text(room, message)
-            return True
 
         match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
         if match:
@@ -20976,6 +22468,52 @@ class TalkinBot:
         """Giant-style persistent management commands. Returns True if consumed."""
         text=str(body or "").strip()
         low=text.casefold()
+
+        if low in VIP_ID_REFRESH_COMMANDS:
+            return self._start_user_id_refresh("vip", sender, is_private)
+        if low in POINTS_ID_REFRESH_COMMANDS:
+            return self._start_user_id_refresh("points", sender, is_private)
+        if low.startswith("ts@"):
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🚫 أمر ts مخصص للماستر الأساسي المحدد في BOT_MASTER فقط.")
+                return True
+            if not is_private:
+                if room:
+                    self.send_room_text(room, "🚫 أرسل أمر ts في خاص البوت فقط.")
+                return True
+            match = re.fullmatch(r"ts@([^@]+)@([^@]+)", text, re.I)
+            if not match:
+                self.send_private_text(sender, "❌ الصيغة: ts@اسم المستخدم@عدد النقاط")
+                return True
+            target = match.group(1).strip().lstrip("@")
+            raw_amount = match.group(2).strip()
+            zero_token = raw_amount.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")).replace(",", "")
+            amount = 0 if zero_token in {"0", "0.0", "0.00"} else _parse_compact_amount(raw_amount)
+            if not target or amount is None or amount < 0:
+                self.send_private_text(sender, "❌ المبلغ غير صالح. استخدم عددًا صحيحًا غير سالب، مثل 0 أو 1000000 أو 10m.")
+                return True
+            result = _set_points_balance(target, amount, actor=sender)
+            if not result.get("ok"):
+                if result.get("error") == "target_not_found":
+                    message = f"❌ لم أجد @{target} في ملف النقاط؛ لم يتغير أي رصيد."
+                elif result.get("error") == "ambiguous_target":
+                    message = f"⚠️ وجدت أكثر من سجل مطابق لـ@{target} في ملف النقاط؛ لم يتغير أي رصيد. استخدم الاسم الكامل لتمييز الحساب."
+                elif result.get("error") == "invalid_amount":
+                    message = "❌ يجب أن يكون عدد النقاط صفرًا أو أكبر."
+                else:
+                    message = "⚠️ تعذر حفظ التسوية بأمان؛ لم يتغير الرصيد. حاول لاحقًا."
+                self.send_private_text(sender, message)
+                return True
+            if result.get("changed"):
+                message = (
+                    f"✅ تمت تسوية نقاط @{result['username']}.\n"
+                    f"قبل: {int(result['old_balance']):,} نقطة\n"
+                    f"بعد: {int(result['balance']):,} نقطة"
+                )
+            else:
+                message = f"ℹ️ رصيد @{result['username']} هو بالفعل {_fmt_points(result['balance'])} نقطة؛ لم يتغير."
+            self.send_private_text(sender, message)
+            return True
 
         if low in {"فحص زرع", "فحص الزرع", "farm check", "check farm"}:
             return self._farm_check_command(sender, english=low in {"farm check", "check farm"})
@@ -22166,37 +23704,7 @@ class TalkinBot:
             if not target or amount <= 0:
                 self.send_private_text(sender, "❌ الصيغة: sb@اسم المستخدم@عدد النقاط")
                 return True
-            result = _transfer_points(sender, target, amount)
-            if not result.get("ok"):
-                error = result.get("error")
-                if error in {"target_not_found", "sender_not_found"}:
-                    message = "❌ فشل التحويل: اكتب اسم المستخدم الصحيح كما هو محفوظ في ملف النقاط. لم يتم خصم أي نقاط."
-                elif error == "insufficient":
-                    message = f"❌ رصيدك غير كافٍ. رصيدك الحالي: {_fmt_points(result.get('sender_balance'))} نقطة. لم يتم خصم شيء."
-                elif error == "same_account":
-                    message = "❌ لا يمكن تحويل النقاط إلى الحساب نفسه. لم يتم خصم أي نقاط."
-                else:
-                    message = "⚠️ تعذر حفظ التحويل بأمان؛ لم يتم تأكيده. أعد المحاولة لاحقاً."
-                if _detect_text_language(text) == "en":
-                    message = {
-                        "target_not_found": "❌ Transfer failed: enter the exact username saved in the points file. No points were deducted.",
-                        "sender_not_found": "❌ Transfer failed: your points account was not found. No points were deducted.",
-                        "insufficient": f"❌ Insufficient balance: {_fmt_points(result.get('sender_balance'))} points. Nothing was deducted.",
-                        "same_account": "❌ You cannot transfer points to the same account. No points were deducted.",
-                        "persistence_failed": "⚠️ The transfer could not be safely saved; it was not confirmed. Please retry later.",
-                    }.get(error, message)
-                self.send_private_text(sender, message)
-                return True
-            recipient = result["recipient"]
-            sender_reply = f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{recipient}. رصيدك: {_fmt_points(result['sender_balance'])}"
-            recipient_reply = f"💰 استلمت {_fmt_points(amount)} نقطة من @{result['sender']}. رصيدك الحالي: {_fmt_points(result['recipient_balance'])}"
-            if _detect_text_language(text) == "en":
-                sender_reply = f"✅ Transferred {_fmt_points(amount)} points to @{recipient}. Your balance: {_fmt_points(result['sender_balance'])}"
-                recipient_reply = f"💰 You received {_fmt_points(amount)} points from @{result['sender']}. Balance: {_fmt_points(result['recipient_balance'])}"
-            self.send_private_text(sender, sender_reply)
-            if _norm_user(recipient) != _norm_user(sender):
-                self.send_private_text(recipient, recipient_reply)
-            return True
+            return self._start_identity_checked_transfer(sender, target, amount)
 
         # VIP users may publish images; the actual image is handled by _handle_publish_media.
         if _is_publish_command(text) and _is_vip_user(sender):
@@ -24363,6 +25871,11 @@ class TalkinBot:
         if self._handle_random_picture_command(room, body, frm):
             return
 
+        if self._handle_explore_command(room, body, frm):
+            return
+        if self._handle_explore_repost_command(room, body, frm):
+            return
+
         # شبيه: متاح كأمر غرفة مستقل ولا يحتاج توثيقاً.
         if self._handle_lookalike_command(room, body, frm):
             return
@@ -24770,23 +26283,32 @@ class TalkinBot:
 
     def on_message(self, ws, message):
         """Queue inbound frames so expensive decoding/commands never block recv()."""
-        if isinstance(message, str):
-            return
         try:
-            # One shallow protobuf pass is enough to prioritize chat/room text
-            # above low-value roster/stream traffic. The full decode happens
-            # once, inside the worker.
-            top = decode_message(message)
-            priority = 2
-            if 9 in top or 10 in top:
+            if isinstance(message, str):
+                if not message.lstrip().startswith("{"):
+                    return
                 priority = 0
-            elif 8 in top:
-                priority = 1
+                queued_message = message
+            else:
+                raw_message = bytes(message)
+                if raw_message.lstrip().startswith(b"{"):
+                    priority = 0
+                    queued_message = raw_message
+                else:
+                    # One shallow protobuf pass prioritizes command-bearing
+                    # frames; JSON profile_other replies use the high priority.
+                    top = decode_message(raw_message)
+                    priority = 2
+                    if 9 in top or 10 in top:
+                        priority = 0
+                    elif 8 in top:
+                        priority = 1
+                    queued_message = raw_message
             with self._event_queue_lock:
                 self._event_queue_seq += 1
                 seq = self._event_queue_seq
             try:
-                self._event_queue.put_nowait((priority, seq, ws, bytes(message)))
+                self._event_queue.put_nowait((priority, seq, ws, queued_message))
             except queue.Full:
                 # Never let a burst of presence/stream frames freeze command
                 # reception. If the queue is full, make one immediate worker
@@ -24794,7 +26316,7 @@ class TalkinBot:
                 # low-priority pressure rather than blocking the socket.
                 if priority == 0:
                     try:
-                        self._process_message(ws, bytes(message))
+                        self._process_message(ws, queued_message)
                     except Exception as exc:
                         self.log("[EVENT-WORKER] urgent frame failed:", repr(exc))
                 else:
@@ -24807,9 +26329,25 @@ class TalkinBot:
     def _process_message(self, ws, message):
         try:
             if isinstance(message, str):
-                self.log("[WS] unexpected text frame received")
+                if not self._handle_profile_other_payload(message):
+                    self.log("[WS] ignored unrelated text frame")
+                return
+            if isinstance(message, (bytes, bytearray)) and bytes(message).lstrip().startswith(b"{"):
+                try:
+                    text_frame = bytes(message).decode("utf-8")
+                except UnicodeDecodeError:
+                    self.log("[WS] ignored non-UTF8 JSON text frame")
+                    return
+                if not self._handle_profile_other_payload(text_frame):
+                    self.log("[WS] ignored unrelated JSON text frame")
                 return
             result = decode_result_message(message)
+            if self._handle_profile_other_payload(result):
+                return
+            if str(result.get("type") or "").strip().casefold() == "profile_other":
+                value = result.get("value")
+                if isinstance(value, str) and self._handle_profile_other_payload(value):
+                    return
             self._handle_stream_result_ack(result)
             self._cache_user_photos_from_result(result)
             # Room join outcomes are emitted as top-level ResultMessage types
@@ -25339,21 +26877,19 @@ class TalkinBot:
             elif kind == "close":
                 raise ConnectionError(f"WebSocket closed during room-list bootstrap: {message}")
 
-        # Startup/reconnect room policy:
-        # OFF = only the configured GROUP_TO_JOIN/FIRST_ROOM.
-        # ON  = all rooms saved in tracked_rooms.json plus GROUP_TO_JOIN.
-        # Manual `.دخول غرفي` is independent and always joins the saved list.
+        # Startup/reconnect room policy is controlled independently from manual
+        # join commands: STARTUP_JOIN_ENABLED gates GROUP_TO_JOIN, while
+        # RESTORE_SAVED_ROOMS_ON_STARTUP gates the persisted room catalog.
         if MASTER_SERVICE_ENABLED:
             rooms_to_restore = set()
         else:
-            # tracked_rooms.json is the authoritative startup source. The
-            # in-memory known_rooms set may be a truncated/stale view after a
-            # reconnect and was the reason only a subset was restored.
-            rooms_to_restore = {
-                str(r).strip() for r in _persistent_rooms()
-                if str(r).strip() and _norm_room(r) not in getattr(self, "blocked_rooms", set())
-            }
-            if self.room:
+            rooms_to_restore = set()
+            if RESTORE_SAVED_ROOMS_ON_STARTUP:
+                rooms_to_restore.update(
+                    str(r).strip() for r in _persistent_rooms()
+                    if str(r).strip() and _norm_room(r) not in getattr(self, "blocked_rooms", set())
+                )
+            if STARTUP_JOIN_ENABLED and self.room:
                 rooms_to_restore.add(str(self.room).strip())
         if rooms_to_restore:
             self._room_restore_candidates = {
@@ -25496,7 +27032,7 @@ class TalkinBot:
             missing.append("BOT_ID (or BOT_USERNAME)")
         if not BOT_PWD:
             missing.append("BOT_PWD (or BOT_PASSWORD)")
-        if not self.room and not MASTER_SERVICE_ENABLED:
+        if STARTUP_JOIN_ENABLED and not self.room and not MASTER_SERVICE_ENABLED:
             missing.append("GROUP_TO_JOIN (or FIRST_ROOM)")
         if DEBUG and not QUIET_MODE:
             print(f"[ROOM_POLICY] startup={'ALL_SAVED_ROOMS' if AUTO_JOIN_ALL_ROOMS else 'FIRST_ROOM_ONLY'} verification={'ON' if VERIFICATION_ENABLED else 'OFF'}", flush=True)

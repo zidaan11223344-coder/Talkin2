@@ -18,6 +18,10 @@ from cricket_integration import CricketIntegration
 from cricket_result import render_result_image
 
 
+def _decoded_text_bodies(packets):
+    return [bot_module.as_text(bot_module.decode_message(packet)[5][0]) for packet in packets]
+
+
 class ProfileStatusRegressions(unittest.TestCase):
     def test_requested_default_profile_status_is_sent_whole_under_ws_limit(self):
         expected = (
@@ -1474,6 +1478,10 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         bot.send_private_text = lambda user, text: private_replies.append((user, text))
         changes = []
         transfers = []
+        identity_checks = []
+        bot._start_identity_checked_transfer = lambda sender, target, amount: identity_checks.append(
+            (sender, target, amount)
+        ) or True
         with patch.object(bot_module, "_is_verified_user", return_value=True), patch.object(
             bot_module, "_transfer_points",
             side_effect=lambda sender, target, amount: transfers.append((sender, target, amount)) or {
@@ -1482,7 +1490,8 @@ class BotGameAndMusicRegressions(unittest.TestCase):
             },
         ), patch.object(bot_module, "_get_points", return_value=1000):
             self.assertTrue(bot._handle_management_command_impl("North", "sb@target@100", "member"))
-        self.assertEqual(transfers, [("member", "target", 100)])
+        self.assertEqual(identity_checks, [("member", "target", 100)])
+        self.assertEqual(transfers, [])
         self.assertEqual(changes, [])
 
         changes.clear()
@@ -2476,33 +2485,22 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(text(6), "North")
         self.assertEqual(text(7), "https://cdn.example/song.mp3")
 
-    def test_oversized_game_result_is_dropped_locally_without_telegram_or_websocket(self):
+    def test_oversized_game_result_is_split_safely_without_telegram(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         packets = []
-        bot.send_query = lambda payload: packets.append(payload)
+        bot.send_query = lambda payload: packets.append(payload) or True
         bot.log = lambda *_args: None
         telegram = []
         bot._send_long_text_to_telegram = lambda text, title="": telegram.append((text, title)) or True
         text = "🏆 انتهت مباراة الكركيت\n" + "\n".join(
             f"💰 @Player{i} +200,000 نقطة — جائزة الفريق الأول والثاني" for i in range(20)
         )
-        self.assertGreater(
-            len(bot_module.encode_query("room_message", type_="text", body=text, room="North")),
-            1008,
-        )
-
+        self.assertGreater(len(bot_module.encode_query("room_message", type_="text", body=text, room="North")), 1008)
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
-            self.assertFalse(bot._send_text_packets(
-                "room_message", text, room="North", oversize_notice_user="Ahmed",
-            ))
-
-        self.assertEqual(len(packets), 1)
-        notice_fields = bot_module.decode_message(packets[0])
-        self.assertEqual(
-            bot_module.as_text(notice_fields[5][0]),
-            "👤 @Ahmed منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل.",
-        )
-        self.assertEqual(bot_module.as_text(notice_fields[6][0]), "North")
+            self.assertTrue(bot._send_text_packets("room_message", text, room="North", oversize_notice_user="Ahmed"))
+        self.assertGreater(len(packets), 1)
+        self.assertTrue(all(len(packet) <= 1008 for packet in packets))
+        self.assertEqual("".join(_decoded_text_bodies(packets)), text)
         self.assertEqual(telegram, [])
 
     def test_send_query_hard_caps_payload_at_1008_and_drops_text_locally(self):
@@ -2523,73 +2521,61 @@ class BotGameAndMusicRegressions(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertEqual(telegram, [])
 
-    def test_oversized_private_text_is_dropped_and_notifies_recipient(self):
+    def test_oversized_private_text_is_split_without_notice(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         sent = []
         bot.send_query = lambda payload: sent.append(payload) or True
         bot.log = lambda *_args: None
         username = "SenderUser"
+        text = "x" * 2000
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
-            self.assertFalse(bot._send_text_packets(
-                "chat_message", "x" * 2000, to=username,
-                oversize_notice_user=username,
-            ))
-        self.assertEqual(len(sent), 1)
-        notice_fields = bot_module.decode_message(sent[0])
-        self.assertEqual(bot_module.as_text(notice_fields[4][0]), username)
-        self.assertEqual(
-            bot_module.as_text(notice_fields[5][0]),
-            f"👤 @{username} منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل.",
-        )
+            self.assertTrue(bot._send_text_packets("chat_message", text, to=username, oversize_notice_user=username))
+        self.assertGreater(len(sent), 1)
+        self.assertTrue(all(len(packet) <= 1008 for packet in sent))
+        self.assertTrue(all(bot_module.as_text(bot_module.decode_message(packet)[4][0]) == username for packet in sent))
+        self.assertEqual("".join(_decoded_text_bodies(sent)), text)
 
-    def test_oversized_notice_uses_the_command_executor_name(self):
+    def test_oversized_master_private_text_is_split_without_notice(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         sent = []
         bot.send_query = lambda payload: sent.append(payload) or True
         bot.log = lambda *_args: None
         decorated_master = "∫♚∫اݪـــۛــ⃮ـۿــ𓏺𓏺ـيّـــّٰـبــۃ∫♚∫"
+        text = "x" * 2000
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
-            self.assertFalse(bot._send_text_packets(
-                "chat_message", "x" * 2000, to=decorated_master,
-                oversize_notice_user=decorated_master,
-            ))
-        notice_fields = bot_module.decode_message(sent[0])
-        self.assertEqual(
-            bot_module.as_text(notice_fields[5][0]),
-            f"👤 @{decorated_master} منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل.",
-        )
+            self.assertTrue(bot._send_text_packets("chat_message", text, to=decorated_master, oversize_notice_user=decorated_master))
+        self.assertGreater(len(sent), 1)
+        self.assertTrue(all(len(packet) <= 1008 for packet in sent))
+        self.assertEqual("".join(_decoded_text_bodies(sent)), text)
 
-    def test_lower_configured_limit_drops_without_1008_notice(self):
+    def test_lower_configured_limit_splits_without_1008_notice(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         sent = []
         bot.send_query = lambda payload: sent.append(payload) or True
         bot.log = lambda *_args: None
+        text = "x" * 700
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "500"}):
-            self.assertFalse(bot._send_text_packets("chat_message", "x" * 700, to="Player"))
-        self.assertEqual(sent, [])
+            self.assertTrue(bot._send_text_packets("chat_message", text, to="Player"))
+        self.assertGreater(len(sent), 1)
+        self.assertTrue(all(len(packet) <= 500 for packet in sent))
+        self.assertEqual("".join(_decoded_text_bodies(sent)), text)
 
-    def test_only_payloads_over_1008_bytes_are_dropped_and_notified(self):
+    def test_payloads_over_1008_bytes_are_split_and_never_exceed_limit(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
         sent = []
         bot.send_query = lambda payload: sent.append(bytes(payload)) or True
         bot.log = lambda *_args: None
         exactly_1008 = "x" * 979
         exactly_1009 = "x" * 980
-        self.assertEqual(
-            len(bot_module.encode_query("room_message", type_="text", body=exactly_1008, room="Hall")),
-            1008,
-        )
-        self.assertEqual(
-            len(bot_module.encode_query("room_message", type_="text", body=exactly_1009, room="Hall")),
-            1009,
-        )
+        self.assertEqual(len(bot_module.encode_query("room_message", type_="text", body=exactly_1008, room="Hall")), 1008)
+        self.assertEqual(len(bot_module.encode_query("room_message", type_="text", body=exactly_1009, room="Hall")), 1009)
         with patch.dict(bot_module.os.environ, {"WS_MAX_MESSAGE_BYTES": "1008"}):
             self.assertTrue(bot._send_text_packets("room_message", exactly_1008, room="Hall"))
-            self.assertFalse(bot._send_text_packets("room_message", exactly_1009, room="Hall"))
-        self.assertEqual(len(sent), 2)
-        self.assertEqual(len(sent[0]), 1008)
-        self.assertNotIn(exactly_1009, bot_module.as_text(bot_module.decode_message(sent[1])[5][0]))
-        self.assertIn("منفّذ الأمر: تم تجاهل رسالتك بسبب رد طويل", bot_module.as_text(bot_module.decode_message(sent[1])[5][0]))
+            self.assertTrue(bot._send_text_packets("room_message", exactly_1009, room="Hall"))
+        self.assertGreater(len(sent), 2)
+        self.assertTrue(all(len(packet) <= 1008 for packet in sent))
+        self.assertEqual(bot_module.as_text(bot_module.decode_message(sent[0])[5][0]), exactly_1008)
+        self.assertEqual("".join(_decoded_text_bodies(sent[1:])), exactly_1009)
 
     def test_games_command_opens_the_a3_catalog_and_sets_ns_navigation(self):
         bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)

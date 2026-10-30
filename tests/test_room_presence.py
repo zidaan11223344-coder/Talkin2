@@ -194,26 +194,26 @@ def test_explicit_id_update_requests_server_roster_and_notifies_privately():
     assert "3456782" not in replies[-1][1]
 
 
-def test_id_command_returns_cached_id_as_plain_number():
+def test_id_command_routes_to_server_lookup_even_when_identity_is_cached():
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
-    replies = []
-    bot.send_room_text = lambda room, text: replies.append((room, text))
+    lookups = []
+    bot._start_profile_id_command = lambda room, target, requester, is_private: lookups.append(
+        (room, target, requester, is_private)
+    ) or True
     with patch.object(bot_module, "_stored_user_id", return_value="3456782"):
         assert bot._room_list_commands("Hall", "ايدي", "Ahmed", is_private=False)
-    assert replies == [("Hall", "3456782")]
+    assert lookups == [("Hall", "Ahmed", "Ahmed", False)]
 
 
-def test_id_display_does_not_fetch_when_identity_is_not_cached():
+def test_id_command_still_routes_to_server_lookup_when_identity_is_not_cached():
     bot = bot_module.TalkinBot.__new__(bot_module.TalkinBot)
-    bot._pending_room_lists = {}
-    queries = []
-    replies = []
-    bot.send_query = lambda query: queries.append(query)
-    bot.send_room_text = lambda room, text: replies.append((room, text))
+    lookups = []
+    bot._start_profile_id_command = lambda room, target, requester, is_private: lookups.append(
+        (room, target, requester, is_private)
+    ) or True
     with patch.object(bot_module, "_stored_user_id", return_value=""):
         assert bot._room_list_commands("Hall", "ايدي", "Ahmed", is_private=False)
-    assert queries == []
-    assert replies and "حدث ايدي" in replies[0][1]
+    assert lookups == [("Hall", "Ahmed", "Ahmed", False)]
 
 
 def test_id_command_is_routed_before_master_only_management_gate():
