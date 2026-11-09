@@ -22,6 +22,8 @@ import re
 import queue
 import mimetypes
 import unicodedata
+import urllib
+from difflib import SequenceMatcher
 import html
 import io
 import sys
@@ -52,16 +54,19 @@ from auction_game import AuctionGame, BIDDING_DURATION_SECONDS, TURN_TIMEOUT_SEC
 from cricket_integration import CricketIntegration
 import shop as member_shop
 from treasure_mining import DIAMOND_KEYS, ITEMS as MINING_ITEMS, MiningStore, format_cooldown, resolve_item_keys
-# Public defaults live in the tracked project settings file. Empty values are
-# ignored so required secrets must come from Railway Variables, while an
-# explicitly injected Railway value always wins over the repository defaults.
+# Environment priority: platform variables, then the project's .env, then
+# non-empty defaults from .env.example. This lets deployment-specific paths win.
 _ENV_BASE_DIR = Path(__file__).resolve().parent
-# Load the deployment's local .env before filling missing values from the
-# tracked example. Existing platform variables retain precedence in both cases.
-load_dotenv(dotenv_path=_ENV_BASE_DIR / ".env", override=False)
-for _key, _value in dotenv_values(_ENV_BASE_DIR / ".env.example").items():
-    if _key and _value not in (None, "") and _key not in os.environ:
-        os.environ[_key] = _value
+_EXTERNAL_ENV_KEYS = frozenset(os.environ)
+
+def _load_project_environment(project_dir):
+    project_dir = Path(project_dir)
+    load_dotenv(dotenv_path=project_dir / ".env", override=False)
+    for key, value in dotenv_values(project_dir / ".env.example").items():
+        if key and value not in (None, "") and key not in os.environ:
+            os.environ[key] = str(value)
+
+_load_project_environment(_ENV_BASE_DIR)
 
 
 # ============================================================
@@ -72,6 +77,10 @@ try:
     import yt_dlp
 except Exception:
     yt_dlp = None
+try:
+    from rapidfuzz import fuzz as _rapidfuzz_fuzz
+except Exception:
+    _rapidfuzz_fuzz = None
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter, features
     PIL_AVAILABLE = True
@@ -104,6 +113,88 @@ MUSIC_BUFFER_SIZE = int(os.getenv("MUSIC_BUFFER_SIZE", str(4 * 1024 * 1024)))
 MUSIC_THROTTLED_RATE = int(os.getenv("MUSIC_THROTTLED_RATE", str(128 * 1024)))
 MUSIC_COOLDOWN = float(os.getenv("MUSIC_COOLDOWN", "15"))
 MUSIC_DIRECT_CACHE_TTL = float(os.getenv("MUSIC_DIRECT_CACHE_TTL", "300"))
+# Reuse successfully prepared MP3 files for repeated requests. The cache is
+# disposable and bounded; each request still receives its own public media file.
+MUSIC_FILE_CACHE_TTL = max(60.0, float(os.getenv("MUSIC_FILE_CACHE_TTL", "1800")))
+MUSIC_FILE_CACHE_MAX_ITEMS = max(4, int(os.getenv("MUSIC_FILE_CACHE_MAX_ITEMS", "24")))
+# Permanent reference library: by default retain only tracks whose source
+# explicitly declares a Creative Commons or public-domain license. An operator
+# may opt in to saving additional tracks only when they own them or have explicit
+# permission to retain them (MUSIC_LIBRARY_SAVE_AUTHORIZED=1).
+MUSIC_LIBRARY_ENABLED = os.getenv("MUSIC_LIBRARY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+MUSIC_LIBRARY_SAVE_AUTHORIZED = os.getenv("MUSIC_LIBRARY_SAVE_AUTHORIZED", "0").strip().lower() in ("1", "true", "yes", "on")
+MUSIC_LIBRARY_MAX_GB = max(1.0, float(os.getenv("MUSIC_LIBRARY_MAX_GB", "5")))
+
+
+def _normalize_music_search_text(value):
+    """Normalize Arabic/Unicode spellings before song query matching."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = re.sub(r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed\u0640]", "", text)
+    text = text.translate(str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي"}))
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return " ".join(text.replace("_", " ").split())
+
+
+def _music_query_variants(query, limit=6):
+    """Build a small, deterministic set of Arabic-friendly YouTube queries."""
+    raw = unicodedata.normalize("NFKC", str(query or "")).strip()
+    if not raw:
+        return []
+    cleaned = re.sub(r"[\[\](){},،؛:!?؟\"'`]+", " ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    normalized = _normalize_music_search_text(cleaned)
+    candidates = [raw, cleaned, normalized]
+
+    # Common Arabic spacing variation in singer names, without changing the
+    # user's original query or forcing a single normalized spelling.
+    for text in (raw, cleaned, normalized):
+        candidates.append(re.sub(r"عبد\s*الله", "عبد الله", text))
+        candidates.append(re.sub(r"عبد\s*الله", "عبدالله", text))
+
+    words = cleaned.split()
+    if len(words) >= 4:
+        # Some users type artist first while search results are indexed title first.
+        candidates.append(" ".join(words[2:] + words[:2]))
+        candidates.append(" ".join(words[1:] + words[:1]))
+    if not re.search(r"(?:أغنية|اغنية|song|audio|official)", raw, re.I):
+        candidates.append(raw + " official audio")
+        candidates.append(raw + " أغنية")
+
+    out, seen = [], set()
+    for candidate in candidates:
+        candidate = re.sub(r"\s+", " ", str(candidate or "")).strip()
+        key = _normalize_music_search_text(candidate)
+        if candidate and key and key not in seen:
+            out.append(candidate)
+            seen.add(key)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _music_candidate_score(query, title, uploader=""):
+    """Score a YouTube/platform result against Arabic title + artist text."""
+    query_text = _normalize_music_search_text(query)
+    candidate_text = _normalize_music_search_text(f"{title or ''} {uploader or ''}")
+    if not query_text or not candidate_text:
+        return 0.0
+    query_tokens = set(query_text.split())
+    candidate_tokens = set(candidate_text.split())
+    coverage = len(query_tokens & candidate_tokens) / max(1, len(query_tokens))
+    if _rapidfuzz_fuzz is not None:
+        lexical = max(
+            _rapidfuzz_fuzz.WRatio(query_text, candidate_text),
+            _rapidfuzz_fuzz.token_set_ratio(query_text, candidate_text),
+        )
+    else:
+        ordered = SequenceMatcher(None, query_text, candidate_text).ratio() * 100
+        unordered = SequenceMatcher(
+            None, " ".join(sorted(query_tokens)), " ".join(sorted(candidate_tokens))
+        ).ratio() * 100
+        lexical = max(ordered, unordered)
+    return round(0.45 * lexical + 55.0 * coverage, 2)
+
+
 MUSIC_FAST_LOOKUP_TIMEOUT = 6.0
 # Audius is an additional lightweight source used primarily by live broadcast.
 # It can search the catalog and expose a streamable MP3 URL without first
@@ -118,6 +209,9 @@ _MUSIC_LOOKUP_THREAD = threading.Thread
 # Optional YouTube Netscape cookies supplied as a secret value or mounted file.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
+# Optional bgutil PO-token provider endpoint. The provider plugin must be installed
+# and its server reachable from this process; a PO token may reduce YouTube 403s.
+YOUTUBE_POT_BASE_URL = os.getenv("YOUTUBE_POT_BASE_URL", "").strip().rstrip("/")
 if YOUTUBE_COOKIE_FILE and not Path(YOUTUBE_COOKIE_FILE).is_file():
     YOUTUBE_COOKIE_FILE = None
 if not YOUTUBE_COOKIE_FILE and YOUTUBE_COOKIES:
@@ -244,7 +338,15 @@ def _spotify_track_metadata(query):
 
 # Gift images copied verbatim from the supplied Giant Chat bot assets/.
 BASE_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = BASE_DIR / "assets"
+
+def _configured_assets_dir(base_dir, configured=""):
+    configured = str(configured or "").strip()
+    candidate = Path(configured).expanduser() if configured else Path(base_dir) / "assets"
+    if not candidate.is_absolute():
+        candidate = Path(base_dir) / candidate
+    return candidate.resolve()
+
+ASSETS_DIR = _configured_assets_dir(BASE_DIR, os.getenv("BOT_ASSETS_DIR", ""))
 # Gift source images: accept PNG/JPG/JPEG from assets/.
 # This keeps the bot working even if the original PNG files are replaced by JPG files.
 GIFT_IMAGE_FILES = {
@@ -346,6 +448,7 @@ GAME_COMMANDS = {
 }
 # Nine scheduled treasure/royal games. The artwork is stored in assets/treasures/.
 # Arabic and English aliases are normalized before lookup so hamza and ة/ه variants work.
+TIMED_TREASURE_ANNOUNCEMENT_INTERVAL_SECONDS = 10 * 60.0
 TIMED_TREASURE_GAMES = {
     "rare_diamond": {
         "title_ar": "💎 الألماس النادر", "title_en": "💎 Rare Diamond",
@@ -455,6 +558,7 @@ TIMED_TREASURE_GAME_ALIASES = {
 
 MILLION_BANK_COOLDOWN_SECONDS = 60.0
 WAGER_GAME_COOLDOWN_SECONDS = 120.0
+WAGER_MIN_AMOUNT = 100_000
 try:
     BILLION_GAME_COOLDOWN_SECONDS = max(1.0, float(os.getenv("BILLION_GAME_COOLDOWN_SECONDS", "60") or 60))
 except (TypeError, ValueError):
@@ -490,17 +594,71 @@ STOCK_MARKET_ASSETS = {
     4: {"icon": "🏞️", "ar": "الأرض", "en": "Land"},
 }
 STOCK_MARKET_MAX_INVESTMENT = 30_000_000_000
+LOAN_AMOUNT = 100_000_000_000
+LOAN_REPAYMENT_PERCENT = 20
+WALLET_MATURITY_SECONDS = 60 * 60
+WALLET_PAGE_SIZE = 10
+WALLET_MIN_INVESTMENT = 100
+WALLET_MAX_INVESTMENT = STOCK_MARKET_MAX_INVESTMENT
+WALLET_MAX_ACTIVE_POSITIONS = 50
+WALLET_HISTORY_LIMIT = 100
+
+# Wallet investments are game-only commodities. Each position uses the amount
+# selected by the player and is automatically sold after one hour at exactly
+# +5% or -5% (50/50 outcome).
+WALLET_ASSETS = {
+    1: {"icon": "🥇", "ar": "الذهب", "en": "Gold", "aliases": ("ذهب", "الذهب", "gold")},
+    2: {"icon": "🥈", "ar": "الفضة", "en": "Silver", "aliases": ("فضة", "الفضة", "فضه", "الفضه", "silver")},
+    3: {"icon": "🛢️", "ar": "النفط", "en": "Oil", "aliases": ("نفط", "النفط", "oil")},
+    4: {"icon": "🏞️", "ar": "الأرض", "en": "Land", "aliases": ("أرض", "ارض", "الأرض", "الارض", "land")},
+    5: {"icon": "💎", "ar": "الماس", "en": "Diamonds", "aliases": ("الماس", "ماس", "diamonds", "diamond")},
+    6: {"icon": "🔩", "ar": "النحاس", "en": "Copper", "aliases": ("النحاس", "نحاس", "copper")},
+    7: {"icon": "⚙️", "ar": "البلاتين", "en": "Platinum", "aliases": ("البلاتين", "بلاتين", "platinum")},
+    8: {"icon": "🌾", "ar": "القمح", "en": "Wheat", "aliases": ("القمح", "قمح", "wheat")},
+    9: {"icon": "☕", "ar": "القهوة", "en": "Coffee", "aliases": ("القهوة", "قهوة", "coffee")},
+    10: {"icon": "🔥", "ar": "الغاز", "en": "Gas", "aliases": ("الغاز", "غاز", "gas")},
+    11: {"icon": "🧵", "ar": "القطن", "en": "Cotton", "aliases": ("القطن", "قطن", "cotton")},
+    12: {"icon": "🍬", "ar": "السكر", "en": "Sugar", "aliases": ("السكر", "سكر", "sugar")},
+    13: {"icon": "🍚", "ar": "الأرز", "en": "Rice", "aliases": ("الأرز", "الارز", "رز", "rice")},
+    14: {"icon": "🚗", "ar": "السيارات", "en": "Cars", "aliases": ("السيارات", "سيارات", "cars", "car")},
+    15: {"icon": "💻", "ar": "التقنية", "en": "Technology", "aliases": ("التقنية", "تقنية", "technology", "tech")},
+    16: {"icon": "🪵", "ar": "الخشب", "en": "Timber", "aliases": ("الخشب", "خشب", "timber", "wood")},
+    17: {"icon": "⚡", "ar": "الطاقة", "en": "Energy", "aliases": ("الطاقة", "طاقة", "energy")},
+    18: {"icon": "🏠", "ar": "العقار", "en": "Property", "aliases": ("العقار", "عقار", "property", "real estate")},
+    19: {"icon": "🖼️", "ar": "الفن", "en": "Art", "aliases": ("الفن", "فن", "art")},
+    20: {"icon": "₿", "ar": "العملات الرقمية", "en": "Crypto", "aliases": ("العملات الرقمية", "كريبتو", "crypto", "bitcoin")},
+}
+
+
+def _wallet_asset_key(value):
+    value = str(value or "").strip().casefold()
+    return (value.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+            .replace("ة", "ه"))
+
+
+WALLET_ASSET_LOOKUP = {
+    _wallet_asset_key(alias): asset_id
+    for asset_id, asset in WALLET_ASSETS.items()
+    for alias in (str(asset_id), asset["ar"], asset["en"], *asset["aliases"])
+}
+
 
 def _parse_compact_amount(value):
-    """Convert plain or compact stakes (1k/1m/1b) to whole points."""
-    token = str(value or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    """Convert plain/compact amounts, including compounds such as 10m10b."""
+    token = str(value or "").strip().translate(str.maketrans(
+        "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"
+    ))
+    token = token.translate(str.maketrans({"ك": "k", "م": "m", "ب": "b"}))
     token = token.replace(",", "")
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([kmb]?)", token, re.I)
-    if not match:
+    parts = re.findall(r"[0-9]+(?:\.[0-9]+)?[kmb]?", token, re.I)
+    if not parts or "".join(parts).casefold() != token.casefold():
         return None
-    multiplier = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000}[match.group(2).casefold()]
+    multipliers = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+    amount = Decimal(0)
     try:
-        amount = Decimal(match.group(1)) * multiplier
+        for part in parts:
+            match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([kmb]?)", part, re.I)
+            amount += Decimal(match.group(1)) * multipliers[match.group(2).casefold()]
     except InvalidOperation:
         return None
     if amount != amount.to_integral_value() or amount <= 0:
@@ -535,6 +693,21 @@ def _parse_stock_market_order(text):
     return None
 
 
+def _parse_wallet_purchase(text):
+    """Parse explicit wallet orders: شراء ذهب 30b / buy gold 30b."""
+    value = str(text or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    match = re.fullmatch(
+        r"(?:شراء|اشتر|اشتري|أشتري|buy)\s+(.+?)\s+([0-9][0-9,]*(?:\.[0-9]+)?[kmb]?)",
+        value, re.I,
+    )
+    if not match:
+        return None
+    asset_token = _wallet_asset_key(match.group(1))
+    asset_id = WALLET_ASSET_LOOKUP.get(asset_token)
+    amount = _parse_compact_amount(match.group(2))
+    return (asset_id, amount) if asset_id is not None and amount is not None else None
+
+
 def _normalize_game_command_text(text):
     """Translate an English game name (and common coin choices) to its Arabic command."""
     raw = str(text or "").strip()
@@ -557,7 +730,10 @@ def _normalize_game_command_text(text):
         return canonical + suffix
     return raw
 
-# Railway exposes this service through RAILWAY_PUBLIC_DOMAIN after a public domain is generated.
+# One public base URL is shared by all generated media, not only gifts.
+# Keep the legacy names as fallbacks so existing deployments continue to work.
+PUBLIC_MEDIA_URL = os.getenv("PUBLIC_MEDIA_URL", "").strip().rstrip("/")
+MEDIA_PUBLIC_URL = os.getenv("MEDIA_PUBLIC_URL", "").strip().rstrip("/")
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL", "").strip() or os.getenv("RAVEN_PUBLIC_URL", "").strip()).rstrip("/")
 GIFT_PUBLIC_BASE_URL = os.getenv("GIFT_PUBLIC_BASE_URL", "").strip().rstrip("/")
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
@@ -565,16 +741,33 @@ RAVEN_PUBLIC_DOMAIN = os.getenv("RAVEN_PUBLIC_DOMAIN", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
 
+def _public_media_base_url_from_env(env):
+    """Resolve one externally reachable base URL for every generated media route."""
+    for key in ("PUBLIC_MEDIA_URL", "MEDIA_PUBLIC_URL", "PUBLIC_BASE_URL", "RAVEN_PUBLIC_URL", "GIFT_PUBLIC_BASE_URL"):
+        value = str(env.get(key, "") or "").strip().rstrip("/")
+        if value:
+            return value
+    for key in ("RAVEN_PUBLIC_DOMAIN", "RAILWAY_PUBLIC_DOMAIN", "RENDER_EXTERNAL_URL", "RENDER_EXTERNAL_HOSTNAME", "RAILWAY_STATIC_URL"):
+        value = str(env.get(key, "") or "").strip().rstrip("/")
+        if value:
+            if not value.startswith(("http://", "https://")):
+                value = "https://" + value
+            return value
+    return ""
+
 def _public_base_url():
-    domain = RAVEN_PUBLIC_DOMAIN or RAILWAY_PUBLIC_DOMAIN or RENDER_EXTERNAL_URL or RENDER_EXTERNAL_HOSTNAME
-    if domain:
-        if not domain.startswith(("http://", "https://")):
-            domain = "https://" + domain
-        return domain.rstrip("/")
-    return (PUBLIC_BASE_URL or GIFT_PUBLIC_BASE_URL).rstrip("/")
+    return _public_media_base_url_from_env(os.environ)
+
+def _asset_http_port_from_env(env):
+    """Use the host-assigned PORT, then the explicit media-port fallback."""
+    value = str(env.get("PORT") or env.get("ASSET_HTTP_PORT") or "8080").strip()
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Invalid media HTTP port: {port}")
+    return port
 
 MEDIA_PUBLIC_BASE_URL = _public_base_url()
-ASSET_HTTP_PORT = int(os.getenv("PORT", "8080"))
+ASSET_HTTP_PORT = _asset_http_port_from_env(os.environ)
 ASSET_HTTP_ENABLED = os.getenv("ASSET_HTTP_ENABLED", "1") == "1"
 
 GIFT_CATALOG = {
@@ -635,12 +828,6 @@ AUTO_JOIN_ALL_ROOMS = (
     or os.getenv("AUTO_JOIN_ROOMS")
     or "on"
 ).strip().casefold() in {"1", "true", "yes", "on", "enable", "enabled"}
-STARTUP_JOIN_ENABLED = os.getenv("STARTUP_JOIN_ENABLED", "1").strip().casefold() not in {
-    "0", "false", "no", "off", "disable", "disabled",
-}
-RESTORE_SAVED_ROOMS_ON_STARTUP = os.getenv(
-    "RESTORE_SAVED_ROOMS_ON_STARTUP", "1"
-).strip().casefold() not in {"0", "false", "no", "off", "disable", "disabled"}
 # Global verification gate. OFF keeps all existing verified/VIP records intact,
 # but bypasses the requirement to be verified for commands that use the
 # verification gate. ON restores the normal verification requirement.
@@ -826,10 +1013,21 @@ def _select_persistent_data_dir():
     return BASE_DIR / "data"
 
 DATA_DIR = _select_persistent_data_dir()
+MUSIC_LIBRARY_DIR = DATA_DIR / "music_library"
+MUSIC_CACHE_DIR = DATA_DIR / "music_cache"
+try:
+    if MUSIC_LIBRARY_ENABLED:
+        MUSIC_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    MUSIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+GENERATED_GIFTS_DIR = DATA_DIR / "generated_gifts"
 
-# Telegram diagnostics: only the bot token is required. The first incoming
-# Telegram message is used to learn and persist the chat_id automatically.
+# Telegram diagnostics may learn a general notice destination; secret export
+# uses a separate fixed private-chat ID and a master-entered password.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_SECRET_CHAT_ID = os.getenv("TELEGRAM_SECRET_CHAT_ID", "").strip()
+TELEGRAM_SECRET_AUTH_FILE = DATA_DIR / "telegram_secret_export_auth.auth"
 TELEGRAM_LOG_COMMANDS = {
     x.strip().casefold() for x in os.getenv(
         "TELEGRAM_LOG_COMMANDS",
@@ -842,6 +1040,10 @@ TELEGRAM_VARIABLE_COMMANDS = {
         "نسخ المتغيرات,نسخه المتغيرات,متغيرات,variables,send variables",
     ).split(",") if x.strip()
 }
+TELEGRAM_VARIABLE_COMMANDS.update({
+    "ارسل المتغيرات السرية", "أرسل المتغيرات السرية",
+    "ارسل المتغيرات السريه", "أرسل المتغيرات السريه",
+})
 TELEGRAM_POLL_SECONDS = max(1.0, float(os.getenv("TELEGRAM_POLL_SECONDS", "2")))
 TELEGRAM_POLL_ENABLED = os.getenv("TELEGRAM_POLL_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 TELEGRAM_LOG_FILE = Path(os.getenv("TELEGRAM_LOG_FILE", str(DATA_DIR / "bot_runtime.log"))).expanduser()
@@ -854,6 +1056,7 @@ TELEGRAM_LONG_TEXT_ENABLED = os.getenv("TELEGRAM_LONG_TEXT_ENABLED", "1").strip(
 
 # Every mutable bot record lives in its own dedicated JSON file.
 MASTERS_FILE = DATA_DIR / "masters.json"
+VIP_FULL_MASTERS_FILE = DATA_DIR / "vipmas_masters.json"
 VIP_FILE = DATA_DIR / "vip_users.json"
 VERIFIED_FILE = DATA_DIR / "verified_users.json"
 POINTS_FILE = DATA_DIR / "points.json"
@@ -869,6 +1072,9 @@ GAME_CONTROL_FILE = DATA_DIR / "game_control.json"
 CROP_PLOTS_FILE = DATA_DIR / "crop_plots.json"
 STOCK_MARKET_FILE = DATA_DIR / "stock_market_investments.json"
 STOCK_MARKET_HISTORY_FILE = DATA_DIR / "stock_market_history.json"
+WAGER_STATE_FILE = DATA_DIR / "wager_state.json"
+WAGER_ADMIN_RULES_FILE = DATA_DIR / "wager_admin_rules.json"
+_WAGER_ADMIN_RULES_LOCK = threading.RLock()
 DRAGON_HUNTERS_FILE = DATA_DIR / "dragon_hunters.json"
 PAYROLL_FILE = DATA_DIR / "payroll.json"
 PAYROLL_COOLDOWN_SECONDS = max(60.0, float(os.getenv("PAYROLL_COOLDOWN_SECONDS", "600") or 600))
@@ -895,20 +1101,23 @@ BOT_BANS_FILE = DATA_DIR / "bot_bans.json"
 LAST_BOT_BANS_FILE = DATA_DIR / "last_bot_bans.json"
 MONEY_GAME_WIN_STATE_FILE = DATA_DIR / "money_game_win_state.json"
 MONEY_GAME_SETTINGS_FILE = DATA_DIR / "money_game_settings.json"
+MONEY_GAME_WIN_HISTORY_FILE = DATA_DIR / "money_game_win_history.json"
 PUBLISH_BANS_FILE = DATA_DIR / "publish_bans.json"
 PROTECTION_FILE = DATA_DIR / "room_protection.json"
 SNAKE_FILE = DATA_DIR / "snake_games.json"
 LUDO_FILE = DATA_DIR / "ludo_games.json"
 # Dedicated persistent file for accounts allowed to manage VIP verification.
 MVIP_MASTERS_FILE = DATA_DIR / "mvip_masters.json"
+NAME_IMAGE_CORRECTIONS_FILE = DATA_DIR / "name_image_corrections.json"
+NAME_IMAGE_SETTINGS_FILE = DATA_DIR / "name_image_settings.json"
 
 # Known legacy state files used by older releases. This migration runs once and
 # NEVER deletes the old files, so replacing bot.py cannot destroy the old data.
 _STATE_FILE_NAMES = (
-    "masters.json", "vip_users.json", "verified_users.json", "points.json",
+    "masters.json", "vipmas_masters.json", "wager_admin_rules.json", "vip_users.json", "verified_users.json", "points.json",
     "messages.json", "published_posts.json", "media_stats.json", "game_stats.json", "game_levels.json", "mining_game.json", "shop_data.json", "game_control.json", "crop_plots.json",
     "tracked_rooms.json", "blocked_rooms.json", "room_users.json", "invite_history.json", "replies.json",
-    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "money_game_win_state.json", "publish_bans.json", "mvip_masters.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
+    "moderation.json", "mf.json", "filter_bans.json", "bot_bans.json", "last_bot_bans.json", "money_game_win_state.json", "publish_bans.json", "mvip_masters.json", "name_image_corrections.json", "name_image_settings.json", "welcome.json", "custom_welcomes.json", "custom_games.json",
     "custom_commands.json", "repair_state.json", "wager_state.json", "cricket_state.json", "last_action.json", "backup_manifest.json",
 )
 
@@ -1362,6 +1571,26 @@ def _extract_media_url_universal(event, body=""):
         if val.startswith(("http://", "https://")):
             return val
     return find_url(event) or find_url(body) or first_http_url(event) or first_http_url(body) or ""
+
+
+def _extract_room_event_profile_photo(event):
+    """Extract only explicit avatar fields; numeric RoomEvent field 3 is `to`."""
+    if not isinstance(event, dict):
+        return ""
+    photo_keys = (
+        "photo_url", "avatar_url", "profile_photo_url", "profile_picture_url",
+        "photo", "avatar", "profile_photo", "profile_picture", "picture",
+        "image_url", "image", "user", "profile",
+    )
+    for key in photo_keys:
+        if key not in event:
+            continue
+        value = event.get(key)
+        url = _extract_media_url_universal({"photo": value})
+        if url:
+            return url
+    return ""
+
 
 def first_http_url(value):
     """Find the first public HTTP(S) URL in a decoded Talkin payload."""
@@ -2757,22 +2986,6 @@ def _persistent_rosters():
     data = _load_local_json(ROOM_USERS_FILE, {})
     return data if isinstance(data, dict) else {}
 
-_IDENTITY_CONTEXT = threading.local()
-
-def _set_identity_context(username, room):
-    previous = getattr(_IDENTITY_CONTEXT, "value", None)
-    _IDENTITY_CONTEXT.value = (_norm_user(username), str(room or "").strip())
-    return previous
-
-def _restore_identity_context(previous):
-    if previous is None:
-        try:
-            del _IDENTITY_CONTEXT.value
-        except AttributeError:
-            pass
-    else:
-        _IDENTITY_CONTEXT.value = previous
-
 def _stored_user_id(username, preferred_room=""):
     """Resolve a username to a previously stored native Talkin user ID."""
     raw = str(username or "").strip().lstrip("@")
@@ -2781,10 +2994,6 @@ def _stored_user_id(username, preferred_room=""):
     wanted = _norm_user(raw)
     if not wanted:
         return ""
-    if not preferred_room:
-        context = getattr(_IDENTITY_CONTEXT, "value", None)
-        if isinstance(context, tuple) and len(context) == 2 and context[0] == wanted:
-            preferred_room = context[1]
     data = _persistent_rosters()
     rooms = data.get("rooms", data) if isinstance(data, dict) else {}
     if not isinstance(rooms, dict):
@@ -2815,33 +3024,6 @@ def _stored_user_id(username, preferred_room=""):
         candidates = set(candidates)
         return next(iter(candidates)) if len(candidates) == 1 else ""
     return unique(exact) or unique(decorated)
-
-def _stored_username_for_id(user_id, preferred_room=""):
-    wanted = str(user_id or "").strip()
-    if not wanted.isdigit():
-        return ""
-    data = _persistent_rosters()
-    rooms = data.get("rooms", data) if isinstance(data, dict) else {}
-    if not isinstance(rooms, dict):
-        return ""
-    room_names = list(rooms)
-    preferred = _norm_room(preferred_room)
-    room_names.sort(key=lambda name: 0 if preferred and _norm_room(name) == preferred else 1)
-    for room_name in room_names:
-        roster = rooms.get(room_name)
-        if not isinstance(roster, dict):
-            continue
-        for key, value in roster.items():
-            if not isinstance(value, dict):
-                continue
-            saved_id = str(value.get("user_id") or (key if str(key).isdigit() else "")).strip()
-            if saved_id == wanted:
-                return str(value.get("username") or "").strip().lstrip("@")
-    return ""
-
-def _user_identity_key(username, preferred_room=""):
-    # Keep live command keys name-based; stable Talkin IDs are compatibility metadata.
-    return _norm_user(username)
 
 
 def _stored_user_aliases(username, preferred_room=""):
@@ -2985,79 +3167,19 @@ def _remember_roster(room, users):
     for user in users or []:
         if not isinstance(user, dict):
             continue
-        username = str(user.get("username") or "").strip().lstrip("@")
+        username = str(user.get("username") or "").strip()
         if not username or _norm_user(username) == _norm_user(BOT_ID):
             continue
-        user_id = str(user.get("user_id") or "").strip()
-        if not user_id.isdigit():
-            user_id = ""
-        normalized_name = _norm_user(username)
-        existing_key = ""
-        existing_id = ""
-        aliases = []
-        for old_key, old_value in list(current.items()):
-            if not isinstance(old_value, dict):
-                continue
-            old_name = str(old_value.get("username") or old_key).strip().lstrip("@")
-            old_id = str(old_value.get("user_id") or (old_key if str(old_key).isdigit() else "")).strip()
-            if (user_id and old_id == user_id) or (not user_id and normalized_name == _norm_user(old_name)):
-                existing_key, existing_id = str(old_key), old_id
-                old_aliases = old_value.get("aliases", [])
-                if isinstance(old_aliases, list):
-                    aliases.extend(str(alias).strip().lstrip("@") for alias in old_aliases if str(alias).strip())
-                if _norm_user(old_name) != normalized_name:
-                    aliases.append(old_name)
-                if user_id and old_id == user_id:
-                    break
-        if user_id:
-            for old_key, old_value in list(current.items()):
-                if not isinstance(old_value, dict):
-                    continue
-                old_id = str(old_value.get("user_id") or (old_key if str(old_key).isdigit() else "")).strip()
-                old_name = str(old_value.get("username") or old_key).strip().lstrip("@")
-                if old_id == user_id or (not old_id and normalized_name == _norm_user(old_name)):
-                    current.pop(old_key, None)
-            storage_key = user_id
-        else:
-            user_id = existing_id if existing_id.isdigit() else ""
-            storage_key = existing_key or normalized_name
-        aliases = list(dict.fromkeys(
-            alias for alias in aliases if alias and _norm_user(alias) != normalized_name
-        ))
-        current[storage_key] = {
+        current[_norm_user(username)] = {
             "username": username,
-            "aliases": aliases,
             "role": str(user.get("role") or "none").strip().lower() or "none",
-            "user_id": user_id,
+            "user_id": str(user.get("user_id") or ""),
             "online": user.get("online", user.get("is_present")),
             "is_present": user.get("is_present", user.get("online")),
             "last_seen": now,
         }
     rosters[room] = current
     _save_persistent_rosters(rosters)
-
-def _room_roster_id_for_name(users, username):
-    wanted = _norm_user(username)
-    if not wanted:
-        return ""
-    valid = [
-        (str(item.get("username") or "").strip().lstrip("@"), str(item.get("user_id") or "").strip())
-        for item in (users or [])
-        if isinstance(item, dict) and str(item.get("user_id") or "").strip().isdigit()
-    ]
-    exact_ids = {user_id for name, user_id in valid if _norm_user(name) == wanted}
-    if len(exact_ids) == 1:
-        return next(iter(exact_ids))
-    if exact_ids:
-        return ""
-    decorated_key = _game_name_key(username)
-    if not decorated_key:
-        return ""
-    decorated_ids = {
-        user_id for name, user_id in valid
-        if _game_name_key(name) == decorated_key
-    }
-    return next(iter(decorated_ids)) if len(decorated_ids) == 1 else ""
 
 
 def _game_control_data():
@@ -3117,6 +3239,19 @@ def _master_list():
     data=_load_local_json(MASTERS_FILE, [])
     return data if isinstance(data,list) else []
 
+def _vip_full_master_list():
+    data = _load_local_json(VIP_FULL_MASTERS_FILE, [])
+    return data if isinstance(data, list) else []
+
+def _is_vip_full_master(name):
+    key = _norm_user(name)
+    return bool(key and key in {_norm_user(x) for x in _vip_full_master_list()})
+
+def _is_bot_owner(name):
+    """Only the BOT_MASTER environment account may grant/revoke full masters."""
+    key = _norm_user(name)
+    return bool(key and key == _norm_user(BOT_MASTER))
+
 def _is_master_name(name):
     n = _norm_user(name)
     configured = {
@@ -3124,7 +3259,8 @@ def _is_master_name(name):
         _norm_user(os.getenv("MASTER_ID", "").strip()),
     }
     configured.discard("")
-    return bool(n and (n in configured or n in {_norm_user(x) for x in _master_list()}))
+    saved = {_norm_user(x) for x in _master_list()}
+    return bool(n and (n in configured or n in saved or _is_vip_full_master(name)))
 
 def _is_configured_master_account(name):
     """Return only whether *name* is the master configured by deployment vars.
@@ -3160,10 +3296,22 @@ def _is_verification_manager_command(text):
         or value.casefold() in {"l@mvip"}
     )
 
+def _is_env_master_for_game_cooldown(name):
+    """Full masters bypass normal player cooldowns, just like the owner."""
+    key = _norm_user(name)
+    if not key:
+        return False
+    configured = {
+        _norm_user(os.getenv(var, "").strip())
+        for var in ("BOT_MASTER", "MASTER_USERNAME", "MASTER_ID")
+    }
+    configured.discard("")
+    return key in configured or _is_vip_full_master(name)
+
 def _is_primary_master(name):
-    """Only the account configured in BOT_MASTER has unlimited points."""
-    n=_norm_user(name)
-    return bool(n and n == _norm_user(BOT_MASTER))
+    """Return true for the deployment owner and explicitly appointed full masters."""
+    n = _norm_user(name)
+    return bool(n and (n == _norm_user(BOT_MASTER) or _is_vip_full_master(name)))
 def _verification_notice():
     master = BOT_MASTER or "الماستر"
     return f"🔒 حسابك ليس موثقاً.\n📩 يرجى مراسلة الماستر لتوثيق حسابك @{master}"
@@ -3173,23 +3321,13 @@ def _looks_like_bot_command(text):
     low = _normalize_game_command_text(text).strip().casefold()
     if not low:
         return False
-    if (low.startswith("la@")
-            or low.startswith("ts@")
-            or low in {"رتبتك", "رتبتي", "bot rank", "your rank"}
-            or low in {"ايدي", "أيدي", "id"}
-            or re.fullmatch(r"(?:ايدي|أيدي|id)@.+", low, re.I)
-            or re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", low, re.I)
-            or low in VIP_ID_REFRESH_COMMANDS
-            or low in POINTS_ID_REFRESH_COMMANDS):
-        return True
     timed_game_command = _normalize_timed_treasure_command(text) in TIMED_TREASURE_GAME_ALIASES
     prefixes = (
-        "ax@", "x@",
-        "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
+        "sa@", "sav@", "bom@", "work", "salary", "عمل", "راتبي", ".sa ", ".aa", "vi@", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@",
         ".u", "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق",
-        "mas@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "sb@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
-        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "points", "توب", "top", "ملياري", "مليارات", "مليوني", "ملايين", "هدايا", "gifts", "gv", "sher@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
-        "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
+        "mas@", "umas@", "vipmas@", "unvipmas@", "-vipmas@", "l@vipmas", "ربح@", "سحب ربح@", "-ربح@", "umas@", "mvip@", "umvip@", "l@mvip", "l@mas", "l@vipmas", "vipmas@", "unvipmas@", "-vipmas@", "ربح@", "سحب ربح@", "-ربح@", "sb@", "ts@", "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "رساله ", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج",
+        "say ", "قل ", "دخول@", "join@", "play ", "music ", "song ", "post@", "publish@", "protection", "enable protection", "disable protection", "رساله ", "تحويل للكل@", "خاص@", "رسالة@", "رساله خاص@", "broadcast@", "رسالهغرف@", "رسالةغرف@", "رساله غرفه@", "رسالة غرفه@", "مشاركه ", "مشاركة ", ".تشغيل ", "بث ", "help", "a1", "a2", "a3", "a4", "a5", "a6", "ns", "التالي", "القائمة التالية", "next", "اوامر", "المسترات", "نقاطي", "نقاط ", "points", "points ", "توب", "توب المراهنين", "توب رهان", "كمين", "الكمين", "top", "ملياري", "مليارات", "مليوني", "ملايين", "هدايا", "gifts", "gv", "sher@", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار",
+        "العاب", "ألعاب", "لعب", "تسليه", "تسلية", "زواج", "زوجه", "تحدي", "لغز", "مزاج", "حظ", "حظ يا نصيب", "نرد", "بورصه", "بورصة", "بورصتي", "my stock history", "my stock market", "سلفني", "loan", "محفظة", "محفظه", "محفظتي", "wallet", "portfolio", "my wallet", "بنك", "تخمين", "سؤال", "حجر", "ورق", "مقص", "مليار", "بنك مليون", "ثعبان", "snake", "سناكي", "لودو", "ludo", "انضمام", "join", "rool", "roll", "مراهنة@", "مراهنه@", "رهان@", "مضاربة@", "استثمار@", "حظي@", "زرع", "حصانه", "حصانة", "عملة", "عجلة", "صندوق", "كوب", "كأس", "طاولة", "اونو", "وحش", "بركان", "طائر", "نجم", "حصانة", "فيس", "سنارة", "سناره", "برق", "ياقوت", "صدام", "كاشف", "اسرق", "بوست", "انشر", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "mr@", "mbp@",
         "+sr@", "sr@", "swc", "خاص@", "رسالة@", "broadcast@", "mf@", "+mf@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "دخول الكل", "دخولكل", "اضف لملف الغرف", "أضف لملف الغرف", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "s@", "صورتي", "صورتك", ".صوره", ".صوره@", "شبيه@", "شبيه ", "شبيهك@", "شبيهك ",
         ".دخول غرفي", "دخول غرفي", "دخولغرفي", "my rooms", "start verification", "stop verification", "تشغيل التوثيق", "إيقاف التوثيق", "ايقاف التوثيق",
     )
@@ -3198,9 +3336,15 @@ def _looks_like_bot_command(text):
         "ذهب ", "الذهب ", "فضة ", "الفضة ", "فضه ", "الفضه ",
         "نفط ", "النفط ", "أرض ", "ارض ", "الأرض ", "الارض ",
         "gold ", "silver ", "oil ", "land ",
+        "شراء ", "اشتر ", "اشتري ", "أشتري ", "buy ",
         "سجل التحويل", "سجل تحويلاتي", "سجل المليار", "سجل مليار", "سجل المليون", "سجل مليون",
         "transfer history", "transfer log", "billion record", "billion history", "million record", "million history",
         "top b", "topb", "top m", "topm",
+        "room message@",
+        "فحص صورة المليون", "فحص صوره المليون", "فحص_صورة_المليون",
+        "فحص اسم", "اصلاح اسم", "إصلاح اسم", "تعديل اسم", "تعديل الاسم", "حذف اسم", "حذفاسم", "حذف تصحيح اسم", "حذف تصحيح الاسم", "حذف تصحييح اسم", "حذف تصحييح الاسم",
+        "تشغيل الاسما", "تشغيل الاسماء", "تشغيل الأسماء", "تشغيل الاسم", "تشغيل الأسماء المعدلة",
+        "ايقاف الاسما", "إيقاف الاسما", "ايقاف الاسماء", "إيقاف الأسماء", "ايقاف الاسم", "إيقاف الاسماء المعدلة",
     )
     normalized_low = low.replace("ة", "ه")
     normalized_prefixes = tuple(str(x).casefold().replace("ة", "ه") for x in prefixes)
@@ -3247,6 +3391,12 @@ def _auto_reply_key(value):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _departure_trigger_key(value):
+    """Return a departure key only for one actual alphabetic character."""
+    key = _auto_reply_key(value)
+    return key if len(key) == 1 and key.isalpha() else ""
+
+
 def _normalize_lang_choice(val):
     """Normalize 1/2 language selection from Arabic/English numerals or words."""
     s = str(val or "").strip().casefold()
@@ -3284,18 +3434,17 @@ def _is_room_creator(room, sender):
 
 def _looks_like_admin_command(text):
     low = str(text or "").strip().casefold()
-    if (low.startswith(("+ds@", "ts@"))
-            or low in VIP_ID_REFRESH_COMMANDS
-            or low in POINTS_ID_REFRESH_COMMANDS):
+    if low.startswith("+ds@"):
         return True
     if re.match(r"^(?:إضافة|اضافة|استرجاع|استعادة|زيادة|زود)\s+(?:العاب|ألعاب)@", str(text or "").strip(), re.I):
         return True
     prefixes = (
-        ".u", "vi", "vi@", "vip", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@",
+        ".u", "vi", "vi@", "vip", "vip@", "unvip@", "uns@", "ازالة توثيق@", "إزالة توثيق@", "سحب التوثيق@", "mas@", "umas@", "إضافة ماستر@", "اضافة ماستر@", "سحب ماستر@", "إزالة ماستر@", "sb@", "ts@",
         "b@", "bl@", "k@", "u@", "ub@", "m@", "member ", "a@", "o@", "ban ", "kick ", "unban ", "admin ", "owner ", "ادمن", "طرد", "حظر", "اونر", "أونر", "عضو", "ماستر", "ماستر توثيق", "msb@", "-sb@",
-        "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
+        "i@", "inv", "دعوات", "دعوه ", "دعوة ", "invite", "protection", "enable protection", "disable protection", "mvip@", "umvip@", "l@mvip", "l@mas", "l@vipmas", "vipmas@", "unvipmas@", "-vipmas@", "ربح@", "سحب ربح@", "-ربح@", "خروج", "say ", "قل ", "بوست", "انشر", "+sr@", "sr@",
         "swc", "mf@", "+mf@", "l@a", "l@m", "l@o", "l@b", "is@", "-mf@", "l@mf", "l@sr", "l@mbp", "l@a", "l@m", "l@o", "l@b", "is@", "mbp@", "clear@mf", "amf@", "l@mfb", "mr@", "دخول الكل", "حماية", "حمايه", "حماية الغرفة", "حمايه الغرفه", "تشغيل الحماية", "تشغيل الحمايه", "إيقاف الحماية", "ايقاف الحماية", "إيقاف الحمايه", "ايقاف الحمايه", "تشغيل الدعوات", "ايقاف الدعوات", "إيقاف الدعوات", "تشغيل الالعاب", "تشغيل الألعاب", "ايقاف الالعاب", "إيقاف الالعاب", "ايقاف الألعاب", "إيقاف الألعاب", "فتح المليون", "غلق المليون", "فتح مليار", "غلق مليار", "فتح المليار", "غلق المليار", "s@", "توثيق الكل", "وثق الكل", "verify", "سجل الغرفه", "سجل الغرفة",
     )
+    prefixes = prefixes + ("room message@", "فحص اسم", "اصلاح اسم", "إصلاح اسم", "تعديل اسم", "تعديل الاسم", "حذف اسم", "حذفاسم", "حذف تصحيح اسم", "حذف تصحيح الاسم", "حذف تصحييح اسم", "حذف تصحييح الاسم")
     return low.startswith(prefixes)
 
 def _verified_data():
@@ -3305,82 +3454,6 @@ def _verified_data():
 def _vip_data():
     data=_load_local_json(VIP_FILE,{})
     return data if isinstance(data,dict) else {}
-
-def _vip_identity_entries(data):
-    """Return (path, username) pairs for the supported VIP JSON layouts."""
-    rows = []
-    identity_keys = ("username", "user_name", "name", "display_name", "nickname")
-    containers = {"users", "vip_users", "records", "accounts", "data", "items", "entries", "members"}
-    metadata = {"version", "schema_version", "format", "updated_at", "created_at", "granted_by"}
-
-    def walk(node, path=()):
-        if isinstance(node, list):
-            for index, value in enumerate(node):
-                walk(value, path + (index,))
-            return
-        if not isinstance(node, dict):
-            return
-        normalized_keys = {str(key).casefold().replace("-", "_"): key for key in node}
-        for identity_key in identity_keys:
-            original_key = normalized_keys.get(identity_key)
-            value = node.get(original_key) if original_key is not None else None
-            if isinstance(value, str) and value.strip():
-                rows.append((path, value.strip().lstrip("@"), node))
-                return
-        for key, value in node.items():
-            key_norm = str(key).casefold().replace("-", "_")
-            if key_norm in metadata:
-                continue
-            if key_norm in containers:
-                walk(value, path + (key,))
-            elif isinstance(value, dict):
-                name = next((str(value.get(field) or "").strip().lstrip("@") for field in identity_keys
-                             if str(value.get(field) or "").strip()), str(key).strip().lstrip("@"))
-                if name:
-                    rows.append((path + (key,), name, value))
-            elif isinstance(value, list):
-                walk(value, path + (key,))
-            elif str(key).strip():
-                # Legacy files may store a bare username key with a boolean value.
-                rows.append((path + (key,), str(key).strip().lstrip("@"), value))
-
-    walk(data)
-    return rows
-
-def _update_vip_user_id(username, user_id):
-    """Set one exact VIP record's Talkin user ID without replacing its metadata."""
-    target = str(username or "").strip().lstrip("@")
-    uid = str(user_id or "").strip()
-    if not target or not uid.isdigit():
-        return {"ok": False, "error": "invalid_identity"}
-    try:
-        with _LOCAL_JSON_WRITE_LOCK:
-            data = _vip_data()
-            matches = [row for row in _vip_identity_entries(data) if _norm_user(row[1]) == _norm_user(target)]
-            if not matches:
-                return {"ok": False, "error": "target_not_found"}
-            if len(matches) != 1:
-                return {"ok": False, "error": "ambiguous_target"}
-            path, saved_name, saved_record = matches[0]
-            item = dict(saved_record) if isinstance(saved_record, dict) else {"username": saved_name}
-            changed = str(item.get("user_id") or "").strip() != uid
-            if not changed:
-                return {"ok": True, "changed": False, "username": saved_name, "user_id": uid}
-            item["username"] = str(item.get("username") or saved_name)
-            item["user_id"] = uid
-            item["updated_at"] = int(time.time())
-            if path:
-                parent = data
-                for key in path[:-1]:
-                    parent = parent[key]
-                parent[path[-1]] = item
-            else:
-                data = item
-            _save_local_json(VIP_FILE, data)
-            return {"ok": True, "changed": True, "username": saved_name, "user_id": uid}
-    except Exception as exc:
-        print(f"[VIP] user ID update failed: {exc}", flush=True)
-        return {"ok": False, "error": "persistence_failed"}
 
 def _saved_identity_groups(data):
     """Build account identity groups once; exclude audit metadata from identities."""
@@ -3473,20 +3546,7 @@ def _saved_identity_groups_match(groups, name):
 
 
 def _saved_identity_matches(data, name):
-    groups = _saved_identity_groups(data)
-    if _saved_identity_groups_match(groups, name):
-        return True
-    target_id = _stored_user_id(name)
-    if not target_id:
-        return False
-    for group in groups:
-        saved_ids = {
-            user_id for candidate in group
-            if (user_id := _stored_user_id(candidate))
-        }
-        if saved_ids == {target_id}:
-            return True
-    return False
+    return _saved_identity_groups_match(_saved_identity_groups(data), name)
 
 def _is_verified_user(name):
     # When verification is disabled, treat users as passing the verification
@@ -3529,7 +3589,6 @@ def _is_vip_user(name):
 
 
 _GAME_STATE_LOCK = threading.RLock()
-_IDENTITY_METADATA_LOCK = threading.RLock()
 _GAME_STATS_CACHE = None
 _GAME_STATS_MIGRATION_DONE = False
 _GAME_SNAPSHOT_LOCK = threading.RLock()
@@ -3666,13 +3725,23 @@ def _game_name_key(name):
     """Compare decorated usernames without changing their displayed form."""
     raw = unicodedata.normalize("NFKC", str(name or "")).strip().lstrip("@")
     # Talkin names commonly contain ornamental symbols, tatweel, zero-width
-    # joiners, and Arabic combining marks. Ignore those only for lookup; keep
-    # the original spelling for the welcome text.
-    compact = "".join(
-        char for char in raw
-        if not unicodedata.category(char).startswith(("M", "P", "S", "C", "Z"))
-        and not (0x13000 <= ord(char) <= 0x1345F)  # ornamental Egyptian-hieroglyph brackets
-    )
+    # joiners, and Arabic combining marks. Ignore decorative edge marks only
+    # for lookup; preserve a meaningful symbol between name characters. For
+    # example, SOU☀REA and SOUREA are two different Talkin accounts, not two
+    # spellings of one account. Keeping that internal separator also prevents
+    # their game history and level welcome from being merged.
+    compact_chars = []
+    for index, char in enumerate(raw):
+        category = unicodedata.category(char)
+        if category.startswith(("M", "C", "Z")) or (0x13000 <= ord(char) <= 0x1345F):
+            continue
+        if category.startswith(("P", "S")):
+            previous = raw[index - 1] if index > 0 else ""
+            following = raw[index + 1] if index + 1 < len(raw) else ""
+            if not (previous.isalnum() and following.isalnum()):
+                continue
+        compact_chars.append(char)
+    compact = "".join(compact_chars)
     compact = compact.replace("ـ", "")
     return (compact or raw).casefold()
 
@@ -3718,17 +3787,9 @@ def _game_record_matches(data, username):
     if not isinstance(data, dict):
         return []
     wanted = _game_name_key(username)
-    matches = [(str(key), candidate) for key, candidate in data.items()
-               if isinstance(candidate, dict)
-               and _game_name_key(candidate.get("username") or key) == wanted]
-    if matches:
-        return matches
-    target_id = _stored_user_id(username)
-    if not target_id:
-        return []
     return [(str(key), candidate) for key, candidate in data.items()
             if isinstance(candidate, dict)
-            and _stored_user_id(candidate.get("username") or key) == target_id]
+            and _game_name_key(candidate.get("username") or key) == wanted]
 
 
 def _merged_game_item(data, username):
@@ -3960,9 +4021,6 @@ def _save_game_levels_snapshot():
                 "plays": plays,
                 "star_rank": ranks.get(canonical),
             }
-            user_id = _stored_user_id(username)
-            if user_id:
-                players[canonical]["user_id"] = user_id
     _queue_local_json_save(GAME_LEVELS_FILE, {"version": 1, "players": players})
 
 
@@ -3998,17 +4056,19 @@ def _game_welcome(username, room):
 
 
 def _join_welcome_message(username, room, custom_welcome_enabled=True, custom_welcome=None):
+    # All members use the same welcome flow, regardless of VIP/master role.
+    # No role-specific VIP greeting and no custom-welcome exclusion.
     _level, _label, plays = _game_level_info(username)
-    is_vip = _is_vip_user(username) and not _is_master_name(username)
     prefix = ""
-    if plays < 100 and is_vip:
-        prefix = f"👑 عضو Vip\n👤 {username}\n🏠 الغرفة: {room}"
-    elif (custom_welcome_enabled and not is_vip
-          and isinstance(custom_welcome, dict) and custom_welcome.get("message")):
-        prefix = (str(custom_welcome["message"]).replace("{username}", username).replace("{room}", room))
+    if custom_welcome_enabled and isinstance(custom_welcome, dict) and custom_welcome.get("message"):
+        prefix = (
+            str(custom_welcome["message"])
+            .replace("{username}", username)
+            .replace("{room}", room)
+        )
     level_welcome = _game_welcome(username, room)
     if level_welcome:
-        return f"{prefix}\n\n{level_welcome}" if prefix else level_welcome
+        return f"{prefix}\\n\\n{level_welcome}" if prefix else level_welcome
     return prefix or None
 
 
@@ -4115,14 +4175,6 @@ def _game_top(game_key, limit=15):
 
 _POINTS_STATE_VERSION = 2
 _POINT_TRANSFER_HISTORY_LIMIT = 1000
-PROFILE_LOOKUP_TIMEOUT_SECONDS = 18.0
-PROFILE_LOOKUP_UID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHJKLMNOPQRSTUVWXYZ"
-VIP_ID_REFRESH_COMMANDS = frozenset({
-    "تحديث ايدي ملفvip", "تحديث ايدي ملف vip", "تحديث ايديهات ملفvip", "تحديث ايديهات ملف vip",
-})
-POINTS_ID_REFRESH_COMMANDS = frozenset({
-    "حدث ايديهات ملف النقاط", "تحديث ايديهات ملف النقاط", "تحديث ايدي ملف النقاط",
-})
 
 
 def _decode_points_payload(payload):
@@ -4173,15 +4225,6 @@ def _points_account_candidates(data, username, *, exact_only=False):
             exact.append((str(key), item))
     if exact or exact_only:
         return exact
-    target_id = _stored_user_id(username)
-    if target_id:
-        id_matches = [
-            (str(key), item) for key, item in data.items()
-            if isinstance(item, dict)
-            and _stored_user_id(item.get("username") or key) == target_id
-        ]
-        if id_matches:
-            return id_matches
     canonical = _game_name_key(username)
     if not canonical:
         return []
@@ -4252,72 +4295,6 @@ def _mutate_points_state(updater):
         _POINTS_CACHE, _POINTS_TRANSFER_CACHE = _decode_points_payload(payload)
         return result
 
-def _persist_identity_to_points(username, user_id, preferred_room=""):
-    """Attach a Talkin ID to existing points rows without touching balances/history."""
-    user_id = str(user_id or "").strip()
-    if not user_id.isdigit():
-        return 0
-    wanted = _norm_user(username)
-
-    def update(accounts, history):
-        changed = 0
-        for key, item in list(accounts.items()):
-            if not isinstance(item, dict):
-                continue
-            stored_id = str(item.get("user_id") or "").strip()
-            exact_name = _norm_user(key) == wanted or _norm_user(item.get("username")) == wanted
-            same_identity = (
-                stored_id == user_id
-                or _stored_user_id(item.get("username") or key, preferred_room) == user_id
-            )
-            if not (exact_name or same_identity) or (stored_id and stored_id != user_id):
-                continue
-            if stored_id != user_id:
-                updated = dict(item)
-                updated["user_id"] = user_id
-                accounts[key] = updated
-                changed += 1
-        return {"ok": True, "updated": changed}, bool(changed)
-
-    try:
-        result = _mutate_points_state(update)
-        return int(result.get("updated", 0)) if isinstance(result, dict) else 0
-    except Exception as exc:
-        print(f"[IDENTITY] points metadata save failed: {type(exc).__name__}", flush=True)
-        return 0
-
-
-def _persist_identity_to_levels(username, user_id, preferred_room=""):
-    """Annotate an existing level row with ID metadata; preserve all play counts."""
-    user_id = str(user_id or "").strip()
-    if not user_id.isdigit():
-        return False
-    payload = _load_local_json(GAME_LEVELS_FILE, {})
-    players = payload.get("players", {}) if isinstance(payload, dict) else {}
-    if not isinstance(players, dict):
-        return False
-    wanted = _norm_user(username)
-    changed = False
-    for key, item in players.items():
-        if not isinstance(item, dict):
-            continue
-        stored_id = str(item.get("user_id") or "").strip()
-        name = str(item.get("username") or key).strip().lstrip("@")
-        if not (
-            _norm_user(name) == wanted
-            or stored_id == user_id
-            or _stored_user_id(name, preferred_room) == user_id
-        ):
-            continue
-        if stored_id and stored_id != user_id:
-            continue
-        if stored_id != user_id:
-            item["user_id"] = user_id
-            changed = True
-    if changed:
-        _save_local_json(GAME_LEVELS_FILE, payload)
-    return changed
-
 
 class PointsInsufficientError(RuntimeError):
     """Raised when a concurrent game debit would overdraw a points account."""
@@ -4327,11 +4304,32 @@ class PointsPersistenceError(RuntimeError):
     """Raised when a points mutation cannot be durably stored."""
 
 
-def _add_points(username, amount):
+def _apply_loan_repayment(account, reward_basis):
+    """Withhold 20% of eligible winnings, preserving fractional points as carry."""
+    try:
+        debt = max(0, int(account.get("loan_debt", 0) or 0))
+        basis = max(0, int(reward_basis or 0))
+        carry = max(0, min(99, int(account.get("loan_repay_carry", 0) or 0)))
+    except (TypeError, ValueError):
+        debt, basis, carry = 0, 0, 0
+    if debt <= 0:
+        account["loan_debt"] = 0
+        account["loan_repay_carry"] = 0
+        return 0
+    if basis <= 0:
+        return 0
+    numerator = basis * LOAN_REPAYMENT_PERCENT + carry
+    repayment = min(debt, numerator // 100)
+    account["loan_debt"] = debt - repayment
+    account["loan_repay_carry"] = 0 if repayment >= debt else numerator % 100
+    return repayment
+
+
+def _add_points(username, amount, *, repay_loan=False, loan_repayment_basis=None, return_details=False):
     amount = int(amount)
     display_name = str(username or "").strip().lstrip("@")
     if not _norm_user(display_name):
-        return 0
+        return {"balance": 0, "loan_repayment": 0, "loan_debt": 0} if return_details else 0
 
     def update(accounts, _history):
         resolved = _resolve_points_account(accounts, display_name)
@@ -4346,10 +4344,18 @@ def _add_points(username, amount):
         old_balance = _points_balance(item)
         if amount < 0 and old_balance < -amount:
             raise PointsInsufficientError("Insufficient points for this game debit")
+        repayment = 0
+        if repay_loan and amount > 0:
+            basis = amount if loan_repayment_basis is None else loan_repayment_basis
+            repayment = _apply_loan_repayment(item, basis)
         item["username"] = _preferred_display_name(item.get("username"), display_name)
-        item["points"] = old_balance + amount
+        item["points"] = old_balance + amount - repayment
         accounts[key] = item
-        return item["points"], True
+        result = {
+            "balance": item["points"], "gross_amount": amount,
+            "loan_repayment": repayment, "loan_debt": max(0, int(item.get("loan_debt", 0) or 0)),
+        }
+        return (result if return_details else item["points"]), True
 
     try:
         return _mutate_points_state(update)
@@ -4359,7 +4365,10 @@ def _add_points(username, amount):
         raise PointsPersistenceError("Could not persist points mutation") from exc
 
 
-def _apply_points_delta_once(username, delta, transaction_id, reason):
+def _apply_points_delta_once(
+    username, delta, transaction_id, reason, *, repay_loan=False, loan_repayment_basis=None,
+    stock_market_investment=None,
+):
     """Atomically apply one idempotent game debit/credit and audit it."""
     try:
         delta = int(delta)
@@ -4371,10 +4380,16 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
         return {"ok": False, "error": "invalid_transaction"}
 
     def update(accounts, history):
-        if any(isinstance(row, dict) and str(row.get("id") or "") == txid for row in history):
+        existing_row = next((row for row in history
+                             if isinstance(row, dict) and str(row.get("id") or "") == txid), None)
+        if existing_row is not None:
+            changed = False
+            if stock_market_investment and not existing_row.get("stock_market_investment"):
+                existing_row["stock_market_investment"] = copy.deepcopy(stock_market_investment)
+                changed = True
             existing = _resolve_points_account(accounts, display_name)
             return {"ok": True, "already_applied": True,
-                    "balance": _points_balance(existing[1]) if existing else 0}, False
+                    "balance": _points_balance(existing[1]) if existing else 0}, changed
         resolved = _resolve_points_account(accounts, display_name)
         if not resolved:
             if delta < 0:
@@ -4387,12 +4402,17 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
         old_balance = _points_balance(item)
         if delta < 0 and old_balance < -delta:
             return {"ok": False, "error": "insufficient", "balance": old_balance}, False
-        new_balance = old_balance + delta
+        repayment = 0
+        if repay_loan and delta > 0:
+            basis = delta if loan_repayment_basis is None else loan_repayment_basis
+            repayment = _apply_loan_repayment(item, basis)
+        credited_delta = delta - repayment
+        new_balance = old_balance + credited_delta
         item["username"] = _preferred_display_name(item.get("username"), display_name)
         item["points"] = new_balance
         accounts[key] = item
         positive = delta > 0
-        history.append({
+        audit_row = {
             "id": txid, "timestamp": int(time.time()),
             "sender": (
                 "wager_refund" if positive and str(reason or "").casefold().startswith("refund expired")
@@ -4401,17 +4421,228 @@ def _apply_points_delta_once(username, delta, transaction_id, reason):
             "sender_key": "" if positive else key,
             "recipient": item["username"] if positive else "stock_market",
             "recipient_key": key if positive else "",
-            "amount": abs(delta), "sender_balance_after": None if positive else new_balance,
+            "amount": abs(credited_delta), "gross_amount": abs(delta),
+            "loan_repayment": repayment,
+            "sender_balance_after": None if positive else new_balance,
             "recipient_balance_after": new_balance if positive else None,
             "reason": str(reason or "stock_market"),
-        })
+        }
+        if stock_market_investment:
+            audit_row["stock_market_investment"] = copy.deepcopy(stock_market_investment)
+        history.append(audit_row)
         del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
-        return {"ok": True, "already_applied": False, "balance": new_balance}, True
+        return {
+            "ok": True, "already_applied": False, "balance": new_balance,
+            "gross_amount": delta, "loan_repayment": repayment,
+            "loan_debt": max(0, int(item.get("loan_debt", 0) or 0)),
+        }, True
 
     try:
         return _mutate_points_state(update)
     except Exception as exc:
         print(f"[POINTS] idempotent game mutation failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
+
+
+def _request_points_loan(username):
+    """Issue one 100b loan only when balance is below 100b and no debt remains."""
+    display_name = str(username or "").strip().lstrip("@")
+    if not _norm_user(display_name):
+        return {"ok": False, "error": "invalid_user"}
+    now = int(time.time())
+
+    def update(accounts, history):
+        resolved = _resolve_points_account(accounts, display_name)
+        if resolved:
+            key, saved = resolved
+            item = dict(saved)
+        else:
+            key = _norm_user(display_name)
+            item = {"username": display_name, "points": 0}
+        balance = _points_balance(item)
+        debt = max(0, int(item.get("loan_debt", 0) or 0))
+        if debt > 0:
+            return {"ok": False, "error": "outstanding_loan", "balance": balance, "loan_debt": debt}, False
+        if balance >= LOAN_AMOUNT:
+            return {"ok": False, "error": "balance_too_high", "balance": balance, "loan_debt": 0}, False
+        item["username"] = _preferred_display_name(item.get("username"), display_name)
+        item["points"] = balance + LOAN_AMOUNT
+        item["loan_debt"] = LOAN_AMOUNT
+        item["loan_repay_carry"] = 0
+        accounts[key] = item
+        history.append({
+            "id": f"loan-issued:{uuid.uuid4().hex}", "timestamp": now,
+            "sender": "loan_service", "sender_key": "loan_service",
+            "recipient": item["username"], "recipient_key": key,
+            "amount": LOAN_AMOUNT, "reason": "100b points loan issued",
+        })
+        del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
+        return {"ok": True, "balance": item["points"], "loan_debt": LOAN_AMOUNT}, True
+
+    try:
+        return _mutate_points_state(update)
+    except Exception as exc:
+        print(f"[LOAN] issue failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
+
+
+def _create_wallet_position(username, asset_id, amount, room="", now=None):
+    """Atomically debit the stake and append an hour-maturity wallet position."""
+    try:
+        asset_id, amount = int(asset_id), int(amount)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_amount"}
+    if asset_id not in WALLET_ASSETS:
+        return {"ok": False, "error": "invalid_asset"}
+    if amount < WALLET_MIN_INVESTMENT or amount > WALLET_MAX_INVESTMENT:
+        return {"ok": False, "error": "amount_out_of_range"}
+    display_name = str(username or "").strip().lstrip("@")
+    if not _norm_user(display_name):
+        return {"ok": False, "error": "invalid_user"}
+    now = time.time() if now is None else float(now)
+    position_id = uuid.uuid4().hex
+    txid = f"wallet-buy:{position_id}"
+
+    def update(accounts, history):
+        if any(isinstance(row, dict) and str(row.get("id") or "") == txid for row in history):
+            resolved = _resolve_points_account(accounts, display_name)
+            return {"ok": True, "already_applied": True,
+                    "balance": _points_balance(resolved[1]) if resolved else 0}, False
+        resolved = _resolve_points_account(accounts, display_name)
+        if not resolved:
+            return {"ok": False, "error": "target_not_found", "balance": 0}, False
+        key, saved = resolved
+        item = dict(saved)
+        balance = _points_balance(item)
+        if balance < amount:
+            return {"ok": False, "error": "insufficient", "balance": balance}, False
+        positions = item.get("wallet_positions", [])
+        positions = [dict(row) for row in positions if isinstance(row, dict)] if isinstance(positions, list) else []
+        if len(positions) >= WALLET_MAX_ACTIVE_POSITIONS:
+            return {"ok": False, "error": "too_many_positions", "balance": balance}, False
+        asset = WALLET_ASSETS[asset_id]
+        position = {
+            "id": position_id, "username": str(item.get("username") or display_name),
+            "asset_id": asset_id, "amount": amount, "room": str(room or ""),
+            "created_at": now, "due_at": now + WALLET_MATURITY_SECONDS,
+        }
+        positions.append(position)
+        item["username"] = _preferred_display_name(item.get("username"), display_name)
+        item["points"] = balance - amount
+        item["wallet_positions"] = positions
+        accounts[key] = item
+        history.append({
+            "id": txid, "timestamp": int(now), "sender": item["username"],
+            "sender_key": key, "recipient": "wallet_investment", "recipient_key": "wallet",
+            "amount": amount, "sender_balance_after": balance - amount,
+            "reason": f"wallet investment in {asset['en']}",
+        })
+        del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
+        return {"ok": True, "position": position, "balance": balance - amount}, True
+
+    try:
+        return _mutate_points_state(update)
+    except Exception as exc:
+        print(f"[WALLET] purchase failed: {exc}", flush=True)
+        return {"ok": False, "error": "persistence_failed"}
+
+
+def _wallet_due_positions(now=None):
+    now = time.time() if now is None else float(now)
+    with _GAME_STATE_LOCK:
+        accounts = copy.deepcopy(_points_data())
+    due = []
+    for key, item in accounts.items():
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username") or key or "").strip()
+        for position in item.get("wallet_positions", []) if isinstance(item.get("wallet_positions"), list) else []:
+            if not isinstance(position, dict):
+                continue
+            try:
+                if float(position.get("due_at", 0) or 0) <= now:
+                    due.append((username, str(position.get("id") or "")))
+            except (TypeError, ValueError):
+                continue
+    return [(username, position_id) for username, position_id in due if username and position_id]
+
+
+def _settle_wallet_position(username, position_id, now=None):
+    """Settle a due wallet position and its debt sweep in one points.json transaction."""
+    display_name = str(username or "").strip().lstrip("@")
+    position_id = str(position_id or "").strip()
+    now = time.time() if now is None else float(now)
+    txid = f"wallet-settle:{position_id}"
+    if not _norm_user(display_name) or not position_id:
+        return {"ok": False, "error": "invalid_transaction"}
+
+    def update(accounts, history):
+        resolved = _resolve_points_account(accounts, display_name)
+        if not resolved:
+            return {"ok": False, "error": "target_not_found"}, False
+        key, saved = resolved
+        item = dict(saved)
+        positions = item.get("wallet_positions", [])
+        positions = [dict(row) for row in positions if isinstance(row, dict)] if isinstance(positions, list) else []
+        position = next((row for row in positions if str(row.get("id") or "") == position_id), None)
+        if not position:
+            prior = next((row for row in history if isinstance(row, dict) and row.get("id") == txid), None)
+            if prior:
+                return {"ok": True, "already_applied": True,
+                        "balance": _points_balance(item)}, False
+            return {"ok": False, "error": "position_not_found"}, False
+        try:
+            if float(position.get("due_at", 0) or 0) > now:
+                return {"ok": False, "error": "not_due"}, False
+            principal = int(position.get("amount", 0) or 0)
+            asset_id = int(position.get("asset_id", 0) or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid_position"}, False
+        if principal < WALLET_MIN_INVESTMENT or asset_id not in WALLET_ASSETS:
+            return {"ok": False, "error": "invalid_position"}, False
+        outcome = "profit" if secrets.randbelow(2) else "loss"
+        change = max(1, principal * 5 // 100)
+        payout = principal + change if outcome == "profit" else max(0, principal - change)
+        net_change = payout - principal
+        repayment = _apply_loan_repayment(item, net_change) if outcome == "profit" else 0
+        credited = payout - repayment
+        balance = _points_balance(item)
+        new_balance = balance + credited
+        item["points"] = new_balance
+        item["wallet_positions"] = [row for row in positions if str(row.get("id") or "") != position_id]
+        settled_row = {
+            **position, "status": "settled", "outcome": outcome,
+            "change_percent": 5, "change": change, "payout": payout,
+            "net_change": net_change, "loan_repayment": repayment,
+            "loan_debt": max(0, int(item.get("loan_debt", 0) or 0)),
+            "balance_after": new_balance, "settled_at": now,
+        }
+        wallet_history = item.get("wallet_history", [])
+        wallet_history = [dict(row) for row in wallet_history if isinstance(row, dict)] if isinstance(wallet_history, list) else []
+        wallet_history.append(settled_row)
+        item["wallet_history"] = wallet_history[-WALLET_HISTORY_LIMIT:]
+        accounts[key] = item
+        history.append({
+            "id": txid, "timestamp": int(now), "sender": "wallet_investment",
+            "sender_key": "wallet", "recipient": item["username"], "recipient_key": key,
+            "amount": credited, "gross_amount": payout, "loan_repayment": repayment,
+            "sender_balance_after": None, "recipient_balance_after": new_balance,
+            "reason": f"wallet {outcome} settlement ({WALLET_ASSETS[asset_id]['en']})",
+        })
+        del history[:-_POINT_TRANSFER_HISTORY_LIMIT]
+        return {
+            "ok": True, "settled": True, "username": item["username"],
+            "asset_id": asset_id, "principal": principal, "payout": payout,
+            "net_change": net_change, "outcome": outcome,
+            "loan_repayment": repayment,
+            "loan_debt": max(0, int(item.get("loan_debt", 0) or 0)),
+            "balance": new_balance,
+        }, True
+
+    try:
+        return _mutate_points_state(update)
+    except Exception as exc:
+        print(f"[WALLET] settlement failed for {position_id}: {exc}", flush=True)
         return {"ok": False, "error": "persistence_failed"}
 
 
@@ -4525,67 +4756,9 @@ def _set_points_balance(username, balance, *, actor=""):
         print(f"[POINTS] master balance replacement failed: {exc}", flush=True)
         return {"ok": False, "error": "persistence_failed"}
 
-def _set_points_user_id(username, user_id):
-    """Persist one server-verified Talkin ID on an exact points account."""
-    target_name = str(username or "").strip().lstrip("@")
-    uid = str(user_id or "").strip()
-    if not target_name or not uid.isdigit():
-        return {"ok": False, "error": "invalid_identity"}
-
-    def update(accounts, _history):
-        matches = _points_account_candidates(accounts, target_name, exact_only=True)
-        if not matches:
-            return {"ok": False, "error": "target_not_found"}, False
-        if len(matches) != 1:
-            return {"ok": False, "error": "ambiguous_target"}, False
-        key, saved = matches[0]
-        item = dict(saved)
-        saved_name = str(item.get("username") or key).strip().lstrip("@")
-        if _norm_user(saved_name) != _norm_user(target_name) and _norm_user(key) != _norm_user(target_name):
-            return {"ok": False, "error": "target_not_found"}, False
-        if str(item.get("user_id") or "").strip() == uid:
-            return {"ok": True, "changed": False, "username": saved_name, "user_id": uid}, False
-        item["username"] = str(item.get("username") or target_name)
-        item["user_id"] = uid
-        item["user_id_updated_at"] = int(time.time())
-        accounts[key] = item
-        return {"ok": True, "changed": True, "username": item["username"], "user_id": uid}, True
-
-    try:
-        return _mutate_points_state(update)
-    except Exception as exc:
-        print(f"[POINTS] user ID update failed: {exc}", flush=True)
-        return {"ok": False, "error": "persistence_failed"}
-
-def _points_identity_status(username, user_id):
-    """Return whether the exact saved name and its server ID identify one points account."""
-    target_name = str(username or "").strip().lstrip("@")
-    uid = str(user_id or "").strip()
-    matches = _points_account_candidates(_points_data(), target_name, exact_only=True)
-    if not matches:
-        return {"ok": False, "error": "target_not_found"}
-    if len(matches) != 1:
-        return {"ok": False, "error": "ambiguous_target"}
-    key, item = matches[0]
-    saved_name = str(item.get("username") or key).strip().lstrip("@")
-    saved_id = str(item.get("user_id") or "").strip()
-    if _norm_user(saved_name) != _norm_user(target_name):
-        return {"ok": False, "error": "name_mismatch"}
-    if not saved_id.isdigit():
-        return {"ok": False, "error": "id_missing"}
-    if not uid or saved_id != uid:
-        return {"ok": False, "error": "id_mismatch"}
-    id_accounts = [
-        key for key, record in _points_data().items()
-        if isinstance(record, dict) and str(record.get("user_id") or "").strip() == uid
-    ]
-    if len(id_accounts) != 1:
-        return {"ok": False, "error": "ambiguous_user_id"}
-    return {"ok": True, "key": key, "username": saved_name, "user_id": saved_id}
 
 def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_source=True,
-                     require_exact_target=True, create_target_if_missing=False,
-                     expected_sender_id=None, expected_target_id=None):
+                     require_exact_target=True, create_target_if_missing=False):
     """Move points and append the audit entry in the same points.json commit."""
     amount = int(amount)
     if amount <= 0:
@@ -4604,22 +4777,6 @@ def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_s
             return {"ok": False, "error": "sender_not_found"}, False
         source_key, source_item = source
         target_key, target_item = destination
-        if expected_sender_id is not None or expected_target_id is not None:
-            expected_source = str(expected_sender_id or "").strip()
-            expected_target = str(expected_target_id or "").strip()
-            if (_norm_user(source_item.get("username") or source_key) != _norm_user(sender_name)
-                    or _norm_user(target_item.get("username") or target_key) != _norm_user(target_name)):
-                return {"ok": False, "error": "identity_name_mismatch"}, False
-            if expected_source and str(source_item.get("user_id") or "").strip() != expected_source:
-                return {"ok": False, "error": "sender_id_mismatch"}, False
-            if expected_target and str(target_item.get("user_id") or "").strip() != expected_target:
-                return {"ok": False, "error": "target_id_mismatch"}, False
-            for expected_id in (expected_source, expected_target):
-                if expected_id and sum(
-                    1 for record in accounts.values()
-                    if isinstance(record, dict) and str(record.get("user_id") or "").strip() == expected_id
-                ) != 1:
-                    return {"ok": False, "error": "ambiguous_user_id"}, False
         if source_key == target_key:
             return {"ok": False, "error": "same_account"}, False
         source_balance = _points_balance(source_item)
@@ -4659,6 +4816,7 @@ def _transfer_points(sender, target, amount, *, reason="transfer", allow_alias_s
     except Exception as exc:
         print(f"[POINTS] transfer commit failed: {exc}", flush=True)
         return {"ok": False, "error": "persistence_failed"}
+
 
 def _get_points(username):
     resolved = _resolve_points_account(_points_data(), username)
@@ -4808,6 +4966,59 @@ def _fmt_points(value):
         return f"{sign}{text}k"
     return f"{sign}{number}"
 
+
+def _record_money_game_win(game, username):
+    """Persist one win for the rolling monthly money-game leaderboard."""
+    game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
+    username = str(username or "").strip().lstrip("@")
+    if not username:
+        return
+    history = _load_local_json(MONEY_GAME_WIN_HISTORY_FILE, {})
+    if not isinstance(history, dict):
+        history = {}
+    rows = history.get(game) if isinstance(history.get(game), list) else []
+    rows.append({"username": username, "at": int(time.time())})
+    cutoff = int(time.time()) - 31 * 86400
+    history[game] = [row for row in rows if isinstance(row, dict) and int(row.get("at", 0) or 0) >= cutoff][-5000:]
+    _queue_local_json_save(MONEY_GAME_WIN_HISTORY_FILE, history)
+
+def _money_game_winner_rows(game, days=30, limit=15):
+    game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
+    history = _load_local_json(MONEY_GAME_WIN_HISTORY_FILE, {})
+    rows = history.get(game, []) if isinstance(history, dict) else []
+    cutoff = time.time() - max(1, int(days)) * 86400
+    counts = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or float(row.get("at", 0) or 0) < cutoff:
+            continue
+        username = str(row.get("username") or "").strip().lstrip("@")
+        key = _game_name_key(username)
+        if username and key:
+            counts.setdefault(key, {"username": username, "wins": 0, "latest": 0})
+            counts[key]["wins"] += 1
+            counts[key]["latest"] = max(counts[key]["latest"], int(row.get("at", 0) or 0))
+    ordered = sorted(counts.values(), key=lambda row: (-row["wins"], -row["latest"], _game_name_key(row["username"])))
+    return [(row["wins"], row["username"]) for row in ordered[:max(1, int(limit))]]
+
+def _money_game_top_text(game, *, english=False):
+    game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
+    label = "Billion" if game == "billion" else "Million"
+    label_ar = "المليار" if game == "billion" else "المليون"
+    rows = _money_game_winner_rows(game)
+    lines = [
+        f"🏆 Top {label} winners — last 30 days" if english
+        else f"🏆 توب الفائزين بلعبة {label_ar} — خلال آخر 30 يومًا",
+        "━━━━━━━━━━━━",
+    ]
+    for rank, (wins, username) in enumerate(rows, 1):
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}️⃣")
+        lines.append(
+            f"{medal} @{username} — {wins} wins" if english
+            else f"{medal} @{username} — {wins} فوز"
+        )
+    if not rows:
+        lines.append("No wins recorded in the last 30 days." if english else "لا توجد انتصارات خلال آخر 30 يومًا.")
+    return "\n".join(lines)
 
 def _money_game_win_text(game, username, language="ar"):
     game = "billion" if str(game).casefold() in {"billion", "مليار"} else "million"
@@ -4962,6 +5173,23 @@ def _points_summary_text(username):
             f"┃ 🎮 مرات اللعب: {plays}\n"
             f"┃ {rank_label}: {rank_text}\n"
             f"╰━━━━━━━━━━━━━━╯")
+
+def _named_points_text(username):
+    """Return the current points balance for a requested username."""
+    requested = str(username or "").strip().lstrip("@").strip()
+    safe_name = _transfer_log_safe_field(requested, max_bytes=80)
+    resolved = _resolve_points_account(_points_data(), requested) if requested else None
+    if resolved:
+        shown_name = str(resolved[1].get("username") or requested).strip().lstrip("@")
+        balance = _points_balance(resolved[1])
+    else:
+        shown_name = safe_name
+        balance = 0
+    return (
+        f"💰 نقاط المستخدم\n"
+        f"👤 @{shown_name}\n"
+        f"💎 الرصيد: {_fmt_points(balance)} نقطة"
+    )
 
 def _ensure_replies_file():
     data = _load_local_json(REPLIES_FILE, {})
@@ -5176,12 +5404,19 @@ def _record_publish_ban(username, room, word=""):
     return True
 
 def _remove_publish_ban(username):
-    data=_publish_bans_data(); rows=data.get("users",[])
-    if not isinstance(rows,list): rows=[]
-    key=_norm_user(username)
-    data["users"]=[row for row in rows if _norm_user(row.get("username") if isinstance(row,dict) else row)!=key]
-    _save_local_json(PUBLISH_BANS_FILE,data)
-    return True
+    data = _publish_bans_data()
+    rows = data.get("users", [])
+    if not isinstance(rows, list):
+        rows = []
+    key = _norm_user(username)
+    kept = [
+        row for row in rows
+        if _norm_user(row.get("username") if isinstance(row, dict) else row) != key
+    ]
+    removed = len(rows) - len(kept)
+    data["users"] = kept
+    _save_local_json(PUBLISH_BANS_FILE, data)
+    return removed
 
 def _publish_ban_rows():
     data=_publish_bans_data(); rows=data.get("users",[])
@@ -5293,19 +5528,10 @@ def _room_manager(bot, room, sender):
         "صانع", "صانع_الغرفة", "مالك",
     }
 
-def _normalize_room_role(value):
-    role = str(value or "").casefold().strip().replace(" ", "_")
-    return {
-        "o": "owner", "a": "admin", "m": "member",
-        "normal": "member", "user": "member",
-        "roomowner": "room_owner", "roomcreator": "room_creator",
-    }.get(role, role)
-
-
 def _room_role(bot, room, sender, event_role=None):
     """Return a cached/event room role, without guessing when rank data is absent."""
     if event_role is not None and str(event_role).strip():
-        return _normalize_room_role(event_role), True
+        return str(event_role).strip().casefold(), True
     rosters = getattr(bot, "room_users", {}) or {}
     room_key = _norm_room(room)
     for roster_room, users in rosters.items():
@@ -5313,8 +5539,23 @@ def _room_role(bot, room, sender, event_role=None):
             continue
         for username, role in users.items():
             if _norm_user(username) == _norm_user(sender):
-                return _normalize_room_role(role or "none"), True
+                return str(role or "none").strip().casefold(), True
     return "", False
+
+def _room_owner_for_music(bot, room, sender):
+    """Allow a native room owner to request live music without general verification."""
+    role, known = _room_role(bot, room, sender)
+    if not known:
+        return False
+    role_key = re.sub(r"[\s_-]+", "", str(role or "").casefold())
+    return role_key in {
+        "owner", "creator", "roomowner", "roomcreator", "host",
+        "مالك", "صانع", "صانعي", "صانعالغرفة", "صانعالغرفه",
+    }
+
+def _owner_live_music_allowed(bot, room, sender, text):
+    """Only the explicit live-broadcast command gets the room-owner exception."""
+    return str(text or "").strip().startswith("بث ") and _room_owner_for_music(bot, room, sender)
 
 def _auto_ban_candidate(bot, room, sender, event_role=None):
     """Auto-ban every known role except room owners and supervision roles."""
@@ -5440,31 +5681,34 @@ def _default_help_sections():
     return {
         1: [
             '📋 أوامر الإدارة — 1 | الحظر والطرد\n━━━━━━━━━━━━\nk@اسم — طرد عضو\nkick اسم — طرد عضو\nb@اسم — حظر عضو\nban اسم — حظر عضو\nub@اسم — فك الحظر\nu@اسم — فك الحظر\nunban اسم — فك الحظر\n.u — تراجع عن آخر إجراء للبوت',
-            '📋 أوامر الإدارة — 2 | الرتب\n━━━━━━━━━━━━\nm@اسم — منح عضوية\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك\n+صانع@اسم — إضافة صانع للغرفة\n-صانع@اسم — سحب صانع للغرفة\nصانعي — عرض صانعي الغرفة\nl@mas — عرض الماسترات\nmas@اسم — إضافة ماستر\numas@اسم — سحب ماستر',
+            '📋 أوامر الإدارة — 2 | الرتب\n━━━━━━━━━━━━\nm@اسم — منح عضوية\na@اسم — تعيين إداري\nadmin اسم — تعيين إداري\no@اسم — تعيين أونر/مالك\nowner اسم — تعيين أونر/مالك\n+صانع@اسم — إضافة صانع للغرفة\n-صانع@اسم — سحب صانع للغرفة\nصانعي — عرض صانعي الغرفة\nl@mas — عرض الماسترات\nmas@اسم — إضافة ماستر\numas@اسم — سحب ماستر\nvipmas@اسم — إضافة ماستر كامل\n-vipmas@اسم — سحب ماستر كامل\nunvipmas@اسم — سحب ماستر كامل\nl@vipmas — قائمة الماسترات الكاملة',
             '📋 أوامر الإدارة — 3 | التوثيق وVIP\n━━━━━━━━━━━━\nvi@اسم — توثيق مستخدم\nuns@اسم — سحب التوثيق\nسحب التوثيق@اسم — سحب التوثيق\nإزالة توثيق@اسم — سحب التوثيق\nتوثيق الكل — توثيق كل الأعضاء\nvi — عدد الموثقين\nvip@اسم — منح VIP\nunvip@اسم — سحب VIP\nvip — عدد أعضاء VIP\nmvip@اسم — إضافة ماستر توثيق\numvip@اسم — سحب ماستر توثيق\nl@mvip — عرض ماسترات التوثيق',
             '📋 أوامر الإدارة — 4 | التوثيق والحماية\n━━━━━━━━━━━━\nتشغيل التوثيق — تشغيل نظام التوثيق\nإيقاف التوثيق — إيقاف نظام التوثيق\nحماية@اسم_الغرفة — قائمة الحماية الخاصة بالماستر\nتشغيل/إيقاف الحماية — إعداد عام للغرفة\nحالة الحماية — عرض الحالة\nحمايه البوت — حماية داخلية للبوت\nالمحظورين — المحظورون داخل البوت',
             '📋 أوامر الإدارة — 5 | الفلتر والنشر\n━━━━━━━━━━━━\nmf@on — تشغيل فلتر الكلمات\nmf@off — إيقاف فلتر الكلمات\n+mf@كلمة — إضافة كلمة للفلتر\n-mf@كلمة — حذف كلمة من الفلتر\nl@mf — عرض كلمات الفلتر\nclear@mf — مسح كلمات الفلتر\nl@mfb — عرض المحظورين بسبب الفلتر\nl@mbp — عرض الممنوعين من النشر\nmbp@اسم — فك منع النشر\namf@اسم — استثناء مستخدم من حظر الفلتر',
-            '📋 أوامر الإدارة — 6 | أوامر متقدمة\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nغرفي / myrooms — الغرف المتصلة\nدخول الكل / دخولكل / .دخول غرفي — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم / is@اسم — البحث عن مستخدم\nl@a / l@m / l@o / l@b — قوائم الرتب',
+            '📋 أوامر الإدارة — 6 | أوامر النظام والتشخيص\n━━━━━━━━━━━━\nحالة البوت — حالة الاتصال\nرام / cpu — الموارد\nمالذي يؤخرك — تشخيص تأخر الرد (لماستر المتغيرات فقط)\nفحص الماس — فحص ألماسة تجريبية داخل الغرفة\nتنظيف — حذف الملفات المؤقتة\nنسخ احتياطي — إنشاء نسخة\nإعادة تشغيل البوت — إعادة تشغيل الخدمة\nتشغيل الماستر / إيقاف الماستر / حالة الماستر\nتشغيل/إيقاف الدعوات\nتشغيل/إيقاف الألعاب\nفحص صورة المليون / فحص صورة المليار — معاينة داخل الغرفة',
+            '📋 أوامر الإدارة — 7 | النقاط وسجلاتها\n━━━━━━━━━━━━\nmsb@اسم@عدد — إضافة نقاط من الماستر في الخاص\n-sb@اسم@عدد — خصم نقاط (الماستر الكامل في الخاص)\nربح@اسم — 3 انتصارات ثم خسارة في رهانات المستخدم\n-ربح@اسم — إلغاء التحكم بنتائج رهاناته\nسحب ربح@اسم — إيقاف التحكم بنتائج رهاناته\nts@اسم@عدد — استبدال رصيد المستخدم بدل رصيده القديم\nتحويل للكل@عدد — تحويل جماعي للمستخدمين الموجودين في الغرف\nسجل التحويل — عرض سجل عمليات النقاط\nسجل تحويل@اسم — عرض التحويلات إلى مستخدم\n\nمثال التسوية:\nts@ahmd555@5000',
+            '📋 أوامر الإدارة — 8 | الغرف والقوائم\n━━━━━━━━━━━━\nغرفي / myrooms — عرض الغرف المتصلة\nدخول الكل / دخولكل — دخول الغرف المحفوظة\nاضف لملف الغرف — حفظ الغرف الحالية\nجلب غرف السيرفر — طلب قائمة الغرف\ninv / دعوات / invite — جلب أعضاء الغرفة\ns@اسم — البحث عن اسم في الغرف\nis@اسم — عرض وجود المستخدم ورتبته المحلية\nl@a — قائمة الإداريين\nl@m — قائمة الأعضاء\nl@o — قائمة الأونرات\nl@b — قائمة المحظورين\nl@all — عرض قوائم الغرفة بالتتابع',
+            '📋 أوامر الإدارة — 9 | إعدادات وقوائم إضافية\n━━━━━━━━━━━━\namf@اسم / -amf@اسم — إضافة/سحب استثناء الفلتر\nl@amf — عرض مستثني الفلتر\nl@mfb — عرض المحظورين بسبب الفلتر\nl@mbp — عرض الممنوعين من النشر\nmr@عدد — ضبط حد تكرار الأوامر\nsf@on / sf@off — إعداد فلتر أمان الغرفة\nl@mas — عرض الماسترات\nl@mvip — عرض ماسترات التوثيق\n📌 تستخدم ns للتنقل حتى آخر قائمة.',
         ],
         2: [
             '🎵 الموسيقى — 1\n━━━━━━━━━━━━\n.sa اسم الأغنية — تشغيل أغنية\nsher@اسم — مشاركة آخر أغنية مع مستخدم\n\nمثال: .sa يا ليل\nsher@ahmd555\n\n🔒 تشغيل الأغاني للحسابات الموثقة.',
-            '❤️ التفاعلات والصور والشبيه — 2\n━━━━━━━━━━━━\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي أو صورتك — بحث آمن عن صورة مناسبة لاسمك\n.صوره اسم_المستخدم — بحث آمن عن صورة المستخدم\nشبيه@اسم — بحث آمن عن الشبيه\nشبيهك@اسم — بحث آمن عن شبيهك\n\n📌 النتائج العامة من الإنترنت، مع تفعيل SafeSearch ومنع البحث عن الصور المخلة.',
+            '❤️ التفاعلات والصور والشبيه — 2\n━━━━━━━━━━━━\nصمم صورتي — تصميم صورة حسابك بحركة 3D\nاسم احمد — إنشاء صورة اسم ثلاثية الأبعاد\nتغيير صورتك — تغيير صورة البوت (ماستر)\n👍 lk@كود — إعجاب\n❤️ lv@كود — حب\n👎 dl@كود — عدم إعجاب\n💬 cm@كود نص — تعليق\n🚨 report@كود نص — إبلاغ\n\nصورتي — عرض صورة حسابك الحقيقية فقط\n.صوره اسم_المستخدم أو موضوع — بحث آمن عن صورة من الإنترنت\n.صوره — صورة عشوائية: 30% قرود والباقي صورة بالغ/بالغة حسب الجنس المعروف\nشبيه@اسم / شبيهك@اسم — بحث آمن عن صورة شبيهة\n📌 SafeSearch صارم، وطلبات الصور المخلة محظورة.',
         ],
         3: [
             '🎮 A3 — الألعاب — 1: ضد البوت\n━━━━━━━━━━━━\n1. حجر/ورق/مقص — rock/paper/scissors\n2. استثمار — investment\n3. حظ — luck/chance\n4. عملة@وجه/كتابة — coin@heads/tails\n5. عجلة — wheel/roulette\n6. صندوق@1..3 — box/chest\n7. كوب@1..3 — cup\n8. وحش — monster\n9. بركان — volcano\n10. طائر — bird\n11. نجم — star\n12. طاولة — table\n13. اونو — uno\n📌 اكتب ns للقائمة التالية',
-            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n📌 حدد المبلغ بعد الاسم.',
+            '🎮 A3 — الألعاب — 2: الرهان والحظ\n━━━━━━━━━━━━\n14. رهان@مبلغ — bet/wager\n15. مضاربة@مبلغ — duel\n16. حظي@مبلغ — my luck\n17. استثمار@مبلغ — investment\n18. حظ@مبلغ — luck@amount\n44. كمين — تحدي لاعبَين؛ من يتفادى الفخ يفوز بمليار نقطة.\nتوب المراهنين / توب رهان — ترتيب أعلى 10 حسب إجمالي الرهانات المسجلة.\n📌 الحد الأدنى لجميع الرهانات المدفوعة 100k نقطة؛ اكتب 100k أو أكثر. «حظ» بلا مبلغ يبقى مجانيًا.',
             '🎮 A3 — الألعاب — 3: البنك والجوائز\n━━━━━━━━━━━━\n19. بنك مليون — bank million\n20. مليار — billion\n21. زرع@رمز — farm/crop@item\n22. فيس@اسم — face@name\n📌 زرع أو farm يعرض المحاصيل؛ 30 محصولاً كحد أقصى في كل قائمة، ثم ns للتالي. الأسماء العربية والإنجليزية مقبولة.',
-            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n\n🔨 المزاد: يفعّله الماستر بالخاص: تشغيل/إيقاف لعبة مزاد.\nافتح مزاد — ابدأ؛ مزايده — انضم (3–5 لاعبين).\nبعد البدء: لكل لاعب 7 ثوانٍ للمزايدة أو يمرّ الدور تلقائيًا؛ أقصى جولة 60 ثانية. اكتب «زايد 110m» أو «تمرير».\n⚠️ قد لا تكون القطع أصلية.\nsv — المخزون؛ red auction <الرمز> — استرداد 50/50: أصلي +0.75%، مغشوش -1.25%.',
+            '🎮 A3 — الألعاب — 4: ألعاب الغرف\n━━━━━━━━━━━━\n23. ثعبان — snake/snakes and ladders\n24. لودو — ludo\n25. سنارة — fishing/fishing rod/snare\n26. برق — lightning\n27. ياقوت — ruby\n28. صدام — crash\n29. كاشف — detector/guess who\n\n🔨 المزاد العالمي: الماستر في الخاص يرسل شغل لعبة مزاد / أوقف لعبة مزاد.\nافتح مزاد — يختار البوت سلعة نادرة ويرسل صورتها (≤50 KB).\nمزايده — تسجيل؛ عند 3 مشاركين يبدأه الفاتح، وعند 5 يبدأ تلقائياً.\nبعد البدء: المزايدة بالدور لمدة 60 ثانية. عند دورك اكتب «زايد <المبلغ>»؛ أول مزايدة لا تقل عن السعر الابتدائي، وكل مزايدة لاحقة أعلى من السعر الحالي بـ10,000,000 نقطة على الأقل، أو اكتب «تمرير». يتجاهل البوت أوامر المزايدة خارج الدور بصمت.\nأثناء الجولة، مزايده تعني أن المزاد شغال؛ انتظر انتهاءه. فاتح الجولة أو الماستر يستطيع إقفاله بأمر «اقفل المزاد». بعد الإغلاق: «زايد/مزايده» يرد بأن المزاد مغلق وانتظر جولة أخرى.\nsv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاسترداد بالحظ: 1% ربح، 1% خسارة، و98% دون ربح أو خسارة.',
             '🎮 A3 — ألعاب إضافية\n━━━━━━━━━━━━\n30. زواج / marriage\n31. تحدي / challenge\n32. لغز / riddle\n33. مزاج / mood\n34. حصانه / horse\n35. تسليه / entertainment\n36. بورصة / stock — استثمار تلقائي بالذهب بعد التحذير؛ بورصتي لسجلك\n37. اسرق@اسم / steal\n38. شبيه@اسم / lookalike\n39. Shot / شوت — صيد عادي؛ التنين بعد الإعلان\n40. صيد مزه / صيد مز — اختيار عضو عشوائي وصورة عامة\n41. طليقي — اختيار طليق عشوائي\n42. خلع — حكم مزاح ورد النفقات\n43. طلاق — حكم مزاح بالثلاث\n📌 ns للقائمة التالية.',
             '🏏 A3 — الألعاب — 6: الكركيت\n━━━━━━━━━━━━\nللماستر في الخاص: تشغيل لعبة الكركيت / start cricket game لتفعيل الملفات؛ الإيقاف .cr 0 / stop cricket game.\nللموثقين داخل الغرفة: أرسل .cr 1 لفتح الإعداد، ثم أرسل رقمًا من 1 إلى 4 (مثل .cr 4) وبعدها يرسل كل لاعب Join. عند بدء المباراة يعلن البوت أسماء الفريقين والغرفتين في جميع غرفه، ثم تنضم الغرفة الثانية بـ Join.\nبعد اكتمال الفريقين: 1 هجوم أو 2 دفاع. كل لاعب 6 كرات؛ أرسل 0–6. bot أو cricket 1..4 مباراة فردية. الجائزة 200,000 نقطة، مع صور الكرات والبطّة والهتريك.',
         ],
         4: [
             '🎁 الهدايا — 1\n━━━━━━━━━━━━\nsa@رقم@اسم — إرسال هدية\nهدايا — عرض/فتح نظام الهدايا (حتى 30 هدية في القائمة)\ngifts / gv — قائمة الهدايا؛ اكتب ns للتالي\n\n🔒 المرسل والمستلم يجب أن يكونا موثقين/مسموحاً لهما بالنظام.\n💰 يتم خصم قيمة الهدية من رصيد النقاط.',
-            '📢 النشر — 2\n━━━━━━━━━━━━\nبوست أو انشر — تجهيز ونشر صورة\nax@النص — نشر بطاقة اكسبلور مع الرموز التعبيرية والتفاعلات\nبوست@وصف أو انشر@وصف — نشر صورة مع وصف\n📌 الوصف يمر عبر فلتر الكلمات المسيئة، ومن يخالفه يُمنع من النشر حتى mbp@اسم\n\n📌 أرسل الصورة بعد أمر بوست أو انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
+            '📢 النشر — 2\n━━━━━━━━━━━━\nبوست أو انشر — تجهيز ونشر صورة\nبوست@وصف أو انشر@وصف — نشر صورة مع وصف\nax@النص — إنشاء بطاقة اكسبلور بصورة حسابك ونشرها في الغرف\nx@كود — إعادة نشر منشور اكسبلور مع اسم من أعاد نشره\n👍 lk@كود / 👎 dl@كود / ❤️ lv@كود — تفاعل؛ يصل الرد إلى الغرفة والناشر\n🚨 report@كود نص — إرسال بلاغ للماستر\n📌 الوصف يمر عبر فلتر الكلمات المسيئة، ومن يخالفه يُمنع من النشر حتى mbp@اسم\n\n📌 أرسل الصورة بعد أمر بوست أو انشر عندما يطلب البوت ذلك.\n📌 النشر متاح للحسابات المسموح لها حسب إعدادات البوت.',
         ],
         5: [
             '💰 النقاط — 1\n━━━━━━━━━━━━\nنقاطي — عرض الرصيد والمستوى وإحصاءات اللعب\npoints — عرض النقاط\nتوب — المتصدرين العام\ntop — المتصدرين العام\n\nتوب رهان — متصدروا الرهان\nتوب مضاربة — متصدروا المضاربة\nتوب حظي — متصدروا حظي\nتوب استثمار — متصدروا الاستثمار',
-            '💸 النقاط — 2: التحويل والتسوية\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل؛ يتطلب تطابق الاسم وID المرسل والمستلم مع ملف النقاط\nmsb@اسم@عدد — تحويل الماستر من الخاص دون خصم\nts@اسم@عدد — استبدال رصيد المستخدم (الماستر الأساسي، بالخاص فقط)\n\n📌 sb للموثقين؛ يرفض أي ID غير مطابق ولا يخصم عند الفشل.\n📌 للماستر الأساسي: تحديث ايدي ملفvip / حدث ايديهات ملف النقاط\n\nللاطلاع على الرصيد استخدم: نقاطي',
+            '💸 النقاط — 2: التحويل والتسوية\n━━━━━━━━━━━━\nsb@اسم@عدد — تحويل عادي من رصيد المرسل\nmsb@اسم@عدد — تحويل الماستر من الخاص دون خصم\nts@اسم@عدد — استبدال رصيد المستخدم من ملف النقاط\n\nمثال اللاعب:\nsb@ahmd555@1000\nمثال الماستر في الخاص:\nmsb@ahmd555@1000\nts@ahmd555@5000\n\n📌 sb متاح للموثقين في الغرف والخاص ويخصم من رصيد المرسل.\n📌 msb وts للماستر الأساسي في خاص البوت فقط.\n\nللاطلاع على الرصيد استخدم: نقاطي',
         ],
         6: [
             '🚪 الغرف — 1\n━━━━━━━━━━━━\nدخول@اسم_الغرفة — دخول غرفة\nدخول غرفي — دخول جميع الغرف المحفوظة بالتتابع\nمثال: دخول@مشاعر\nخروج — الخروج من الغرفة الحالية\nخروج اسم_الغرفة — الخروج من غرفة محددة\nغرفي — عرض الغرف التي يتواجد بها البوت\nmyrooms — نفس الأمر\n\ninv — دعوة أعضاء الغرفة الحالية\ninv اسم_الغرفة — دعوة أعضاء غرفة محددة\nدعوات — نفس أمر inv\ninvite — نفس أمر inv\ninvmsg نص — تغيير رسالة الدعوة\ni@اسم — دعوة مستخدم واحد',
@@ -5478,7 +5722,7 @@ def _default_help_pages():
 
 
 def _help_sections_from_messages():
-    # The six help pages are a fixed public contract. Older deployments may
+    # The six help categories are a fixed public contract. Older deployments may
     # still contain root/bot_data messages.json files with a mixed help_pages
     # format; never let those legacy files merge categories together.
     # The canonical categories are defined in _default_help_sections().
@@ -5564,27 +5808,40 @@ _AR_LAM_ALEF_FINAL = {
 }
 
 def _embedded_reshape(source_text):
-    """Shape Arabic letters into Unicode Presentation Forms without any library."""
+    """Shape Arabic letters while keeping every combining mark attached."""
     chars = list(str(source_text or ""))
-    letters = [i for i, c in enumerate(chars) if c not in _AR_TASHKEEL]
     out = list(chars)
-    m = len(letters)
-    for idx, i in enumerate(letters):
-        c = chars[i]
-        if c not in _ARABIC_FORMS:
+
+    def neighbor(index, step):
+        j = index + step
+        while 0 <= j < len(chars):
+            ch = chars[j]
+            if unicodedata.category(ch).startswith("M"):
+                j += step
+                continue
+            return ch
+        return None
+
+    for i, ch in enumerate(chars):
+        if ch not in _ARABIC_FORMS:
             continue
-        prev_c = chars[letters[idx - 1]] if idx > 0 else None
-        next_c = chars[letters[idx + 1]] if idx < m - 1 else None
-        # Lam-Alef ligature
-        if c == '\u0644' and (prev_c, next_c is not None) and next_c in ('\u0622', '\u0623', '\u0625', '\u0627'):
+        prev_c = neighbor(i, -1)
+        next_c = neighbor(i, 1)
+        if ch == "\u0644" and next_c in ("\u0622", "\u0623", "\u0625", "\u0627"):
+            pair = (ch, next_c)
             joined_prev = prev_c in _AR_DUAL_JOIN
-            pair = (c, next_c)
-            out[i] = (_AR_LAM_ALEF_FINAL if joined_prev else _AR_LAM_ALEF).get(pair, out[i])
-            out[letters[idx + 1]] = ""
+            out[i] = (_AR_LAM_ALEF_FINAL if joined_prev else _AR_LAM_ALEF)[pair]
+            # Consume only the alef codepoint, never the marks beside it.
+            for j in range(i + 1, len(chars)):
+                if unicodedata.category(chars[j]).startswith("M"):
+                    continue
+                if chars[j] == next_c:
+                    out[j] = ""
+                break
             continue
         connect_prev = prev_c in _AR_DUAL_JOIN
-        connect_next = c in _AR_DUAL_JOIN and next_c in _ARABIC_FORMS
-        forms = _ARABIC_FORMS[c]
+        connect_next = ch in _AR_DUAL_JOIN and next_c in _ARABIC_FORMS
+        forms = _ARABIC_FORMS[ch]
         if connect_prev and connect_next:
             out[i] = forms[3]
         elif connect_prev:
@@ -5632,17 +5889,340 @@ def _shape_name(text):
             return get_display(arabic_reshaper.reshape(raw), base_dir="R")
         except Exception:
             pass
-    # Embedded fallback: correct shaping and visual order with no external libs.
-    if _has_arabic(raw):
+    # Never use the old embedded bidi approximation as a last resort: it can
+    # reverse decorated usernames. The original logical text is safer than a
+    # visually corrupted name when optional shaping libraries are unavailable.
+    return raw
+
+def _shape_name_for_fallback(text):
+    """Shape Arabic and resolve mixed-direction runs for manual font fallback.
+    This path is used only when no single font has every decoration/glyph.
+    Plain and decorated names are returned in the same visual order used by
+    the room client. The original logical name is never modified in storage or
+    in chat messages; this function only prepares a temporary drawing string.
+    """
+    raw = _clean_name_for_image(text)
+    if not raw or not _has_arabic(raw):
+        return raw
+    # A fallback is needed only when the base Arabic font cannot render every
+    # symbol. Shape and reorder the complete mixed string exactly once before
+    # splitting it between fonts; otherwise a name such as ``مرحبا ☀🐎`` is
+    # drawn left-to-right in separate runs and appears visually reversed.
+    if arabic_reshaper is not None and get_display is not None:
         try:
-            return _embedded_bidi(raw)
+            return get_display(arabic_reshaper.reshape(raw), base_dir="R")
+        except Exception:
+            pass
+    return _embedded_bidi(raw)
+
+
+def _shape_name_for_ltr(text):
+    """Prepare Arabic glyph forms while preserving the user's left-to-right order."""
+    raw = _clean_name_for_image(text)
+    if not raw or not _has_arabic(raw):
+        return raw
+    if arabic_reshaper is not None:
+        try:
+            return arabic_reshaper.reshape(raw)
         except Exception:
             pass
     return raw
 
+_NAME_BIDI_CONTROLS = frozenset(
+    "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+)
+
+def _clean_name_for_image(text):
+    """Remove a mention prefix and invisible bidi overrides from image text."""
+    raw = str(text or "").lstrip("@")
+    return "".join(ch for ch in raw if ch not in _NAME_BIDI_CONTROLS)
+
+def _strip_hidden_image_decorations(text):
+    """Remove unsafe control characters without deleting name decoration.
+
+    Arabic combining marks, tatweel, musical combining marks, ZWJ and ZWNJ
+    are part of many decorated usernames and must survive image rendering.
+    Bidi overrides are already removed by _clean_name_for_image.
+    """
+    raw = str(text or "")
+    return "".join(
+        ch for ch in raw
+        if unicodedata.category(ch) not in {"Cc", "Cs", "Cn"}
+    )
+
+def _compact_name_for_image(text):
+    """Keep the readable name while dropping width-heavy decoration.
+
+    This is used only for image display. Preserve all visible letters, symbols,
+    punctuation and tatweel in their original order; remove only tiny marks
+    and hidden controls. Account identity and saved correction records
+    remain based on the original text.
+    """
+    raw = _clean_name_for_image(text)
+    normalized = raw
+    kept = []
+    for ch in normalized:
+        category = unicodedata.category(ch)
+        # Preserve Arabic tashkeel, decorative combining marks and ZWJ/ZWNJ.
+        if category in {"Cc", "Cs", "Cn"}:
+            continue
+        kept.append(ch)
+    compact = "".join(kept)
+    return compact.strip() or normalized.strip()
+
+def _name_for_chat_text(text):
+    """Isolate a decorated username inside mixed Arabic chat sentences."""
+    raw = str(text or "")
+    return f"\u2068{raw}\u2069" if raw else raw
+
+def _image_name_key(text):
+    value = _clean_name_for_image(text).strip()
+    return unicodedata.normalize("NFC", value).casefold()
+
+def _image_name_corrections_enabled():
+    """Whether approved display-name overrides are enabled (default: on)."""
+    state = _load_local_json(NAME_IMAGE_SETTINGS_FILE, {})
+    if not isinstance(state, dict):
+        return True
+    value = state.get("enabled", True)
+    return value not in (False, 0, "0", "false", "False", "off", "OFF", "disabled")
+
+
+def _set_image_name_corrections_enabled(enabled):
+    _save_local_json(NAME_IMAGE_SETTINGS_FILE, {
+        "enabled": bool(enabled),
+        "updated_at": int(time.time()),
+    })
+    return bool(enabled)
+
+
+def _display_name_for_image(text):
+    """Return the master-approved image spelling for this exact username."""
+    source = _clean_name_for_image(text)
+    if not _image_name_corrections_enabled():
+        return source
+    key = _image_name_key(source)
+    if not key:
+        return source
+    records = _load_local_json(NAME_IMAGE_CORRECTIONS_FILE, {})
+    record = records.get(key) if isinstance(records, dict) else None
+    if record is None and isinstance(records, dict):
+        compact_key = _game_name_key(source)
+        for candidate in records.values():
+            if not isinstance(candidate, dict):
+                continue
+            if compact_key in {
+                _game_name_key(candidate.get("source_name", "")),
+                _game_name_key(candidate.get("display_name", "")),
+            }:
+                record = candidate
+                break
+    corrected = record.get("display_name") if isinstance(record, dict) else record
+    if isinstance(record, dict) and isinstance(corrected, str) and corrected:
+        # Earlier versions required masters to enter the exact inverse visual
+        # order as a workaround for the old LTR renderer. Recognize that legacy
+        # compensation and transparently restore the original chat spelling.
+        legacy_source = _clean_name_for_image(record.get("source_name", "")).strip()
+        if legacy_source and _has_arabic(legacy_source):
+            try:
+                legacy_tokens = _mixed_rtl_name_tokens(legacy_source)
+                if (any(t.get("kind") == "arabic" for t in legacy_tokens)
+                        and any(t.get("kind") == "other" for t in legacy_tokens)):
+                    legacy_inverse = "".join(
+                        t.get("text", "") + t.get("suffix", "")
+                        for t in reversed(legacy_tokens)
+                    )
+                    if _image_name_key(legacy_inverse) == _image_name_key(corrected):
+                        return legacy_source
+            except Exception:
+                pass
+    return _clean_name_for_image(corrected) if isinstance(corrected, str) and corrected else source
+
+def _has_image_name_correction(text):
+    """Return whether this username has an approved image spelling."""
+    source = _clean_name_for_image(text)
+    key = _image_name_key(source)
+    records = _load_local_json(NAME_IMAGE_CORRECTIONS_FILE, {})
+    record = records.get(key) if isinstance(records, dict) else None
+    if record is None and isinstance(records, dict):
+        compact_key = _game_name_key(source)
+        record = next(
+            (
+                candidate for candidate in records.values()
+                if isinstance(candidate, dict)
+                and compact_key in {
+                    _game_name_key(candidate.get("source_name", "")),
+                    _game_name_key(candidate.get("display_name", "")),
+                }
+            ),
+            None,
+        )
+    return isinstance(record, dict) and bool(record.get("display_name"))
+
+def _clear_image_name_corrections():
+    """Remove all previously approved image-name overrides."""
+    _save_local_json(NAME_IMAGE_CORRECTIONS_FILE, {})
+
+def _delete_image_name_correction(username):
+    """Delete one user's correction chain and return whether anything changed."""
+    source = _clean_name_for_image(username).strip()
+    if not source:
+        return False
+    records = _load_local_json(NAME_IMAGE_CORRECTIONS_FILE, {})
+    if not isinstance(records, dict):
+        return False
+    related_names = {_image_name_key(source)}
+    related_game_names = {_game_name_key(source)}
+    changed = True
+    while changed:
+        before = (len(related_names), len(related_game_names))
+        for record in records.values():
+            if isinstance(record, dict):
+                record_names = {
+                    _image_name_key(record.get("source_name", "")),
+                    _image_name_key(record.get("display_name", "")),
+                }
+                record_game_names = {
+                    _game_name_key(record.get("source_name", "")),
+                    _game_name_key(record.get("display_name", "")),
+                }
+            else:
+                record_names = {_image_name_key(str(record or ""))}
+                record_game_names = {_game_name_key(str(record or ""))}
+            if ((record_names & related_names) or
+                    (record_game_names & related_game_names)):
+                related_names.update(record_names)
+                related_game_names.update(record_game_names)
+        changed = (len(related_names), len(related_game_names)) != before
+    removed = False
+    for key, record in list(records.items()):
+        if key in related_names or (
+            (
+                _game_name_key(record.get("source_name", "")) in related_game_names
+                or _game_name_key(record.get("display_name", "")) in related_game_names
+            ) if isinstance(record, dict) else
+            _game_name_key(str(record or "")) in related_game_names
+        ):
+            records.pop(key, None)
+            removed = True
+    if removed:
+        _save_local_json(NAME_IMAGE_CORRECTIONS_FILE, records)
+    return removed
+
+def _save_image_name_correction(source_name, display_name):
+    source = _clean_name_for_image(source_name).strip()
+    display = _clean_name_for_image(display_name).strip()
+    key = _image_name_key(source)
+    if not key or not display:
+        raise ValueError("اسم المصدر أو الاسم المصحح فارغ")
+    records = _load_local_json(NAME_IMAGE_CORRECTIONS_FILE, {})
+    if not isinstance(records, dict):
+        records = {}
+    # Replace the user's previous correction chain instead of accumulating
+    # stale aliases when the master uses "تعديل اسم" again.
+    related_names = {key, _image_name_key(display)}
+    related_game_names = {_game_name_key(source), _game_name_key(display)}
+    changed = True
+    while changed:
+        changed = False
+        for record in records.values():
+            if isinstance(record, dict):
+                record_names = {
+                    _image_name_key(record.get("source_name", "")),
+                    _image_name_key(record.get("display_name", "")),
+                }
+                record_game_names = {
+                    _game_name_key(record.get("source_name", "")),
+                    _game_name_key(record.get("display_name", "")),
+                }
+            else:
+                record_names = {_image_name_key(str(record or ""))}
+                record_game_names = {_game_name_key(str(record or ""))}
+            overlap = (record_names & related_names) or (record_game_names & related_game_names)
+            if overlap and not record_names.issubset(related_names):
+                before = (len(related_names), len(related_game_names))
+                related_names.update(record_names)
+                related_game_names.update(record_game_names)
+                changed = (len(related_names), len(related_game_names)) != before
+    for old_key, record in list(records.items()):
+        if old_key in related_names or (
+            (
+                _game_name_key(record.get("source_name", "")) in related_game_names
+                or _game_name_key(record.get("display_name", "")) in related_game_names
+            ) if isinstance(record, dict) else
+            _game_name_key(str(record or "")) in related_game_names
+        ):
+            records.pop(old_key, None)
+    correction = {
+        "source_name": source,
+        "display_name": display,
+        "updated_at": time.time(),
+    }
+    # Keep both spellings addressable. The platform may report the user's
+    # original spelling in one event and the manually corrected spelling in a
+    # later event; either must resolve to the approved display name.
+    records[key] = correction
+    display_key = _image_name_key(display)
+    if display_key:
+        records[display_key] = {
+            **correction,
+            "source_name": source,
+        }
+    _save_local_json(NAME_IMAGE_CORRECTIONS_FILE, records)
+    return display
+
+_SECRET_EXPORT_PASSWORD_ITERATIONS = 390000
+_SECRET_EXPORT_PASSWORD_LOCK = threading.RLock()
+
+def _set_secret_export_password(password):
+    password = str(password or "")
+    if not 8 <= len(password) <= 256:
+        raise ValueError("يجب أن تتكون كلمة المرور من 8 إلى 256 حرفًا")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, _SECRET_EXPORT_PASSWORD_ITERATIONS
+    )
+    path = Path(TELEGRAM_SECRET_AUTH_FILE)
+    payload = json.dumps({
+        "scheme": "pbkdf2_sha256",
+        "iterations": _SECRET_EXPORT_PASSWORD_ITERATIONS,
+        "salt": salt.hex(),
+        "digest": digest.hex(),
+    }, separators=(",", ":"))
+    with _SECRET_EXPORT_PASSWORD_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(payload, encoding="utf-8")
+            temporary.chmod(0o600)
+            temporary.replace(path)
+            path.chmod(0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+def _verify_secret_export_password(password):
+    with _SECRET_EXPORT_PASSWORD_LOCK:
+        record = _load_local_json(TELEGRAM_SECRET_AUTH_FILE, None)
+    if not isinstance(record, dict) or record.get("scheme") != "pbkdf2_sha256":
+        return False
+    try:
+        iterations = int(record.get("iterations", 0))
+        salt = bytes.fromhex(str(record.get("salt", "")))
+        expected = str(record.get("digest", ""))
+        if not 100000 <= iterations <= 1000000 or len(salt) != 16 or len(expected) != 64:
+            return False
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", str(password or "").encode("utf-8"), salt, iterations
+        ).hex()
+        return secrets.compare_digest(actual, expected)
+    except (TypeError, ValueError):
+        return False
+
 _GIFT_FONT_CACHE = {}
 _GLYPH_CACHE = {}
 _FONT_CMAP_CACHE = {}
+_EMOJI_FONT_PATH = ASSETS_DIR / "NotoColorEmoji.ttf"
+_EMOJI_FONT_CACHE = {}
 
 try:
     from fontTools.ttLib import TTFont
@@ -5657,243 +6237,21 @@ def _load_font(path, size):
         _GIFT_FONT_CACHE[key]=ImageFont.truetype(str(path),int(size))
     return _GIFT_FONT_CACHE[key]
 
-def _font_cmap(path):
-    """Return a real Unicode cmap so .notdef/tofu glyphs are never mistaken
-    for supported characters.  This fixes square boxes for decorative Unicode.
-    """
-    key=str(path)
-    if key in _FONT_CMAP_CACHE:
-        return _FONT_CMAP_CACHE[key]
-    cmap=set()
-    if _FONTTOOLS_OK:
+
+_GIFT_BASIC_FONT_CACHE = {}
+
+def _load_font_basic(path, size):
+    """Load BASIC layout to prevent a dotted-circle fallback for isolated marks."""
+    key = (str(path), int(size), "basic")
+    if key not in _GIFT_BASIC_FONT_CACHE:
         try:
-            ft=TTFont(key, lazy=True)
-            for table in ft['cmap'].tables:
-                cmap.update(table.cmap.keys())
-            ft.close()
+            engine = getattr(getattr(ImageFont, "Layout", ImageFont), "BASIC", None)
+            font = (ImageFont.truetype(str(path), int(size), layout_engine=engine)
+                    if engine is not None else ImageFont.truetype(str(path), int(size)))
         except Exception:
-            cmap=set()
-    _FONT_CMAP_CACHE[key]=cmap
-    return cmap
-
-def _gift_font(text,size):
-    # Main Arabic font.  Other scripts/symbols are chosen from real Unicode
-    # coverage below; NotoSansArabic must not claim missing glyphs.
-    candidates = [
-        BASE_DIR/"assets"/"NotoSansArabic-SemiBold.ttf",
-        BASE_DIR/"assets"/"Amiri-Bold.ttf",
-        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"),
-        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-SemiBold.ttf"),
-        BASE_DIR/"assets"/"DejaVuSans.ttf",
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-    ]
-    for path in candidates:
-        if path.is_file():
-            return _load_font(path,size)
-    raise RuntimeError("لم أجد خطًا صالحًا لرسم أسماء الهدايا")
-
-def _fallback_font_paths():
-    paths=[
-        BASE_DIR/"assets"/"NotoSansArabic-SemiBold.ttf",
-        BASE_DIR/"assets"/"Amiri-Bold.ttf",
-        BASE_DIR/"assets"/"DejaVuSans.ttf",
-        BASE_DIR/"assets"/"NotoSansSymbols2-Regular.ttf",
-        BASE_DIR/"assets"/"NotoSansSymbols-Regular.ttf",
-        BASE_DIR/"assets"/"Symbola.ttf",
-        BASE_DIR/"assets"/"NotoSansEgyptianHieroglyphs-Regular.ttf",
-        BASE_DIR/"assets"/"NotoMusic-Regular.ttf",
-        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"),
-        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-SemiBold.ttf"),
-        Path("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
-        Path("/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
-        Path("/usr/share/fonts/truetype/noto/NotoSansEgyptianHieroglyphs-Regular.ttf"),
-        Path("/usr/share/fonts/truetype/noto/NotoMusic-Regular.ttf"),
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-    ]
-    # Also inspect any extra font files already shipped inside the bot assets.
-    try:
-        for root in (BASE_DIR/"assets", Path("/usr/share/fonts")):
-            if root.exists():
-                for ext in ("*.ttf", "*.otf"):
-                    for fp in root.rglob(ext):
-                        paths.append(fp)
-    except Exception:
-        pass
-    out=[]; seen=set()
-    for p in paths:
-        p=Path(p)
-        if p.is_file() and str(p) not in seen:
-            seen.add(str(p)); out.append(p)
-    return out
-
-def _fallback_fonts(size):
-    out=[]
-    for p in _fallback_font_paths():
-        try:
-            out.append(_load_font(p,size))
-        except Exception:
-            continue
-    return out
-
-def _font_has_glyph(font, ch):
-    """Check Unicode cmap first; never accept a tofu/.notdef box as support."""
-    try:
-        path=getattr(font, 'path', None)
-        if path:
-            cmap=_font_cmap(path)
-            if cmap:
-                return ord(ch) in cmap
-        # Compatibility fallback when fontTools is unavailable.
-        mask=font.getmask(ch)
-        return mask.getbbox() is not None and font.getlength(ch) > 0
-    except Exception:
-        return False
-
-def _pick_font_for_char(base, fallbacks, ch):
-    # Prefer the Arabic/main font only when its cmap really contains the glyph.
-    if _font_has_glyph(base, ch):
-        return base
-    for font in fallbacks:
-        if _font_has_glyph(font, ch):
-            return font
-    return None
-
-def _draw_name_visual(draw, xy, raw_text, size, fill, stroke_width=2,
-                      stroke_fill=(0,0,0,220), direction="ltr"):
-    """Draw one username from the user's exact command/message text.
-
-    Arabic is reshaped/bidi-ordered once.  Each Unicode code point is then
-    rendered with a font that genuinely contains that code point.  This is
-    what prevents boxes for names containing 𓆩♛𓆪 and musical symbols.
-    """
-    raw_text = str(raw_text or "")
-    try:
-        native_rtl = bool(PIL_AVAILABLE and features.check("raqm") and _has_arabic(raw_text))
-    except Exception:
-        native_rtl = False
-    # Raqm expects logical Arabic text and performs shaping plus bidi itself.
-    # Do not pre-reverse it, otherwise the generated card shows mirrored text.
-    base_font = _gift_font(raw_text, int(size))
-    native_complete = native_rtl and all(
-        _font_has_glyph(base_font, ch) or unicodedata.category(ch).startswith("M")
-        for ch in raw_text if not ch.isspace()
-    )
-    if native_complete:
-        try:
-            draw.text(xy, raw_text, font=base_font, fill=fill,
-                      stroke_width=stroke_width, stroke_fill=stroke_fill,
-                      direction="rtl", language="ar")
-        except Exception:
-            draw.text(xy, raw_text, font=base_font, fill=fill,
-                      stroke_width=stroke_width, stroke_fill=stroke_fill)
-        try:
-            return xy[0] + draw.textlength(raw_text, font=base_font,
-                                           direction="rtl", language="ar")
-        except Exception:
-            return xy[0] + base_font.getlength(raw_text)
-
-    # Decorative names often mix Arabic with Egyptian glyphs, chess symbols,
-    # musical symbols, and tatweel.  No single font contains all of them, so
-    # shape/bidi the complete logical string once, then draw visual runs with
-    # real fallback fonts. This avoids tofu squares without reversing twice.
-    # Without Raqm the runs path must draw the already-shaped visual string
-    # (reshaped + bidi-ordered once by _shape_name) or Arabic renders reversed.
-    visual = _shape_name(raw_text) if not native_rtl else raw_text
-    if not visual:
-        return xy[0]
-    base=_gift_font(visual,int(size))
-    fallbacks=_fallback_fonts(int(size))
-
-    # Keep combining marks attached to the preceding glyph's font where possible.
-    runs=[]; cur_font=None; cur=[]
-    unsupported=[]
-    prev_font=None
-    for ch in visual:
-        font=_pick_font_for_char(base,fallbacks,ch)
-        # Combining marks/variation selectors should follow the previous font.
-        cat=unicodedata.category(ch)
-        if font is None and prev_font is not None and cat.startswith("M"):
-            font=prev_font
-        if font is None:
-            unsupported.append(ch)
-            # Do not draw a fake square. The character is omitted only when no
-            # installed/shipped font can actually render it.
-            continue
-        if cur_font is None or getattr(font,'path',None)==getattr(cur_font,'path',None):
-            cur.append(ch)
-        else:
-            runs.append((cur_font,''.join(cur))); cur=[ch]
-        cur_font=font; prev_font=font
-    if cur:
-        runs.append((cur_font,''.join(cur)))
-
-    # Mixed decorative names need RTL run placement. Arabic runs are shaped
-    # natively by Raqm; symbol runs use their fallback font and retain order.
-    if _has_arabic(raw_text) and native_rtl:
-        y = xy[1]
-        widths=[]
-        for font,run in runs:
-            try:
-                direction = "rtl" if _has_arabic(run) else "ltr"
-                width = draw.textlength(run, font=font, direction=direction, language="ar" if direction == "rtl" else None)
-            except Exception:
-                width = font.getlength(run)
-            widths.append(width)
-        x_right = xy[0] + sum(widths)
-        for (font,run), width in reversed(list(zip(runs, widths))):
-            x_right -= width
-            direction = "rtl" if _has_arabic(run) else "ltr"
-            try:
-                draw.text((x_right,y),run,font=font,fill=fill,stroke_width=stroke_width,
-                          stroke_fill=stroke_fill,direction=direction,
-                          language="ar" if direction == "rtl" else None)
-            except Exception:
-                draw.text((x_right,y),run,font=font,fill=fill,stroke_width=stroke_width,
-                          stroke_fill=stroke_fill)
-        return xy[0] + sum(widths)
-
-    x,y=xy
-    for font,run in runs:
-        try:
-            draw.text((x,y),run,font=font,fill=fill,stroke_width=stroke_width,
-                      stroke_fill=stroke_fill,direction="ltr")
-        except Exception:
-            draw.text((x,y),run,font=font,fill=fill,stroke_width=stroke_width,
-                      stroke_fill=stroke_fill)
-        try:
-            x += draw.textlength(run,font=font,direction="ltr")
-        except Exception:
-            x += font.getlength(run)
-    if unsupported:
-        try:
-            # Keep a concise diagnostic in the log without exposing the full name.
-            print("[GIFT-FONT] unsupported Unicode: " + " ".join(f"U+{ord(c):04X}" for c in sorted(set(unsupported))))
-        except Exception:
-            pass
-    return x
-
-def _draw_exact_text(draw, xy, raw_text, size, fill, stroke_width=2, stroke_fill=(0,0,0,220)):
-    return _draw_name_visual(draw, xy, raw_text, size, fill, stroke_width, stroke_fill)
-
-def _fit_crop(im,size):
-    im=im.convert("RGB"); tw,th=size; scale=max(tw/im.width,th/im.height); nw,nh=max(tw,int(im.width*scale)),max(th,int(im.height*scale)); im=im.resize((nw,nh),Image.LANCZOS); left=max(0,(nw-tw)//2); top=max(0,(nh-th)//2); return im.crop((left,top,left+tw,top+th))
-
-def _draw_centered(draw,center,raw_text,size,fill,max_width):
-    return _draw_name_centered(draw, center, raw_text, size, fill, max_width)
-
-_EMOJI_FONT_PATH = BASE_DIR / "assets" / "NotoColorEmoji.ttf"
-
-_EMOJI_FONT_CACHE = {}
-
-_NAME_BIDI_CONTROLS = frozenset(
-    "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
-)
-
-
-def _clean_name_for_image(text):
-    """Strip the mention prefix and invisible bidi overrides from image text."""
-    raw = str(text or "").lstrip("@")
-    return "".join(char for char in raw if char not in _NAME_BIDI_CONTROLS)
+            font = _load_font(path, size)
+        _GIFT_BASIC_FONT_CACHE[key] = font
+    return _GIFT_BASIC_FONT_CACHE[key]
 
 
 def _emoji_font():
@@ -5912,6 +6270,7 @@ def _emoji_font():
     _EMOJI_FONT_CACHE[key] = font
     return font
 
+
 def _is_emoji_base(ch):
     codepoint = ord(ch)
     return (
@@ -5927,6 +6286,7 @@ def _is_emoji_base(ch):
             0x2796, 0x2797, 0x27A1, 0x27B0, 0x27BF, 0x2B50, 0x2B55,
         }
     )
+
 
 def _draw_color_emoji(draw, xy, token, size):
     """Draw one emoji token without losing color emoji unsupported by TTF fonts."""
@@ -5955,381 +6315,667 @@ def _draw_color_emoji(draw, xy, token, size):
     except Exception:
         return None
 
-_EXPLORE_TEXT_COLORS = (
-    (255, 221, 163),  # warm gold
-    (137, 231, 222),  # mint
-    (255, 170, 196),  # rose
-    (176, 199, 255),  # periwinkle
-    (226, 184, 255),  # lavender
-    (255, 193, 139),  # peach
-)
+def _parse_font_cmap_without_fonttools(path):
+    """Read Unicode cmap entries from a TTF/OTF using only the stdlib."""
+    data = Path(path).read_bytes()
+    if len(data) < 12 or data[:4] == b"ttcf":
+        return set()
+    table_count = struct.unpack_from(">H", data, 4)[0]
+    cmap_offset = cmap_length = None
+    for index in range(table_count):
+        record = 12 + index * 16
+        if record + 16 > len(data):
+            break
+        tag = data[record:record + 4]
+        if tag == b"cmap":
+            cmap_offset, cmap_length = struct.unpack_from(">II", data, record + 8)
+            break
+    if cmap_offset is None or cmap_offset + 4 > len(data):
+        return set()
 
-_EXPLORE_TEXT_COLOR_LOCK = threading.Lock()
-
-_EXPLORE_TEXT_COLOR_INDEX = random.randrange(len(_EXPLORE_TEXT_COLORS))
-
-def _next_explore_text_color():
-    """Cycle through refined text colors so consecutive Explore posts differ."""
-    global _EXPLORE_TEXT_COLOR_INDEX
-    with _EXPLORE_TEXT_COLOR_LOCK:
-        color = _EXPLORE_TEXT_COLORS[_EXPLORE_TEXT_COLOR_INDEX]
-        _EXPLORE_TEXT_COLOR_INDEX = (_EXPLORE_TEXT_COLOR_INDEX + 1) % len(_EXPLORE_TEXT_COLORS)
-    return color
-
-def _explore_heart_mask(size, scale=4):
-    """Build a smooth, symmetric heart mask from sampled cubic Bézier curves."""
-    canvas_size = int(size) * int(scale)
-    curves = (
-        ((.50, .94), (.38, .82), (.02, .60), (.02, .35)),
-        ((.02, .35), (.02, .12), (.29, .03), (.50, .16)),
-        ((.50, .16), (.71, .03), (.98, .12), (.98, .35)),
-        ((.98, .35), (.98, .60), (.62, .82), (.50, .94)),
-    )
-    points = []
-    for p0, p1, p2, p3 in curves:
-        for step in range(25):
-            t = step / 24
-            u = 1 - t
-            x = u**3*p0[0] + 3*u*u*t*p1[0] + 3*u*t*t*p2[0] + t**3*p3[0]
-            y = u**3*p0[1] + 3*u*u*t*p1[1] + 3*u*t*t*p2[1] + t**3*p3[1]
-            points.append((round(x * canvas_size), round(y * canvas_size)))
-    mask = Image.new("L", (canvas_size, canvas_size), 0)
-    ImageDraw.Draw(mask).polygon(points, fill=255)
-    return mask.resize((int(size), int(size)), Image.Resampling.LANCZOS)
-
-def _draw_explore_username(draw, center, username, max_width):
-    """Draw decorated Arabic/Latin names and emoji in a polished gradient."""
-    name = _clean_name_for_image(str(username or "").strip().lstrip("@"))[:80]
-    if not name:
-        return
-    base = getattr(draw, "_image", None)
-    if not isinstance(base, Image.Image):
-        _draw_name_centered(draw, center, name, 50, (255, 221, 163, 255), max_width)
-        return
-    name_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    _draw_name_centered(ImageDraw.Draw(name_layer), center, name, 50,
-                        (255, 255, 255, 255), max_width)
-    alpha = name_layer.getchannel("A")
-
-    # Soft shadow keeps the multicolor name readable over both image regions.
-    shadow_alpha = alpha.filter(ImageFilter.GaussianBlur(9)).point(lambda value: int(value * .52))
-    shadow = Image.new("RGBA", base.size, (18, 11, 34, 0))
-    shadow.putalpha(shadow_alpha)
-
-    # A vivid gold → rose → sky gradient gives the username its own
-    # colored tone while the shared name renderer handles Arabic, ornaments,
-    # fallback glyphs, and emoji.
-    stops = ((0.0, (255, 219, 105)), (0.48, (255, 91, 157)), (1.0, (91, 211, 255)))
-    gradient = Image.new("RGB", base.size, (255, 219, 105))
-    gradient_draw = ImageDraw.Draw(gradient)
-    width, height = base.size
-    name_bounds = alpha.getbbox() or (0, 0, width, height)
-    text_left, _text_top, text_right, _text_bottom = name_bounds
-    for x in range(width):
-        position = (x - text_left) / max(1, text_right - text_left - 1)
-        position = min(1.0, max(0.0, position))
-        left, right = stops[0], stops[-1]
-        for index in range(len(stops) - 1):
-            if stops[index][0] <= position <= stops[index + 1][0]:
-                left, right = stops[index], stops[index + 1]
-                break
-        ratio = (position - left[0]) / max(1e-9, right[0] - left[0])
-        color = tuple(round(a + (b - a) * ratio) for a, b in zip(left[1], right[1]))
-        gradient_draw.line((x, 0, x, height), fill=color)
-    gradient.putalpha(alpha)
-
-    composed = base.convert("RGBA")
-    composed.alpha_composite(shadow)
-    composed.alpha_composite(gradient)
-    base.paste(composed.convert(base.mode))
-
-def _explore_emoji_cluster_end(text, start):
-    """Return the end of one Unicode emoji cluster, including modifiers/ZWJ."""
-    if start >= len(text):
-        return start
-    first = text[start]
-    keycap_bases = "#*0123456789"
-    if first in keycap_bases:
-        end = start + 1
-        if end < len(text) and text[end] == "\ufe0f":
-            end += 1
-        return end + 1 if end < len(text) and text[end] == "\u20e3" else start
-    if not _is_emoji_base(first):
-        return start
-
-    end = start + 1
-    first_codepoint = ord(first)
-    if 0x1F1E6 <= first_codepoint <= 0x1F1FF and end < len(text):
-        next_codepoint = ord(text[end])
-        if 0x1F1E6 <= next_codepoint <= 0x1F1FF:
-            end += 1
-    while end < len(text):
-        codepoint = ord(text[end])
-        if (
-            codepoint in {0xFE0E, 0xFE0F, 0x20E3}
-            or 0x1F3FB <= codepoint <= 0x1F3FF
-            or 0xE0020 <= codepoint <= 0xE007F
-            or unicodedata.category(text[end]).startswith("M")
-        ):
-            end += 1
+    cmap_end = min(len(data), cmap_offset + int(cmap_length or 0))
+    num_tables = struct.unpack_from(">H", data, cmap_offset + 2)[0]
+    result = set()
+    for index in range(num_tables):
+        record = cmap_offset + 4 + index * 8
+        if record + 8 > cmap_end:
+            break
+        sub_offset = struct.unpack_from(">I", data, record + 4)[0]
+        sub = cmap_offset + sub_offset
+        if sub + 2 > cmap_end:
             continue
-        if codepoint == 0x200D and end + 1 < len(text):
-            end += 2
+        fmt = struct.unpack_from(">H", data, sub)[0]
+        try:
+            if fmt == 4:
+                seg_count = struct.unpack_from(">H", data, sub + 6)[0] // 2
+                if seg_count <= 0 or seg_count > 8192:
+                    continue
+                end_pos = sub + 14
+                start_pos = end_pos + seg_count * 2 + 2
+                delta_pos = start_pos + seg_count * 2
+                range_pos = delta_pos + seg_count * 2
+                for j in range(seg_count):
+                    end_code = struct.unpack_from(">H", data, end_pos + j * 2)[0]
+                    start_code = struct.unpack_from(">H", data, start_pos + j * 2)[0]
+                    delta = struct.unpack_from(">h", data, delta_pos + j * 2)[0]
+                    range_offset = struct.unpack_from(">H", data, range_pos + j * 2)[0]
+                    if start_code > end_code or end_code == 0xFFFF:
+                        continue
+                    for cp in range(start_code, end_code + 1):
+                        if range_offset == 0:
+                            glyph_id = (cp + delta) & 0xFFFF
+                        else:
+                            glyph_pos = range_pos + j * 2 + range_offset + (cp - start_code) * 2
+                            if glyph_pos + 2 > cmap_end:
+                                continue
+                            glyph_id = struct.unpack_from(">H", data, glyph_pos)[0]
+                            if glyph_id:
+                                glyph_id = (glyph_id + delta) & 0xFFFF
+                        if glyph_id:
+                            result.add(cp)
+            elif fmt in (12, 13):
+                group_count = struct.unpack_from(">I", data, sub + 12)[0]
+                if group_count > 100000:
+                    continue
+                group_pos = sub + 16
+                for j in range(group_count):
+                    pos = group_pos + j * 12
+                    if pos + 12 > cmap_end:
+                        break
+                    first, last, start_gid = struct.unpack_from(">III", data, pos)
+                    if first > last or last > 0x10FFFF:
+                        continue
+                    if fmt == 13:
+                        if start_gid:
+                            result.update(range(first, last + 1))
+                    else:
+                        # A format-12 group maps sequential glyph IDs. Ignore
+                        # glyph zero (the .notdef entry) if present at its start.
+                        if start_gid:
+                            result.update(range(first, last + 1))
+            elif fmt == 0:
+                if sub + 262 <= cmap_end:
+                    result.update(cp for cp, gid in enumerate(data[sub + 6:sub + 262]) if gid)
+        except (IndexError, struct.error, OverflowError):
             continue
-        break
-    return end
+    return result
 
-def _explore_visual_tokens(text, font):
-    """Split a post into visually ordered text and complete color-emoji runs."""
-    logical_tokens = []
-    markers = {}
-    buffer = []
-    index = 0
-    while index < len(text):
-        end = _explore_emoji_cluster_end(text, index)
-        if end > index:
-            if buffer:
-                logical_tokens.append(("text", "".join(buffer)))
-                buffer = []
-            marker = chr(0xE000 + len(markers))
-            markers[marker] = text[index:end]
-            logical_tokens.append(("emoji", marker))
-            index = end
-        else:
-            buffer.append(text[index])
-            index += 1
-    if buffer:
-        logical_tokens.append(("text", "".join(buffer)))
-    if not markers:
-        return None
 
-    marked_text = "".join(value if kind == "emoji" else value for kind, value in logical_tokens)
-    # Use bidi's visual ordering with markers standing in for emoji, then draw
-    # Arabic presentation forms with BASIC layout so they are not reordered a
-    # second time when each run is rendered next to a color glyph.
-    draw_font = font
-    draw_mode = "ltr"
+def _font_cmap(path):
+    """Return real Unicode coverage; never infer support from a tofu mask."""
+    key = str(path)
+    if key in _FONT_CMAP_CACHE:
+        return _FONT_CMAP_CACHE[key]
+    cmap = set()
+    if _FONTTOOLS_OK:
+        try:
+            ft = TTFont(key, lazy=True)
+            for table in ft["cmap"].tables:
+                cmap.update(table.cmap.keys())
+            ft.close()
+        except Exception:
+            cmap = set()
+    if not cmap:
+        try:
+            cmap = _parse_font_cmap_without_fonttools(key)
+        except Exception:
+            cmap = set()
+    _FONT_CMAP_CACHE[key] = cmap
+    return cmap
+
+def _gift_font(text,size):
+    # Main Arabic font.  Other scripts/symbols are chosen from real Unicode
+    # coverage below; NotoSansArabic must not claim missing glyphs.
+    candidates = [
+        ASSETS_DIR/"NotoSansArabic-SemiBold.ttf",
+        ASSETS_DIR/"Amiri-Bold.ttf",
+        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-SemiBold.ttf"),
+        ASSETS_DIR/"DejaVuSans.ttf",
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ]
+    for path in candidates:
+        if path.is_file():
+            return _load_font(path,size)
+    raise RuntimeError("لم أجد خطًا صالحًا لرسم أسماء الهدايا")
+
+def _fallback_font_paths():
+    paths=[
+        ASSETS_DIR/"NotoSansArabic-SemiBold.ttf",
+        ASSETS_DIR/"Amiri-Bold.ttf",
+        ASSETS_DIR/"DejaVuSans.ttf",
+        # Prefer script-specific outline fonts over Unifont's pixel glyphs.
+        # Unifont remains the final broad-coverage fallback, not first choice.
+        # Script-specific fonts are preferred for the rare codepoints that
+        # commonly appear in decorated usernames. They avoid pixel/tofu-like
+        # fallback glyphs from the broad Unifont files.
+        ASSETS_DIR/"NotoSansMath-Regular.ttf",
+        ASSETS_DIR/"NotoSansSymbols2-Regular.ttf",
+        ASSETS_DIR/"NotoSansSymbols-Regular.ttf",
+        ASSETS_DIR/"Symbola.ttf",
+        ASSETS_DIR/"NotoSansEgyptianHieroglyphs-Regular.ttf",
+        ASSETS_DIR/"NotoMusic-Regular.ttf",
+        ASSETS_DIR/"NotoSansMiao-Regular.ttf",
+        ASSETS_DIR/"NotoSansBrahmi-Regular.ttf",
+        ASSETS_DIR/"NotoSansAnatolianHieroglyphs-Regular.ttf",
+        ASSETS_DIR/"NotoSansHebrew-Regular.ttf",
+        ASSETS_DIR/"NotoSansKayahLi-Regular.ttf",
+        ASSETS_DIR/"NotoSansTaiViet-Regular.ttf",
+        ASSETS_DIR/"NotoSansEthiopic-Regular.ttf",
+        ASSETS_DIR/"NotoSans-Regular.ttf",
+        ASSETS_DIR/"NotoSansHanifiRohingya-Regular.ttf",
+        ASSETS_DIR/"NotoSansBamum-Regular.ttf",
+        ASSETS_DIR/"NotoSansChakma-Regular.ttf",
+        ASSETS_DIR/"NotoSansCham-Regular.ttf",
+        ASSETS_DIR/"NotoSansDevanagari-Regular.ttf",
+        ASSETS_DIR/"NotoSansJavanese-Regular.ttf",
+        ASSETS_DIR/"NotoSansKaithi-Regular.ttf",
+        ASSETS_DIR/"NotoSansKharoshthi-Regular.ttf",
+        ASSETS_DIR/"NotoSansLepcha-Regular.ttf",
+        ASSETS_DIR/"NotoSansMedefaidrin-Regular.ttf",
+        ASSETS_DIR/"NotoSansSylotiNagri-Regular.ttf",
+        ASSETS_DIR/"NotoSansTaiLe-Regular.ttf",
+        ASSETS_DIR/"NotoSansUgaritic-Regular.ttf",
+        ASSETS_DIR/"NotoSansDisplay-Regular.ttf",
+        ASSETS_DIR/"NotoSansSinhala-Regular.ttf",
+        ASSETS_DIR/"NotoSansKhmer-Regular.ttf",
+        ASSETS_DIR/"Unifont.otf",
+        ASSETS_DIR/"UnifontUpper.otf",
+        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-SemiBold.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansEgyptianHieroglyphs-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoMusic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansMiao-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansBrahmi-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansAnatolianHieroglyphs-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansKayahLi-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansTaiViet-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansEthiopic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansHanifiRohingya-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansBamum-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansChakma-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansCham-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansJavanese-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansKaithi-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansKharoshthi-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansLepcha-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansMedefaidrin-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansSylotiNagri-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansTaiLe-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansUgaritic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansDisplay-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ]
+    # Inspect only the project's assets directory. Recursively scanning the
+    # host's entire /usr/share/fonts tree (often thousands of font files) on
+    # every rendered card caused unnecessary latency in live rooms.
     try:
-        if _has_arabic(marked_text) and arabic_reshaper is not None and get_display is not None:
-            visual = get_display(arabic_reshaper.reshape(marked_text))
-            draw_mode = "visual"
-            font_path = getattr(font, "path", None)
-            font_size = getattr(font, "size", None)
-            if font_path and font_size:
-                draw_font = ImageFont.truetype(
-                    str(font_path), int(font_size), layout_engine=ImageFont.Layout.BASIC
-                )
-        elif not _has_arabic(marked_text):
-            visual = marked_text
-        else:
-            # RAQM can shape a logical Arabic run itself. Approximate bidi at
-            # token boundaries by reversing the mixed run order, while leaving
-            # the letters inside each Arabic run to RAQM.
-            fallback_tokens = [
-                (kind, markers[value] if kind == "emoji" else value)
-                for kind, value in logical_tokens
-            ]
-            return list(reversed(fallback_tokens)), font, "rtl"
+        if ASSETS_DIR.exists():
+            for ext in ("*.ttf", "*.otf"):
+                for fp in ASSETS_DIR.rglob(ext):
+                    paths.append(fp)
     except Exception:
-        return None
+        pass
+    out=[]; seen=set()
+    for p in paths:
+        p=Path(p)
+        if p.is_file() and str(p) not in seen:
+            seen.add(str(p)); out.append(p)
+    return out
 
-    visual_tokens = []
-    text_run = []
-    for char in visual:
-        if char in markers:
-            if text_run:
-                visual_tokens.append(("text", "".join(text_run)))
-                text_run = []
-            visual_tokens.append(("emoji", markers[char]))
-        else:
-            text_run.append(char)
-    if text_run:
-        visual_tokens.append(("text", "".join(text_run)))
-    return visual_tokens, draw_font, draw_mode
+def _fallback_fonts(size):
+    out=[]
+    for p in _fallback_font_paths():
+        try:
+            out.append(_load_font(p,size))
+        except Exception:
+            continue
+    return out
 
-def _explore_visual_text_width(draw, text, font, emoji_size):
-    prepared = _explore_visual_tokens(text, font)
-    if prepared is None:
-        return None
-    tokens, draw_font, draw_mode = prepared
-    width = 0.0
-    for kind, value in tokens:
-        if kind == "emoji":
-            width += emoji_size
-        else:
-            if draw_mode == "rtl":
-                width += draw.textlength(value, font=draw_font, direction="rtl", language="ar")
+def _font_has_glyph(font, ch):
+    """Return True only when the font has a real glyph for this codepoint.
+
+    Do not use a non-empty Pillow mask as proof: Pillow renders the font's
+    .notdef (tofu square) for missing characters, which made decorative names
+    look like a row of boxes on hosts without fontTools.
+    """
+    try:
+        path = getattr(font, "path", None)
+        if path:
+            # An empty cmap means unsupported. Do not fall back to Pillow's
+            # non-empty .notdef mask, which is exactly the square placeholder.
+            return ord(ch) in _font_cmap(path)
+        mask = font.getmask(ch)
+        return mask.getbbox() is not None and font.getlength(ch) > 0
+    except Exception:
+        return False
+
+def _pick_font_for_char(base, fallbacks, ch):
+    # Prefer the Arabic/main font only when its cmap really contains the glyph.
+    if _font_has_glyph(base, ch):
+        return base
+    for font in fallbacks:
+        if _font_has_glyph(font, ch):
+            return font
+    return None
+
+def _draw_name_visual(draw, xy, raw_text, size, fill, stroke_width=2,
+                      stroke_fill=(0,0,0,220), direction="ltr", *,
+                      preserve_order=False, vertical_center=None):
+    """Draw decorated usernames while keeping combining marks attached.
+
+    A combining mark is never drawn alone through RAQM (which can add a dotted
+    circle). If a complete cluster is not present in one font, draw the base
+    glyph and overlay its marks with BASIC layout without changing their shape.
+    """
+    raw_text = _clean_name_for_image(raw_text)
+    if not raw_text:
+        return xy[0]
+    base_font = _gift_font(raw_text, int(size))
+    try:
+        native_rtl = bool(PIL_AVAILABLE and features.check("raqm") and _has_arabic(raw_text))
+    except Exception:
+        native_rtl = False
+
+    ignorable = {"\u200c", "\u200d", "\ufe0e", "\ufe0f"}
+    native_complete = (
+        native_rtl and direction != "ltr"
+        and all(ch.isspace() or ch in ignorable or _font_has_glyph(base_font, ch)
+                for ch in raw_text)
+    )
+    if native_complete:
+        try:
+            draw.text(xy, raw_text, font=base_font, fill=fill,
+                      stroke_width=stroke_width, stroke_fill=stroke_fill,
+                      direction=direction, language="ar" if direction == "rtl" else None)
+            try:
+                return xy[0] + draw.textlength(
+                    raw_text, font=base_font, direction=direction,
+                    language="ar" if direction == "rtl" else None
+                )
+            except Exception:
+                return xy[0] + base_font.getlength(raw_text)
+        except Exception:
+            pass
+
+    # Keep the order delivered by the chat; only reshape Arabic glyph forms.
+    visual = raw_text if preserve_order else _shape_name_for_ltr(raw_text)
+    if not visual:
+        return xy[0]
+    base = _gift_font(visual, int(size))
+    fallbacks = _fallback_fonts(int(size))
+    x, y = map(float, xy)
+    unsupported = []
+
+    clusters = []
+    current = ""
+    for ch in visual:
+        cat = unicodedata.category(ch)
+        extender = cat.startswith("M") or ch in ignorable
+        if extender:
+            if current:
+                current += ch
             else:
-                width += draw.textlength(value, font=draw_font)
+                clusters.append(("", ch))
+        else:
+            if current:
+                clusters.append((current[0], current[1:]))
+            current = ch
+    if current:
+        clusters.append((current[0], current[1:]))
+
+    def pick(ch):
+        if not ch or ch in ignorable:
+            return None
+        return _pick_font_for_char(base, fallbacks, ch)
+
+    def is_below(mark):
+        name = unicodedata.name(mark, "")
+        return any(x in name for x in (
+            "BELOW", "SUBSCRIPT", "CEDILLA", "OGONEK", "UNDER",
+            "LOWER", "BOTTOM", "HOOK BELOW", "TAIL BELOW",
+        ))
+
+    def draw_basic(value, font, px, py, sw=stroke_width):
+        path = getattr(font, "path", None)
+        f = _load_font_basic(path, int(size)) if path else font
+        try:
+            draw.text((px, py), value, font=f, fill=fill,
+                      stroke_width=sw, stroke_fill=stroke_fill, direction="ltr")
+        except Exception:
+            draw.text((px, py), value, font=f, fill=fill,
+                      stroke_width=sw, stroke_fill=stroke_fill)
+        try:
+            return float(draw.textlength(value, font=f, direction="ltr"))
+        except Exception:
+            return float(f.getlength(value))
+
+    for base_char, suffix in clusters:
+        marks = [ch for ch in suffix if unicodedata.category(ch).startswith("M")]
+        if not base_char:
+            # Leading marks have no base; render only the marks, never a dotted circle.
+            for mark in marks:
+                mf = pick(mark)
+                if mf is None:
+                    unsupported.append(mark)
+                    continue
+                draw_basic(mark, mf, x, y - max(1, int(size * 0.2)), sw=0)
+            continue
+
+        bf = pick(base_char)
+        if bf is None:
+            unsupported.append(base_char)
+            x += max(1, int(size * 0.3))
+            continue
+
+        # If one font supports the base and all marks, render the cluster as a
+        # whole with BASIC layout so the font itself positions the marks.
+        if all(_font_has_glyph(bf, m) for m in marks):
+            try:
+                adv = draw_basic(base_char + "".join(marks), bf, x, y)
+                x += adv
+                continue
+            except Exception:
+                pass
+
+        # Cross-font cluster: draw the base, then manually attach marks. This
+        # keeps tiny dot ornaments as dots rather than RAQM's dotted circle.
+        fbase = _load_font_basic(getattr(bf, "path", ""), int(size)) if getattr(bf, "path", None) else bf
+        try:
+            bb = draw.textbbox((x, y), base_char, font=fbase, stroke_width=stroke_width)
+        except Exception:
+            bb = (x, y, x + max(1, int(size * .55)), y + size)
+        adv = draw_basic(base_char, bf, x, y)
+        mid = (bb[0] + bb[2]) / 2.0
+        top_stack = float(bb[1]) - max(1, int(size * .08))
+        bottom_stack = float(bb[3]) - max(1, int(size * .10))
+        above = below = 0
+        for mark in marks:
+            mf = pick(mark)
+            if mf is None:
+                unsupported.append(mark)
+                continue
+            fm = _load_font_basic(getattr(mf, "path", ""), int(size)) if getattr(mf, "path", None) else mf
+            try:
+                mb = draw.textbbox((0, 0), mark, font=fm, stroke_width=0)
+                mw = max(1, mb[2] - mb[0])
+                mh = max(1, mb[3] - mb[1])
+            except Exception:
+                mb = (0, 0, max(1, int(size * .25)), max(1, int(size * .18)))
+                mw, mh = mb[2], mb[3]
+            mx = mid - mw / 2.0 - mb[0]
+            if is_below(mark):
+                my = bottom_stack + below * max(1, int(size * .12)) - mb[1]
+                below += 1
+            else:
+                my = top_stack - mh - above * max(1, int(size * .10)) - mb[1]
+                above += 1
+            draw_basic(mark, mf, mx, my, sw=0)
+        x += adv
+
+    if unsupported:
+        try:
+            print("[GIFT-FONT] unsupported Unicode: " +
+                  " ".join(f"U+{ord(c):04X}" for c in sorted(set(unsupported))))
+        except Exception:
+            pass
+    return x
+
+def _mixed_rtl_name_tokens(text):
+    """Split a mixed Arabic/decorated username into logical RTL chunks.
+
+    The returned chunks stay in their original logical order. The renderer
+    places the chunks from right to left, while each Arabic chunk is shaped by
+    libraqm as one complete Arabic run. Non-Arabic ornament groups (such as
+    𓆩♛𓆪) stay intact and are never reversed character-by-character.
+    """
+    tokens = []
+    for ch in str(text or ""):
+        code = ord(ch)
+        category = unicodedata.category(ch)
+        name = unicodedata.name(ch, "")
+        is_arabic = (
+            0x0600 <= code <= 0x06FF
+            or 0x0750 <= code <= 0x077F
+            or 0x08A0 <= code <= 0x08FF
+            or 0xFB50 <= code <= 0xFDFF
+            or 0xFE70 <= code <= 0xFEFF
+            or ch == "ـ"
+        )
+        is_music = "MUSICAL SYMBOL" in name
+
+        if is_arabic:
+            if not tokens or tokens[-1]["kind"] != "arabic":
+                tokens.append({"kind": "arabic", "text": "", "suffix": ""})
+            tokens[-1]["text"] += ch
+            continue
+
+        # Musical notation commonly decorates the end of an Arabic username.
+        # Keep that notation attached to the Arabic chunk instead of letting
+        # its Unicode L-direction class pull it to the opposite side.
+        if is_music and tokens and tokens[-1]["kind"] == "arabic":
+            tokens[-1]["suffix"] += ch
+            continue
+        if category.startswith("M") and tokens:
+            if tokens[-1]["kind"] == "arabic" and tokens[-1]["suffix"]:
+                tokens[-1]["suffix"] += ch
+            else:
+                tokens[-1]["text"] += ch
+            continue
+
+        # Consecutive ornaments / Latin fragments are kept as one visual
+        # island. This preserves bracket pairs and multi-character symbols.
+        if tokens and tokens[-1]["kind"] == "other":
+            tokens[-1]["text"] += ch
+        else:
+            tokens.append({"kind": "other", "text": ch, "suffix": ""})
+
+    return tokens
+
+
+def _measure_ltr_name_piece(draw, text, size, base_font, fallbacks):
+    width = 0.0
+    for ch in str(text or ""):
+        if _is_emoji_base(ch):
+            width += size
+            continue
+        font = _pick_font_for_char(base_font, fallbacks, ch)
+        if font is not None:
+            try:
+                width += float(draw.textlength(ch, font=font, direction="ltr"))
+            except Exception:
+                width += float(font.getlength(ch))
     return width
 
-def _draw_explore_text_line(draw, center_x, y, text, font, fill, emoji_size):
-    prepared = _explore_visual_tokens(text, font)
-    if prepared is None:
-        return False
-    tokens, draw_font, draw_mode = prepared
-    total_width = sum(
-        emoji_size if kind == "emoji" else (
-            draw.textlength(value, font=draw_font, direction="rtl", language="ar")
-            if draw_mode == "rtl" else draw.textlength(value, font=draw_font)
-        )
-        for kind, value in tokens
-    )
-    cursor = float(center_x) - total_width / 2
-    for kind, value in tokens:
-        if kind == "emoji":
-            drawn_width = _draw_color_emoji(
-                draw, (cursor, y + max(0, (62 - emoji_size) / 2)), value, emoji_size
-            )
-            cursor += drawn_width or emoji_size
-        else:
-            if draw_mode == "rtl":
-                run_width = draw.textlength(value, font=draw_font, direction="rtl", language="ar")
-                draw.text(
-                    (cursor + run_width, y), value, font=draw_font, fill=fill,
-                    anchor="rt", direction="rtl", language="ar",
+
+def _draw_ltr_name_piece(draw, x, center_y, text, size, fill, base_font, fallbacks):
+    """Draw one neutral/Latin ornament island without changing its sequence."""
+    cursor = float(x)
+    normal = []
+    for ch in str(text or ""):
+        if _is_emoji_base(ch):
+            if normal:
+                cursor = _draw_name_visual(
+                    draw, (cursor, center_y), "".join(normal), size, fill,
+                    stroke_width=2, stroke_fill=(0, 0, 0, 220),
+                    direction="ltr", preserve_order=True,
+                    vertical_center=center_y,
                 )
+                normal = []
+            emoji_width = _draw_color_emoji(
+                draw, (cursor, float(center_y) - size / 2), ch, size
+            )
+            if emoji_width is not None:
+                cursor += emoji_width
             else:
-                run_width = draw.textlength(value, font=draw_font)
-                draw.text((cursor, y), value, font=draw_font, fill=fill, anchor="lt")
+                normal.append(ch)
+        else:
+            normal.append(ch)
+    if normal:
+        cursor = _draw_name_visual(
+            draw, (cursor, center_y), "".join(normal), size, fill,
+            stroke_width=2, stroke_fill=(0, 0, 0, 220),
+            direction="ltr", preserve_order=True,
+            vertical_center=center_y,
+        )
+    return cursor
+
+
+def _arabic_name_font(text, size, base_font, fallbacks):
+    candidates = [base_font] + list(fallbacks)
+    best = base_font
+    best_count = -1
+    for font in candidates:
+        count = 0
+        total = 0
+        for ch in text:
+            if ch.isspace() or unicodedata.category(ch).startswith("M"):
+                continue
+            total += 1
+            if _font_has_glyph(font, ch):
+                count += 1
+        if count > best_count:
+            best, best_count = font, count
+        if total == count:
+            return font
+    return best
+
+
+def _arabic_name_metrics(draw, text, font, stroke_width=2):
+    try:
+        bbox = draw.textbbox(
+            (0, 0), text, font=font, direction="rtl", language="ar",
+            stroke_width=stroke_width,
+        )
+        return float(bbox[2] - bbox[0]), bbox
+    except Exception:
+        try:
+            width = float(draw.textlength(text, font=font))
+        except Exception:
+            width = float(font.getlength(text))
+        return width, (0, 0, int(width), int(getattr(font, "size", 24)))
+
+
+def _draw_mixed_rtl_name(draw, center, raw_text, size, fill, max_width):
+    """Render decorated Arabic names using one shaping pass per Arabic run."""
+    tokens = _mixed_rtl_name_tokens(raw_text)
+    if not tokens or not any(t["kind"] == "arabic" for t in tokens):
+        return False
+    if not any(t["kind"] == "other" for t in tokens):
+        return False
+
+    try:
+        raqm = bool(PIL_AVAILABLE and features.check("raqm"))
+    except Exception:
+        raqm = False
+
+    # Logical input is RTL. A left-to-right image canvas therefore receives
+    # the chunks in reverse placement order, but the source text itself is
+    # never reversed or rewritten. With RAQM, each Arabic chunk remains in
+    # logical order; without RAQM, shape+bidi it once before LTR drawing.
+    layout_tokens = list(reversed(tokens))
+
+    def prepare_core(core):
+        return core if raqm else _shape_name_for_fallback(core)
+
+    while size > 14:
+        base = _gift_font(raw_text, size)
+        fallbacks = _fallback_fonts(size)
+        total_width = 0.0
+        for token in layout_tokens:
+            if token["kind"] == "arabic":
+                core = token["text"]
+                suffix = token["suffix"]
+                rendered = prepare_core(core)
+                font = _arabic_name_font(rendered, size, base, fallbacks)
+                if raqm:
+                    measured, _ = _arabic_name_metrics(draw, rendered, font)
+                else:
+                    measured = _measure_ltr_name_piece(draw, rendered, size, font, fallbacks)
+                total_width += _measure_ltr_name_piece(draw, suffix, size, base, fallbacks)
+                total_width += measured
+            else:
+                total_width += _measure_ltr_name_piece(draw, token["text"], size, base, fallbacks)
+        if total_width <= max_width or size <= 16:
+            break
+        size -= 2
+
+    base = _gift_font(raw_text, size)
+    fallbacks = _fallback_fonts(size)
+    total_width = 0.0
+    prepared = []
+    for token in layout_tokens:
+        if token["kind"] == "arabic":
+            core = token["text"]
+            suffix = token["suffix"]
+            rendered = prepare_core(core)
+            font = _arabic_name_font(rendered, size, base, fallbacks)
+            if raqm:
+                measured, bbox = _arabic_name_metrics(draw, rendered, font)
+            else:
+                measured = _measure_ltr_name_piece(draw, rendered, size, font, fallbacks)
+                try:
+                    bbox = draw.textbbox((0, 0), rendered, font=font,
+                                         direction="ltr", stroke_width=2)
+                except Exception:
+                    bbox = (0, 0, int(measured), int(size))
+            suffix_width = _measure_ltr_name_piece(draw, suffix, size, base, fallbacks)
+            prepared.append(("arabic", rendered, suffix, font, bbox, measured,
+                             suffix_width, raqm))
+            total_width += measured + suffix_width
+        else:
+            width = _measure_ltr_name_piece(draw, token["text"], size, base, fallbacks)
+            prepared.append(("other", token["text"], None, None, None, width, 0.0, False))
+            total_width += width
+
+    cursor = float(center[0]) - total_width / 2
+    cy = float(center[1])
+    for kind, value, suffix, font, bbox, run_width, suffix_width, use_raqm in prepared:
+        if kind == "arabic":
+            # Suffix decorations are logically after the Arabic run, so they
+            # occupy its visual left edge in an RTL paragraph.
+            if suffix:
+                _draw_ltr_name_piece(draw, cursor, cy, suffix, size, fill, base, fallbacks)
+                cursor += suffix_width
+            if use_raqm:
+                try:
+                    x = cursor - bbox[0]
+                    y = cy - (bbox[1] + bbox[3]) / 2
+                    draw.text(
+                        (x, y), value, font=font, fill=fill,
+                        stroke_width=2, stroke_fill=(0, 0, 0, 220),
+                        direction="rtl", language="ar",
+                    )
+                except Exception:
+                    _draw_name_visual(
+                        draw, (cursor, cy), value, size, fill,
+                        stroke_width=2, stroke_fill=(0, 0, 0, 220),
+                        direction="ltr", preserve_order=True,
+                        vertical_center=cy,
+                    )
+            else:
+                _draw_ltr_name_piece(draw, cursor, cy, value, size, fill, base, fallbacks)
             cursor += run_width
+        else:
+            cursor = _draw_ltr_name_piece(
+                draw, cursor, cy, value, size, fill, base, fallbacks
+            )
     return True
 
-def render_explore_card(text, username, photo_url=""):
-    """Render a polished Explore card with a large heart portrait and glass caption."""
-    if not PIL_AVAILABLE:
-        raise RuntimeError("Pillow غير متاح")
-    width, height = 1080, 1500
-    image = Image.new("RGB", (width, height), (16, 20, 43))
-    gradient = ImageDraw.Draw(image)
-    top, bottom = (17, 26, 58), (46, 27, 67)
-    for y in range(height):
-        t = y / max(1, height - 1)
-        color = tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3))
-        gradient.line((0, y, width, y), fill=color)
-    draw = ImageDraw.Draw(image, "RGBA")
-    draw.ellipse((-240, -160, 450, 520), fill=(255, 116, 159, 26))
-    draw.ellipse((710, 110, 1310, 710), fill=(113, 180, 255, 23))
 
-    # Compact portrait near the top: a soft shadow, a warm metallic rim, and
-    # the user's square-cropped profile photo clipped directly to the heart.
-    outer_size, photo_size = 450, 410
-    outer_mask = _explore_heart_mask(outer_size)
-    photo_mask = _explore_heart_mask(photo_size)
-    outer_x, outer_y = (width - outer_size) // 2, 68
-    photo_x, photo_y = (width - photo_size) // 2, outer_y + (outer_size-photo_size)//2
-    shadow_mask = Image.new("L", image.size, 0)
-    shadow_mask.paste(outer_mask, (outer_x, outer_y + 15))
-    shadow_mask = shadow_mask.filter(ImageFilter.GaussianBlur(18))
-    shadow_layer = Image.new("RGBA", image.size, (6, 5, 18, 0))
-    shadow_layer.putalpha(shadow_mask.point(lambda value: int(value * .58)))
-    image = Image.alpha_composite(image.convert("RGBA"), shadow_layer)
-    border_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    border_layer.paste((248, 207, 142, 255), (outer_x, outer_y), outer_mask)
-    image = Image.alpha_composite(image, border_layer)
+def _draw_exact_text(draw, xy, raw_text, size, fill, stroke_width=2, stroke_fill=(0,0,0,220)):
+    return _draw_name_visual(draw, xy, raw_text, size, fill, stroke_width, stroke_fill)
 
-    avatar = None
-    if photo_url and str(photo_url).startswith(("http://", "https://")):
-        try:
-            response = requests.get(photo_url, headers={"User-Agent": "TalkinBot/22", "Accept": "image/*"}, timeout=(3, 6))
-            if response.status_code == 200 and response.content and len(response.content) <= 8 * 1024 * 1024:
-                source_photo = Image.open(io.BytesIO(response.content)).convert("RGB")
-                scale = max(photo_size / source_photo.width, photo_size / source_photo.height)
-                resized = source_photo.resize(
-                    (max(photo_size, int(source_photo.width * scale)),
-                     max(photo_size, int(source_photo.height * scale))),
-                    Image.Resampling.LANCZOS,
-                )
-                crop_left = (resized.width - photo_size) // 2
-                # Favor the upper face slightly so eyes and forehead remain
-                # visible beneath the heart's top cleft.
-                crop_top = int((resized.height - photo_size) * .38)
-                avatar = resized.crop(
-                    (crop_left, crop_top, crop_left + photo_size, crop_top + photo_size)
-                ).convert("RGBA")
-        except Exception:
-            avatar = None
-    if avatar is None:
-        avatar = Image.new("RGBA", (photo_size, photo_size), (53, 66, 100, 255))
-        ad = ImageDraw.Draw(avatar)
-        ad.ellipse((photo_size*.34, photo_size*.18, photo_size*.66, photo_size*.50), fill=(221, 230, 245, 255))
-        ad.rounded_rectangle((photo_size*.20, photo_size*.49, photo_size*.80, photo_size*.94),
-                             radius=photo_size*.18, fill=(221, 230, 245, 255))
-    avatar.putalpha(photo_mask)
-    image.paste(avatar, (photo_x, photo_y), avatar)
-    image = image.convert("RGB")
-    draw = ImageDraw.Draw(image, "RGBA")
+def _fit_crop(im,size):
+    im=im.convert("RGB"); tw,th=size; scale=max(tw/im.width,th/im.height); nw,nh=max(tw,int(im.width*scale)),max(th,int(im.height*scale)); im=im.resize((nw,nh),Image.LANCZOS); left=max(0,(nw-tw)//2); top=max(0,(nh-th)//2); return im.crop((left,top,left+tw,top+th))
 
-    # Title, profile heart, and colorful unboxed username form the top stack.
-    title_font_path = ASSETS_DIR / "NotoSansArabic-SemiBold.ttf"
-    try:
-        title_font = ImageFont.truetype(str(title_font_path), 30)
-    except Exception:
-        title_font = ImageFont.load_default()
-    draw.text((width//2, 36), "اكسبلور", font=title_font, fill=(247, 222, 190, 255), anchor="mm")
-    _draw_explore_username(draw, (width//2, 558), username, 920)
-    draw.line((385, 600, 695, 600), fill=(249, 207, 143, 180), width=2)
-    draw.ellipse((width//2-4, 596, width//2+4, 604), fill=(255, 228, 180, 255))
-
-    # Translucent glass-style text panel; each new render takes the next
-    # color from the palette so consecutive posts visibly vary.
-    box = (84, 642, 996, 1270)
-    draw.rounded_rectangle(box, radius=42, fill=(13, 17, 38, 152), outline=(255, 255, 255, 92), width=2)
-    draw.rounded_rectangle((box[0]+10, box[1]+10, box[2]-10, box[3]-10),
-                           radius=34, outline=(255, 255, 255, 30), width=1)
-    try:
-        font_path = ASSETS_DIR / "NotoSansArabic-Regular.ttf"
-        font = ImageFont.truetype(str(font_path), 46) if font_path.exists() else ImageFont.load_default()
-    except Exception:
-        font = ImageFont.load_default()
-    raw = str(text or "").strip()[:150]
-    words = raw.split() or [raw]
-    lines, current = [], ""
-    for word in words:
-        candidate = (current + " " + word).strip()
-        try:
-            measured = _explore_visual_text_width(draw, candidate, font, 46)
-            if measured is None:
-                measured = draw.textlength(candidate, font=font, direction="rtl", language="ar") if _has_arabic(candidate) else draw.textlength(candidate, font=font)
-        except Exception:
-            measured = draw.textlength(candidate, font=font)
-        if current and measured > 790:
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
-    max_lines = 10
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = lines[-1].rstrip("…") + "…"
-    line_height = 62
-    first_y = box[1] + max(42, (box[3]-box[1]-(len(lines)*line_height))//2)
-    text_color = _next_explore_text_color()
-    for line in lines:
-        if _draw_explore_text_line(draw, width//2, first_y, line, font, (*text_color, 255), 46):
-            first_y += line_height
-            continue
-        shown = line if (_has_arabic(line) and PIL_AVAILABLE and features.check("raqm")) else _visual_rtl_text(line)
-        direction = {"direction": "rtl", "language": "ar"} if _has_arabic(line) and PIL_AVAILABLE and features.check("raqm") else {}
-        draw.text((width//2, first_y), shown, font=font, fill=(*text_color, 255), anchor="mt", align="center", **direction)
-        first_y += line_height
-
-    footer_font_path = ASSETS_DIR / "NotoSansArabic-SemiBold.ttf"
-    try:
-        footer_font = ImageFont.truetype(str(footer_font_path), 31)
-    except Exception:
-        footer_font = ImageFont.load_default()
-    draw.text((width//2, 1395), "كوفي بوت", font=footer_font,
-              fill=(245, 225, 199, 245), anchor="mm")
-    draw.line((420, 1350, 660, 1350), fill=(244, 194, 120, 115), width=2)
-
-    out_dir = BASE_DIR / "generated_publish"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"explore_{uuid.uuid4().hex}.jpg"
-    image.save(out, "JPEG", quality=91, optimize=True, progressive=True)
-    return out
+def _draw_centered(draw,center,raw_text,size,fill,max_width):
+    return _draw_name_centered(draw, center, raw_text, size, fill, max_width, grow_short=False)
 
 def _visual_rtl_text(text):
     """Return logical text unchanged when Pillow/Raqm can shape Arabic.
@@ -6351,43 +6997,354 @@ def _visual_rtl_text(text):
 def _has_arabic(text):
     return any("\u0600" <= ch <= "\u06ff" or "\u0750" <= ch <= "\u077f" or "\u08a0" <= ch <= "\u08ff" for ch in str(text or ""))
 
-def _draw_name_centered(draw, center, raw_text, size, fill, max_width):
-    """Center the username using actual mixed-font glyph widths."""
-    size=int(size)
-    while size>14:
-        visual=_shape_name(raw_text)
-        base=_gift_font(visual,size)
-        fallbacks=_fallback_fonts(size)
-        width=0
-        for ch in visual:
-            font=_pick_font_for_char(base,fallbacks,ch)
-            if font is None:
-                continue
-            try: width += draw.textlength(ch,font=font,direction='ltr')
-            except Exception: width += font.getlength(ch)
-        if width<=max_width:
-            break
-        size-=2
-    visual=_shape_name(raw_text)
-    base=_gift_font(visual,size)
-    fallbacks=_fallback_fonts(size)
-    width=0
-    top=999999; bottom=-999999
-    for ch in visual:
-        font=_pick_font_for_char(base,fallbacks,ch)
-        if font is None: continue
-        try: width += draw.textlength(ch,font=font,direction='ltr')
-        except Exception: width += font.getlength(ch)
+def _is_arabic_render_char(ch):
+    codepoint = ord(ch)
+    return (
+        0x0600 <= codepoint <= 0x06FF
+        or 0x0750 <= codepoint <= 0x077F
+        or 0x08A0 <= codepoint <= 0x08FF
+        or 0xFB50 <= codepoint <= 0xFDFF
+        or 0xFE70 <= codepoint <= 0xFEFF
+    )
+
+
+def _logical_arabic_from_visual(text):
+    """Undo a bidi visual Arabic run before handing it to Pillow/RAQM."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    clusters = []
+    for ch in normalized:
+        if (ch == "\u0640" or unicodedata.category(ch).startswith("M")) and clusters:
+            clusters[-1] += ch
+        else:
+            clusters.append(ch)
+    return "".join(reversed(clusters))
+
+
+def _is_arabic_only_name(text):
+    """True for ordinary Arabic names (allowing spaces and punctuation).
+
+    Such names must always use the native RTL layout engine, even when a
+    caller requests force_ltr for Latin/decorated names.
+    """
+    value = str(text or "")
+    if not _has_arabic(value):
+        return False
+    allowed_punctuation = set("ـ-‐‑‒–—_.,،؛:!?؟()[]{}<>«»")
+    for ch in value:
+        if (_is_arabic_render_char(ch)
+                or unicodedata.category(ch).startswith("M")
+                or ch.isspace()
+                or ch in allowed_punctuation):
+            continue
+        return False
+    return True
+
+
+def _draw_name_centered(draw, center, raw_text, size, fill, max_width, *, apply_correction=True, grow_short=True, force_ltr=False, native_arabic_runs=False):
+    """Center the exact username using mixed fonts and color emoji."""
+    raw_text = _clean_name_for_image(raw_text)
+    if apply_correction:
+        raw_text = _display_name_for_image(raw_text)
+    raw_text = _strip_hidden_image_decorations(raw_text)
+    size = int(size)
+    if not raw_text:
+        return
+    # Several legacy card callers pass force_ltr=True for every username.
+    # That is correct for Latin names but reverses plain Arabic names.
+    # Arabic-only names must be handed to RAQM as logical RTL text.
+    if _is_arabic_only_name(raw_text):
+        force_ltr = False
+    if grow_short:
+        meaningful = [
+            ch for ch in raw_text
+            if unicodedata.category(ch)[0] not in {"M", "C", "P", "S"}
+            and ch != "ـ"
+        ]
+        count = len(meaningful)
+        if count <= 8:
+            size = int(size * 1.38)
+        elif count <= 14:
+            size = int(size * 1.20)
+        elif count <= 22:
+            size = int(size * 1.08)
+
+    # Any decorated Arabic username is rendered as logical RTL chunks. This
+    # avoids the old per-character LTR path that reversed Arabic fragments
+    # around symbols, then reversed the correction again on preview cards.
+    if _has_arabic(raw_text) and _draw_mixed_rtl_name(
+        draw, center, raw_text, size, fill, max_width
+    ):
+        return
+
+    def metrics(value, font, ch):
         try:
-            b=font.getbbox(ch)
-            top=min(top,b[1]); bottom=max(bottom,b[3])
+            return float(draw.textlength(value, font=font, direction="ltr"))
+        except Exception:
+            return float(font.getlength(value))
+
+    def visual_for_centered(value, current_size):
+        if native_arabic_runs and _has_arabic(value):
+            return _shape_name_for_fallback(value)
+        # Keep ordinary Arabic logical text for libraqm: draw.text(direction=rtl)
+        # will shape and order it. Only pre-shape when a mixed-font fallback is
+        # genuinely required, otherwise the title itself gets reversed twice.
+        if force_ltr:
+            return _shape_name_for_ltr(value)
+        if _has_arabic(value):
+            candidate = _gift_font(value, current_size)
+            complete = all(
+                _font_has_glyph(candidate, ch) or unicodedata.category(ch).startswith("M")
+                for ch in value if not ch.isspace()
+            )
+            try:
+                if complete and PIL_AVAILABLE and features.check("raqm"):
+                    return value
+            except Exception:
+                pass
+        # Mixed Arabic names need a visual bidi pass when fallback fonts are
+        # involved. It keeps a decorative frame at the edges in place while
+        # moving internal symbol-separated Arabic runs to the readable order.
+        return _shape_name_for_fallback(value)
+
+    compacted = False
+    while size > 14:
+        visual = visual_for_centered(raw_text, size)
+        base = _gift_font(visual, size)
+        fallbacks = _fallback_fonts(size)
+        width = 0.0
+        for ch in visual:
+            if _is_emoji_base(ch):
+                width += size
+                continue
+            font = _pick_font_for_char(base, fallbacks, ch)
+            if font is not None:
+                width += metrics(ch, font, ch)
+        if width <= max_width:
+            break
+        # Use the same light cleanup for Arabic and English names. Visible
+        # ornaments stay untouched; only tiny marks are removed when the
+        # unmodified name cannot fit at the current size.
+        if not compacted:
+            compact = _compact_name_for_image(raw_text)
+            if compact and compact != raw_text:
+                raw_text = compact
+                compacted = True
+                continue
+        size -= 2
+
+    visual = visual_for_centered(raw_text, size)
+    base = _gift_font(visual, size)
+    fallbacks = _fallback_fonts(size)
+    # When one Arabic-capable font contains the complete name, let libraqm
+    # draw the whole logical string in one operation. The previous per-
+    # character path advanced a right-to-left run from left to right, which
+    # made winner names appear reversed on million/billion cards.
+    native_rtl = False
+    if visual == raw_text and not force_ltr and _has_arabic(raw_text):
+        try:
+            native_rtl = bool(PIL_AVAILABLE and features.check("raqm") and all(
+                _font_has_glyph(base, ch) or unicodedata.category(ch).startswith("M")
+                for ch in raw_text if not ch.isspace()
+            ))
+        except Exception:
+            native_rtl = False
+    if native_rtl:
+        try:
+            bbox = draw.textbbox(
+                (0, 0), raw_text, font=base, direction="rtl", language="ar",
+                stroke_width=2,
+            )
+            x = float(center[0]) - (bbox[2] - bbox[0]) / 2 - bbox[0]
+            y = float(center[1]) - (bbox[3] - bbox[1]) / 2 - bbox[1]
+            draw.text(
+                (x, y), raw_text, font=base, fill=fill, stroke_width=2,
+                stroke_fill=(0, 0, 0, 220), direction="rtl", language="ar",
+            )
+            return
         except Exception:
             pass
-    if top==999999:
+
+    if native_arabic_runs and _has_arabic(raw_text):
+        tokens = []
+        index = 0
+        while index < len(visual):
+            if _is_emoji_base(visual[index]):
+                tokens.append(("emoji", visual[index]))
+                index += 1
+                continue
+            is_arabic = _is_arabic_render_char(visual[index])
+            end = index + 1
+            while (end < len(visual) and not _is_emoji_base(visual[end])
+                   and _is_arabic_render_char(visual[end]) == is_arabic):
+                end += 1
+            tokens.append(("arabic" if is_arabic else "text", visual[index:end]))
+            index = end
+
+        prepared = []
+        total_width = 0.0
+        try:
+            raqm_enabled = bool(PIL_AVAILABLE and features.check("raqm"))
+        except Exception:
+            raqm_enabled = False
+        for kind, value in tokens:
+            if kind == "emoji":
+                prepared.append((kind, value, size, None, None))
+                total_width += size
+                continue
+            if kind == "arabic":
+                logical = _logical_arabic_from_visual(value)
+                font = _gift_font(logical, size)
+                supported = raqm_enabled and all(
+                    _font_has_glyph(font, ch) or unicodedata.category(ch).startswith("M")
+                    for ch in logical if not ch.isspace()
+                )
+                if supported:
+                    try:
+                        bbox = draw.textbbox(
+                            (0, 0), logical, font=font, direction="rtl",
+                            language="ar", stroke_width=2,
+                        )
+                        token_width = float(bbox[2] - bbox[0])
+                    except Exception:
+                        supported = False
+                if not supported:
+                    token_width = sum(
+                        metrics(ch, font, ch) for ch in value
+                        if _pick_font_for_char(base, fallbacks, ch) is not None
+                    )
+                prepared.append((kind, value, token_width, logical, font if supported else None))
+                total_width += token_width
+                continue
+            token_width = sum(
+                metrics(ch, _pick_font_for_char(base, fallbacks, ch), ch)
+                for ch in value if _pick_font_for_char(base, fallbacks, ch) is not None
+            )
+            prepared.append((kind, value, token_width, None, None))
+            total_width += token_width
+
+        cursor = float(center[0]) - total_width / 2
+        for kind, value, token_width, logical, font in prepared:
+            if kind == "emoji":
+                cursor += _draw_color_emoji(
+                    draw, (cursor, float(center[1]) - size / 2), value, size
+                ) or size
+            elif kind == "arabic" and font is not None:
+                bbox = draw.textbbox(
+                    (0, 0), logical, font=font, direction="rtl",
+                    language="ar", stroke_width=2,
+                )
+                x = cursor - bbox[0]
+                y = float(center[1]) - (bbox[3] - bbox[1]) / 2 - bbox[1]
+                draw.text(
+                    (x, y), logical, font=font, fill=fill, stroke_width=2,
+                    stroke_fill=(0, 0, 0, 220), direction="rtl", language="ar",
+                )
+                cursor += token_width
+            else:
+                cursor = _draw_name_visual(
+                    draw, (cursor, center[1]), value, size, fill,
+                    stroke_width=2, stroke_fill=(0, 0, 0, 220),
+                    direction="ltr", preserve_order=True,
+                    vertical_center=center[1],
+                )
         return
-    x=center[0]-width/2
-    y=center[1]-(bottom-top)/2-top
-    _draw_name_visual(draw,(x,y),raw_text,size,fill,stroke_width=2,stroke_fill=(0,0,0,220))
+
+    width = 0.0
+    for ch in visual:
+        if _is_emoji_base(ch):
+            width += size
+            continue
+        font = _pick_font_for_char(base, fallbacks, ch)
+        if font is None:
+            continue
+        width += metrics(ch, font, ch)
+    if width <= 0:
+        return
+
+    cursor = float(center[0]) - width / 2
+    run_direction = "rtl" if visual == raw_text and not force_ltr else "ltr"
+    normal = []
+    normal_width = 0.0
+    for ch in visual:
+        if _is_emoji_base(ch):
+            if normal:
+                _draw_name_visual(
+                    draw, (cursor, center[1]), "".join(normal), size, fill,
+                    stroke_width=2, stroke_fill=(0, 0, 0, 220),
+                    direction=run_direction, preserve_order=True,
+                    vertical_center=center[1],
+                )
+                cursor += normal_width
+                normal = []
+                normal_width = 0.0
+            cursor += _draw_color_emoji(
+                draw, (cursor, float(center[1]) - size / 2), ch, size
+            ) or size
+            continue
+        normal.append(ch)
+        font = _pick_font_for_char(base, fallbacks, ch)
+        if font is not None:
+            normal_width += metrics(ch, font, ch)
+    if normal:
+        _draw_name_visual(
+            draw, (cursor, center[1]), "".join(normal), size, fill,
+            stroke_width=2, stroke_fill=(0, 0, 0, 220),
+            direction=run_direction, preserve_order=True,
+            vertical_center=center[1],
+        )
+
+
+# Render all names into a transparent scratch layer, then shift by their actual
+# visible-pixel bounding box. This guarantees true horizontal and vertical
+# centering inside every name rectangle (game, gift, publish, welcome, explore).
+_draw_name_centered_raw = _draw_name_centered
+
+def _draw_name_centered(draw, center, raw_text, size, fill, max_width, *, apply_correction=True, grow_short=True, force_ltr=False, native_arabic_runs=False):
+    base = getattr(draw, "_image", None)
+    if not PIL_AVAILABLE or not isinstance(base, Image.Image):
+        return _draw_name_centered_raw(
+            draw, center, raw_text, size, fill, max_width,
+            apply_correction=apply_correction, grow_short=grow_short,
+            force_ltr=force_ltr, native_arabic_runs=native_arabic_runs,
+        )
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    layer_draw = ImageDraw.Draw(layer)
+    _draw_name_centered_raw(
+        layer_draw, center, raw_text, size, fill, max_width,
+        apply_correction=apply_correction, grow_short=grow_short,
+        force_ltr=force_ltr, native_arabic_runs=native_arabic_runs,
+    )
+    bbox = layer.getchannel("A").getbbox()
+    if not bbox:
+        return None
+    dx = int(round(float(center[0]) - (bbox[0] + bbox[2]) / 2.0))
+    dy = int(round(float(center[1]) - (bbox[1] + bbox[3]) / 2.0))
+    base.paste(layer, (dx, dy), layer)
+    return None
+
+def render_name_preview_card(name, *, corrected=False):
+    """Create a private visual check using the same username renderer as cards."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبت")
+    display_name = _clean_name_for_image(name).strip()
+    if not display_name:
+        raise ValueError("الاسم فارغ")
+    image = Image.new("RGBA", (1600, 560), (8, 14, 30, 255))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((24, 24, 1576, 536), radius=42,
+                           fill=(12, 22, 42, 255), outline=(244, 196, 92, 255), width=6)
+    title = "معاينة الاسم بعد الإصلاح" if corrected else "فحص كتابة الاسم"
+    _draw_centered(draw, (800, 170), title, 54, (255, 224, 145, 255), 1450)
+    draw.line((100, 245, 1500, 245), fill=(244, 196, 92, 220), width=3)
+    _draw_name_centered(draw, (800, 380), display_name, 82,
+                        (255, 255, 255, 255), 1430, apply_correction=False,
+                        force_ltr=False)
+    image = image.convert("RGB")
+    out_dir = BASE_DIR / "generated_welcomes"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"name_check_{uuid.uuid4().hex}.jpg"
+    image.save(out, "JPEG", quality=91, optimize=True)
+    return out
 
 def _visual_runs(text, size):
     # Kept for compatibility with older helpers.
@@ -6417,28 +7374,111 @@ def _visual_text_width(draw, text, size):
 def _draw_exact_text(draw, xy, raw_text, size, fill, stroke_width=1, stroke_fill=(0,0,0,180)):
     return _draw_name_centered(draw, (xy[0], xy[1]+size/2), raw_text, size, fill, 10000)
 
-def _draw_centered(draw, center, raw_text, size, fill, max_width):
-    return _draw_name_centered(draw, center, raw_text, size, fill, max_width)
+
+def _draw_centered(draw, center, raw_text, size, fill, max_width, *, force_ltr=False, apply_correction=True):
+    return _draw_name_centered(
+        draw, center, raw_text, size, fill, max_width,
+        grow_short=False, force_ltr=force_ltr, apply_correction=apply_correction,
+    )
+
+
+_PROFILE_PHOTO_CACHE = {}
+_PROFILE_PHOTO_CACHE_LOCK = threading.RLock()
+_PROFILE_PHOTO_CACHE_TTL = 300.0
+_PROFILE_PHOTO_CACHE_MAX = 80
+
+
+def _download_profile_photo(photo_url):
+    """Fetch and decode a profile image once, with sane limits and short caching."""
+    if not PIL_AVAILABLE:
+        return None
+    url = str(photo_url or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    if not url.lower().startswith(("http://", "https://")):
+        return None
+    now = time.time()
+    with _PROFILE_PHOTO_CACHE_LOCK:
+        cached = _PROFILE_PHOTO_CACHE.get(url)
+        if cached and now - cached[0] < _PROFILE_PHOTO_CACHE_TTL:
+            return cached[1].copy()
+        if cached:
+            _PROFILE_PHOTO_CACHE.pop(url, None)
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TalkinBot/23)",
+                     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"},
+            timeout=(8, 15), allow_redirects=True, stream=True,
+        )
+        if int(getattr(response, "status_code", 0) or 0) != 200:
+            return None
+        content = bytearray()
+        iterator = getattr(response, "iter_content", None)
+        if callable(iterator):
+            try:
+                for chunk in iterator(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    content.extend(chunk)
+                    if len(content) > 8 * 1024 * 1024:
+                        return None
+            except (AttributeError, TypeError):
+                content.clear()
+        if not content:
+            fallback_content = getattr(response, "content", b"") or b""
+            if len(fallback_content) > 8 * 1024 * 1024:
+                return None
+            content.extend(fallback_content)
+        if not content:
+            return None
+        from io import BytesIO
+        with Image.open(BytesIO(content)) as source:
+            if source.width <= 0 or source.height <= 0 or source.width * source.height > 20_000_000:
+                return None
+            source.load()
+            image = source.convert("RGB")
+        with _PROFILE_PHOTO_CACHE_LOCK:
+            _PROFILE_PHOTO_CACHE[url] = (now, image.copy())
+            while len(_PROFILE_PHOTO_CACHE) > _PROFILE_PHOTO_CACHE_MAX:
+                _PROFILE_PHOTO_CACHE.pop(next(iter(_PROFILE_PHOTO_CACHE)))
+        return image
+    except Exception:
+        return None
+
+
+def _store_profile_photo_for_public_media(photo_url):
+    """Convert a public profile photo to baseline JPEG under the hosted media root."""
+    image = _download_profile_photo(photo_url)
+    if image is None:
+        return None
+    try:
+        out_dir = BASE_DIR / "generated_publish"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha256(str(photo_url or "").strip().encode("utf-8")).hexdigest()[:24]
+        target = out_dir / f"profile_{cache_key}.jpg"
+        if target.is_file() and target.stat().st_size > 4096:
+            return target
+        temporary = out_dir / f".profile_{cache_key}_{uuid.uuid4().hex}.tmp.jpg"
+        image.convert("RGB").save(temporary, "JPEG", quality=91, optimize=True, progressive=False)
+        os.replace(temporary, target)
+        return target
+    except Exception:
+        return None
 
 
 def _load_sender_avatar(photo_url, size=190):
     """Download a sender profile photo and crop it to a circular avatar."""
-    if not photo_url or not photo_url.startswith(("http://", "https://")):
+    av = _download_profile_photo(photo_url)
+    if av is None:
         return None
     try:
-        r = requests.get(photo_url, headers={"User-Agent":"TalkinBot/22"}, timeout=3)
-        if r.status_code != 200 or not r.content:
-            return None
-        from io import BytesIO
-        av = Image.open(BytesIO(r.content)).convert("RGB")
-        av = _fit_crop(av, (size,size)).convert("RGBA")
-        mask = Image.new("L", (size,size), 0)
-        md = ImageDraw.Draw(mask)
-        md.ellipse((2,2,size-2,size-2), fill=255)
-        out = Image.new("RGBA", (size,size), (0,0,0,0))
-        out.paste(av, (0,0), mask)
-        ring = ImageDraw.Draw(out)
-        ring.ellipse((2,2,size-2,size-2), outline=(248,202,91,255), width=7)
+        av = _fit_crop(av, (size, size)).convert("RGBA")
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((2, 2, size - 2, size - 2), fill=255)
+        out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        out.paste(av, (0, 0), mask)
+        ImageDraw.Draw(out).ellipse((2, 2, size - 2, size - 2), outline=(248, 202, 91, 255), width=7)
         return out
     except Exception:
         return None
@@ -6497,21 +7537,10 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
         gift_path = random.choice(choices)
         _GIFT_LAST_VARIANT[gift_key] = gift_path
 
-    # Clean old generated gift cards from the project before creating the
-    # current one.  The source artwork itself is NEVER generated or replaced.
-    generated_dir = BASE_DIR / "generated_gifts"
-    try:
-        generated_dir.mkdir(parents=True, exist_ok=True)
-        for old_card in generated_dir.iterdir():
-            if old_card.is_file() and old_card.name.startswith("gift_"):
-                try:
-                    old_card.unlink()
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    # Do not delete previous cards here: their public URLs are already in chat
+    # history. The runtime cleanup worker removes them only after its retention window.
 
-    template_path = BASE_DIR / "assets" / "gift_template_elegant.png"
+    template_path = ASSETS_DIR / "gift_template_elegant.png"
     if template_path.is_file():
         template = Image.open(template_path).convert("RGBA")
     else:
@@ -6631,6 +7660,7 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
         38,
         sender_color,
         text_max_w,
+        native_arabic_runs=True,
     )
     _draw_name_centered(
         d,
@@ -6639,6 +7669,7 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
         38,
         receiver_color,
         text_max_w,
+        native_arabic_runs=True,
     )
 
     # A light unsharp mask improves the apparent clarity of the ORIGINAL
@@ -6648,7 +7679,7 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
     except Exception:
         pass
 
-    out = BASE_DIR / "generated_gifts" / f"gift_{gift_id}_{uuid.uuid4().hex}.jpg"
+    out = GENERATED_GIFTS_DIR / f"gift_{gift_id}_{uuid.uuid4().hex}.jpg"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     rgb = image.convert("RGB")
@@ -6656,7 +7687,7 @@ def render_gift_card(gift_id, sender_name, receiver_name, sender_photo_url="", r
     # artificial 95KB cap here because that cap was the reason the card was
     # being compressed too aggressively and losing visible detail.
     for quality in (94, 92, 90, 88, 86, 84, 82):
-        rgb.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+        rgb.save(out, "JPEG", quality=quality, optimize=True, progressive=False)
         if out.stat().st_size <= 180 * 1024:
             break
 
@@ -6705,10 +7736,12 @@ def render_billion_card(winner_name, winner_photo_url=""):
     text_right = panel[2] - max(18, int(w * 0.035))
     text_center = ((text_left + text_right) / 2, panel_y + panel_h * 0.32)
     _draw_centered(d, text_center, "🏆 الفائز بالمليار", max(22, int(h * 0.055)),
-                   (255, 224, 145, 255), max(80, text_right - text_left))
+                   (255, 224, 145, 255), max(80, text_right - text_left), force_ltr=True)
+    display_name = _display_name_for_image(str(winner_name or "").strip().lstrip("@"))
     _draw_name_centered(d, ((text_left + text_right) / 2, panel_y + panel_h * 0.68),
-                        "@" + str(winner_name or ""), max(24, int(h * 0.065)),
-                        (255, 255, 255, 255), max(80, text_right - text_left))
+                        display_name, max(25, int(h * 0.032)),
+                        (255, 255, 255, 255), max(80, text_right - text_left),
+                        apply_correction=False, force_ltr=False)
 
     image = Image.alpha_composite(image, overlay).convert("RGB")
     out_dir = BASE_DIR / "generated_billion"
@@ -6724,7 +7757,7 @@ def render_billion_card(winner_name, winner_photo_url=""):
         pass
     out = out_dir / f"billion_{uuid.uuid4().hex}.jpg"
     for quality in (92, 88, 84, 80, 76):
-        image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+        image.save(out, "JPEG", quality=quality, optimize=True, progressive=False)
         if out.stat().st_size <= 300 * 1024:
             break
     return out
@@ -6749,7 +7782,7 @@ def render_money_game_winner_card(game_key, winner_name, winner_photo_url="", la
     w, h = image.size
     gold = (244, 196, 92, 255)
     panel = (3, 28, 31, 235)
-    panel_box = (int(w * .07), int(h * .785), int(w * .93), int(h * .94))
+    panel_box = (int(w * .07), int(h * .745), int(w * .93), int(h * .965))
     draw.rounded_rectangle(
         panel_box, radius=max(20, int(w * .025)), fill=panel,
         outline=gold, width=max(3, int(w * .004)),
@@ -6772,14 +7805,27 @@ def render_money_game_winner_card(game_key, winner_name, winner_photo_url="", la
 
     english = str(language or "ar").casefold().startswith("en")
     title = ("Million winner" if game_key == "million" else "Billion winner") if english else (
-        "الفائز بالمليون" if game_key == "million" else "الفائز بالمليار"
+        "فائز لعبة المليون" if game_key == "million" else "فائز لعبة المليار"
     )
-    text_center = ((text_left + text_right) / 2, panel_box[1] + (panel_box[3] - panel_box[1]) * .34)
-    _draw_centered(draw, text_center, "🏆 " + title, max(28, int(h * .038)),
-                   (255, 224, 145, 255), max(80, text_right - text_left))
-    name_center = ((text_left + text_right) / 2, panel_box[1] + (panel_box[3] - panel_box[1]) * .70)
-    _draw_name_centered(draw, name_center, "@" + str(winner_name or ""), max(34, int(h * .044)),
-                        (255, 255, 255, 255), max(80, text_right - text_left))
+    text_center = ((text_left + text_right) / 2, panel_box[1] + (panel_box[3] - panel_box[1]) * .22)
+    _draw_centered(draw, text_center, title, max(28, int(h * .038)),
+                   (255, 224, 145, 255), max(80, text_right - text_left), force_ltr=True)
+    source_name = str(winner_name or "").strip().lstrip("@")
+    # Apply the master-approved spelling only to the image display. The raw
+    # username remains untouched in identity, points, and command handling.
+    raw_name = _display_name_for_image(source_name)
+    # Keep the username on one line. _draw_name_centered will reduce the
+    # fitted size when a decorated name is wider than the winner panel.
+    name_lines = [raw_name]
+    line_ys = (.68,)
+    # Keep the million name a little smaller so decorated names remain clear.
+    name_size = max(25, int(h * (.030 if game_key == "million" else .034)))
+    for line, y_ratio in zip(name_lines, line_ys):
+        name_center = ((text_left + text_right) / 2,
+                       panel_box[1] + (panel_box[3] - panel_box[1]) * y_ratio)
+        _draw_name_centered(draw, name_center, line, name_size,
+                            (255, 255, 255, 255), max(80, text_right - text_left),
+                            apply_correction=False, force_ltr=False)
 
     image = Image.alpha_composite(image, overlay).convert("RGB")
     out_dir = BASE_DIR / "generated_games"
@@ -6792,7 +7838,7 @@ def render_money_game_winner_card(game_key, winner_name, winner_photo_url="", la
         pass
     out = out_dir / f"{game_key}_winner_{uuid.uuid4().hex}.jpg"
     for quality in (92, 88, 84, 80, 76):
-        image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+        image.save(out, "JPEG", quality=quality, optimize=True, progressive=False)
         if out.stat().st_size <= 300 * 1024:
             break
     return out
@@ -6940,12 +7986,14 @@ def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_pat
     _draw_centered(
         draw, (center_x, panel_box[1] + (panel_box[3] - panel_box[1]) * .32),
         str(title or "💎 الفائز بالألماسة النادرة"), max(27, int(h * .038)),
-        (115, 225, 255, 255), max(80, text_right - text_left),
+        (115, 225, 255, 255), max(80, text_right - text_left), force_ltr=True,
     )
     _draw_name_centered(
         draw, (center_x, panel_box[1] + (panel_box[3] - panel_box[1]) * .70),
-        "@" + str(winner_name or ""), max(34, int(h * .045)),
+        str(winner_name or "").lstrip("@"), max(34, int(h * .045)),
         (255, 255, 255, 255), max(80, text_right - text_left),
+        apply_correction=True,
+        force_ltr=False,
     )
     image = Image.alpha_composite(image, overlay).convert("RGB")
     out_dir = BASE_DIR / "generated_games"
@@ -6958,10 +8006,66 @@ def render_rare_diamond_winner_card(winner_name, winner_photo_url="", source_pat
         pass
     out = out_dir / f"rare_diamond_winner_{uuid.uuid4().hex}.jpg"
     for quality in (92, 88, 84, 80, 76):
-        image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+        image.save(out, "JPEG", quality=quality, optimize=True, progressive=False)
         if out.stat().st_size <= 300 * 1024:
             break
     return out
+
+_KEMIN_STATE_LOCK = threading.RLock()
+
+
+def render_kemin_card(owner_name, challenger_name, loser_name, owner_photo_url="", challenger_photo_url=""):
+    """Render a self-contained dramatic trap-game result card."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبت")
+    w, h = 1100, 720
+    image = Image.new("RGBA", (w, h), (9, 14, 30, 255))
+    d = ImageDraw.Draw(image)
+    # Layered frame and subtle arena panels.
+    d.rounded_rectangle((18, 18, w-18, h-18), radius=42,
+                        fill=(13, 23, 45, 255), outline=(231, 177, 72, 255), width=7)
+    d.rounded_rectangle((45, 45, w-45, 150), radius=28,
+                        fill=(28, 39, 63, 255), outline=(231, 177, 72, 255), width=3)
+    _draw_centered(d, (w/2, 96), "🪤 تحدي الكمين", 58,
+                   (255, 220, 142, 255), 900, force_ltr=False)
+    # Winner and loser labels.
+    winner_name = challenger_name if _norm_user(loser_name) == _norm_user(owner_name) else owner_name
+    winner_photo = challenger_photo_url if _norm_user(loser_name) == _norm_user(owner_name) else owner_photo_url
+    loser_photo = owner_photo_url if _norm_user(loser_name) == _norm_user(owner_name) else challenger_photo_url
+    d.rounded_rectangle((65, 190, 1035, 640), radius=34,
+                        fill=(18, 30, 52, 255), outline=(74, 104, 142, 255), width=3)
+    # Winner panel at left.
+    d.rounded_rectangle((90, 225, 410, 600), radius=28,
+                        fill=(19, 54, 61, 255), outline=(71, 207, 161, 255), width=4)
+    _draw_centered(d, (250, 270), "🏆 الفائز", 34, (126, 238, 190, 255), 270)
+    win_avatar = _load_sender_avatar(winner_photo, 180)
+    if win_avatar:
+        _paste_avatar_safe(image, win_avatar, (160, 315))
+    _draw_centered(d, (250, 540), "@" + str(winner_name), 30,
+                   (255, 255, 255, 255), 280)
+    # Trap cage in the center, with the losing player's actual avatar inside.
+    cx, cy = 740, 420
+    d.polygon([(cx-145, cy-115), (cx+145, cy-115), (cx+112, cy+145), (cx-112, cy+145)],
+              fill=(47, 32, 35, 255), outline=(238, 91, 76, 255))
+    d.line((cx-145, cy-115, cx-112, cy+145), fill=(247, 188, 92, 255), width=12)
+    d.line((cx+145, cy-115, cx+112, cy+145), fill=(247, 188, 92, 255), width=12)
+    d.line((cx-145, cy-115, cx+145, cy-115), fill=(247, 188, 92, 255), width=12)
+    d.line((cx-112, cy+145, cx+112, cy+145), fill=(247, 188, 92, 255), width=12)
+    for x in (cx-85, cx-30, cx+30, cx+85):
+        d.line((x, cy-108, x+int((x-cx)*.10), cy+138), fill=(247, 188, 92, 255), width=7)
+    lose_avatar = _load_sender_avatar(loser_photo, 150)
+    if lose_avatar:
+        _paste_avatar_safe(image, lose_avatar, (cx-75, cy-65))
+    else:
+        d.ellipse((cx-75, cy-65, cx+75, cy+85), fill=(90, 42, 42, 255), outline=(255, 191, 105, 255), width=5)
+    _draw_centered(d, (cx, 590), "وقع في الفخ!", 30, (255, 139, 120, 255), 300)
+    _draw_centered(d, (cx, 625), "@" + str(loser_name), 26, (255, 255, 255, 255), 300)
+    out_dir = BASE_DIR / "generated_games"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"kemin_{uuid.uuid4().hex}.jpg"
+    image.convert("RGB").save(out, "JPEG", quality=88, optimize=True)
+    return out
+
 
 def render_game_winner_card(game_key, winner_name, winner_photo_url="", language="ar"):
     """Elegant winner card in the same style as the gift cards.
@@ -7008,6 +8112,7 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url="", language
         34,
         (255, 222, 155, 255),
         header[2] - header[0] - 40,
+        force_ltr=True,
     )
 
     # Winner identity panel near the bottom: name INSIDE the rectangle,
@@ -7042,14 +8147,17 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url="", language
         24,
         (255, 224, 165, 255),
         text_max_w,
+        force_ltr=True,
     )
     _draw_name_centered(
         d,
-        (text_center_x, box_y + box_h * .68),
-        "@" + str(winner_name or ""),
+        (box_x + box_w / 2, box_y + box_h * .68),
+        str(winner_name or "").lstrip("@"),
         38,
         (126, 226, 255, 255),
         text_max_w,
+        apply_correction=True,
+        force_ltr=False,
     )
 
     try:
@@ -7070,14 +8178,14 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url="", language
     if hunt_card:
         max_bytes = 50 * 1024
         for quality in (86, 80, 74, 68, 62, 56, 50, 44):
-            image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+            image.save(out, "JPEG", quality=quality, optimize=True, progressive=False)
             if out.stat().st_size <= max_bytes:
                 break
         if out.stat().st_size > max_bytes:
             for width in (720, 640, 560, 480, 400, 320):
                 resized = image.resize((width, max(1, round(width * image.height / image.width))), Image.Resampling.LANCZOS)
                 for quality in (70, 62, 54, 46, 38):
-                    resized.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+                    resized.save(out, "JPEG", quality=quality, optimize=True, progressive=False)
                     if out.stat().st_size <= max_bytes:
                         break
                 if out.stat().st_size <= max_bytes:
@@ -7087,7 +8195,7 @@ def render_game_winner_card(game_key, winner_name, winner_photo_url="", language
             raise RuntimeError("Dragon Hunt winner card could not be compressed below 50KB")
     else:
         for quality in (94, 92, 90, 88, 86, 84, 82):
-            image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+            image.save(out, "JPEG", quality=quality, optimize=True, progressive=False)
             if out.stat().st_size <= 300 * 1024:
                 break
     return out
@@ -7132,7 +8240,7 @@ def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
     avatar_y = h + margin
     _paste_avatar_safe(canvas, avatar, (avatar_x, avatar_y))
 
-    name = "@" + str(publisher_name or "").strip().lstrip("@")
+    name = _display_name_for_image(str(publisher_name or "").strip().lstrip("@"))
     font_size = max(18, int(avatar_size * .30))
     try:
         measured = int(_visual_text_width(d, name, font_size))
@@ -7161,8 +8269,632 @@ def render_publish_card(source_url, publisher_name, publisher_photo_url=""):
     except Exception: pass
     out = out_dir / f"publish_{uuid.uuid4().hex}.jpg"
     for quality in (92,88,84,80,76):
-        image.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+        image.save(out, "JPEG", quality=quality, optimize=True, progressive=False)
         if out.stat().st_size <= 350 * 1024: break
+    return out
+
+
+_EXPLORE_TEXT_COLORS = (
+    (255, 221, 163),  # warm gold
+    (137, 231, 222),  # mint
+    (255, 170, 196),  # rose
+    (176, 199, 255),  # periwinkle
+    (226, 184, 255),  # lavender
+    (255, 193, 139),  # peach
+)
+_EXPLORE_TEXT_COLOR_LOCK = threading.Lock()
+_EXPLORE_TEXT_COLOR_INDEX = random.randrange(len(_EXPLORE_TEXT_COLORS))
+
+
+def _next_explore_text_color():
+    """Cycle through refined text colors so consecutive Explore posts differ."""
+    global _EXPLORE_TEXT_COLOR_INDEX
+    with _EXPLORE_TEXT_COLOR_LOCK:
+        color = _EXPLORE_TEXT_COLORS[_EXPLORE_TEXT_COLOR_INDEX]
+        _EXPLORE_TEXT_COLOR_INDEX = (_EXPLORE_TEXT_COLOR_INDEX + 1) % len(_EXPLORE_TEXT_COLORS)
+    return color
+
+
+def _explore_heart_mask(size, scale=4):
+    """Build a smooth, symmetric heart mask from sampled cubic Bézier curves."""
+    canvas_size = int(size) * int(scale)
+    curves = (
+        ((.50, .94), (.38, .82), (.02, .60), (.02, .35)),
+        ((.02, .35), (.02, .12), (.29, .03), (.50, .16)),
+        ((.50, .16), (.71, .03), (.98, .12), (.98, .35)),
+        ((.98, .35), (.98, .60), (.62, .82), (.50, .94)),
+    )
+    points = []
+    for p0, p1, p2, p3 in curves:
+        for step in range(25):
+            t = step / 24
+            u = 1 - t
+            x = u**3*p0[0] + 3*u*u*t*p1[0] + 3*u*t*t*p2[0] + t**3*p3[0]
+            y = u**3*p0[1] + 3*u*u*t*p1[1] + 3*u*t*t*p2[1] + t**3*p3[1]
+            points.append((round(x * canvas_size), round(y * canvas_size)))
+    mask = Image.new("L", (canvas_size, canvas_size), 0)
+    ImageDraw.Draw(mask).polygon(points, fill=255)
+    return mask.resize((int(size), int(size)), Image.Resampling.LANCZOS)
+
+
+def _draw_explore_username(draw, center, username, max_width):
+    """Draw decorated Arabic/Latin names and emoji in a polished gradient."""
+    name = _display_name_for_image(_clean_name_for_image(str(username or "").strip().lstrip("@")))[:80]
+    if not name:
+        return
+    base = getattr(draw, "_image", None)
+    if not isinstance(base, Image.Image):
+        _draw_name_centered(draw, center, name, 50, (255, 221, 163, 255), max_width,
+                            grow_short=False, native_arabic_runs=True)
+        return
+    name_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    _draw_name_centered(ImageDraw.Draw(name_layer), center, name, 50,
+                        (255, 255, 255, 255), max_width, grow_short=False,
+                        native_arabic_runs=True)
+    alpha = name_layer.getchannel("A")
+
+    # Soft shadow keeps the multicolor name readable over both image regions.
+    shadow_alpha = alpha.filter(ImageFilter.GaussianBlur(9)).point(lambda value: int(value * .52))
+    shadow = Image.new("RGBA", base.size, (18, 11, 34, 0))
+    shadow.putalpha(shadow_alpha)
+
+    # A vivid gold → rose → sky gradient gives the username its own
+    # colored tone while the shared name renderer handles Arabic, ornaments,
+    # fallback glyphs, and emoji.
+    stops = ((0.0, (255, 219, 105)), (0.48, (255, 91, 157)), (1.0, (91, 211, 255)))
+    gradient = Image.new("RGB", base.size, (255, 219, 105))
+    gradient_draw = ImageDraw.Draw(gradient)
+    width, height = base.size
+    name_bounds = alpha.getbbox() or (0, 0, width, height)
+    text_left, _text_top, text_right, _text_bottom = name_bounds
+    for x in range(width):
+        position = (x - text_left) / max(1, text_right - text_left - 1)
+        position = min(1.0, max(0.0, position))
+        left, right = stops[0], stops[-1]
+        for index in range(len(stops) - 1):
+            if stops[index][0] <= position <= stops[index + 1][0]:
+                left, right = stops[index], stops[index + 1]
+                break
+        ratio = (position - left[0]) / max(1e-9, right[0] - left[0])
+        color = tuple(round(a + (b - a) * ratio) for a, b in zip(left[1], right[1]))
+        gradient_draw.line((x, 0, x, height), fill=color)
+    gradient.putalpha(alpha)
+
+    composed = base.convert("RGBA")
+    composed.alpha_composite(shadow)
+    composed.alpha_composite(gradient)
+    base.paste(composed.convert(base.mode))
+
+
+def _explore_emoji_cluster_end(text, start):
+    """Return the end of one Unicode emoji cluster, including modifiers/ZWJ."""
+    if start >= len(text):
+        return start
+    first = text[start]
+    keycap_bases = "#*0123456789"
+    if first in keycap_bases:
+        end = start + 1
+        if end < len(text) and text[end] == "\ufe0f":
+            end += 1
+        return end + 1 if end < len(text) and text[end] == "\u20e3" else start
+    if not _is_emoji_base(first):
+        return start
+
+    end = start + 1
+    first_codepoint = ord(first)
+    if 0x1F1E6 <= first_codepoint <= 0x1F1FF and end < len(text):
+        next_codepoint = ord(text[end])
+        if 0x1F1E6 <= next_codepoint <= 0x1F1FF:
+            end += 1
+    while end < len(text):
+        codepoint = ord(text[end])
+        if (
+            codepoint in {0xFE0E, 0xFE0F, 0x20E3}
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+            or 0xE0020 <= codepoint <= 0xE007F
+            or unicodedata.category(text[end]).startswith("M")
+        ):
+            end += 1
+            continue
+        if codepoint == 0x200D and end + 1 < len(text):
+            end += 2
+            continue
+        break
+    return end
+
+
+def _explore_visual_tokens(text, font):
+    """Split a post into visually ordered text and complete color-emoji runs."""
+    logical_tokens = []
+    markers = {}
+    buffer = []
+    index = 0
+    while index < len(text):
+        end = _explore_emoji_cluster_end(text, index)
+        if end > index:
+            if buffer:
+                logical_tokens.append(("text", "".join(buffer)))
+                buffer = []
+            marker = chr(0xE000 + len(markers))
+            markers[marker] = text[index:end]
+            logical_tokens.append(("emoji", marker))
+            index = end
+        else:
+            buffer.append(text[index])
+            index += 1
+    if buffer:
+        logical_tokens.append(("text", "".join(buffer)))
+    if not markers:
+        return None
+
+    marked_text = "".join(value if kind == "emoji" else value for kind, value in logical_tokens)
+    # Use bidi's visual ordering with markers standing in for emoji, then draw
+    # Arabic presentation forms with BASIC layout so they are not reordered a
+    # second time when each run is rendered next to a color glyph.
+    draw_font = font
+    draw_mode = "ltr"
+    try:
+        if _has_arabic(marked_text) and arabic_reshaper is not None and get_display is not None:
+            visual = get_display(arabic_reshaper.reshape(marked_text))
+            draw_mode = "visual"
+            font_path = getattr(font, "path", None)
+            font_size = getattr(font, "size", None)
+            if font_path and font_size:
+                draw_font = ImageFont.truetype(
+                    str(font_path), int(font_size), layout_engine=ImageFont.Layout.BASIC
+                )
+        elif not _has_arabic(marked_text):
+            visual = marked_text
+        else:
+            # RAQM can shape a logical Arabic run itself. Approximate bidi at
+            # token boundaries by reversing the mixed run order, while leaving
+            # the letters inside each Arabic run to RAQM.
+            fallback_tokens = [
+                (kind, markers[value] if kind == "emoji" else value)
+                for kind, value in logical_tokens
+            ]
+            return list(reversed(fallback_tokens)), font, "rtl"
+    except Exception:
+        return None
+
+    visual_tokens = []
+    text_run = []
+    for char in visual:
+        if char in markers:
+            if text_run:
+                visual_tokens.append(("text", "".join(text_run)))
+                text_run = []
+            visual_tokens.append(("emoji", markers[char]))
+        else:
+            text_run.append(char)
+    if text_run:
+        visual_tokens.append(("text", "".join(text_run)))
+    return visual_tokens, draw_font, draw_mode
+
+
+def _explore_visual_text_width(draw, text, font, emoji_size):
+    prepared = _explore_visual_tokens(text, font)
+    if prepared is None:
+        return None
+    tokens, draw_font, draw_mode = prepared
+    width = 0.0
+    for kind, value in tokens:
+        if kind == "emoji":
+            width += emoji_size
+        else:
+            if draw_mode == "rtl":
+                width += draw.textlength(value, font=draw_font, direction="rtl", language="ar")
+            else:
+                width += draw.textlength(value, font=draw_font)
+    return width
+
+
+def _draw_explore_text_line(draw, center_x, y, text, font, fill, emoji_size):
+    prepared = _explore_visual_tokens(text, font)
+    if prepared is None:
+        return False
+    tokens, draw_font, draw_mode = prepared
+    total_width = sum(
+        emoji_size if kind == "emoji" else (
+            draw.textlength(value, font=draw_font, direction="rtl", language="ar")
+            if draw_mode == "rtl" else draw.textlength(value, font=draw_font)
+        )
+        for kind, value in tokens
+    )
+    cursor = float(center_x) - total_width / 2
+    for kind, value in tokens:
+        if kind == "emoji":
+            drawn_width = _draw_color_emoji(
+                draw, (cursor, y + max(0, (62 - emoji_size) / 2)), value, emoji_size
+            )
+            cursor += drawn_width or emoji_size
+        else:
+            if draw_mode == "rtl":
+                run_width = draw.textlength(value, font=draw_font, direction="rtl", language="ar")
+                draw.text(
+                    (cursor + run_width, y), value, font=draw_font, fill=fill,
+                    anchor="rt", direction="rtl", language="ar",
+                )
+            else:
+                run_width = draw.textlength(value, font=draw_font)
+                draw.text((cursor, y), value, font=draw_font, fill=fill, anchor="lt")
+            cursor += run_width
+    return True
+
+
+def render_explore_card(text, username, photo_url="", language="ar", secondary_text=""):
+    """Render a polished Explore card with a large heart portrait and glass caption."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير متاح")
+    width, height = 1080, 1500
+    image = Image.new("RGB", (width, height), (16, 20, 43))
+    gradient = ImageDraw.Draw(image)
+    top, bottom = (9, 20, 58), (82, 18, 78)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3))
+        gradient.line((0, y, width, y), fill=color)
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.ellipse((-240, -160, 450, 520), fill=(255, 116, 159, 26))
+    draw.ellipse((710, 110, 1310, 710), fill=(113, 180, 255, 23))
+
+    # Compact portrait near the top: a soft shadow, a warm metallic rim, and
+    # the user's square-cropped profile photo clipped directly to the heart.
+    outer_size, photo_size = 450, 410
+    outer_mask = _explore_heart_mask(outer_size)
+    photo_mask = _explore_heart_mask(photo_size)
+    outer_x, outer_y = (width - outer_size) // 2, 68
+    photo_x, photo_y = (width - photo_size) // 2, outer_y + (outer_size-photo_size)//2
+    shadow_mask = Image.new("L", image.size, 0)
+    shadow_mask.paste(outer_mask, (outer_x, outer_y + 15))
+    shadow_mask = shadow_mask.filter(ImageFilter.GaussianBlur(18))
+    shadow_layer = Image.new("RGBA", image.size, (6, 5, 18, 0))
+    shadow_layer.putalpha(shadow_mask.point(lambda value: int(value * .58)))
+    image = Image.alpha_composite(image.convert("RGBA"), shadow_layer)
+    border_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    border_layer.paste((248, 207, 142, 255), (outer_x, outer_y), outer_mask)
+    image = Image.alpha_composite(image, border_layer)
+
+    avatar = None
+    source_photo = _download_profile_photo(photo_url)
+    if source_photo is not None:
+        try:
+            scale = max(photo_size / source_photo.width, photo_size / source_photo.height)
+            resized = source_photo.resize(
+                (max(photo_size, int(source_photo.width * scale)),
+                 max(photo_size, int(source_photo.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+            crop_left = (resized.width - photo_size) // 2
+            # Favor the upper face slightly so eyes and forehead remain
+            # visible beneath the heart's top cleft.
+            crop_top = int((resized.height - photo_size) * .38)
+            avatar = resized.crop(
+                (crop_left, crop_top, crop_left + photo_size, crop_top + photo_size)
+            ).convert("RGBA")
+        except Exception:
+            avatar = None
+    if avatar is None:
+        avatar = Image.new("RGBA", (photo_size, photo_size), (53, 66, 100, 255))
+        ad = ImageDraw.Draw(avatar)
+        ad.ellipse((photo_size*.34, photo_size*.18, photo_size*.66, photo_size*.50), fill=(221, 230, 245, 255))
+        ad.rounded_rectangle((photo_size*.20, photo_size*.49, photo_size*.80, photo_size*.94),
+                             radius=photo_size*.18, fill=(221, 230, 245, 255))
+    avatar.putalpha(photo_mask)
+    image.paste(avatar, (photo_x, photo_y), avatar)
+    image = image.convert("RGB")
+    draw = ImageDraw.Draw(image, "RGBA")
+
+    # Title, profile heart, and colorful unboxed username form the top stack.
+    title_font_path = (ASSETS_DIR / "DejaVuSans.ttf" if str(language).casefold() == "en"
+                       else ASSETS_DIR / "NotoSansArabic-SemiBold.ttf")
+    if str(language).casefold() == "en" and not title_font_path.exists():
+        title_font_path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    try:
+        title_font = ImageFont.truetype(str(title_font_path), 30)
+    except Exception:
+        title_font = ImageFont.load_default()
+    draw.text((width//2, 36), "Explore" if str(language).casefold() == "en" else "اكسبلور", font=title_font, fill=(247, 222, 190, 255), anchor="mm")
+    _draw_explore_username(draw, (width//2, 558), username, 920)
+    draw.line((385, 600, 695, 600), fill=(249, 207, 143, 180), width=2)
+    draw.ellipse((width//2-4, 596, width//2+4, 604), fill=(255, 228, 180, 255))
+
+    # Translucent glass-style text panel; each new render takes the next
+    # color from the palette so consecutive posts visibly vary.
+    box = (84, 642, 996, 1270)
+    draw.rounded_rectangle(box, radius=42, fill=(13, 17, 38, 152), outline=(255, 255, 255, 92), width=2)
+    draw.rounded_rectangle((box[0]+10, box[1]+10, box[2]-10, box[3]-10),
+                           radius=34, outline=(255, 255, 255, 30), width=1)
+    try:
+        if _has_arabic(str(text or "")):
+            font_candidates = (
+                ASSETS_DIR / "NotoSansArabic-Regular.ttf",
+                Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"),
+            )
+        else:
+            font_candidates = (
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+                ASSETS_DIR / "DejaVuSans.ttf",
+                Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+            )
+        font_path = next((candidate for candidate in font_candidates if candidate.exists()), None)
+        font = ImageFont.truetype(str(font_path), 46) if font_path else ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+    # Keep the Explore text exactly as submitted: Arabic stays Arabic and
+    # English stays English. Translation is intentionally not applied here.
+    raw = str(text or "").strip()[:150]
+    words = raw.split() or [raw]
+    lines, current = [], ""
+    for word in words:
+        candidate = (current + " " + word).strip()
+        try:
+            measured = _explore_visual_text_width(draw, candidate, font, 46)
+            if measured is None:
+                measured = draw.textlength(candidate, font=font, direction="rtl", language="ar") if _has_arabic(candidate) else draw.textlength(candidate, font=font)
+        except Exception:
+            measured = draw.textlength(candidate, font=font)
+        if current and measured > 790:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    max_lines = 10
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip("…") + "…"
+    line_height = 62
+    first_y = box[1] + max(42, (box[3]-box[1]-(len(lines)*line_height))//2)
+    text_color = _next_explore_text_color()
+    for line in lines:
+        if _draw_explore_text_line(draw, width//2, first_y, line, font, (*text_color, 255), 46):
+            first_y += line_height
+            continue
+        if not _has_arabic(line):
+            # English/Latin text must never be sent through the Arabic shaping
+            # fallback: some deployed builds render that fallback as squares.
+            latin_path = next((candidate for candidate in (
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+                ASSETS_DIR / "DejaVuSans.ttf",
+            ) if candidate.exists()), None)
+            try:
+                latin_font = ImageFont.truetype(str(latin_path), 46) if latin_path else font
+            except Exception:
+                latin_font = font
+            draw.text((width//2, first_y), line, font=latin_font,
+                      fill=(*text_color, 255), anchor="mt", align="center")
+        else:
+            shown = line if (PIL_AVAILABLE and features.check("raqm")) else _visual_rtl_text(line)
+            direction = {"direction": "rtl", "language": "ar"} if PIL_AVAILABLE and features.check("raqm") else {}
+            draw.text((width//2, first_y), shown, font=font, fill=(*text_color, 255), anchor="mt", align="center", **direction)
+        first_y += line_height
+
+    footer_font_path = (ASSETS_DIR / "DejaVuSans.ttf" if str(language).casefold() == "en"
+                        else ASSETS_DIR / "NotoSansArabic-SemiBold.ttf")
+    if str(language).casefold() == "en" and not footer_font_path.exists():
+        footer_font_path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    try:
+        footer_font = ImageFont.truetype(str(footer_font_path), 31)
+    except Exception:
+        footer_font = ImageFont.load_default()
+    draw.text((width//2, 1395), "Kofi Bot" if str(language).casefold() == "en" else "كوفي بوت", font=footer_font,
+              fill=(245, 225, 199, 245), anchor="mm")
+    draw.line((420, 1350, 660, 1350), fill=(244, 194, 120, 115), width=2)
+
+    out_dir = BASE_DIR / "generated_publish"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"explore_{uuid.uuid4().hex}.jpg"
+    image.save(out, "JPEG", quality=91, optimize=True, progressive=False)
+    return out
+
+
+def render_explore_animated_card(text, username, photo_url="", language="ar", secondary_text=""):
+    """Create an animated 3D-style Explore card with layered bevels.
+
+    Frames type the post text in while the metallic border, portrait hearts,
+    orbiting highlights and depth shadow move in subtle parallax. The first
+    frame remains a valid static fallback for clients without GIF playback.
+    """
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير متاح")
+    out_dir = BASE_DIR / "generated_publish"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw = str(text or "").strip()[:150]
+    # Render short prefixes to create a genuine typewriter effect. Rendering
+    # through the normal card keeps Arabic shaping and the Latin font fix in
+    # one code path instead of duplicating the layout engine here.
+    prefixes = [raw[:max(0, int(len(raw) * n / 8))] for n in range(1, 9)]
+    if raw and prefixes[-1] != raw:
+        prefixes[-1] = raw
+    frames = []
+    temporary = []
+    # Decode the user's original photo once for the floating mini-hearts.
+    avatar = _download_profile_photo(photo_url)
+    if avatar is not None:
+        try:
+            side = min(avatar.width, avatar.height)
+            left = (avatar.width - side) // 2
+            top = (avatar.height - side) // 2
+            avatar = avatar.crop((left, top, left + side, top + side)).convert("RGBA")
+        except Exception:
+            avatar = None
+    try:
+        for index, prefix in enumerate(prefixes or [""]):
+            jpg = render_explore_card(prefix, username, photo_url,
+                                      language=language, secondary_text=secondary_text)
+            temporary.append(jpg)
+            with Image.open(jpg) as source:
+                frame = source.convert("RGBA")
+            # Keep the Explore artwork, background and text panel fixed. Only
+            # the portrait hearts and luminous particles move between frames.
+            overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+            od = ImageDraw.Draw(overlay)
+            # Beveled frame + offset extrusion create a visible 3D card edge.
+            tilt_x = int(7 * math.sin(index * math.pi / 4))
+            tilt_y = int(4 * math.cos(index * math.pi / 4))
+            od.rounded_rectangle((24+tilt_x+12, 24+tilt_y+14,
+                                  frame.width-24+tilt_x+12, frame.height-24+tilt_y+14),
+                                 radius=54, outline=(2, 5, 24, 205), width=20)
+            od.rounded_rectangle((24+tilt_x, 24+tilt_y,
+                                  frame.width-24+tilt_x, frame.height-24+tilt_y),
+                                 radius=54, outline=(60, 205, 255, 205), width=8)
+            od.rounded_rectangle((34+tilt_x, 34+tilt_y,
+                                  frame.width-34+tilt_x, frame.height-34+tilt_y),
+                                 radius=46, outline=(255, 202, 112, 150), width=3)
+            # A moving specular streak simulates light traveling across a raised edge.
+            shine_x = int(80 + (frame.width-160) * ((index % 5) / 4))
+            od.line((shine_x-100, 30+tilt_y, shine_x+100, 30+tilt_y),
+                    fill=(225, 250, 255, 210), width=5)
+            pulse = int(30 + 30 * (0.5 + 0.5 * math.sin(index * math.pi / 2)))
+            ring_color = (255, 194, 97, pulse) if index % 2 == 0 else (110, 230, 255, pulse)
+            drift = int(18 * math.sin(index * math.pi / 2))
+            od.ellipse((70 + drift, 95, 1010 + drift, 1340), outline=ring_color, width=7)
+            # Three scattered copies of the user's photo move on gentle arcs.
+            for j, (cx, cy, size) in enumerate(((150, 280, 105), (900, 420, 82), (170, 1110, 72))):
+                ox = int(42 * math.sin(index * math.pi / 2 + j * 1.7))
+                oy = int(34 * math.cos(index * math.pi / 2 + j * 1.3))
+                x, y = cx + ox - size // 2, cy + oy - size // 2
+                if avatar is not None:
+                    mini = avatar.resize((size, size), Image.Resampling.LANCZOS)
+                    mask = _explore_heart_mask(size)
+                    mini.putalpha(mask)
+                    overlay.paste(mini, (x, y), mini)
+                    od = ImageDraw.Draw(overlay)
+                    od.line((x + size//2, y + size - 5, x + size//2 + 8, y + size + 18), fill=(255, 220, 142, 120), width=3)
+                else:
+                    od = ImageDraw.Draw(overlay)
+                    od.polygon([(x+size//2, y+size), (x, y+size//3), (x+size//2, y+size//2), (x+size, y+size//3)], fill=(255, 93, 150, 180))
+            # Moving sparkles and small hearts provide a visible rhythm on GIF clients.
+            for j in range(7):
+                sx = int(90 + ((index * 97 + j * 137) % max(1, frame.width - 180)))
+                sy = int(180 + ((index * 61 + j * 181) % max(1, frame.height - 360)))
+                r = 4 + (j % 3)
+                od.ellipse((sx-r, sy-r, sx+r, sy+r), fill=(255, 241, 190, 185))
+            frames.append(Image.alpha_composite(frame, overlay).convert("P", palette=Image.Palette.ADAPTIVE))
+        out = out_dir / f"explore_{uuid.uuid4().hex}.gif"
+        frames[0].save(out, "GIF", save_all=True, append_images=frames[1:],
+                       duration=190, loop=0, optimize=True, disposal=2)
+        return out
+    finally:
+        for path in temporary:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+# ============================================================
+# Personal 3D-style image commands: animated portrait + rendered name art.
+# These are lightweight Pillow effects (not AI face reconstruction).
+# ============================================================
+
+def render_user_3d_portrait_gif(photo_url, username):
+    """Render a compact animated portrait card with layered depth and orbiting rings."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبت")
+    avatar = _download_profile_photo(photo_url)
+    if avatar is None:
+        raise RuntimeError("تعذر تحميل صورة الحساب")
+    size = 560
+    side = min(avatar.width, avatar.height)
+    avatar = avatar.crop(((avatar.width-side)//2, (avatar.height-side)//2,
+                          (avatar.width+side)//2, (avatar.height+side)//2))
+    avatar = avatar.resize((330, 330), Image.Resampling.LANCZOS).convert("RGBA")
+    mask = Image.new("L", (330, 330), 0)
+    ImageDraw.Draw(mask).ellipse((3, 3, 327, 327), fill=255)
+    avatar.putalpha(mask)
+    out_dir = BASE_DIR / "generated_publish"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames=[]
+    # A dark blue-violet gradient background is reused for every frame.
+    bg = Image.new("RGB", (size, size))
+    px = bg.load()
+    for y in range(size):
+        t = y / max(1, size-1)
+        c = (int(7+12*t), int(15+5*t), int(42+35*t))
+        for x in range(size):
+            glow = max(0, 1 - (((x-280)/390)**2 + ((y-230)/390)**2))
+            px[x,y] = tuple(min(255, int(v + glow*k)) for v,k in zip(c,(14,18,48)))
+    for frame_no in range(10):
+        frame = bg.convert("RGBA")
+        d = ImageDraw.Draw(frame)
+        pulse = int(5 + 5 * (0.5 + 0.5 * math.sin(frame_no * math.pi / 5)))
+        # Extruded portrait base and luminous concentric rings.
+        d.ellipse((104, 82, 456, 434), fill=(2, 5, 20, 255), outline=(20, 88, 190, 255), width=16)
+        d.ellipse((112-pulse, 90-pulse, 448+pulse, 426+pulse), outline=(40, 190, 255, 220), width=5)
+        d.ellipse((125, 103, 435, 413), outline=(255, 190, 70, 190), width=3)
+        angle = frame_no * 36
+        # Orbiting 3D light beads.
+        for j in range(3):
+            a = math.radians(angle + j*120)
+            cx = int(280 + 198*math.cos(a))
+            cy = int(258 + 198*math.sin(a)*0.48)
+            r = 10 if j == 0 else 7
+            d.ellipse((cx-r-3, cy-r-3, cx+r+3, cy+r+3), fill=(15, 75, 145, 180))
+            d.ellipse((cx-r, cy-r, cx+r, cy+r), fill=((75,220,255,255) if j%2==0 else (255,205,105,255)))
+        bob = int(5 * math.sin(frame_no * math.pi / 5))
+        # Depth extrusion behind the portrait.
+        for offset in range(12, 0, -2):
+            frame.alpha_composite(avatar, (115+offset, 98+offset+bob))
+        frame.alpha_composite(avatar, (115, 98+bob))
+        d = ImageDraw.Draw(frame)
+        d.rounded_rectangle((55, 455, 505, 525), radius=25,
+                            fill=(8, 24, 56, 245), outline=(70, 195, 255, 235), width=3)
+        _draw_name_centered(d, (280, 490), str(username or ""), 34,
+                            (255, 225, 155, 255), 410, apply_correction=False)
+        frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=128))
+    out = out_dir / f"portrait3d_{uuid.uuid4().hex}.gif"
+    frames[0].save(out, "GIF", save_all=True, append_images=frames[1:],
+                   duration=150, loop=0, optimize=True, disposal=2)
+    return out
+
+
+def render_3d_name_card(name):
+    """Create a compact, colorful 3D Arabic/Latin name image."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow غير مثبت")
+    display = _clean_name_for_image(str(name or "")).strip()[:48]
+    if not display:
+        raise ValueError("اكتب الاسم بعد الأمر: اسم احمد")
+    w = h = 900
+    image = Image.new("RGB", (w, h))
+    pix = image.load()
+    for y in range(h):
+        t = y / (h-1)
+        row = (int(5+15*t), int(12+8*t), int(40+45*t))
+        for x in range(w):
+            glow = max(0, 1 - (((x-450)/620)**2 + ((y-390)/620)**2))
+            pix[x,y] = tuple(min(255, int(v + glow*k)) for v,k in zip(row,(28,22,58)))
+    d = ImageDraw.Draw(image)
+    d.rounded_rectangle((24,24,876,876), radius=55, outline=(48,195,255), width=8)
+    d.rounded_rectangle((43,43,857,857), radius=42, outline=(244,183,75), width=3)
+    for i in range(5):
+        pad = 100 + i*26
+        d.ellipse((pad, pad+15, w-pad, h-pad+15), outline=(35, 125+i*12, 230, 65), width=3)
+    # Stars and floating light particles.
+    for i in range(34):
+        x = (i*173+71) % 820 + 40
+        y = (i*257+53) % 820 + 40
+        r = 2 + (i % 4)
+        d.ellipse((x-r,y-r,x+r,y+r), fill=(110,220,255))
+    _draw_centered(d, (450, 250), "اسم بتصميم ثلاثي الأبعاد", 38,
+                   (195,225,255), 760, apply_correction=False)
+    # Extruded shadow layers, then a warm metallic face.
+    for offset in range(20, 0, -2):
+        _draw_name_centered(d, (450+offset, 500+offset), display, 104,
+                            (5, 20, 65), 760, apply_correction=False)
+    _draw_name_centered(d, (450, 500), display, 104,
+                        (255, 207, 92), 760, apply_correction=False)
+    d.line((190, 650, 710, 650), fill=(65,205,255), width=4)
+    _draw_centered(d, (450, 720), "GAZANET • 3D DESIGN", 25,
+                   (160,220,255), 700, force_ltr=True, apply_correction=False)
+    out_dir = BASE_DIR / "generated_publish"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"name3d_{uuid.uuid4().hex}.jpg"
+    image.save(out, "JPEG", quality=86, optimize=True, progressive=True)
     return out
 
 
@@ -7197,58 +8929,181 @@ def _extract_image_urls_from_bing(html_text):
     return urls
 
 
-def _search_lookalike_images(query, exclude_urls=None, limit=12):
-    """Return several current Bing results, falling back to Commons search."""
-    q = str(query or "").strip()
-    if not q:
-        return []
-    excluded = {str(x).strip() for x in (exclude_urls or []) if str(x).strip()}
-    urls = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Android 10; Mobile) AppleWebKit/537.36 "
-                      "Chrome/120.0 Mobile Safari/537.36",
-        "Accept-Language": "ar,en;q=0.8",
+def _is_explicit_picture_query(query):
+    """Fail closed for explicitly sexual image searches; normal searches use strict SafeSearch."""
+    text = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
+    english_terms = {
+        "nsfw", "xxx", "porn", "porno", "nude", "nudes", "nudity",
+        "erotic", "hentai", "sex", "sexual", "sexy",
     }
-    try:
-        r = requests.get(
-            "https://www.bing.com/images/search",
-            params={"q": q + " safe for work", "form": "HDRSC2", "first": "1", "adlt": "strict"},
-            headers=headers,
-            timeout=(3, 6),
-        )
-        r.raise_for_status()
-        urls = _extract_image_urls_from_bing(r.text)
-    except Exception:
-        urls = []
-    fresh = list(dict.fromkeys(url for url in urls if url and url not in excluded))
-    if len(fresh) < min(3, max(1, int(limit))):
-        # Bing can block datacenter IPs or change its image-result markup.
-        # Commons' public API is a stable, license-aware image-search fallback.
+    if set(re.findall(r"[a-z0-9]+", text)) & english_terms:
+        return True
+    normalized = _norm_user(text)
+    return any(term in normalized for term in (
+        "اباحي", "اباحيه", "عاري", "عاريه", "تعري", "عري", "مخل", "فاضح",
+        "سكس", "جنس", "مثير", "مثيرة", "خلاعي",
+    ))
+
+
+def _is_monkey_picture_query(query):
+    normalized = _norm_user(query)
+    return any(term in normalized for term in ("قرد", "قرود", "شمبانزي", "monkey", "chimp"))
+
+
+def _image_search_core_query(query):
+    """Remove presentation words so encyclopedic image search sees the subject name."""
+    value = str(query or "").strip()
+    value = re.sub(
+        r"\b(?:safe\s+for\s+work|fully\s+clothed|official\s+portrait|"
+        r"red\s+carpet\s+portrait|celebrity\s+headshot|portrait|headshot|photo|image)\b",
+        " ", value, flags=re.I,
+    )
+    value = re.sub(r"\s+", " ", value).strip(" -_,")
+    return value or str(query or "").strip()
+
+
+def _search_wikipedia_portrait_images(query, limit=10):
+    """Fetch article lead-image thumbnails from Arabic/English Wikipedia APIs."""
+    core = _image_search_core_query(query)
+    if not core:
+        return []
+    headers = {
+        "User-Agent": "TalkinBot/1.0 (public image lookup; contact bot administrator)",
+        "Accept": "application/json",
+    }
+    found = []
+    for language in ("ar", "en"):
         try:
-            commons_query = re.sub(r"\b(?:celebrity|portrait|safe for work)\b", " ", q, flags=re.I)
-            commons_query = re.sub(r"\s+", " ", commons_query).strip() or q
             response = requests.get(
-                "https://commons.wikimedia.org/w/api.php",
+                f"https://{language}.wikipedia.org/w/api.php",
                 params={
-                    "action": "query", "generator": "search", "gsrsearch": commons_query,
-                    "gsrnamespace": 6, "gsrlimit": max(8, int(limit)),
-                    "prop": "imageinfo", "iiprop": "url|mime", "iiurlwidth": 1200,
-                    "format": "json", "formatversion": 2,
+                    "action": "query", "generator": "search", "gsrsearch": core,
+                    "gsrlimit": max(5, min(15, int(limit) + 3)),
+                    "prop": "pageimages", "piprop": "thumbnail", "pithumbsize": 1000,
+                    "redirects": 1, "format": "json", "formatversion": 2,
                 },
-                headers={"User-Agent": "TalkinBot/1.0 (https://github.com/zidaan11223344-coder/Talkin2)", "Accept": "application/json"},
-                timeout=(3, 6),
+                headers=headers, timeout=(4, 9),
             )
             response.raise_for_status()
-            for page in response.json().get("query", {}).get("pages", []):
-                image = (page.get("imageinfo") or [{}])[0]
-                image_url = image.get("thumburl") or image.get("url")
-                mime = str(image.get("mime") or "").lower()
-                if image_url and mime in {"image/jpeg", "image/png", "image/webp"} and image_url not in excluded:
-                    fresh.append(image_url)
+            payload = response.json()
+            pages = (payload.get("query") or {}).get("pages") or []
+            if isinstance(pages, dict):
+                pages = list(pages.values())
+            for page in pages:
+                thumb = page.get("thumbnail") if isinstance(page, dict) else None
+                image_url = str((thumb or {}).get("source") or "").strip()
+                if image_url.startswith("https://") and image_url not in found:
+                    found.append(image_url)
+        except Exception:
+            continue
+        if len(found) >= int(limit):
+            break
+    return found[:max(1, int(limit))]
+
+
+def _search_commons_image_files(query, limit=10):
+    """Search Wikimedia Commons files and resolve their actual image URLs."""
+    core = _image_search_core_query(query)
+    if not core:
+        return []
+    headers = {
+        "User-Agent": "TalkinBot/1.0 (public image lookup; contact bot administrator)",
+        "Accept": "application/json",
+    }
+    try:
+        search_response = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action": "query", "list": "search", "srsearch": core,
+                "srnamespace": 6, "srlimit": max(8, min(30, int(limit) * 2)),
+                "format": "json", "formatversion": 2,
+            },
+            headers=headers, timeout=(4, 9),
+        )
+        search_response.raise_for_status()
+        rows = (search_response.json().get("query") or {}).get("search") or []
+        pageids = [str(row.get("pageid")) for row in rows if row.get("pageid")]
+        if not pageids:
+            return []
+        info_response = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action": "query", "pageids": "|".join(pageids),
+                "prop": "imageinfo", "iiprop": "url|mime", "iiurlwidth": 1000,
+                "format": "json", "formatversion": 2,
+            },
+            headers=headers, timeout=(4, 9),
+        )
+        info_response.raise_for_status()
+        pages = (info_response.json().get("query") or {}).get("pages") or []
+        if isinstance(pages, dict):
+            pages = list(pages.values())
+        urls = []
+        allowed_mimes = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+        for page in pages:
+            info = (page.get("imageinfo") or [{}])[0] if isinstance(page, dict) else {}
+            mime = str(info.get("mime") or "").lower()
+            image_url = str(info.get("thumburl") or info.get("url") or "").strip()
+            if mime in allowed_mimes and image_url.startswith("https://") and image_url not in urls:
+                urls.append(image_url)
+        return urls[:max(1, int(limit))]
+    except Exception:
+        return []
+
+
+def _search_lookalike_images(query, exclude_urls=None, limit=12):
+    """Return image URLs from Wikipedia, Commons, then Bing as a final fallback."""
+    q = str(query or "").strip()
+    if not q or _is_explicit_picture_query(q):
+        return []
+    excluded = {str(x).strip() for x in (exclude_urls or []) if str(x).strip()}
+    wanted = max(1, min(30, int(limit)))
+    collected = []
+
+    # Wikipedia page thumbnails are stable direct image URLs and avoid scraping
+    # a search-results HTML page whose markup changes frequently.
+    try:
+        collected.extend(_search_wikipedia_portrait_images(q, limit=wanted))
+    except Exception:
+        pass
+
+    # Commons supplies genuine image-file URLs when the encyclopedia has no
+    # article thumbnail (common for regional celebrities and public figures).
+    if len(set(collected)) < wanted:
+        try:
+            collected.extend(_search_commons_image_files(q, limit=wanted))
         except Exception:
             pass
-    return fresh[:max(1, int(limit))]
 
+    # Bing remains the final fallback for broader image searches.
+    if len(set(collected)) < wanted:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Android 10; Mobile) AppleWebKit/537.36 "
+                          "Chrome/120.0 Mobile Safari/537.36",
+            "Accept-Language": "ar,en;q=0.8",
+        }
+        safe_query = q if re.search(r"\bsafe for work\b", q, flags=re.I) else q + " safe for work"
+        try:
+            response = requests.get(
+                "https://www.bing.com/images/search",
+                params={"q": safe_query, "form": "HDRSC2", "first": "1", "adlt": "strict"},
+                headers=headers, timeout=(4, 8),
+            )
+            response.raise_for_status()
+            collected.extend(_extract_image_urls_from_bing(response.text))
+        except Exception:
+            pass
+
+    result = []
+    seen = set(excluded)
+    for url in collected:
+        value = str(url or "").strip()
+        if value.startswith("https://") and len(value) <= 900 and value not in seen:
+            seen.add(value)
+            result.append(value)
+            if len(result) >= wanted:
+                break
+    return result
 
 def _search_lookalike_image(query, exclude_urls=None):
     """Return a fresh random image URL from Bing or Wikimedia Commons."""
@@ -7300,21 +9155,19 @@ def _search_monkey_image(exclude_urls=None):
 
 
 def _download_lookalike_image(image_url, target_name):
-    """Download, validate, and lightly optimize a found image."""
+    """Download and validate an image; Pillow optimization is optional."""
     if not image_url:
         return None
     LOOKALIKE_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        r = requests.get(
+        response = requests.get(
             image_url,
             headers={"User-Agent": "Mozilla/5.0", "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
-            timeout=(3, 7),
-            stream=True,
+            timeout=(5, 15), stream=True,
         )
-        r.raise_for_status()
-        chunks = []
-        total = 0
-        for chunk in r.iter_content(64 * 1024):
+        response.raise_for_status()
+        chunks, total = [], 0
+        for chunk in response.iter_content(64 * 1024):
             if not chunk:
                 continue
             total += len(chunk)
@@ -7322,23 +9175,40 @@ def _download_lookalike_image(image_url, target_name):
                 return None
             chunks.append(chunk)
         data = b"".join(chunks)
-        if not data:
+        if len(data) < 128:
             return None
-        if not PIL_AVAILABLE:
-            return None
-        from io import BytesIO
-        img = Image.open(BytesIO(data)).convert("RGB")
-        # Keep the found image recognizable; only normalize dimensions/file size.
-        max_side = 1100
-        if max(img.size) > max_side:
-            scale = max_side / float(max(img.size))
-            img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
-        out = LOOKALIKE_DIR / f"look_{uuid.uuid4().hex}.jpg"
-        for quality in (92, 88, 84, 80, 76, 72):
-            img.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
-            if out.stat().st_size <= 220 * 1024:
-                break
-        return out if out.is_file() else None
+        if data.startswith(b"\xff\xd8\xff"):
+            ext = ".jpg"
+        elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+            ext = ".png"
+        elif data[:6] in (b"GIF87a", b"GIF89a"):
+            ext = ".gif"
+        elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            ext = ".webp"
+        else:
+            ctype = str(response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+            ext = {"image/jpeg":".jpg", "image/png":".png", "image/webp":".webp", "image/gif":".gif"}.get(ctype, "")
+            if not ext:
+                return None
+        out = LOOKALIKE_DIR / f"look_{uuid.uuid4().hex}{ext}"
+        if PIL_AVAILABLE:
+            try:
+                from io import BytesIO
+                img = Image.open(BytesIO(data))
+                img.load()
+                img = img.convert("RGB")
+                if max(img.size) > 1100:
+                    scale = 1100 / float(max(img.size))
+                    img = img.resize((max(1, int(img.width*scale)), max(1, int(img.height*scale))), Image.LANCZOS)
+                out = out.with_suffix(".jpg")
+                img.save(out, "JPEG", quality=86, optimize=True, progressive=False)
+                if out.is_file() and out.stat().st_size > 128:
+                    return out
+            except Exception:
+                pass
+        # Do not fail image delivery just because Pillow is absent or a decoder rejects the file.
+        out.write_bytes(data)
+        return out if out.is_file() and out.stat().st_size > 128 else None
     except Exception:
         return None
 
@@ -7616,6 +9486,10 @@ def _cleanup_runtime_files(bot=None):
             music_dir = BASE_DIR / "generated_music"
             if music_dir.exists():
                 for item in list(music_dir.iterdir()):
+                    # The prepared MP3 cache must survive routine cleanup so
+                    # repeated songs remain fast across bot restarts.
+                    if item.name == ".music_cache":
+                        continue
                     try:
                         # Keep files created during the current cleanup window.
                         age = now - item.stat().st_mtime
@@ -7628,18 +9502,20 @@ def _cleanup_runtime_files(bot=None):
                     elif item.suffix.lower() in _CLEANUP_SUFFIXES or item.name.startswith("."):
                         removed_files += _safe_remove_file(item)
 
-        # Remove generated images/audio from all disposable runtime folders.
-        # Persistent bot state is kept in DATA_DIR and is never touched here.
+        # Remove old generated files after the retention window. Gift cards now
+        # live in DATA_DIR so deployment replaces do not immediately break links.
         # Files younger than CLEANUP_MAX_AGE_SECONDS are kept so an active
         # request/broadcast is not interrupted. The base folders themselves
         # are preserved because the HTTP media server uses them as roots.
         if CLEANUP_GENERATED_ENABLED:
             generated_dirs = (
                 BASE_DIR / "generated_music",
+                GENERATED_GIFTS_DIR,
                 BASE_DIR / "generated_gifts",
                 BASE_DIR / "generated_billion",
                 BASE_DIR / "generated_games",
                 BASE_DIR / "generated_publish",
+                BASE_DIR / "generated_welcomes",
                 BASE_DIR / "generated_lookalikes",
             )
             for generated_dir in generated_dirs:
@@ -7650,8 +9526,11 @@ def _cleanup_runtime_files(bot=None):
                         # Only delete files/directories that are actually
                         # inside the disposable generated root.
                         try:
-                            item.relative_to(generated_dir)
+                            relative_item = item.relative_to(generated_dir)
                         except ValueError:
+                            continue
+                        # Never prune the prepared MP3 cache under generated_music.
+                        if generated_dir.name == "generated_music" and ".music_cache" in relative_item.parts:
                             continue
                         try:
                             age = now - item.stat().st_mtime
@@ -7763,11 +9642,13 @@ class _MediaHandler(SimpleHTTPRequestHandler):
         elif path.startswith("/cricket-media/"):
             rel=path[len("/cricket-media/"):].lstrip("/"); root=(DATA_DIR/"cricket_media").resolve(); target=(DATA_DIR/"cricket_media"/rel).resolve()
         elif path.startswith("/gifts/"):
-            rel=path[len("/gifts/"):].lstrip("/"); root=(BASE_DIR/"generated_gifts").resolve(); target=(BASE_DIR/"generated_gifts"/rel).resolve()
+            rel=path[len("/gifts/"):].lstrip("/"); root=GENERATED_GIFTS_DIR.resolve(); target=(GENERATED_GIFTS_DIR/rel).resolve()
         elif path.startswith("/billion/"):
             rel=path[len("/billion/"):].lstrip("/"); root=(BASE_DIR/"generated_billion").resolve(); target=(BASE_DIR/"generated_billion"/rel).resolve()
         elif path.startswith("/games/"):
             rel=path[len("/games/"):].lstrip("/"); root=(BASE_DIR/"generated_games").resolve(); target=(BASE_DIR/"generated_games"/rel).resolve()
+        elif path.startswith("/welcomes/"):
+            rel=path[len("/welcomes/"):].lstrip("/"); root=(BASE_DIR/"generated_welcomes").resolve(); target=(BASE_DIR/"generated_welcomes"/rel).resolve()
         elif path.startswith("/publish/"):
             rel=path[len("/publish/"):].lstrip("/"); root=(BASE_DIR/"generated_publish").resolve(); target=(BASE_DIR/"generated_publish"/rel).resolve()
         elif path.startswith("/media/"):
@@ -7776,7 +9657,14 @@ class _MediaHandler(SimpleHTTPRequestHandler):
             rel=path[len("/lookalikes/"):].lstrip("/"); root=LOOKALIKE_DIR.resolve(); target=(LOOKALIKE_DIR/rel).resolve()
         else:
             return None
-        if root not in target.parents or not target.is_file(): return None
+        if root not in target.parents or not target.is_file():
+            # Existing links created before the persistent-path update may still
+            # point to the old generated_gifts directory beside bot.py.
+            if path.startswith("/gifts/"):
+                legacy_root=(BASE_DIR/"generated_gifts").resolve()
+                legacy_target=(legacy_root/rel).resolve()
+                if legacy_root in legacy_target.parents and legacy_target.is_file(): return legacy_target
+            return None
         return target
 
     def _ctype(self,target):
@@ -7831,7 +9719,8 @@ class _MediaHandler(SimpleHTTPRequestHandler):
 def start_asset_server():
     if not ASSET_HTTP_ENABLED: return None
     try:
-        (BASE_DIR/"generated_gifts").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_music").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_publish").mkdir(parents=True,exist_ok=True); (DATA_DIR/"cricket_media").mkdir(parents=True,exist_ok=True); LOOKALIKE_DIR.mkdir(parents=True,exist_ok=True)
+        GENERATED_GIFTS_DIR.mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_gifts").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_music").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_publish").mkdir(parents=True,exist_ok=True); (BASE_DIR/"generated_welcomes").mkdir(parents=True,exist_ok=True); (DATA_DIR/"cricket_media").mkdir(parents=True,exist_ok=True); LOOKALIKE_DIR.mkdir(parents=True,exist_ok=True)
+        # Altare and similar hosts must be able to reach the listener externally.
         server=ThreadingHTTPServer(("0.0.0.0",ASSET_HTTP_PORT),_MediaHandler)
         threading.Thread(target=server.serve_forever,name="media-http",daemon=True).start()
         if DEBUG and not QUIET_MODE:
@@ -7856,6 +9745,18 @@ class TalkinBot:
             target=self._event_worker_loop, name="ws-event-worker", daemon=True
         )
         self._event_worker.start()
+        self._room_broadcast_queue = queue.Queue(maxsize=20)
+        self._room_broadcast_worker = threading.Thread(
+            target=self._room_broadcast_worker_loop,
+            name="room-broadcast-worker", daemon=True,
+        )
+        self._room_broadcast_worker.start()
+        self._private_broadcast_queue = queue.Queue(maxsize=8)
+        self._private_broadcast_worker = threading.Thread(
+            target=self._private_broadcast_worker_loop,
+            name="private-broadcast-worker", daemon=True,
+        )
+        self._private_broadcast_worker.start()
         self._silent_master_local = threading.local()
         self._master_reply_local = threading.local()
         self.http = requests.Session()
@@ -7925,6 +9826,7 @@ class TalkinBot:
         self._pending_inv_role_check = {}
         # Private list requests waiting for the native occupants_list response.
         self._pending_room_lists = {}
+        self._pending_bot_room_role_checks = {}
         self._pending_presence = {}
         # Live profile photos learned from Talkin UserItem field 3.
         # username(casefold) -> public photo URL.
@@ -8082,7 +9984,7 @@ class TalkinBot:
         self._first_connection_status_sent = False
         self.music_lock = threading.Lock()
         # Mini-games: free-to-play, no points are deducted.
-        self.game_lock = threading.Lock()
+        self.game_lock = threading.RLock()
         self.game_cooldown = defaultdict(float)
         self.board_game_cooldown = {}
         self.guess_games = {}
@@ -8121,8 +10023,11 @@ class TalkinBot:
             row for row in saved_stock_rows
             if isinstance(row, dict) and row.get("id") and row.get("username")
         ] if isinstance(saved_stock_rows, list) else []
-        # Global wager queues, crop timers, and fruit-match state.
-        self.wager_waiting = {}
+        self._recover_stock_market_investments_from_points_history()
+        # Global wager queues, crop timers, and fruit-match state. A wager
+        # reserves points immediately, so it must survive a process restart.
+        self.wager_waiting = self._load_wager_state()
+        self._recover_pending_wager_debits()
         # Global fixed-prize PvP queues: one open challenge per game name.
         self.fixed_game_waiting = {}
         # Temporary one-minute anti-steal protection granted by the حصانه command.
@@ -8152,10 +10057,10 @@ class TalkinBot:
         self.auto_replies = {}
         self.custom_welcome_enabled = True
         self.custom_welcomes = {}
-        self.welcome_identities = {}
         self._load_social_features()
         self._load_departure_replies()
         threading.Thread(target=self._crop_worker, name="crop-worker", daemon=True).start()
+        threading.Thread(target=self._wallet_settlement_worker, name="wallet-settlement-worker", daemon=True).start()
         if not MASTER_SERVICE_ENABLED:
             threading.Thread(target=self._fishing_event_worker, name="fishing-event-worker", daemon=True).start()
             threading.Thread(target=self._stock_market_worker, name="stock-market-worker", daemon=True).start()
@@ -8194,42 +10099,15 @@ class TalkinBot:
             self.custom_welcome_enabled = bool(data.get("enabled", True))
             raw = data.get("welcomes", {})
             self.custom_welcomes = raw if isinstance(raw, dict) else {}
-            identities = data.get("identities", {})
-            self.welcome_identities = identities if isinstance(identities, dict) else {}
         except Exception:
             self.custom_welcome_enabled, self.custom_welcomes = True, {}
-            self.welcome_identities = {}
 
     def _save_social_features(self):
         data = _ensure_replies_file()
         data["auto_replies_enabled"] = bool(self.auto_replies_enabled)
         data["auto_replies"] = self.auto_replies
         _save_local_json(self.auto_replies_file, data)
-        _save_local_json(self.custom_welcomes_file, {
-            "enabled": self.custom_welcome_enabled,
-            "welcomes": self.custom_welcomes,
-            "identities": getattr(self, "welcome_identities", {}),
-        })
-
-    def _custom_welcome_for_identity(self, username, room=""):
-        welcomes = getattr(self, "custom_welcomes", {})
-        if not isinstance(welcomes, dict):
-            return None
-        exact = welcomes.get(_norm_user(username))
-        if exact is not None:
-            return exact
-        user_id = _stored_user_id(username, room)
-        if not user_id:
-            return None
-        matches = []
-        for key, value in welcomes.items():
-            if not isinstance(value, dict):
-                continue
-            stored_id = str(value.get("user_id") or "").strip()
-            stored_name = value.get("username") or key
-            if stored_id == user_id or _stored_user_id(stored_name, room) == user_id:
-                matches.append(value)
-        return matches[0] if len(matches) == 1 else None
+        _save_local_json(self.custom_welcomes_file, {"enabled": self.custom_welcome_enabled, "welcomes": self.custom_welcomes})
 
     def _load_departure_replies(self):
         """Load departure-trigger replies from their own file, separate from auto replies."""
@@ -8242,9 +10120,9 @@ class TalkinBot:
         fixed = {}
         if isinstance(raw, dict):
             for trigger, replies in raw.items():
-                key = _auto_reply_key(trigger)
+                key = _departure_trigger_key(trigger)
                 values = [str(item).strip() for item in (replies if isinstance(replies, list) else [replies]) if str(item).strip()]
-                if len(key) == 1 and values:
+                if key and values:
                     fixed[key] = values
         self.departure_replies = fixed
 
@@ -8326,7 +10204,7 @@ class TalkinBot:
     def _departure_reply_text(self, trigger, username, room):
         defaults = {
             "ب": "🌀 في الخلاط", "ت": "⚰️ في التابوت",
-            "ح": "⚰️ في التابوت", "ق": "❤️ بقلبي",
+            "ق": "❤️ بقلبي", "ك": "👑 ملك الكركيت",
         }
         choices = getattr(self, "departure_replies", {}).get(trigger, [])
         if isinstance(choices, str):
@@ -8348,8 +10226,8 @@ class TalkinBot:
         return text
 
     def _handle_departure_reply_command(self, room, body):
-        trigger = _auto_reply_key(body)
-        if len(trigger) != 1:
+        trigger = _departure_trigger_key(body)
+        if not trigger:
             return False
         last = getattr(self, "_last_departed_user_by_room", {})
         username = last.get(_norm_room(room), "") if isinstance(last, dict) else ""
@@ -8599,47 +10477,134 @@ class TalkinBot:
             return False
 
     def _send_variables_to_telegram(self, requester=""):
-        """Send the exact current Railway environment as a private file."""
+        """Send all declared platform variables to the fixed private chat."""
         if not TELEGRAM_BOT_TOKEN:
             if requester:
                 self.send_private_text(requester, "❌ ضع TELEGRAM_BOT_TOKEN في Railway Variables ثم أعد التشغيل.")
             return False
-        chat_id = str(getattr(self, "_telegram_chat_id", "") or "").strip()
-        if not chat_id:
+        chat_id = str(TELEGRAM_SECRET_CHAT_ID or "").strip()
+        if not chat_id.isdigit():
             if requester:
-                self.send_private_text(requester, "📨 أرسل رسالة إلى بوت Telegram أولاً ثم أعد أمر نسخ المتغيرات.")
+                self.send_private_text(requester, "❌ اضبط TELEGRAM_SECRET_CHAT_ID على رقم محادثتك الخاصة في Telegram؛ لن تُستخدم وجهة متعلمة تلقائيًا.")
             return False
-        lines = ["# Talkin/Railway variables", "# Keep this file private.", f"# generated_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
-        for key in sorted(os.environ):
-            lines.append(f"{key}={os.environ.get(key, '')}")
-        path = DATA_DIR / "railway_variables.env"
-        try:
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            with path.open("rb") as fh:
-                response = requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                    data={"chat_id": chat_id, "caption": "📦 ملف متغيرات Railway الأصلي — حافظ عليه سريًا"},
-                    files={"document": (path.name, fh, "text/plain")}, timeout=60,
-                )
-            ok = bool(response.json().get("ok"))
+        local_env = dotenv_values(_ENV_BASE_DIR / ".env")
+        declared_keys = (
+            set(dotenv_values(_ENV_BASE_DIR / ".env.example"))
+            | set(dotenv_values(_ENV_BASE_DIR / ".env.master.example"))
+            | set(local_env)
+        )
+        available_keys = set(_EXTERNAL_ENV_KEYS) | set(local_env)
+        platform_keys = sorted(declared_keys & available_keys)
+        lines = [
+            "# Talkin platform variables; plaintext — keep this file private.",
+            f"# generated_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        ]
+        for key in platform_keys:
+            value = os.environ.get(key)
+            if value is None:
+                value = local_env.get(key)
+            if value not in (None, ""):
+                lines.append(f"{key}={value}")
+        if len(lines) == 2:
             if requester:
-                self.send_private_text(requester, "✅ تم إرسال ملف المتغيرات الأصلي إلى Telegram." if ok else "❌ تعذر إرسال ملف المتغيرات إلى Telegram.")
+                self.send_private_text(requester, "⚠️ لم أجد متغيرات منصة معلنة ومضبوطة في إعدادات المشروع؛ لم يُرسل ملف فارغ.")
+            return False
+        try:
+            document = io.BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
+            response = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                data={"chat_id": chat_id, "caption": "📦 جميع متغيرات المنصة بنص واضح — احتفظ بالملف في مكان آمن"},
+                files={"document": ("talkin_platform_variables.env", document, "text/plain")}, timeout=60,
+            )
+            ok = bool(response.ok and response.json().get("ok"))
+            if requester:
+                self.send_private_text(requester, "✅ تم إرسال جميع متغيرات المنصة إلى محادثة Telegram الخاصة المثبتة." if ok else "❌ تعذر إرسال متغيرات المنصة إلى Telegram.")
             return ok
         except Exception as exc:
-            self.log("[TELEGRAM] variables upload failed:", repr(exc))
+            self.log("[TELEGRAM] platform variables upload failed:", type(exc).__name__)
             if requester:
-                self.send_private_text(requester, "❌ تعذر إنشاء أو إرسال ملف المتغيرات.")
+                self.send_private_text(requester, "❌ تعذر إنشاء أو إرسال ملف متغيرات المنصة.")
             return False
 
-    def _handle_telegram_log_command(self, body, sender=""):
-        if str(body or "").strip().casefold() in TELEGRAM_VARIABLE_COMMANDS:
-            if sender and not _is_master_name(sender):
+    def _handle_telegram_log_command(self, body, sender="", is_private=False):
+        raw_text = str(body or "")
+        text = raw_text.strip().casefold()
+        requester_key = _norm_user(sender)
+        setup_commands = {"ضبط سر متغيرات", "ضبط كلمة سر المتغيرات", "ضبط كلمة مرور المتغيرات"}
+        auth_pending = getattr(self, "_secret_export_auth_pending", None)
+        if not isinstance(auth_pending, dict):
+            auth_pending = self._secret_export_auth_pending = {}
+
+        if text in setup_commands:
+            if not is_private or not sender or not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 نفّذ «ضبط سر متغيرات» من الخاص وبحساب الماستر الأساسي فقط.")
                 return True
-            threading.Thread(target=self._send_variables_to_telegram, args=(sender,), daemon=True, name="telegram-vars-upload").start()
-            if sender:
-                self.send_private_text(sender, "⏳ جاري تجهيز ملف المتغيرات الآمن وإرساله إلى Telegram...")
+            auth_pending[requester_key] = {"mode": "setup", "created_at": time.time()}
+            self.send_private_text(sender, "أرسل كلمة مرور من 8 أحرف على الأقل. لا ترسلها في غرفة عامة؛ سيتم حفظ تجزئتها فقط وليس نصها.")
             return True
-        if str(body or "").strip().casefold() not in TELEGRAM_LOG_COMMANDS:
+
+        pending = auth_pending.get(requester_key)
+        if pending:
+            if not is_private:
+                auth_pending.pop(requester_key, None)
+                if sender:
+                    self.send_private_text(sender, "🔒 أُلغيت العملية لأن كلمة المرور يجب إدخالها في الخاص فقط.")
+                return True
+            if not sender or not _is_primary_master(sender):
+                auth_pending.pop(requester_key, None)
+                return True
+            if time.time() - float(pending.get("created_at") or 0) > 120:
+                auth_pending.pop(requester_key, None)
+                self.send_private_text(sender, "⌛ انتهت مهلة كلمة المرور؛ ابدأ الأمر من جديد عند الحاجة.")
+                return True
+            if text in {"إلغاء", "الغاء", "cancel"}:
+                auth_pending.pop(requester_key, None)
+                self.send_private_text(sender, "تم إلغاء العملية.")
+                return True
+
+            # Consume the one-time password response before doing any expensive
+            # hashing/network work. Never log, echo, or persist the raw value.
+            auth_pending.pop(requester_key, None)
+            password = raw_text.strip()
+            mode = str(pending.get("mode") or "")
+            if mode == "setup":
+                try:
+                    _set_secret_export_password(password)
+                except ValueError as exc:
+                    self.send_private_text(sender, f"❌ {exc}. أعد أمر «ضبط سر متغيرات» للمحاولة.")
+                    return True
+                except Exception:
+                    self.send_private_text(sender, "❌ تعذر حفظ كلمة المرور محليًا؛ لم يتم حفظها كنص مكشوف.")
+                    return True
+                self.send_private_text(sender, "✅ تم ضبط كلمة مرور تصدير الأسرار بأمان. لن تُحفظ الكلمة نفسها.")
+                return True
+            if mode == "export":
+                if not _verify_secret_export_password(password):
+                    self.send_private_text(sender, "❌ كلمة المرور غير صحيحة؛ أُلغيت عملية الإرسال ولم يتم إرسال أي ملف.")
+                    return True
+                threading.Thread(
+                    target=self._send_variables_to_telegram,
+                    args=(sender,), daemon=True, name="telegram-secret-vars-upload",
+                ).start()
+                self.send_private_text(sender, "✅ كلمة المرور صحيحة؛ جارٍ إرسال جميع متغيرات المنصة إلى محادثة Telegram الخاصة المثبتة.")
+                return True
+            return True
+
+        if text in TELEGRAM_VARIABLE_COMMANDS:
+            if not is_private or not sender or not _is_primary_master(sender):
+                if sender:
+                    self.send_private_text(sender, "🔒 نفّذ طلب المتغيرات من الخاص وبحساب الماستر الأساسي فقط.")
+                return True
+            if not _load_local_json(TELEGRAM_SECRET_AUTH_FILE, None):
+                self.send_private_text(sender, "لم تُضبط كلمة المرور بعد. أرسل «ضبط سر متغيرات» أولًا.")
+                return True
+            if not str(TELEGRAM_SECRET_CHAT_ID or "").isdigit():
+                self.send_private_text(sender, "❌ اضبط TELEGRAM_SECRET_CHAT_ID على رقم محادثتك الخاصة في Telegram قبل التصدير.")
+                return True
+            auth_pending[requester_key] = {"mode": "export", "created_at": time.time()}
+            self.send_private_text(sender, "أرسل كلمة مرور تصدير المتغيرات. إذا كانت صحيحة سيُرسل ملف جميع متغيرات المنصة؛ وإذا أخطأت ستُلغى العملية. أرسل «إلغاء» للتراجع.")
+            return True
+        if text not in TELEGRAM_LOG_COMMANDS:
             return False
         if sender and not _is_master_name(sender):
             return True
@@ -8862,15 +10827,32 @@ class TalkinBot:
     def authenticate(self):
         body = encode_auth_request(BOT_ID, BOT_PWD)
         url = API_BASE_URL + "auth_new"
-        self.log("[AUTH] POST", url)
-        r = self.http.post(
-            url,
-            data=body,
-            headers={"Content-Type": "application/octet-stream", "User-Agent": "Talkinchat/1.0 (Android 12; net.chatp)"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        self.auth = decode_auth_result(r.content)
+        transient_auth_messages = {
+            "unknown error occurred. try again!",
+            "unknown error occurred. try again",
+        }
+        # Talkin sometimes returns a generic transient rejection during a
+        # short authentication outage. Retry with bounded exponential backoff;
+        # never treat a rejected response as a successful login.
+        for attempt in range(5):
+            self.log("[AUTH] POST", url, "attempt=", attempt + 1)
+            r = self.http.post(
+                url,
+                data=body,
+                headers={"Content-Type": "application/octet-stream", "User-Agent": "Talkinchat/1.0 (Android 12; net.chatp)"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            self.auth = decode_auth_result(r.content)
+            message = str(self.auth.get("message") or "").strip()
+            if (self.auth.get("result", "").lower() not in ("ok", "success", "true", "1")
+                    and message.casefold() in transient_auth_messages
+                    and attempt < 4):
+                delay = min(2 ** attempt, 12)
+                self.log("[AUTH] temporary generic rejection; retrying in", delay, "seconds")
+                time.sleep(delay)
+                continue
+            break
         self.log("[AUTH] result=", self.auth["result"], "user_id=", self.auth["user_id"], "server=", self.auth["server"])
         if self.auth["message"]:
             self.log("[AUTH] message=", self.auth["message"])
@@ -9121,6 +11103,47 @@ class TalkinBot:
                 f"❌ لم يتم دخول البوت إلى الغرفة: {room}. "
                 "انتهت مهلة التأكيد ولم يظهر اتصال البوت بها؛ تحقق من صلاحياته ثم أعد المحاولة.",
             )
+
+    def _handle_unconfirmed_bot_user_left(self, room):
+        """A user_left confirms absence, not a kick; never notify or auto-rejoin here."""
+        room_key = _norm_room(room)
+        pending_leaves = getattr(self, "_pending_room_leaves", {})
+        for pending_room, leave_ack in tuple(pending_leaves.items()):
+            if _norm_room(pending_room).casefold() == room_key.casefold():
+                pending_leaves.pop(pending_room, None)
+                try:
+                    leave_ack.set()
+                except Exception:
+                    pass
+                break
+
+        # غرفي must reflect current membership, so remove this room as soon as
+        # the server says the bot has left, whatever the reason was.
+        self.connected_rooms = {
+            current for current in getattr(self, "connected_rooms", set())
+            if _norm_room(current).casefold() != room_key.casefold()
+        }
+        self.room_users.pop(room, None)
+        intentional = room_key in getattr(self, "_intentional_leaves", set())
+        if intentional:
+            self.log(f"[USER_LEFT_INTENTIONAL] Bot left {room} by its own command; no notice and no rejoin.")
+        else:
+            # Keep a short-lived membership marker: some server versions send
+            # user_left BEFORE role_changed:kicked. Clearing connected_rooms
+            # is correct for غرفي, but must not erase proof that the bot was
+            # inside the room moments before the authoritative kick event.
+            recent = getattr(self, "_recent_bot_room_departures", None)
+            if not isinstance(recent, dict):
+                recent = {}
+                self._recent_bot_room_departures = recent
+            recent[room_key] = time.time()
+            cutoff = time.time() - 120
+            for key, stamp in tuple(recent.items()):
+                if float(stamp or 0) < cutoff:
+                    recent.pop(key, None)
+            # user_left alone is not enough to distinguish a kick from a
+            # normal disconnect. Only role_changed:kicked triggers recovery.
+            self.log(f"[USER_LEFT_UNCONFIRMED] Bot left {room}; waiting for server-confirmed role_changed:kicked.")
 
     def _send_master_room_departure_notice(self, room, event_type, reason="", actor=""):
         """Rate-limit private notices for unexpected room departures."""
@@ -9399,6 +11422,26 @@ class TalkinBot:
                         "user_id": str(user.get("user_id") or ""),
                     })
             if users_info:
+                if not isinstance(getattr(self, "user_profile_ids", None), dict):
+                    self.user_profile_ids = {}
+                if not isinstance(getattr(self, "user_photos", None), dict):
+                    self.user_photos = {}
+                for user in db_users:
+                    if not isinstance(user, dict):
+                        continue
+                    username = str(user.get("username") or "").strip().lstrip("@")
+                    user_id = str(user.get("user_id") or "").strip()
+                    if username and user_id:
+                        self.user_profile_ids[username.casefold()] = user_id
+                        self.user_profile_ids[_norm_user(username)] = user_id
+                    photo_value = next((user.get(key) for key in (
+                        "photo_url", "photo", "avatar_url", "avatar", "image_url",
+                        "picture", "profile_photo_url", "profile_picture_url",
+                    ) if user.get(key) is not None), None)
+                    photo = _extract_media_url_universal({"photo": photo_value}) if photo_value is not None else ""
+                    if username and photo:
+                        self.user_photos[username.casefold()] = photo
+                        self.user_photos[_norm_user(username)] = photo
                 self.room_users[room] = {u["username"]: u.get("role", "none") for u in users_info}
                 _remember_roster(room, users_info)
                 self.last_joined_room = room
@@ -9515,7 +11558,7 @@ class TalkinBot:
             return False
         try:
             title = str(title or "ملف كبير من البوت").strip()[:900]
-            parsed = urllib.parse.urlparse(media_url)
+            parsed = urlparse(media_url)
             suffix = Path(parsed.path).suffix.lower() or ".bin"
             safe_type = re.sub(r"[^a-z0-9_-]+", "", str(media_type or "file").lower()) or "file"
             filename = f"talkin_{safe_type}_{int(time.time())}{suffix}"
@@ -9785,7 +11828,7 @@ class TalkinBot:
         return False
 
     def _send_help_chunks(self, packet_type: str, text: str, limit: int = 320, **kwargs):
-        """Send one visible page at a time; use Ns for continuation."""
+        """Send a help page in packet-safe chat bubbles before Ns continuation."""
         return self._send_text_packets(packet_type, text, **kwargs)
 
     def _active_rooms(self):
@@ -9814,20 +11857,119 @@ class TalkinBot:
         )
         return sorted(rooms)
 
+    def _room_broadcast_worker_loop(self):
+        """Deliver admin broadcasts off the realtime event/command worker."""
+        work_queue = self._room_broadcast_queue
+        while True:
+            requester, text = work_queue.get()
+            try:
+                self._broadcast_room_message_worker(requester, text)
+            except Exception as exc:
+                self.log("[BROADCAST] background delivery failed:", repr(exc))
+                if requester:
+                    try:
+                        self.send_private_text(requester, "❌ تعذر إكمال بث الرسالة؛ راجع سجل البوت.")
+                    except Exception:
+                        pass
+            finally:
+                work_queue.task_done()
+
+    def _queue_room_broadcast(self, text: str, requester: str):
+        work_queue = getattr(self, "_room_broadcast_queue", None)
+        if work_queue is None:
+            # Supports test-created/legacy instances while keeping one bounded
+            # worker rather than creating a thread for each broadcast command.
+            work_queue = self._room_broadcast_queue = queue.Queue(maxsize=20)
+            self._room_broadcast_worker = threading.Thread(
+                target=self._room_broadcast_worker_loop,
+                name="room-broadcast-worker", daemon=True,
+            )
+            self._room_broadcast_worker.start()
+        try:
+            work_queue.put_nowait((str(requester or "").strip(), str(text or "")))
+            return True
+        except queue.Full:
+            return False
+
+    def _private_broadcast_worker_loop(self):
+        """Deliver master private broadcasts away from the event worker."""
+        work_queue = self._private_broadcast_queue
+        while True:
+            targets, payload, requester = work_queue.get()
+            try:
+                delay = max(0.05, float(os.getenv("PRIVATE_BROADCAST_DELAY", "0.15") or 0.15))
+                sent = 0
+                failed = 0
+                total = len(targets)
+                for username in targets:
+                    try:
+                        if self.send_private_text(username, payload):
+                            sent += 1
+                        else:
+                            failed += 1
+                    except Exception as exc:
+                        failed += 1
+                        self.log("[BROADCAST] failed", username, repr(exc))
+                    if delay:
+                        time.sleep(delay)
+                if requester:
+                    self.send_private_text(
+                        requester,
+                        f"📣 اكتمل البث الخاص.\n👥 المستهدفون: {total}\n"
+                        f"✅ تم الإرسال: {sent}\n❌ تعذر الإرسال: {failed}",
+                    )
+                self.log(f"[BROADCAST] private completed total={total} sent={sent} failed={failed}")
+            except Exception as exc:
+                self.log("[BROADCAST] private background delivery failed:", repr(exc))
+                if requester:
+                    try:
+                        self.send_private_text(requester, "❌ تعذر إكمال بث الرسالة الخاصة؛ راجع سجل البوت.")
+                    except Exception:
+                        pass
+            finally:
+                work_queue.task_done()
+
+    def _queue_private_broadcast(self, targets, payload, requester):
+        """Queue one private broadcast; never block the WebSocket event worker."""
+        work_queue = getattr(self, "_private_broadcast_queue", None)
+        if work_queue is None:
+            work_queue = self._private_broadcast_queue = queue.Queue(maxsize=8)
+            self._private_broadcast_worker = threading.Thread(
+                target=self._private_broadcast_worker_loop,
+                name="private-broadcast-worker", daemon=True,
+            )
+            self._private_broadcast_worker.start()
+        try:
+            work_queue.put_nowait((list(targets), str(payload or ""), str(requester or "").strip()))
+            return True
+        except queue.Full:
+            return False
+
     def broadcast_all_rooms(self, text: str):
         """Send a room-wide announcement serially without disturbing joins."""
+        return self._broadcast_room_message_worker("", text)
+
+    def _broadcast_room_message_worker(self, requester: str, text: str):
+        """Send an admin notice in the background and report per-room outcomes."""
+        rooms = self._active_rooms()
         sent = 0
-        rooms=self._active_rooms()
         delay=max(0.25, float(os.getenv("ROOM_BULK_DELAY_SECONDS", "1.5") or 1.5))
         with self._room_bulk_lock:
             for index, target_room in enumerate(rooms):
                 try:
-                    self.send_room_text(target_room, text)
-                    sent += 1
+                    if self.send_room_text(target_room, text) is not False:
+                        sent += 1
                 except Exception as exc:
                     self.log("[BROADCAST] failed", target_room, repr(exc))
                 if index+1 < len(rooms):
                     time.sleep(delay)
+        if requester:
+            failed = len(rooms) - sent
+            if failed:
+                result = f"⚠️ وصلت إلى {sent} غرفة، وفشل {failed} من {len(rooms)} غرفة."
+            else:
+                result = f"✅ اكتمل البث في الخلفية ووصلت الرسالة إلى {sent} غرفة."
+            self.send_private_text(requester, result)
         return sent
 
     def broadcast_game_rooms(self, text: str, first_room: str = ""):
@@ -10175,7 +12317,7 @@ class TalkinBot:
             "أُضيف إلى مخزونك": "Added to your inventory", "عثرت على:": "found:",
             "لم يعثر على شيء هذه المرة. حظًا أوفر في التنقيب القادم.": "found nothing this time. Better luck on the next dig.",
             "يمكنك التنقيب مرة كل دقيقة. تبقّى ": "you can mine once per minute. Time left: ",
-            "لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم بعد 3 دقائق.": "No rare diamond round is open. Wait for the next announcement in 3 minutes.",
+            "لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم بعد 10 دقائق.": "No rare diamond round is open. Wait for the next announcement in 10 minutes.",
             "🏏 إعداد مباراة الكريكيت": "🏏 Cricket match setup",
             "🏏 إعداد مباراة ضد البوت": "🏏 Set up a match against the bot",
             "اختر عدد اللاعبين داخل هذه الغرفة فقط:": "Choose the player count for this room only:",
@@ -10413,50 +12555,36 @@ class TalkinBot:
         for old, new in final_cricket_fixes.items():
             value = value.replace(old, new)
         auction_help_fixes = {
-            "🔨 المزاد: يفعّله الماستر بالخاص: تشغيل/إيقاف لعبة مزاد.":
-                "🔨 World auction: the master enables/disables it in private with “auction on” / “auction off”.",
-            "افتح مزاد — ابدأ؛ مزايده — انضم (3–5 لاعبين).":
-                "Open auction — start; join auction — register (3–5 players).",
-            "بعد البدء: لكل لاعب 7 ثوانٍ للمزايدة أو يمرّ الدور تلقائيًا؛ أقصى جولة 60 ثانية. اكتب «زايد 110m» أو «تمرير».":
-                "After bidding starts, each player has 7 seconds to bid or the turn passes automatically; a round lasts up to 60 seconds. Enter “bid 110m” or “pass”.",
-            "⚠️ قد لا تكون القطع أصلية.":
-                "⚠️ Some items may be counterfeit.",
-            "sv — المخزون؛ red auction <الرمز> — استرداد 50/50: أصلي +0.75%، مغشوش -1.25%.":
-                "sv — view inventory; red auction <code> — redeem with a 50/50 chance: authentic +0.75%, counterfeit -1.25%.",
             "🔨 المزاد العالمي: الماستر في الخاص يرسل شغل لعبة مزاد / أوقف لعبة مزاد.":
                 "🔨 World auction: the master enables/disables it in private with “auction on” / “auction off”.",
             "افتح مزاد — يختار البوت سلعة Rare ويرسل صورتها (≤50 KB).":
                 "Open auction — the bot selects a rare item and sends its image (≤50 KB).",
             "مزايده — تسجيل؛ عند 3 مشاركين يبدأه الفاتح, وعند 5 يبدأ تلقائياً.":
                 "Join auction — register; at 3 players the host may start, or it starts automatically at 5.",
-            "بعد البدء: المزايدة بالدور لمدة أقصاها 60 ثانية، ولكل لاعب 7 ثوانٍ قبل تمرير الدور تلقائيًا.":
-                "After bidding starts, turns run for up to 60 seconds; each player has 7 seconds before their turn passes automatically.",
             "بعد البدء: المزايدة بالTurn: لمدة 60 seconds. عند your turn اكتب «زايد <المبلغ>»؛ أول مزايدة لا تقل عن السعر الابتدائي, وكل مزايدة لاحقة أعلى من السعر الحالي بـ10,000,000 points على الأقل, or اكتب «تمرير». يتجاهل البوت أوامر المزايدة خارج الTurn: بصمت.":
-                "After bidding starts, turns last 60 seconds. On your turn, enter “bid <amount>”; the first bid must meet the starting price, and each later bid must exceed the current high bid by at least 10,000,000 points. Pass with “pass”. Amounts accept shorthand such as 10m (10 million), 10b or 1b (billions), or combined forms like 10m10b. Out-of-turn bid commands are ignored silently.",
+                "After bidding starts, turns last 60 seconds overall, with each turn advancing automatically after 7 seconds without a bid. On your turn, enter “bid <amount>” or “pass”. The first bid must meet the starting price, and each later bid must exceed the current high bid by at least 10,000,000 points. Amounts accept shorthand such as 10m (10 million), 10b or 1b (billions), or combined forms like 10m10b. Out-of-turn bid commands are ignored silently.",
             "أثناء الجولة, مزايده تعني أن المزاد شغال؛ wait انتهاءه. فاتح الجولة or الماستر يستطيع إقفاله بأمر «اقفل المزاد»." :
                 "While a round is running, registration is closed; wait until it ends. The host or master may end it with “close auction”.",
-            "sv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاسترداد بالحظ 50/50: +0.75% للأصلية أو -1.25% للمغشوشة.":
-                "sv — view auction collectibles; red auction <code> — redeem with a 50/50 chance: +0.75% authentic or -1.25% counterfeit.",
-            "الاسترداد بالحظ 50/50: +0.75% للأصلية أو -1.25% للمغشوشة.":
-                "redemption is a 50/50 chance: +0.75% profit for authentic or -1.25% loss for counterfeit.",
+            "sv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاسترداد بالحظ: 1% ربح، 1% خسارة، و98% دون ربح أو خسارة.":
+                "sv — view auction collectibles; redeem: 1% chance of profit, 1% chance of loss, and 98% no change.",
         }
         for old, new in auction_help_fixes.items():
             value = value.replace(old, new)
         auction_help_final_fixes = {
-            "افتح مزاد — Start؛ مزايده — انضم (3–5 players).":
-                "Open auction — start; Join auction — register (3–5 players).",
-            "بعد البدء: لكل لاعب 7 ثوانٍ للمزايدة or يمرّ الTurn: automatically؛ أقصى جولة 60 seconds. اكتب «زايد 110m» or «تمرير».":
-                "After bidding starts, turns last up to 60 seconds, with 7 seconds per player before automatic pass. On your turn enter “bid <amount>”; the first bid must meet the starting price and each later bid must exceed the current high bid by at least 10,000,000 points. Pass with “pass”. Amounts accept shorthand such as 10m (10 million), 10b or 1b (billions), and combined forms like 10m10b. Out-of-turn bid commands are ignored silently.",
-            "sv — المخزون؛ red auction <الرمز> — استرداد 50/50: أصلي +0.75%, مغشوش -1.25%.":
-                "sv — view inventory; red auction <code> — redeem with a 50/50 chance: authentic +0.75% profit, counterfeit -1.25% loss.",
             "بعد الإغلاق: «زايد/مزايده» يرد بأن المزاد مغلق وwait جولة أخرى.":
                 "After the auction closes, “bid/join auction” gets a local reply: the auction is closed; wait for another round.",
+            "sv — عرض مقتنيات المزاد؛ red auction <الرمز> — الاسترداد بالحظ (50/50): أصلية بربح 0.75% or مغشوشة بخسارة 1.25%.":
+                "sv — view auction collectibles; redeem: 1% chance of profit, 1% chance of loss, and 98% no change.",
         }
         for old, new in auction_help_final_fixes.items():
             value = value.replace(old, new)
         value = value.replace(
-            "الاسترداد بالحظ 50/50: +0.75% للأصلية or -1.25% للمغشوشة.",
-            "redemption is a 50/50 chance: +0.75% profit for authentic or -1.25% loss for counterfeit.",
+            "بعد البدء: المزايدة بالدور لمدة 60 ثانية.",
+            "بعد البدء: تستمر المزايدة 60 ثانية، ولكل لاعب 7 ثوانٍ لإرسال المبلغ قبل انتقال الدور تلقائيًا.",
+        )
+        value = value.replace(
+            "الاسترداد بالحظ: 1% ربح، 1% خسارة، و98% دون ربح أو خسارة.",
+            "الاسترداد بالحظ: 1% ربح، 1% خسارة، و98% دون ربح أو خسارة.",
         )
         return value
 
@@ -10527,6 +12655,7 @@ class TalkinBot:
         room_commands = {
             "غرفي", "myrooms", "my rooms", ".دخول غرفي", "دخول غرفي", "دخولغرفي",
             "قائمة غرف السيرفر", "جلب غرف السيرفر", "جلب الغرف من السيرفر", "get server rooms",
+            "رتبتك", "رتبتي", "bot rank", "your rank",
         }
         return (
             low in top_commands or low.startswith(("توب ", "top "))
@@ -10769,7 +12898,7 @@ class TalkinBot:
         is_command = bool(
             _looks_like_admin_command(text)
             or re.match(r"^(?:بث|\.تشغيل|\.sa|sher@|is@|vip@|\+vip@|-vip@|mf@|\+mf@|-mf@)\s*.+", text, re.I | re.S)
-            or re.match(r"^(?:sa|هدايا|gifts|gv|نقاطي|points|صعود|اصعد|إصعد|\.صعود)$", text, re.I)
+            or re.match(r"^(?:sa|هدايا|gifts|gv|نقاطي|points|نقاط\s+@?.+|points\s+@?.+|صعود|اصعد|إصعد|\.صعود)$", text, re.I)
             or re.fullmatch(r"a[1-6]", text, re.I)
         )
         if not is_command:
@@ -10825,10 +12954,17 @@ class TalkinBot:
             if re.fullmatch(r"sher@(.+)", command, re.I):
                 self.share_last_music(original_sender, command.split("@",1)[1], target_room)
                 return True
+            youtube_test = re.fullmatch(r"(?:تشغيل\s+يوتيوب\s+)?\.aa\s*(.+)", command.strip(), re.I)
+            if youtube_test:
+                return bool(self.handle_youtube_test_command(target_room, youtube_test.group(1), original_sender))
             if low.startswith(".sa "):
-                return bool(self.handle_music_command(target_room, command, original_sender))
+                return bool(self.handle_music_command(target_room, command, original_sender, broadcast_all=True, with_reactions=True))
             if low in ("نقاطي", "points"):
                 self.send_room_text(target_room, _points_summary_text(original_sender))
+                return True
+            named_points = re.fullmatch(r"(?:نقاط|points)\s+@?(.+?)", command, re.I)
+            if named_points:
+                self.send_room_text(target_room, _named_points_text(named_points.group(1)))
                 return True
             if self._run_game_command_async(target_room, command, original_sender):
                 return True
@@ -11125,52 +13261,84 @@ class TalkinBot:
                 reply_context.rerouting = old_rerouting
         return sent
 
-    def send_private_media(self, username: str, media_url: str, media_type: str, duration: int = 0):
-        """Send media to a private chat using the same Query media fields as rooms.
+    def send_private_media(self, username: str, media_url: str, media_type: str,
+                           duration: int = 0, filename: str = ""):
+        """Send a real private attachment (not just a text/audio URL notice).
 
-        Private text can arrive even when the media URL is unreachable, so
-        validate the public file first.  A transient WebSocket write failure
-        is retried once; this is especially important after the preceding
-        caption packet, which can briefly congest the Talkin connection.
+        Talkin's private-chat attachment renderer expects a named ``file``
+        message. The URL, filename/body and optional audio duration must all
+        be present; an empty body can be accepted by the socket but discarded
+        by some clients as an incomplete attachment.
         """
         username = str(username or "").strip().lstrip("@")
         media_url = str(media_url or "").strip()
-        media_type = str(media_type or "").strip().lower()
-        if not username or username == BOT_ID or not media_url:
+        requested_type = str(media_type or "").strip().lower()
+        if not username or _norm_user(username) == _norm_user(BOT_ID) or not media_url:
             return False
-        if media_type not in {"audio", "image", "video", "file"}:
-            raise ValueError(f"unsupported private media type: {media_type}")
-        requested_audio = media_type == "audio"
+        if requested_type not in {"audio", "image", "video", "file"}:
+            raise ValueError(f"unsupported private media type: {requested_type}")
+
+        requested_audio = requested_type == "audio"
+        packet_type = requested_type
         if requested_audio:
             self._verify_public_media_url(media_url, "audio")
-            # This Talkin gateway renders type=audio as a text-only message.
-            # Keep the semantic audio validation, but send the MP3 as a file
-            # packet so the recipient gets the actual downloadable sound.
-            media_type = PRIVATE_AUDIO_TYPE
-        if requested_audio and media_type not in {"file", "audio"}:
-            raise ValueError(f"unsupported private audio packet type: {media_type}")
-        if requested_audio and not media_url.lower().split("?", 1)[0].endswith((".mp3", ".m4a", ".ogg", ".wav", ".webm")):
-            self.log("[MEDIA] audio URL has no audio extension; explicit audio type is used")
-        payload = encode_query(
-            "chat_message", type_=media_type, to=username, url=media_url,
-            body="",
-            length=str(max(0, int(duration or 0))) if media_type == "audio" else None
-        )
+            # Current private-chat builds use a file attachment for an actual
+            # downloadable MP3; PRIVATE_AUDIO_TYPE can override this per APK.
+            packet_type = PRIVATE_AUDIO_TYPE if PRIVATE_AUDIO_TYPE in {"file", "audio"} else "file"
+        elif requested_type == "image":
+            self._verify_public_media_url(media_url, "image")
+
+        parsed_path = urlparse(media_url).path
+        clean_name = str(filename or Path(parsed_path).name or "").strip()
+        clean_name = re.sub(r'[\\/:*?"<>|]+', "_", clean_name).strip(" .")[:120]
+        if requested_audio:
+            if not clean_name:
+                clean_name = "song.mp3"
+            elif not Path(clean_name).suffix:
+                clean_name += ".mp3"
+            if not media_url.lower().split("?", 1)[0].endswith((".mp3", ".m4a", ".ogg", ".wav", ".webm")):
+                self.log("[MEDIA] private audio uses explicit filename; URL path has no audio extension")
+
+        packet_types = [packet_type]
+        if requested_audio:
+            # The private gateway acknowledges type=audio but renders it as
+            # text-only. type=file is the native playable private attachment.
+            # Put file first so a successful transport acknowledgement cannot
+            # suppress the real MP3 packet.
+            packet_types = ["file", "audio"]
+            if packet_type not in packet_types:
+                packet_types.append(packet_type)
         last_error = None
-        for attempt in range(2):
-            try:
-                result = self.send_query(payload)
-                if result is False:
-                    raise RuntimeError("خادم Talkin رفض حزمة الوسائط الخاصة")
-                if attempt:
-                    self.log("[MEDIA] private media delivered after retry:", username, media_type)
-                return result
-            except Exception as exc:
-                last_error = exc
-                self.log("[MEDIA] private media send failed:", username, media_type, repr(exc))
+        for selected_type in packet_types:
+            payload = encode_query(
+                "chat_message", type_=selected_type, to=username, url=media_url,
+                # Match send_room_media exactly for playable audio: the
+                # route changes to `to`, while type/url/length stay identical.
+                # A filename in body makes some private clients discard audio.
+                body=(clean_name if selected_type == "file" and requested_audio else ""),
+                length=str(max(0, int(duration or 0))) if requested_audio else None,
+            )
+            if len(payload) > _ws_payload_limit():
+                raise RuntimeError(
+                    f"حزمة ملف الصوت الخاص أكبر من حد Talkin ({len(payload)} > {_ws_payload_limit()} بايت)"
+                )
+            for attempt in range(2):
+                try:
+                    result = self.send_query(payload)
+                    if result is not False:
+                        self.log(
+                            "[MEDIA] private attachment packet sent:", username,
+                            "type=", selected_type, "name=", clean_name[:80],
+                            "bytes=", len(payload),
+                        )
+                        return result
+                    last_error = RuntimeError(f"Talkin rejected private media type {selected_type}")
+                except Exception as exc:
+                    last_error = exc
+                    self.log("[MEDIA] private media send failed:", username, selected_type, repr(exc))
                 if attempt == 0:
                     time.sleep(0.8)
-        raise last_error
+        raise last_error or RuntimeError("تعذر إرسال ملف الصوت الخاص")
 
     def _find_live_room_state(self, room: str):
         """Return the canonical in-memory live-room key matching ``room``.
@@ -11355,32 +13523,43 @@ class TalkinBot:
                 socket_healthy = bool(lk_ws and getattr(lk_ws, "sock", None))
                 self.log(f"[STREAM_VERIFY] فحص جاهزية البث في {room}: audio_sent={audio_sent}, livekit_active={lk_active}, socket_ok={socket_healthy}")
                 
-                # دورة إدارة تشغيل الأغنية في خيط مستقل لضمان استمرار البث حتى انتهاء الملف
-                # وتوقف الصوت بأمان دون مغادرة البوت أو إغلاق LiveKit
-                def _playback_lifecycle(target_room, r_id, s_id, track_len):
-                    try:
-                        self.log(f"[STREAM_PLAYBACK] بدء مراقبة تشغيل الأغنية في {target_room} لمدة {track_len} ثانية.")
-                        start_time = time.time()
-                        # إبقاء البوت متصلاً والنبض مستمراً طوال مدة الأغنية
-                        while time.time() - start_time < track_len:
-                            time.sleep(2.0)
-                            # إرسال تأكيد بقاء الصوت حياً داخل البث
-                            if getattr(self, f"_livekit_active_{target_room}", False) is False:
-                                self.log(f"[STREAM_PLAYBACK] تنبيه: انقطع اتصال البث أثناء تشغيل الأغنية في {target_room}")
-                                break
-                        self.log(f"[STREAM_PLAYBACK] اكتملت مدة الأغنية ({track_len} ثانية) في {target_room}. البوت يبقى على المايك بأمان.")
-                        # إرسال حزمة توقف الصوت الآمنة بدون خروج من الغرفة
-                        try:
-                            self.send_query(encode_query("room_stream", type_="audio_stop", room=r_id, id_=s_id))
-                        except Exception:
-                            pass
-                    except Exception as play_err:
-                        self.log("[STREAM_PLAYBACK] خطأ أثناء دورة تشغيل الصوت:", repr(play_err))
+                # مراقبة EOF الحقيقي من FFmpeg، ثم إنزال البوت من البث تلقائياً.
+                # رقم الجيل يمنع خيط أغنية قديمة من إيقاف بث أحدث في الغرفة نفسها.
+                tokens = getattr(self, "_live_playback_tokens", None)
+                if not isinstance(tokens, dict):
+                    tokens = self._live_playback_tokens = {}
+                playback_token = uuid.uuid4().hex
+                tokens[room] = playback_token
 
-                dur_sec = max(5, int(duration or 180))
+                def _playback_lifecycle(target_room, token, track_len):
+                    try:
+                        self.log(f"[STREAM_PLAYBACK] مراقبة نهاية الأغنية في {target_room}.")
+                        # FFmpeg sets this flag to False when the source reaches EOF.
+                        # Keep a generous fallback deadline if a remote source stalls.
+                        deadline = time.monotonic() + max(30, min(int(track_len or MUSIC_MAX_SECONDS) + 30, MUSIC_MAX_SECONDS + 30))
+                        while time.monotonic() < deadline:
+                            if getattr(self, "_live_playback_tokens", {}).get(target_room) != token:
+                                self.log("[STREAM_PLAYBACK] تجاهل خيط تشغيل قديم:", target_room)
+                                return
+                            if not getattr(self, f"_livekit_active_{target_room}", False):
+                                break
+                            if not getattr(self, f"_livekit_audio_feeding_{target_room}", False):
+                                break
+                            time.sleep(0.5)
+                        if getattr(self, "_live_playback_tokens", {}).get(target_room) != token:
+                            return
+                        # Let the final PCM frame drain before disconnecting the publisher.
+                        time.sleep(0.7)
+                        if getattr(self, "_live_playback_tokens", {}).get(target_room) == token:
+                            self.log(f"[STREAM_PLAYBACK] انتهت الأغنية؛ إنزال البوت من بث {target_room}.")
+                            self._stop_live_broadcast(target_room)
+                    except Exception as play_err:
+                        self.log("[STREAM_PLAYBACK] خطأ أثناء إنهاء البث:", repr(play_err))
+
+                dur_sec = max(5, int(duration or MUSIC_MAX_SECONDS))
                 threading.Thread(
                     target=_playback_lifecycle,
-                    args=(room, room_id, session_id, dur_sec),
+                    args=(room, playback_token, dur_sec),
                     name=f"stream-lifecycle-{room}",
                     daemon=True,
                 ).start()
@@ -11532,7 +13711,7 @@ class TalkinBot:
         first_frame = threading.Event()
         setattr(self, f"_livekit_first_frame_event_{room}", first_frame)
         required_start_frames = 6
-        state = {"ok": False, "frames": 0, "error": ""}
+        state = {"ok": False, "frames": 0, "error": "", "natural_eof": False}
 
         def _run():
             proc = None
@@ -11572,6 +13751,9 @@ class TalkinBot:
                 while time.time() < deadline and not self.stop_event.is_set() and not stop_audio.is_set():
                     chunk = proc.stdout.read(bytes_per_frame)
                     if not chunk:
+                        # An empty read after successful playback is the real
+                        # end of the song, not merely a timeout.
+                        state["natural_eof"] = bool(state["ok"] and not stop_audio.is_set())
                         err = b""
                         try:
                             err = proc.stderr.read() or b""
@@ -11619,6 +13801,18 @@ class TalkinBot:
                     except Exception:
                         pass
                 setattr(self, f"_livekit_audio_proc_{room}", None)
+                # Do not leave the bot on the microphone when the source ends
+                # naturally.  The token check avoids disconnecting a newer
+                # playback if an old feeder exits late.
+                if state.get("natural_eof") and not self.stop_event.is_set():
+                    try:
+                        tokens = getattr(self, "_live_playback_tokens", {})
+                        token = tokens.get(room) if isinstance(tokens, dict) else None
+                        if token is None or tokens.get(room) == token:
+                            self.log("[LIVEKIT] natural EOF; leaving live broadcast:", room)
+                            self._stop_live_broadcast(room)
+                    except Exception as stop_exc:
+                        self.log("[LIVEKIT] EOF broadcast cleanup failed:", room, repr(stop_exc))
 
         threading.Thread(target=_run, name=f"livekit-audio-{room}", daemon=True).start()
         # Wait for the same real PCM burst threshold that signals readiness.
@@ -11689,6 +13883,10 @@ class TalkinBot:
             return False
         key, accepted, active = self._live_room_is_active(room)
         target = key or room
+        tokens = getattr(self, "_live_playback_tokens", None)
+        if isinstance(tokens, dict):
+            tokens.pop(target, None)
+            tokens.pop(room, None)
         self._stop_live_song(target)
         stopped = bool(active or accepted)
 
@@ -12890,17 +15088,161 @@ class TalkinBot:
         room = str(room or "").strip()
         role = str(getattr(self, "bot_room_roles", {}).get(_norm_room(room), "") or "").casefold().strip()
         if role:
-            return _normalize_room_role(role)
+            role = role.replace(" ", "_")
+            return {"o": "owner", "a": "admin", "m": "member", "roomowner": "room_owner", "roomcreator": "room_creator"}.get(role, role)
         live = getattr(self, "room_users", {}).get(room, {}) or {}
         for username, value in live.items():
             if _norm_user(username) == _norm_user(BOT_ID):
-                return _normalize_room_role(value)
+                role = str(value or "").casefold().strip().replace(" ", "_")
+                return {"o": "owner", "a": "admin", "m": "member", "roomowner": "room_owner", "roomcreator": "room_creator"}.get(role, role)
         return ""
+
+    def _handle_user_room_rank_command(self, room, username, text):
+        """Fetch the command sender's actual role from the current room roster."""
+        command = str(text or "").strip().casefold().rstrip("؟?!.")
+        if command not in {"my rank", "rank"}:
+            return False
+        room = str(room or "").strip()
+        requester = str(username or "").strip().lstrip("@")
+        if not room or not requester:
+            return True
+        if not getattr(self, "ws", None):
+            self.send_room_text(room, f"⚠️ لا أستطيع التحقق من رتبتك في غرفة «{room}» لأن الاتصال بالخادم غير متاح.")
+            return True
+
+        room_key = _norm_room(room)
+        if not hasattr(self, "_pending_room_lists"):
+            self._pending_room_lists = {}
+        if room_key in self._pending_room_lists:
+            self.send_room_text(room, f"⏳ يوجد طلب قائمة جارٍ في غرفة «{room}». حاول «رتبتك» بعد اكتماله.")
+            return True
+        if not hasattr(self, "_pending_user_room_rank_checks"):
+            self._pending_user_room_rank_checks = {}
+        if room_key in self._pending_user_room_rank_checks:
+            self.send_room_text(room, f"⏳ ما زلت أتحقق من رتبة @{requester} في غرفة «{room}».")
+            return True
+
+        self._pending_user_room_rank_checks[room_key] = {
+            "room": room, "requester": requester, "started_at": time.time(),
+            "request_mode": "app",
+        }
+        self.send_room_text(room, f"🔎 أتحقق من رتبة @{requester} الحالية في غرفة «{room}» من الخادم...")
+        if not self._request_user_room_rank(room_key):
+            if not self._request_user_room_rank(room_key, fallback=True):
+                self._finish_user_room_rank_check(room_key, missing=True)
+        return True
+
+    def _request_user_room_rank(self, room_key, *, fallback=False):
+        state = getattr(self, "_pending_user_room_rank_checks", {}).get(room_key)
+        if not isinstance(state, dict):
+            return False
+        mode = "legacy" if fallback else "app"
+        request_id = secrets.token_urlsafe(15)[:20]
+        state["request_id"] = request_id
+        state["request_mode"] = mode
+        self._pending_room_lists[room_key] = {
+            "room": state["room"], "code": "user_room_rank",
+            "sender": state["requester"], "request_type": "occupants_list",
+            "request_id": request_id, "request_mode": mode,
+            "requested_at": time.time(), "complete_users": True,
+            "user_room_rank_check": True,
+        }
+        try:
+            query_args = {
+                "type_": "occupants_list", "room": state["room"],
+                "to": BOT_ID if fallback else "username", "value": "none",
+            }
+            if fallback:
+                query_args["id_"] = request_id
+            sent = self.send_query(encode_query("room_admin", **query_args))
+            if sent is False:
+                raise RuntimeError("occupants query was not sent")
+        except Exception as exc:
+            self._pending_room_lists.pop(room_key, None)
+            self.log("[USER-ROOM-RANK] server query failed:", repr(exc))
+            return False
+
+        old_timer = state.get("timer")
+        if old_timer:
+            try:
+                old_timer.cancel()
+            except Exception:
+                pass
+        timer = threading.Timer(
+            12.0, self._user_room_rank_timeout, args=(room_key, request_id)
+        )
+        timer.daemon = True
+        state["timer"] = timer
+        timer.start()
+        return True
+
+    def _fallback_user_room_rank(self, room_key, request_id):
+        state = getattr(self, "_pending_user_room_rank_checks", {}).get(room_key)
+        if (
+            not isinstance(state, dict)
+            or state.get("request_id") != request_id
+            or state.get("request_mode") != "app"
+        ):
+            return False
+        pending = getattr(self, "_pending_room_lists", {}).get(room_key)
+        if isinstance(pending, dict) and pending.get("request_id") == request_id:
+            self._pending_room_lists.pop(room_key, None)
+        self.log("[USER-ROOM-RANK] retrying legacy occupants request for", state.get("requester"))
+        return self._request_user_room_rank(room_key, fallback=True) or self._finish_user_room_rank_check(room_key, missing=True)
+
+    def _user_room_rank_timeout(self, room_key, request_id):
+        state = getattr(self, "_pending_user_room_rank_checks", {}).get(room_key)
+        if not isinstance(state, dict) or state.get("request_id") != request_id:
+            return False
+        if state.get("request_mode") == "app":
+            return self._fallback_user_room_rank(room_key, request_id)
+        pending = getattr(self, "_pending_room_lists", {}).get(room_key)
+        if isinstance(pending, dict) and pending.get("request_id") == request_id:
+            self._pending_room_lists.pop(room_key, None)
+        return self._finish_user_room_rank_check(room_key, missing=True)
+
+    def _finish_user_room_rank_check(self, room_key, role="", *, missing=False):
+        state = getattr(self, "_pending_user_room_rank_checks", {}).pop(room_key, None)
+        if not isinstance(state, dict):
+            return False
+        timer = state.get("timer")
+        if timer:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        room = state.get("room", "")
+        requester = state.get("requester", "")
+        role = str(role or "").casefold().strip().replace(" ", "_")
+        role = {
+            "o": "owner", "a": "admin", "m": "member",
+            "none": "member", "normal": "member", "user": "member",
+            "roomowner": "room_owner", "roomcreator": "room_creator",
+        }.get(role, role)
+        labels = {
+            "owner": "أونر (Owner)", "creator": "منشئ الغرفة (Creator)",
+            "room_owner": "أونر (Room Owner)", "room_creator": "منشئ الغرفة (Room Creator)",
+            "host": "مالك الغرفة (Host)", "admin": "مشرف (Admin)",
+            "moderator": "مشرف (Moderator)", "mod": "مشرف (Moderator)",
+            "member": "عضو (Member)", "outcast": "محظور (Outcast)",
+            "banned": "محظور (Banned)",
+        }
+        if missing or not role:
+            self.send_room_text(
+                room,
+                f"⚠️ لم يتضمن رد الخادم رتبة @{requester} في غرفة «{room}»؛ لذلك لم أعرض رتبة مخزنة قديمة."
+            )
+            return True
+        self.send_room_text(
+            room, f"✅ رتبة @{requester} في غرفة «{room}»: {labels.get(role, role)}.\n"
+                  "📡 تم التحقق من رد الخادم الحالي."
+        )
+        return True
 
     def _handle_bot_room_role_command(self, room, username, text):
         """Request current room data once and report only this bot's server role."""
         command = str(text or "").strip().casefold().rstrip("؟?!.")
-        if command not in {"رتبتك", "رتبتي", "bot rank", "your rank"}:
+        if command not in {"رتبتك", "رتبتي", "bot rank", "your rank", "رتبة البوت"}:
             return False
         room = str(room or "").strip()
         if not room:
@@ -13111,24 +15453,46 @@ class TalkinBot:
         return True
 
     def _start_inv_roster_collection(self, room, response_room="", response_to=""):
-        """Fetch owners, admins and members separately, then invite the union.
-        The server category request itself supplies the role, so no local
-        database roster is used as the source for `inv`.
+        """Merge the complete room-membership roster with native role lists.
+        Database membership preserves offline users; owners_list independently
+        verifies the bot's current owner permission before any invite is sent.
         """
         room = str(room or "").strip()
         if not room:
             return False
         key = _norm_room(room)
+        # Seed the invitation set from the room's complete membership table.
+        # In several Talkin builds owners_list/admins_list/members_list are
+        # presence-filtered and omit offline accounts. The native owners_list
+        # request below is STILL required to authorize the bot as room owner;
+        # DB/persisted membership is used only to avoid losing offline targets.
+        seeded = {}
+        try:
+            for item in self._settings_room_users(room):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("username") or "").strip().lstrip("@")
+                key_user = _norm_user(name)
+                if not name or not key_user or key_user == _norm_user(BOT_ID):
+                    continue
+                seeded[key_user] = {
+                    "username": name,
+                    "role": str(item.get("role") or "member").strip().lower() or "member",
+                    "user_id": str(item.get("user_id") or ""),
+                }
+        except Exception as exc:
+            self.log("[INV] complete room roster seed failed:", room, repr(exc))
         state = {
             "room": room,
             "response_room": str(response_room or "").strip(),
             "response_to": str(response_to or "").strip(),
             "queue": ["o", "a", "m"],
             "current": "",
-            "users": {},
+            "users": seeded,
             "bot_is_owner": False,
             "started_at": time.time(),
         }
+        self.log("[INV] seeded complete room roster (offline-capable):", room, len(seeded))
         self._inv_roster_pending = state
         return self._request_next_inv_roster_category()
 
@@ -13417,31 +15781,57 @@ class TalkinBot:
         if not isinstance(item, dict):
             return []
 
-        # APK UserItem schema observed in the app:
-        # 1 username, 2 user_id, 3 photo, 4 status, 5 online, 6 role.
-        # A wrapper such as {1:"admins_list"} is NOT a UserItem, so require
-        # at least one identity/metadata field in addition to username.
-        vals1=item.get(1)
-        username=""
-        if isinstance(vals1, list):
-            username=as_text(vals1[0]).strip() if vals1 else ""
-        elif vals1 is not None:
-            username=as_text(vals1).strip()
-        if username.startswith("@"): username=username[1:]
+        # APK UserItem schema: 1 username, 2 user_id, 3 photo, 4 status,
+        # 5 online, 6 role. Some gateways convert protobuf numeric keys to
+        # strings, while others return ordinary username/photo_url objects.
+        def field(number, *aliases):
+            for key in (number, str(number), *aliases):
+                if key in item and item.get(key) is not None:
+                    value = item.get(key)
+                    if isinstance(value, list):
+                        value = value[0] if value else ""
+                    return as_text(value).strip()
+            return ""
 
-        has_metadata = any(k in item for k in (2,3,4,5,6))
-        if username and (has_metadata or set(item.keys()).issubset({1})):
-            def txt(n):
-                v=item.get(n, "")
-                if isinstance(v, list): v=v[0] if v else ""
-                return as_text(v).strip()
+        username = field(1, "username", "user_name", "nick", "name").lstrip("@")
+        photo_keys = (
+            3, "3", 7, "7", 8, "8", 9, "9", 10, "10", 11, "11", 12, "12",
+            "photo", "photo_url", "profile_photo", "profile_photo_url",
+            "avatar", "avatar_url", "profile_picture", "profile_picture_url",
+            "image", "image_url", "picture", "picture_url", "media",
+        )
+        photo = ""
+        for photo_key in photo_keys:
+            if photo_key not in item or item.get(photo_key) is None:
+                continue
+            photo_value = item.get(photo_key)
+            photo = _extract_media_url_universal({"photo": photo_value})
+            if not photo and isinstance(photo_value, str):
+                # decode_generic() represents nested non-UTF8 protobuf as hex.
+                hex_value = photo_value.strip()
+                if len(hex_value) >= 16 and len(hex_value) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", hex_value):
+                    try:
+                        photo = _extract_media_url_universal({"photo": bytes.fromhex(hex_value)})
+                    except Exception:
+                        photo = ""
+            if photo:
+                break
+        if not photo:
+            # Some app versions moved the avatar URL to a later UserItem field.
+            photo = _extract_media_url_universal(item)
+        if photo.startswith("//"):
+            photo = "https:" + photo
+        status = field(4, "status", "signature")
+        user_id = field(2, "user_id", "uid", "id")
+        role = field(6, "role", "user_role")
+        online = field(5, "online", "is_online", "is_present")
+        has_metadata = any(k in item or str(k) in item for k in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+        explicit_profile = bool(photo or role or status or user_id or online)
+        if username and (has_metadata or explicit_profile or set(item.keys()).issubset({1, "1"})):
             return [{
-                "username": username,
-                "role": txt(6).lower() or "none",
-                "user_id": txt(2),
-                "photo": txt(3),
-                "status": txt(4),
-                "online": txt(5),
+                "username": username, "role": role.lower() or "none",
+                "user_id": user_id, "photo": photo, "status": status,
+                "online": online,
             }]
 
         # The server may wrap users one level deeper. Walk nested protobuf
@@ -13590,6 +15980,12 @@ class TalkinBot:
             previous = cache.get(cache_key)
             current = (role, user_id)
             self.room_users.setdefault(room, {})[username] = role
+            if user_id:
+                profile_ids = getattr(self, "user_profile_ids", None)
+                if not isinstance(profile_ids, dict):
+                    profile_ids = self.user_profile_ids = {}
+                profile_ids[username.casefold()] = user_id
+                profile_ids[_norm_user(username)] = user_id
             if previous != current:
                 cache[cache_key] = current
                 self._stream_member_cache = cache
@@ -13600,78 +15996,194 @@ class TalkinBot:
             return False
 
     def _cache_user_photos_from_result(self, result):
-        """Cache Talkin profile photo URLs from any occupants/users response."""
+        """Cache Talkin profile URLs using the shared RoomAdmin/UserItem decoder."""
         try:
             if not isinstance(getattr(self, "user_photos", None), dict):
                 self.user_photos = {}
-            for user in (result.get("users") or []):
-                if not isinstance(user, dict):
-                    continue
-                username = str(user.get(1, "") or "").strip()
-                photo = str(user.get(3, "") or "").strip()
-                status = str(user.get(4, "") or "").strip()
-                if username and username.casefold() == BOT_ID.casefold() and status:
-                    with self._profile_status_lock:
-                        self._profile_current_status = status
-                        if status == getattr(self, "_profile_status_pending", ""):
-                            self._profile_status_pending = ""
-                        if self._profile_status_timer is None and not BOT_BASE_STATUS:
-                            self._profile_base_status = status
-                if username and photo and username != BOT_ID and photo.startswith(("http://", "https://")):
-                    self.user_photos[username.casefold()] = photo
-                    self.user_photos[_norm_user(username)] = photo
-            for user in self._users_from_room_admin(result.get("room_admin") or {}):
-                username = str(user.get("username") or "").strip()
+            if not isinstance(getattr(self, "user_profile_ids", None), dict):
+                self.user_profile_ids = {}
+            users = self._extract_room_list_users(result if isinstance(result, dict) else {})
+            for user in users:
+                username = str(user.get("username") or "").strip().lstrip("@")
                 photo = str(user.get("photo") or "").strip()
+                user_id = str(user.get("user_id") or "").strip()
+                if photo.startswith("//"):
+                    photo = "https:" + photo
+                if username and user_id:
+                    self.user_profile_ids[username.casefold()] = user_id
+                    self.user_profile_ids[_norm_user(username)] = user_id
                 status = str(user.get("status") or "").strip()
-                if username and username.casefold() == BOT_ID.casefold() and status:
+                if username and _norm_user(username) == _norm_user(BOT_ID) and status:
                     with self._profile_status_lock:
                         self._profile_current_status = status
                         if status == getattr(self, "_profile_status_pending", ""):
                             self._profile_status_pending = ""
                         if self._profile_status_timer is None and not BOT_BASE_STATUS:
                             self._profile_base_status = status
-                if username and photo and photo.startswith(("http://", "https://")):
+                if (username and _norm_user(username) != _norm_user(BOT_ID)
+                        and photo.startswith(("http://", "https://"))):
                     self.user_photos[username.casefold()] = photo
                     self.user_photos[_norm_user(username)] = photo
+            photo_count = sum(
+                1 for user in users
+                if str(user.get("photo") or "").startswith(("http://", "https://"))
+            )
+            if users:
+                self.log("[PROFILE-PHOTO] native roster parsed:", "users=", len(users), "photos=", photo_count)
         except Exception as exc:
             self.log("[GIFT] photo cache failed:", repr(exc))
 
+    def _request_native_profile_roster(self, room, legacy=False):
+        """Ask Talkin for native UserItems and profile photo URLs.
+
+        Current APK builds use ``to=username`` for occupants_list. Older
+        gateways may still require BOT_ID, so callers can request that legacy
+        shape explicitly after the primary request returns no avatar.
+        """
+        room = str(room or "").strip()
+        if not room:
+            return False
+        try:
+            if not getattr(self, "ws", None):
+                return False
+            query_args = {
+                "type_": "occupants_list", "room": room,
+                "to": BOT_ID if legacy else "username", "value": "none",
+            }
+            if legacy:
+                query_args["id_"] = secrets.token_urlsafe(12)[:16]
+            sent = self.send_query(encode_query("room_admin", **query_args))
+            self.log(
+                "[PROFILE-PHOTO] native occupants request sent:",
+                room, "mode=legacy" if legacy else "mode=app",
+            )
+            return sent is not False
+        except Exception as exc:
+            self.log("[PROFILE-PHOTO] native roster request failed:", room, type(exc).__name__, str(exc)[:160])
+            return False
+
+    def _queue_profile_roster_refresh(self, room, username=""):
+        """Refresh Talkin's native avatar roster in the background per member."""
+        room = str(room or "").strip()
+        room_key = _norm_room(room)
+        user_key = _norm_user(username) if username else "*"
+        key = (room_key, user_key)
+        if not room or not room_key:
+            return False
+        lock = getattr(self, "_profile_roster_refresh_lock", None)
+        if lock is None:
+            lock = self._profile_roster_refresh_lock = threading.Lock()
+        with lock:
+            recent = getattr(self, "_profile_roster_refresh_at", {})
+            now = time.monotonic()
+            if now - float(recent.get(key, 0) or 0) < 30:
+                return False
+            recent[key] = now
+            self._profile_roster_refresh_at = recent
+
+        def refresh():
+            try:
+                # request_room_occupants() prefers Supabase and returns before
+                # asking Talkin. Avatars are delivered in Talkin UserItems, so
+                # explicitly request the native roster here.
+                self._request_native_profile_roster(room)
+            except Exception as exc:
+                self.log("[PROFILE-PHOTO] room roster refresh failed:", type(exc).__name__)
+
+        threading.Thread(target=refresh, name="profile-roster-refresh", daemon=True).start()
+        return True
+
     def _lookup_profile_photo(self, username):
-        """Best-effort profile-photo lookup for a gift receiver not in cache."""
+        """Resolve a photo by cached Talkin user id first, then by username."""
         raw_username = str(username or "").strip().lstrip("@")
-        username = raw_username.casefold()
-        if not username:
+        normalized = raw_username.casefold()
+        if not normalized:
             return ""
         photos = getattr(self, "user_photos", {})
-        for cache_key in (username, _norm_user(raw_username)):
+        for cache_key in (normalized, _norm_user(raw_username)):
             photo = str(photos.get(cache_key, "") or "").strip() if isinstance(photos, dict) else ""
-            if photo.startswith(("http://", "https://")):
-                return photo
+            if photo.startswith(("http://", "https://", "//")):
+                return "https:" + photo if photo.startswith("//") else photo
         client = getattr(getattr(self, "db", None), "client", None)
         if not client:
             return ""
-        try:
-            response = (client.table("profiles").select("*")
-                        .eq("username", username).limit(1).execute())
-            rows = getattr(response, "data", None) or []
-            if rows:
-                row = rows[0] if isinstance(rows[0], dict) else {}
-                photo = next((str(row.get(key) or "").strip() for key in
-                              ("photo_url", "photo", "avatar_url", "avatar", "image_url")
-                              if str(row.get(key) or "").strip().startswith(("http://", "https://"))), "")
-                if photo:
-                    if not isinstance(getattr(self, "user_photos", None), dict):
-                        self.user_photos = {}
-                    self.user_photos[username] = photo
-                    self.user_photos[_norm_user(raw_username)] = photo
-                    return photo
-        except Exception as exc:
-            self.log("[GIFT] receiver photo lookup failed:", repr(exc))
+        profile_ids = getattr(self, "user_profile_ids", {})
+        user_id = ""
+        if isinstance(profile_ids, dict):
+            user_id = str(profile_ids.get(normalized) or profile_ids.get(_norm_user(raw_username)) or "").strip()
+        photo_fields = (
+            "photo_url", "photo", "avatar_url", "avatar", "image_url", "picture",
+            "profile_photo", "profile_photo_url", "profile_picture_url",
+            "profile_image_url", "profile_image", "profile_picture", "profile_pic",
+            "picture_url", "photoURL", "avatarUrl", "profilePicture", "image",
+            "pictureUrl", "profile_photo_url", "photo_uri", "avatar_uri", "media",
+        )
+        queries = []
+        if user_id:
+            queries.append(("id", user_id))
+        queries.extend(("username", candidate) for candidate in dict.fromkeys((raw_username, normalized)))
+        for column, value in queries:
+            try:
+                response = (client.table("profiles").select("*")
+                            .eq(column, value).limit(1).execute())
+                rows = getattr(response, "data", None) or []
+            except Exception as exc:
+                self.log("[PROFILE-PHOTO] profiles lookup failed:", column, type(exc).__name__)
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                photo = ""
+                for key in photo_fields:
+                    value = row.get(key)
+                    if value is None:
+                        continue
+                    candidate_url = _extract_media_url_universal({"photo": value})
+                    if candidate_url:
+                        photo = candidate_url
+                        break
+                if not photo:
+                    continue
+                if photo.startswith("//"):
+                    photo = "https:" + photo
+                if not isinstance(getattr(self, "user_photos", None), dict):
+                    self.user_photos = {}
+                self.user_photos[normalized] = photo
+                self.user_photos[_norm_user(raw_username)] = photo
+                row_id = str(row.get("id") or "").strip()
+                if row_id:
+                    if not isinstance(getattr(self, "user_profile_ids", None), dict):
+                        self.user_profile_ids = {}
+                    self.user_profile_ids[normalized] = row_id
+                    self.user_profile_ids[_norm_user(raw_username)] = row_id
+                return photo
+        # Supabase username columns are often case-sensitive under `eq`; some
+        # deployments preserve account-name casing differently from Talkin.
+        ilike = getattr(client.table("profiles").select("*"), "ilike", None)
+        if callable(ilike):
+            for candidate in dict.fromkeys((raw_username, normalized)):
+                try:
+                    response = (client.table("profiles").select("*")
+                                .ilike("username", candidate).limit(1).execute())
+                    rows = getattr(response, "data", None) or []
+                except Exception as exc:
+                    self.log("[PROFILE-PHOTO] case-insensitive lookup failed:", type(exc).__name__)
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    photo = next((url for key in photo_fields
+                                  if (url := _extract_media_url_universal({"photo": row.get(key)}))), "")
+                    if photo:
+                        if photo.startswith("//"):
+                            photo = "https:" + photo
+                        self.user_photos[normalized] = photo
+                        self.user_photos[_norm_user(raw_username)] = photo
+                        return photo
         return ""
 
     def process_occupants_for_invite(self, result):
-        room = (self.invite_room or result.get("_occupants_room") or
+        room = (result.get("_occupants_room") or self.invite_room or
                 self.last_joined_room or self.room)
         room = str(room or "").strip()
         # An occupants response proves only that the roster was readable; it
@@ -13954,7 +16466,7 @@ class TalkinBot:
         q = str(query or "").strip()
         if not q:
             return None
-        target = q if re.match(r"^https?://", q, re.I) else "ytsearch1:" + q
+        target = q if re.match(r"^https?://", q, re.I) else "ytsearch5:" + q
         # Direct YouTube URLs are short-lived, so cache only briefly. This
         # avoids repeating the slow extractor step when the same song is
         # requested again while keeping the URL fresh enough to play.
@@ -13968,7 +16480,7 @@ class TalkinBot:
             return dict(cached.get("value") or {})
         errors = []
 
-        clients = ("web_embedded", "default")
+        clients = ("android", "web_embedded", "ios", "tv_embedded", "web", "default")
         for client in clients:
             try:
                 opts = {
@@ -13977,9 +16489,9 @@ class TalkinBot:
                     "noplaylist": True,
                     "skip_download": True,
                     "format": "bestaudio[abr<=192]/bestaudio",
-                    "socket_timeout": 4,
-                    "retries": 0,
-                    "extractor_retries": 0,
+                    "socket_timeout": 12,
+                    "retries": 2,
+                    "extractor_retries": 2,
                     "cachedir": False,
                     "check_formats": False,
                     "http_headers": {
@@ -14176,7 +16688,7 @@ class TalkinBot:
             return candidate
         return None
 
-    def _music_download(self,query):
+    def _music_download_uncached(self,query):
         """Search/download public audio and return an MP3 ready for TalkinChat.
         Try fast YouTube and SoundCloud sources first, then Internet Archive audio.
         """
@@ -14215,6 +16727,11 @@ class TalkinBot:
             if source.is_file() and source.stat().st_size > MUSIC_MAX_BYTES:
                 raise RuntimeError(f"ملف الصوت أكبر من {int(MUSIC_MAX_MB)} ميجابايت")
             if source.suffix.lower() == ".mp3":
+                # Keep the normalized MP3 outside yt-dlp's temporary folder;
+                # the successful-download path removes that folder afterward.
+                if source.resolve() != out_mp3.resolve():
+                    shutil.copy2(source, out_mp3)
+                    return out_mp3
                 return source
             ffmpeg_bin = shutil.which("ffmpeg")
             if not ffmpeg_bin:
@@ -14253,8 +16770,8 @@ class TalkinBot:
                 "outtmpl": template,
                 # Brief resolver/API hiccups (including transient DNS errors)
                 # were failing the request on its first network attempt.
-                "socket_timeout": 20, "retries": 3, "fragment_retries": 3,
-                "extractor_retries": 3, "file_access_retries": 3,
+                "socket_timeout": 25, "retries": 4, "fragment_retries": 4,
+                "extractor_retries": 4, "file_access_retries": 3,
                 "cachedir": False, "overwrites": True,
                 "continuedl": True,
                 "concurrent_fragment_downloads": 8,
@@ -14262,26 +16779,77 @@ class TalkinBot:
                 "http_chunk_size": 8 * 1024 * 1024,
                 "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"},
                 "check_formats": False,
-                "js_runtimes": {"node": {}},
+                # The previous code forced Node even when Node 22+ was not
+                # installed. Deno is preferred; Node is enabled only when its
+                # runtime version meets yt-dlp's current minimum.
                 "remote_components": {"ejs": "github"},
                 "match_filter": pre_download_filter,
             }
+            js_runtime = None
+            for runtime_name, executable, minimum in (
+                ("deno", shutil.which("deno"), (2, 3, 0)),
+                ("node", shutil.which("node"), (22, 0, 0)),
+            ):
+                if not executable:
+                    continue
+                try:
+                    runtime_probe = subprocess.run(
+                        [executable, "--version"], capture_output=True, text=True,
+                        timeout=4, check=False,
+                    )
+                    version_text = (runtime_probe.stdout or runtime_probe.stderr or "").strip()
+                    version_match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
+                    if runtime_probe.returncode == 0 and version_match:
+                        actual = tuple(int(part) for part in version_match.groups())
+                        if actual >= minimum:
+                            js_runtime = runtime_name
+                            break
+                except Exception:
+                    continue
+            if js_runtime:
+                opts["js_runtimes"] = {js_runtime: {}}
+            if label.startswith("youtube_"):
+                # Clients not currently requiring PO tokens are attempted first;
+                # if the optional bgutil plugin is installed, it can also issue
+                # tokens for the later clients automatically.
+                extractor_args = {"youtube": {"player_client": [label.split("_", 1)[1]]}}
+                if YOUTUBE_POT_BASE_URL:
+                    extractor_args["youtubepot-bgutilhttp"] = {"base_url": [YOUTUBE_POT_BASE_URL]}
+                opts["extractor_args"] = extractor_args
             if cookies and YOUTUBE_COOKIE_FILE:
                 opts["cookiefile"] = YOUTUBE_COOKIE_FILE
-            if label.startswith("youtube_"):
-                client = label.split("_", 1)[1]
-                if client != "native_default":
-                    opts["extractor_args"] = {"youtube": {"player_client": [client]}}
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(target, download=True)
-                    if info and info.get("entries"):
-                        entries = [x for x in info["entries"] if x]
-                        info = next(
-                            (x for x in entries if not int(x.get("duration") or 0)
-                             or int(x.get("duration") or 0) <= MUSIC_MAX_SECONDS),
-                            None,
-                        )
+                    match_score = 0.0
+                    if str(target).startswith(("ytsearch", "scsearch")):
+                        search_result = ydl.extract_info(target, download=False)
+                        raw_entries = search_result.get("entries") if isinstance(search_result, dict) else []
+                        entries = [x for x in (raw_entries or []) if isinstance(x, dict)]
+                        ranked = []
+                        for entry in entries:
+                            duration = int(entry.get("duration") or 0)
+                            if duration and duration > MUSIC_MAX_SECONDS:
+                                continue
+                            score = _music_candidate_score(
+                                search_query, entry.get("title"),
+                                entry.get("uploader") or entry.get("channel") or entry.get("creator"),
+                            )
+                            ranked.append((score, entry))
+                        ranked.sort(key=lambda pair: pair[0], reverse=True)
+                        if not ranked:
+                            raise RuntimeError("لم تظهر نتائج صوتية مناسبة في البحث")
+                        match_score, selected = ranked[0]
+                        selected_url = str(
+                            selected.get("webpage_url") or selected.get("original_url") or selected.get("url") or ""
+                        ).strip()
+                        if not selected_url:
+                            raise RuntimeError("نتيجة البحث لا تحتوي رابطًا قابلًا للتنزيل")
+                        # Resolve and download the exact ranked result, rather
+                        # than downloading result #1 and then labeling it as a
+                        # different entry from the search page.
+                        info = ydl.extract_info(selected_url, download=True)
+                    else:
+                        info = ydl.extract_info(target, download=True)
                     if not info:
                         raise RuntimeError("لم يتم العثور على الأغنية")
                 candidates = [x for x in tmpdir.iterdir() if x.is_file() and x.suffix.lower() not in (".part", ".ytdl", ".temp") and x.stat().st_size > 4096]
@@ -14299,6 +16867,10 @@ class TalkinBot:
                     "title": str(info.get("title") or query),
                     "uploader": str(info.get("uploader") or info.get("channel") or ""),
                     "duration": duration,
+                    "license": str(info.get("license") or info.get("license_name") or ""),
+                    "source_url": str(info.get("webpage_url") or info.get("original_url") or target),
+                    "source": label,
+                    "match_score": match_score,
                 }, mp3
             except Exception as exc:
                 errors.append(f"{label}: {type(exc).__name__}: {exc}")
@@ -14310,14 +16882,21 @@ class TalkinBot:
             t = resolve_public_title(search_query)
             if t: search_query = t
 
-        # Primary fast source: YouTube (1 result)
+        # Search broadly: Arabic artist names and older tracks are often absent
+        # from the first few YouTube results. Try multiple equivalent queries.
         if re.match(r"^https?://", query, re.I) and not ("soundcloud.com" in query.lower()):
             yt_targets = [query]
         else:
-            yt_targets = ["ytsearch3:" + search_query]
+            variants = _music_query_variants(search_query, limit=5)
+            yt_targets = list(dict.fromkeys("ytsearch10:" + value for value in variants if value))
 
-        for yt_target in yt_targets:
-            for client in ("android", "web_embedded", "web", "default"):
+        for target_index, yt_target in enumerate(yt_targets):
+            clients = (
+                ("tv_simply", "android_vr", "web_safari", "default", "mweb", "android", "ios", "web")
+                if target_index == 0 else
+                ("tv_simply", "android_vr", "web_safari", "default", "mweb")
+            )
+            for client in clients:
                 res = download_with_ydl(yt_target, f"youtube_{client}", cookies=True)
                 if res:
                     info, mp3 = res
@@ -14330,7 +16909,7 @@ class TalkinBot:
         if re.match(r"^https?://", query, re.I) and "soundcloud.com" in query.lower():
             sc_targets = [query]
         elif search_query:
-            sc_targets = ["scsearch1:" + search_query]
+            sc_targets = ["scsearch5:" + value for value in _music_query_variants(search_query, limit=4)]
 
         for target in sc_targets:
             res = download_with_ydl(target, "soundcloud", cookies=False)
@@ -14404,7 +16983,14 @@ class TalkinBot:
                     title = str(doc.get("title") or query_text)
                     creator = str((metadata.get("metadata") or {}).get("creator") or "Internet Archive")
                     self.log("[MUSIC] fallback source=Internet Archive title=", title)
-                    return {"id": identifier, "title": title, "uploader": creator, "duration": duration}, out_mp3
+                    archive_metadata = metadata.get("metadata") or {}
+                    return {
+                        "id": identifier, "title": title, "uploader": creator,
+                        "duration": duration,
+                        "license": str(archive_metadata.get("licenseurl") or archive_metadata.get("rights") or ""),
+                        "source_url": f"https://archive.org/details/{quote(identifier, safe='')}",
+                        "source": "Internet Archive",
+                    }, out_mp3
         except Exception as exc:
             errors.append(f"Internet Archive: {type(exc).__name__}: {exc}")
             self.log("[MUSIC] Internet Archive fallback failed:", repr(exc))
@@ -14415,8 +17001,223 @@ class TalkinBot:
                 except Exception:
                     pass
 
-        detail = " | ".join(errors[-10:])
-        raise RuntimeError("تعذر تنزيل ملف صوت من المصادر المتاحة." + (f" تفاصيل: {detail[:1200]}" if detail else ""))
+        detail_items = list(dict.fromkeys(errors[:2] + errors[-8:]))
+        detail = " | ".join(detail_items)
+        if yt_dlp is None:
+            detail += " | ثبّت yt-dlp[default] في متطلبات الاستضافة"
+        if not shutil.which("ffmpeg"):
+            detail += " | FFmpeg غير موجود؛ يلزم لتجهيز MP3"
+        if not (shutil.which("deno") or shutil.which("node")):
+            detail += " | لا يوجد Deno أو Node.js 22+ لحل تحديات YouTube الحديثة"
+        if any(token in detail.lower() for token in ("403", "requested format is not available", "po token", "sign in to confirm")):
+            detail += " | قد يلزم مزوّد YouTube PO Token (bgutil) أو Cookies صالحة بحسب حظر عنوان الاستضافة"
+        raise RuntimeError("تعذر تنزيل الأغنية من YouTube." + (f" تفاصيل: {detail[:1500]}" if detail else ""))
+
+    def _music_download(self, query):
+        """Return a ready MP3, reusing a recent successful download when possible.
+
+        A per-query lock prevents two simultaneous requests for the same song
+        from downloading it twice. The bounded cache is stored below DATA_DIR so
+        it survives process restarts when the host's persistent volume is mounted.
+        Each caller gets a separate public MP3 filename so media URLs stay isolated.
+        """
+        query_text = str(query or "").strip()
+        if not query_text:
+            return self._music_download_uncached(query)
+
+        outdir = BASE_DIR / "generated_music"
+        outdir.mkdir(parents=True, exist_ok=True)
+        cache_dir = MUSIC_CACHE_DIR
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        normalized_query = _normalize_music_search_text(query_text)
+        cache_basis = normalized_query or re.sub(r"\s+", " ", query_text.casefold()).strip()
+        cache_key = hashlib.sha256(cache_basis.encode("utf-8")).hexdigest()
+        cache_mp3 = cache_dir / (cache_key + ".mp3")
+        cache_meta = cache_dir / (cache_key + ".json")
+        legacy_cache_dir = outdir / ".music_cache"
+        legacy_key = hashlib.sha256(re.sub(r"\s+", " ", query_text.casefold()).strip().encode("utf-8")).hexdigest()
+        legacy_mp3 = legacy_cache_dir / (legacy_key + ".mp3")
+        legacy_meta = legacy_cache_dir / (legacy_key + ".json")
+
+        guard = getattr(self, "_music_download_cache_guard", None)
+        if guard is None:
+            guard = self._music_download_cache_guard = threading.Lock()
+        with guard:
+            locks = getattr(self, "_music_download_cache_locks", None)
+            if locks is None:
+                locks = self._music_download_cache_locks = {}
+            query_lock = locks.setdefault(cache_key, threading.Lock())
+
+        with query_lock:
+            now = time.time()
+            if (not cache_mp3.is_file() and legacy_mp3.is_file() and legacy_meta.is_file()
+                    and now - legacy_mp3.stat().st_mtime <= MUSIC_FILE_CACHE_TTL
+                    and legacy_mp3.stat().st_size > 4096):
+                try:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(legacy_mp3, cache_mp3)
+                    shutil.copy2(legacy_meta, cache_meta)
+                    self.log("[MUSIC] migrated recent cache into persistent DATA_DIR:", cache_key[:12])
+                except Exception as exc:
+                    self.log("[MUSIC] legacy cache migration failed:", type(exc).__name__)
+            # First consult the durable, shared reference library. It is stored
+            # outside generated_music so routine cleanup cannot remove it.
+            library_dir = MUSIC_LIBRARY_DIR
+            library_mp3 = library_dir / (cache_key + ".mp3")
+            library_meta = library_dir / (cache_key + ".json")
+            if MUSIC_LIBRARY_ENABLED and library_mp3.is_file() and library_meta.is_file():
+                try:
+                    if library_mp3.stat().st_size > 4096:
+                        metadata = json.loads(library_meta.read_text(encoding="utf-8"))
+                        cached_source = str((metadata or {}).get("source") or "").casefold()
+                        if "youtube" in cached_source:
+                            request_copy = outdir / (uuid.uuid4().hex + ".mp3")
+                            shutil.copy2(library_mp3, request_copy)
+                            self.log("[MUSIC] permanent YouTube library hit:", cache_key[:12])
+                            return metadata, request_copy
+                        self.log("[MUSIC] ignoring non-YouTube permanent cache:", cached_source or "unknown")
+                except Exception as exc:
+                    self.log("[MUSIC] library read failed:", type(exc).__name__)
+
+            if cache_mp3.is_file() and cache_meta.is_file():
+                try:
+                    age = now - cache_mp3.stat().st_mtime
+                    if age <= MUSIC_FILE_CACHE_TTL and cache_mp3.stat().st_size > 4096:
+                        metadata = json.loads(cache_meta.read_text(encoding="utf-8"))
+                        if isinstance(metadata, dict):
+                            cached_source = str(metadata.get("source") or "").casefold()
+                            if "youtube" in cached_source:
+                                request_copy = outdir / (uuid.uuid4().hex + ".mp3")
+                                shutil.copy2(cache_mp3, request_copy)
+                                os.utime(cache_mp3, None)
+                                os.utime(cache_dir, None)
+                                return metadata, request_copy
+                            self.log("[MUSIC] ignoring non-YouTube cache to honor YouTube-first playback:", cached_source or "unknown")
+                except Exception as exc:
+                    self.log("[MUSIC] prepared-file cache read failed:", type(exc).__name__)
+
+            info, downloaded_path = self._music_download_uncached(query_text)
+            downloaded_path = Path(downloaded_path)
+            if downloaded_path.is_file() and downloaded_path.stat().st_size > 4096:
+                # Default: keep a permanent copy only when the provider explicitly
+                # identifies a reusable license. The optional override is intended
+                # solely for tracks the operator owns or has permission to retain.
+                license_text = str((info or {}).get("license") or "").strip().lower()
+                is_reusable_license = any(token in license_text for token in (
+                    "creativecommons.org", "creative commons", "public domain",
+                    "public-domain", "cc0", "cc-by", "cc by", "cc-by-sa", "cc by-sa",
+                ))
+                may_store_permanently = is_reusable_license or MUSIC_LIBRARY_SAVE_AUTHORIZED
+                if MUSIC_LIBRARY_ENABLED and may_store_permanently:
+                    try:
+                        library_dir.mkdir(parents=True, exist_ok=True)
+                        max_bytes = int(MUSIC_LIBRARY_MAX_GB * 1024 * 1024 * 1024)
+                        used_bytes = sum(f.stat().st_size for f in library_dir.glob("*.mp3") if f.is_file())
+                        source_size = downloaded_path.stat().st_size
+                        if not library_mp3.exists() and used_bytes + source_size <= max_bytes:
+                            temp_library_mp3 = library_dir / (cache_key + ".tmp.mp3")
+                            temp_library_meta = library_dir / (cache_key + ".tmp.json")
+                            shutil.copy2(downloaded_path, temp_library_mp3)
+                            temp_library_meta.write_text(json.dumps(dict(info or {}), ensure_ascii=False), encoding="utf-8")
+                            os.replace(temp_library_mp3, library_mp3)
+                            os.replace(temp_library_meta, library_meta)
+                            self.log("[MUSIC] licensed track saved to permanent library:", cache_key[:12])
+                    except Exception as exc:
+                        self.log("[MUSIC] permanent library write failed:", type(exc).__name__)
+                try:
+                    temp_mp3 = cache_dir / (cache_key + ".tmp.mp3")
+                    temp_meta = cache_dir / (cache_key + ".tmp.json")
+                    shutil.copy2(downloaded_path, temp_mp3)
+                    temp_meta.write_text(json.dumps(dict(info or {}), ensure_ascii=False), encoding="utf-8")
+                    os.replace(temp_mp3, cache_mp3)
+                    os.replace(temp_meta, cache_meta)
+                    os.utime(cache_dir, None)
+                    cached_items = sorted(
+                        (item for item in cache_dir.glob("*.mp3") if item.is_file()),
+                        key=lambda item: item.stat().st_mtime,
+                    )
+                    for stale in cached_items[:-MUSIC_FILE_CACHE_MAX_ITEMS]:
+                        stale.unlink(missing_ok=True)
+                        stale.with_suffix(".json").unlink(missing_ok=True)
+                    self.log("[MUSIC] prepared-file cache stored:", cache_key[:12])
+                except Exception as exc:
+                    self.log("[MUSIC] prepared-file cache write failed:", type(exc).__name__)
+                    for temporary in (cache_dir / (cache_key + ".tmp.mp3"), cache_dir / (cache_key + ".tmp.json")):
+                        try:
+                            temporary.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+            return info, downloaded_path
+
+    def handle_youtube_test_command(self, room, query, requester):
+        """Test YouTube search/download independently without changing .sa behavior."""
+        query = str(query or "").strip()
+        if not query:
+            self.send_room_text(room, "❌ اكتب: تشغيل يوتيوب .aa اسم الأغنية")
+            return True
+        last = getattr(self, "_youtube_test_last", {}).get(_norm_user(requester), 0.0)
+        remaining = 10.0 - (time.time() - float(last or 0.0))
+        if remaining > 0:
+            self.send_room_text(room, f"⏳ انتظر {int(remaining) + 1} ثانية قبل اختبار آخر.")
+            return True
+        if not hasattr(self, "_youtube_test_last"):
+            self._youtube_test_last = {}
+        self._youtube_test_last[_norm_user(requester)] = time.time()
+
+        def worker():
+            try:
+                if yt_dlp is None:
+                    raise RuntimeError("مكتبة yt-dlp غير مثبتة على الاستضافة")
+                public_base = _public_base_url()
+                if not public_base:
+                    raise RuntimeError("رابط الوسائط العام PUBLIC_MEDIA_URL غير مضبوط")
+                # Bypass the shared cross-source cache so this test proves a
+                # fresh YouTube resolution rather than reusing Audius/archive.
+                info, path = self._music_download_uncached(query)
+                info = dict(info or {})
+                source_url = str(info.get("source_url") or "").strip()
+                source_name = str(info.get("source") or "").casefold()
+                if "youtube" not in source_name and not re.search(r"(?:youtube\.com|youtu\.be)", source_url, re.I):
+                    raise RuntimeError("لم ينجح مصدر YouTube؛ النتيجة جاءت من مصدر احتياطي")
+                path = Path(path)
+                if not path.is_file() or path.stat().st_size <= 4096:
+                    raise RuntimeError("ملف الصوت الناتج غير مكتمل")
+                duration = int(info.get("duration") or 0)
+                media_url = public_base.rstrip("/") + "/media/" + path.name
+                self._verify_public_media_url(media_url, media_kind="audio")
+                sent = self.send_room_media(room, media_url, "audio", duration)
+                if sent is False:
+                    raise RuntimeError("Talkin رفض إرسال ملف الصوت")
+                title = str(info.get("title") or query)
+                # Keep this successful .aa track as the requester's latest song,
+                # so `مشاركة username` can send the same audio privately.
+                self.music_current[_norm_user(requester)] = {
+                    "requester": requester,
+                    "title": title,
+                    "artist": str(info.get("uploader") or info.get("channel") or "YouTube"),
+                    "url": media_url,
+                    "local_path": str(path),
+                    "query": query,
+                    "duration": duration,
+                    "source_url": source_url,
+                    "source": "YouTube",
+                    "created_at": time.time(),
+                }
+                caption = ("🎵 تم تشغيل أغنية من YouTube\n"
+                           f"👤 الطلب بواسطة: @{requester}\n"
+                           f"🎶 الأغنية: {title}\n"
+                           "▶️ اضغط زر التشغيل للاستماع مباشرة داخل الشات.\n"
+                           "🔒 رابط YouTube مخفي.\n"
+                           "📩 للمشاركة خاص: مشاركة اسم_المستخدم")
+                self.send_room_text(room, caption)
+                self.log("[MUSIC_TEST] YouTube test succeeded:", title, source_url)
+            except Exception as exc:
+                self.log("[MUSIC_TEST] YouTube test failed:", repr(exc))
+                self.send_room_text(room, "❌ فشل اختبار YouTube: " + str(exc)[:500])
+
+        self.send_room_text(room, "🔎 جاري البحث في YouTube وتجهيز الصوت للاختبار...")
+        threading.Thread(target=worker, name="youtube-music-test", daemon=True).start()
+        return True
 
     def handle_music_command(self, room, text, requester, private_to="", broadcast_all=False,
                              with_reactions=True, room_output=True, live_stream=False):
@@ -14427,8 +17228,10 @@ class TalkinBot:
         if not query:
             self.send_room_text(room, "❌ اكتب: .sa اسم الأغنية")
             return True
-        if live_stream and not self._bot_is_room_owner(room):
-            role = self._bot_room_role(room) or "غير معروفة"
+        role = self._bot_room_role(room) if live_stream else ""
+        known_non_owner_roles = {"admin", "moderator", "mod", "member", "user", "none", "outcast", "banned", "ban", "blocked"}
+        if live_stream and role in known_non_owner_roles:
+            role = role or "غير معروفة"
             self.send_room_text(
                 room,
                 "⚠️ لم يتم تشغيل البث.\n"
@@ -14481,37 +17284,47 @@ class TalkinBot:
                         url = str(info.get("url") or "").strip()
 
                 if live_stream:
-                    for candidate in fast_sources:
-                        candidate_url = str(candidate.get("url") or "").strip()
-                        if not candidate_url or candidate_url in attempted_urls:
-                            continue
-                        attempted_urls.add(candidate_url)
-                        set_source(candidate)
-                        live_started = bool(self._play_music_in_live_room(room, url, duration))
-                        live_status = getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed")
-                        live_queued = live_status == "queued"
-                        if live_started or live_queued:
-                            self.log("[MUSIC] selected measured source:", candidate.get("source"),
-                                     "latency=", candidate.get("resolver_latency_seconds"), "room=", room)
-                            if live_queued:
-                                pending = getattr(self, "_pending_live_tracks", {}).get(room)
-                                if isinstance(pending, dict):
-                                    pending["fallback_search_query"] = search_query
-                                    pending["fallback_source_iterator"] = fast_sources
-                                    pending["attempted_source_urls"] = set(attempted_urls)
-                                    pending["requester"] = requester
-                            break
-                        self.log("[MUSIC] playback rejected source; trying next:", candidate.get("source"), room)
-
-                    if not live_started and not live_queued:
+                    # Same primary source policy as .sa and .تشغيل: YouTube first,
+                    # then SoundCloud/Archive. LiveKit receives the prepared local MP3.
+                    primary_error = None
+                    try:
                         info, path = self._music_download(search_query)
                         set_source(info, path)
                         live_started = bool(self._play_music_in_live_room(room, str(path), duration))
                         live_status = getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed")
                         live_queued = live_status == "queued"
-                        if not live_started and not live_queued:
-                            raise RuntimeError("تعذر بدء تشغيل الصوت من جميع المصادر السريعة والاحتياطية")
-                        self.log("[MUSIC] selected downloaded fallback", "room=", room)
+                        if live_started or live_queued:
+                            self.log("[MUSIC] live primary pipeline source:", info.get("source"), "room=", room)
+                    except Exception as exc:
+                        primary_error = exc
+                        self.log("[MUSIC] live primary pipeline failed:", repr(exc))
+
+                    # Preserve the original direct-stream providers as the final
+                    # fallback if the prepared track cannot be fed to LiveKit.
+                    if not live_started and not live_queued:
+                        for candidate in fast_sources:
+                            candidate_url = str(candidate.get("url") or "").strip()
+                            if not candidate_url or candidate_url in attempted_urls:
+                                continue
+                            attempted_urls.add(candidate_url)
+                            set_source(candidate)
+                            live_started = bool(self._play_music_in_live_room(room, url, duration))
+                            live_status = getattr(self, "_last_live_play_status_by_room", {}).get(room, "failed")
+                            live_queued = live_status == "queued"
+                            if live_started or live_queued:
+                                self.log("[MUSIC] live direct fallback accepted:", candidate.get("source"), "room=", room)
+                                if live_queued:
+                                    pending = getattr(self, "_pending_live_tracks", {}).get(room)
+                                    if isinstance(pending, dict):
+                                        pending["fallback_search_query"] = search_query
+                                        pending["fallback_source_iterator"] = fast_sources
+                                        pending["attempted_source_urls"] = set(attempted_urls)
+                                        pending["requester"] = requester
+                                break
+                            self.log("[MUSIC] live direct fallback rejected:", candidate.get("source"), room)
+                    if not live_started and not live_queued:
+                        detail = f": {primary_error}" if primary_error else ""
+                        raise RuntimeError("تعذر بدء تشغيل الصوت في البث من جميع المصادر" + detail)
                 else:
                     if broadcast_all:
                         target_rooms = [str(item).strip() for item in (self._active_rooms() or []) if str(item).strip()]
@@ -14521,70 +17334,38 @@ class TalkinBot:
                                                          if target.casefold() != room_name.casefold()]
                     else:
                         target_rooms = [str(room or "").strip()] if str(room or "").strip() else []
-                    pending_rooms = list(target_rooms)
-                    first_success_info = None
-                    for candidate in fast_sources:
-                        candidate_url = str(candidate.get("url") or "").strip()
-                        if not candidate_url or candidate_url in attempted_urls or not pending_rooms:
-                            continue
-                        attempted_urls.add(candidate_url)
-                        set_source(candidate)
-                        accepted_rooms = []
-                        for target_room in pending_rooms:
-                            try:
-                                sent = self.send_room_media(target_room, url, "audio", duration)
-                                if sent is False:
-                                    raise RuntimeError("Talkin لم يقبل حزمة الصوت")
-                                accepted_rooms.append(target_room)
-                            except Exception as exc:
-                                self.log("[MUSIC] source playback rejected:", candidate.get("source"),
-                                         target_room, repr(exc))
-                        if accepted_rooms:
-                            if first_success_info is None:
-                                first_success_info = dict(candidate)
-                            published_rooms.extend(accepted_rooms)
-                            pending_rooms = [target for target in pending_rooms if target not in accepted_rooms]
-                            self.log("[MUSIC] selected measured source:", candidate.get("source"),
-                                     "latency=", candidate.get("resolver_latency_seconds"),
-                                     "rooms=", len(accepted_rooms))
-                    if pending_rooms:
-                        if not public_base:
-                            raise RuntimeError("لا يوجد رابط عام قصير وآمن للصوت؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
-                        downloaded_info, downloaded_path = self._music_download(search_query)
-                        downloaded_path = Path(downloaded_path)
-                        downloaded_url = public_base.rstrip("/") + "/media/" + downloaded_path.name
-                        downloaded_duration = int((downloaded_info or {}).get("duration") or 0)
-                        accepted_download_rooms = []
-                        for target_room in pending_rooms:
-                            try:
-                                sent = self.send_room_media(target_room, downloaded_url, "audio", downloaded_duration)
-                                if sent is False:
-                                    raise RuntimeError("Talkin لم يقبل حزمة الصوت الاحتياطية")
-                                accepted_download_rooms.append(target_room)
-                            except Exception as exc:
-                                self.log("[MUSIC] downloaded fallback rejected:", target_room, repr(exc))
-                        if accepted_download_rooms:
-                            if first_success_info is None:
-                                first_success_info = dict(downloaded_info or {})
-                                info = dict(downloaded_info or {})
-                                path = downloaded_path
-                                url = downloaded_url
-                                duration = downloaded_duration
-                                title = str(info.get("title") or search_query)
-                                artist = str(info.get("uploader") or info.get("channel") or "YouTube")
-                            published_rooms.extend(accepted_download_rooms)
-                            pending_rooms = [target for target in pending_rooms if target not in accepted_download_rooms]
-                    if pending_rooms and not published_rooms:
-                        raise RuntimeError("تعذر إرسال الصوت إلى أي غرفة متصلة")
-                    if pending_rooms:
-                        self.log("[MUSIC] audio reached some rooms; fallback failed for remaining rooms:", pending_rooms)
-                    if first_success_info is not None and info is None:
-                        set_source(first_success_info)
-                    music_published = bool(published_rooms)
+                    if not target_rooms:
+                        raise RuntimeError("لا توجد غرفة مستهدفة لإرسال الأغنية")
+                    if not public_base:
+                        raise RuntimeError("لا يوجد رابط عام للصوت؛ اضبط PUBLIC_MEDIA_URL مع المنفذ العام الصحيح")
+                    # Room clients may accept an external stream URL packet yet
+                    # fail to fetch/play that provider URL. Host a normalized
+                    # MP3 on our own media server for reliable room playback.
+                    downloaded_info, downloaded_path = self._music_download(search_query)
+                    info = dict(downloaded_info or {})
+                    path = Path(downloaded_path)
+                    if not path.is_file() or path.stat().st_size <= 4096:
+                        raise RuntimeError("ملف MP3 المحلي غير موجود أو غير مكتمل")
+                    set_source(info, path)
+                    self._verify_public_media_url(url, media_kind="audio")
+                    for target_room in target_rooms:
+                        try:
+                            sent = self.send_room_media(target_room, url, "audio", duration)
+                            if sent is False:
+                                raise RuntimeError("Talkin لم يقبل حزمة MP3 المستضافة")
+                            published_rooms.append(target_room)
+                        except Exception as exc:
+                            self.log("[MUSIC] hosted MP3 rejected:", target_room, repr(exc))
+                    if not published_rooms:
+                        raise RuntimeError("تعذر إرسال MP3 المستضاف إلى أي غرفة متصلة")
+                    music_published = True
 
                 self.music_current[_norm_user(requester)] = {
                     "requester": requester, "title": title, "artist": artist,
-                    "url": url, "duration": duration, "created_at": time.time(),
+                    "url": url,
+                    "local_path": str(path) if path is not None and Path(path).is_file() else "",
+                    "query": search_query,
+                    "duration": duration, "created_at": time.time(),
                 }
                 if with_reactions:
                     music_code = uuid.uuid4().hex[:4]
@@ -14631,7 +17412,14 @@ class TalkinBot:
             except Exception as exc:
                 self.log("[MUSIC] request failed:", repr(exc), "room=", room)
                 if room_output:
-                    self.send_room_text(room, "❌ تعذر جلب الأغنية.")
+                    failure_detail = str(exc).casefold()
+                    message = "❌ تعذر جلب الأغنية."
+                    if "sign in to confirm" in failure_detail or "not a bot" in failure_detail:
+                        message += (
+                            "\n⚙️ YouTube طلب تحققًا إضافيًا من الاستضافة."
+                            " أضف YOUTUBE_COOKIES أو YOUTUBE_COOKIES_FILE في متغيرات Altare."
+                        )
+                    self.send_room_text(room, message)
 
         self.send_room_text(room, f"⏳ جاري تجهيز طلب الأغنية\n@{requester}")
         threading.Thread(
@@ -14641,36 +17429,97 @@ class TalkinBot:
         return True
 
     def share_last_music(self, sender: str, target: str, room: str = ""):
-        """Share the sender's latest successfully prepared song privately."""
+        """Share the requester's last prepared track as text plus a real MP3 file."""
+        sender = str(sender or "").strip().lstrip("@")
         target = str(target or "").strip().lstrip("@")
         info = self.music_current.get(_norm_user(sender), {})
-        if not target or not info.get("url"):
+        if not isinstance(info, dict) or not target:
             self.send_room_text(room, "⚠️ لا توجد أغنية شغّلها المستخدم بعد لمشاركتها.") if room else self.send_private_text(sender, "⚠️ لا توجد أغنية شغّلتها بعد لمشاركتها.")
             return True
-        title = str(info.get("title") or "أغنية")
-        # Send the media packet first. Some Talkin gateway versions accept the
-        # caption but drop an audio packet that immediately follows it.
+
+        title = str(info.get("title") or "أغنية").strip()
+        artist = str(info.get("artist") or "").strip()
+        duration = int(info.get("duration") or 0)
+        media_url = str(info.get("url") or "").strip()
+        local_path_text = str(info.get("local_path") or "").strip()
+        local_path = Path(local_path_text).expanduser() if local_path_text else None
+        public_base = _public_base_url()
+
+        # Prefer the exact prepared MP3 played in the room; rebuild its short
+        # hosted URL rather than sharing a provider URL that may expire.
+        if local_path is not None and local_path.is_file() and local_path.stat().st_size > 4096 and public_base:
+            media_url = public_base.rstrip("/") + "/media/" + local_path.name
+
+        def verify_audio(url):
+            self._verify_public_media_url(url, "audio")
+            return True
+
         try:
-            self.send_private_media(target, str(info["url"]), "audio", int(info.get("duration") or 0))
+            if not media_url:
+                raise RuntimeError("لا يوجد رابط أو ملف صوت محفوظ للأغنية")
+            try:
+                verify_audio(media_url)
+            except Exception as first_error:
+                # If the old hosted file expired/was cleaned, recreate it from
+                # the stored search query and publish a fresh MP3.
+                recovery_query = str(info.get("query") or title).strip()
+                if not recovery_query or not public_base:
+                    raise first_error
+                fresh_info, fresh_path = self._music_download(recovery_query)
+                fresh_path = Path(fresh_path)
+                if not fresh_path.is_file() or fresh_path.stat().st_size <= 4096:
+                    raise RuntimeError("تعذر إعادة تجهيز ملف الأغنية للمشاركة")
+                media_url = public_base.rstrip("/") + "/media/" + fresh_path.name
+                verify_audio(media_url)
+                info.update({
+                    "url": media_url, "local_path": str(fresh_path),
+                    "duration": int((fresh_info or {}).get("duration") or duration),
+                    "title": str((fresh_info or {}).get("title") or title),
+                    "artist": str((fresh_info or {}).get("uploader") or artist),
+                })
+                duration = int(info.get("duration") or 0)
+                title = str(info.get("title") or title)
+                artist = str(info.get("artist") or artist)
+                self.music_current[_norm_user(sender)] = info
+
+            filename = re.sub(r'[\\/:*?"<>|]+', "_", title).strip(" ._")[:90] or "song"
+            if not Path(filename).suffix:
+                filename += ".mp3"
+
+            share_text = f"🎵 تمت مشاركة أغنية معك\n🎼 العنوان: {title}\n▶️ اضغط زر التشغيل للاستماع إليها داخل الخاص."
+            if artist:
+                share_text += f"\n🎤 الفنان: {artist}"
+            text_sent = self.send_private_text(target, share_text)
+            if text_sent is False:
+                raise RuntimeError("تعذر إرسال رسالة المشاركة النصية")
+            # Do not batch the two private messages: let the text packet leave
+            # first, then send the playable audio attachment.
+            time.sleep(0.60)
+            media_sent = self.send_private_media(
+                target, media_url, "audio", duration, filename=filename
+            )
+            if media_sent is False:
+                raise RuntimeError("خادم Talkin لم يؤكد إرسال ملف الصوت")
         except Exception as exc:
-            self.log("[MUSIC] private share audio failed:", repr(exc))
+            self.log(
+                "[MUSIC] private share failed:",
+                "sender=", _norm_user(sender), "target=", _norm_user(target),
+                "error=", repr(exc),
+            )
             reason = str(exc).strip().replace("\n", " ")[:300] or "سبب غير معروف"
-            notice = f"⚠️ تعذر إرسال ملف الأغنية إلى @{target}.\n🧾 سبب الفشل: {reason}"
+            notice = f"⚠️ تعذر إكمال مشاركة الأغنية مع @{target}.\n🧾 سبب الفشل: {reason}"
             if room:
                 self.send_room_text(room, notice)
             else:
                 self.send_private_text(sender, notice)
             return True
-        # Do not send a caption to the recipient: on this gateway the caption
-        # is often the only visible private message while the media card is
-        # hidden. The recipient must receive the audio/file packet alone.
-        # The audio packet is already sent above; avoid an unnecessary fixed
-        # delay before the confirmation so the recipient sees the song faster.
-        time.sleep(0.05)
+
+        confirmation = f"✅ تمت مشاركة أغنية {title} مع @{target} في الخاص."
         if room:
-            self.send_room_text(room, f"✅ تمت مشاركة أغنية {title} مع @{target} في الخاص.")
+            self.send_room_text(room, confirmation)
         else:
-            self.send_private_text(sender, f"✅ تمت مشاركة أغنية {title} مع @{target} في الخاص.")
+            self.send_private_text(sender, confirmation)
+        self.log("[MUSIC] private text + audio attachment sent:", _norm_user(sender), "->", _norm_user(target), "file=", filename)
         return True
 
     def send_gift_native(self, room: str, gift_id: str, target_username: str):
@@ -14910,7 +17759,7 @@ class TalkinBot:
             if not public_base:
                 if charged:
                     _add_points(sender_name, cost)
-                raise RuntimeError("لا يوجد رابط عام لصور الهدايا؛ ضع PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
+                raise RuntimeError("لا يوجد رابط عام لصور الهدايا؛ اضبط PUBLIC_MEDIA_URL أو PUBLIC_BASE_URL أو رابط النطاق العام للاستضافة")
             sender_key = sender_name.casefold().lstrip("@")
             receiver_key = target.casefold().lstrip("@")
             # Use each account's own cached/profile image beside its own name.
@@ -14973,8 +17822,8 @@ class TalkinBot:
     BOARD_GAME_COOLDOWN = 240.0  # 4 minutes between board games for the same player
 
     def _board_game_ready(self, username, room, game_type="board"):
-        """Enforce a separate 4-minute interval per game type for the same player."""
-        if not username:
+        """Enforce a separate 4-minute interval; env-configured masters bypass it."""
+        if not username or _is_env_master_for_game_cooldown(username):
             return True, 0
         key = ("board_games", str(game_type or "board").casefold(), _norm_user(username))
         now = time.time()
@@ -14996,12 +17845,12 @@ class TalkinBot:
         return ok
 
     def _game_award(self, username, amount):
-        # الماستر يلعب مثل أي عضو: المكاسب تُضاف إلى رصيده وتُسجل لعباته.
-        # الاستثناء الوحيد المقصود للماستر موجود في أمر تحويل النقاط sb@،
-        # وليس في الألعاب.
+        # The common reward path atomically diverts 20% to an outstanding loan.
         if not username:
             return 0
-        return _add_points(username, int(amount))
+        result = _add_points(username, int(amount), repay_loan=True, return_details=True)
+        self._notify_loan_repayment(username, result)
+        return int(result.get("balance", 0) or 0) if isinstance(result, dict) else int(result or 0)
 
     def _game_ready(self, username, room, cooldown=40.0, game_name=""):
         # الفاصل مستقل لكل لعبة ولكل مستخدم. لا نفرض 40 ثانية هنا،
@@ -15012,7 +17861,9 @@ class TalkinBot:
             cooldown = max(0.0, float(cooldown))
         except (TypeError, ValueError):
             cooldown = 40.0
-        # الماستر يخضع لنفس فاصل اللعبة مثل بقية الأعضاء.
+        # Only deployment-configured master accounts bypass all per-game cooldowns.
+        if _is_env_master_for_game_cooldown(username):
+            return True, 0
         key = (game_key, _norm_user(username))
         now = time.time()
         with self.game_lock:
@@ -15048,13 +17899,15 @@ class TalkinBot:
 
     def _send_game_result(self, room, text, game_key, winner_name="", target_rooms=None):
         """Send the text result and, when the game has artwork, its winner card."""
-        if _game_results_disabled_for_room(room):
-            return False
         self.send_room_text(room, text)
         if winner_name and game_key:
-            self._send_game_winner_card(game_key, winner_name, target_rooms or [room])
+            self._send_game_winner_card(
+                game_key, winner_name, target_rooms or [room],
+                respect_room_filter=False,
+            )
 
-    def _send_game_winner_card(self, game_key, winner_name, target_rooms, send_delay=0.0):
+    def _send_game_winner_card(self, game_key, winner_name, target_rooms, send_delay=0.0,
+                               respect_room_filter=True):
         """Render the existing game artwork and send it safely room-by-room.
 
         ``send_delay`` is used by multi-room game broadcasts to avoid a burst
@@ -15063,7 +17916,8 @@ class TalkinBot:
         """
         target_rooms = [
             str(room or "").strip() for room in (target_rooms or [])
-            if str(room or "").strip() and not _game_results_disabled_for_room(room)
+            if str(room or "").strip()
+            and (not respect_room_filter or not _game_results_disabled_for_room(room))
         ]
         if not target_rooms:
             return False
@@ -15087,7 +17941,11 @@ class TalkinBot:
                     return False
             else:
                 winner_key = _norm_user(winner_name)
-                winner_photo = getattr(self, "user_photos", {}).get(winner_key, "")
+                photo_cache = getattr(self, "user_photos", {})
+                winner_photo = ""
+                if isinstance(photo_cache, dict):
+                    winner_photo = (photo_cache.get(winner_key, "")
+                                    or photo_cache.get(str(winner_name or "").casefold(), ""))
                 if not winner_photo:
                     winner_photo = self._lookup_profile_photo(winner_name)
                 language = self._effective_room_language(target_rooms[0]) if game_key == "hunt_dragon" and target_rooms else "ar"
@@ -15188,6 +18046,76 @@ class TalkinBot:
                     total += int(waiting.get("stake", 0) or 0)
         return total
 
+    def _load_wager_state(self):
+        """Restore open wagers whose stakes were already reserved."""
+        data = _load_local_json(WAGER_STATE_FILE, {})
+        rows = data.get("waiting", data) if isinstance(data, dict) else {}
+        if not isinstance(rows, dict):
+            return {}
+        restored = {}
+        for key, value in rows.items():
+            if not isinstance(value, dict) or not value.get("user"):
+                continue
+            try:
+                stake = int(value.get("stake", 0) or 0)
+                created = float(value.get("created", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if stake <= 0 or created <= 0:
+                continue
+            item = dict(value)
+            item.update(stake=stake, created=created, reserved=bool(value.get("reserved", True)))
+            item["id"] = str(item.get("id") or uuid.uuid4().hex)
+            restored[str(key).casefold()] = item
+        return restored
+
+    def _recover_pending_wager_debits(self):
+        """Finish a wager debit interrupted by a process/platform restart."""
+        recovered = []
+        with self.game_lock:
+            rows = [
+                (key, dict(value)) for key, value in self.wager_waiting.items()
+                if isinstance(value, dict) and value.get("status") == "pending_debit"
+            ]
+        for key, waiting in rows:
+            user = str(waiting.get("user") or "").strip()
+            stake = int(waiting.get("stake", 0) or 0)
+            challenge_id = str(waiting.get("id") or "")
+            txid = str(waiting.get("debit_transaction_id") or f"wager-debit:{challenge_id}")
+            if not user or stake <= 0 or not challenge_id:
+                continue
+            debit = _apply_points_delta_once(
+                user, -stake, txid, f"reserve {waiting.get('game', 'wager')} stake"
+            )
+            if not debit.get("ok"):
+                if debit.get("error") == "insufficient":
+                    with self.game_lock:
+                        current = self.wager_waiting.get(key)
+                        if current and str(current.get("id") or "") == challenge_id:
+                            self.wager_waiting.pop(key, None)
+                            self._save_wager_state()
+                continue
+            with self.game_lock:
+                current = self.wager_waiting.get(key)
+                if current and str(current.get("id") or "") == challenge_id:
+                    current["status"] = "active"
+                    current["reserved"] = True
+                    current["debit_transaction_id"] = txid
+                    recovered.append(key)
+                    self._save_wager_state()
+        if recovered:
+            self.log("[GAME] recovered wager reservations after restart", len(recovered))
+
+    def _save_wager_state(self):
+        """Persist open wagers through the shared atomic JSON writer."""
+        with self.game_lock:
+            snapshot = {
+                str(key): dict(value)
+                for key, value in self.wager_waiting.items()
+                if isinstance(value, dict)
+            }
+        _save_local_json(WAGER_STATE_FILE, {"version": 1, "waiting": snapshot})
+
     def _cleanup_expired_wagers(self):
         # مدة البحث عن منافس لأي لعبة انتظار = دقيقتان فقط.
         timeout = 120
@@ -15211,6 +18139,8 @@ class TalkinBot:
                         waiting["id"] = challenge_id
                     waiting["_refund_pending"] = True
                     expired.append((key, dict(waiting), challenge_id))
+            if expired:
+                self._save_wager_state()
         for key, waiting, challenge_id in expired:
             room = str(waiting.get("room") or "").strip()
             game = str(waiting.get("game") or "اللعبة").strip()
@@ -15235,6 +18165,7 @@ class TalkinBot:
                 if current and str(current.get("id") or "") == challenge_id:
                     self.wager_waiting.pop(key, None)
                     removed = True
+                    self._save_wager_state()
             if not removed:
                 continue
             if room:
@@ -15255,6 +18186,28 @@ class TalkinBot:
                     self.log("[GAME] expired wager notice failed:", room, repr(exc))
             self.log("[GAME] expired wager refunded", game, user, stake if reserved else 0)
 
+    def _retry_pending_wager_refund(self, key, waiting):
+        """Finish a timeout refund left pending by a concurrent cleanup worker."""
+        if not isinstance(waiting, dict) or not waiting.get("_refund_pending"):
+            return True
+        user = str(waiting.get("user") or "").strip()
+        stake = max(0, int(waiting.get("stake", 0) or 0))
+        challenge_id = str(waiting.get("id") or "")
+        if not challenge_id:
+            return False
+        refund = _apply_points_delta_once(
+            user, stake, f"wager-timeout-refund:{challenge_id}",
+            f"retry refund expired {waiting.get('game', 'wager')} wager",
+        ) if user and stake > 0 and waiting.get("reserved") else {"ok": True}
+        if not refund.get("ok"):
+            return False
+        with self.game_lock:
+            current = self.wager_waiting.get(key)
+            if current and str(current.get("id") or "") == challenge_id:
+                self.wager_waiting.pop(key, None)
+                self._save_wager_state()
+        return True
+
     def _cleanup_expired_fixed_games(self):
         # ألعاب سنارة/برق/ياقوت/صدام/كاشف تنتظر منافساً لمدة دقيقتين فقط.
         timeout = 120
@@ -15274,15 +18227,49 @@ class TalkinBot:
             self.log("[GAME] expired fixed game", game_name, waiting.get("user"))
 
     def _wager_result(self, first, second, game_name):
-        """Resolve a global PvP wager and publish the result only to both origin rooms."""
-        winner, loser = (first, second) if secrets.randbelow(2) == 0 else (second, first)
+        """Resolve a global PvP wager, honoring one admin-configured 3:1 sequence."""
+        first_key = _norm_user(first.get("user"))
+        second_key = _norm_user(second.get("user"))
+        with _WAGER_ADMIN_RULES_LOCK:
+            rules = _load_local_json(WAGER_ADMIN_RULES_FILE, {})
+            if not isinstance(rules, dict): rules = {}
+            active = [
+                (first_key, first) for _ in (0,)
+                if isinstance(rules.get(first_key), dict) and rules[first_key].get("enabled")
+            ] + [
+                (second_key, second) for _ in (0,)
+                if isinstance(rules.get(second_key), dict) and rules[second_key].get("enabled")
+            ]
+            if len(active) == 1:
+                target_key, target_player = active[0]
+                rule = rules[target_key]
+                cycle = int(rule.get("cycle", 0) or 0) % 4
+                target_wins = cycle < 3
+                opponent = second if target_player is first else first
+                winner, loser = (target_player, opponent) if target_wins else (opponent, target_player)
+                rule["cycle"] = (cycle + 1) % 4
+                rule["wins"] = int(rule.get("wins", 0) or 0) + (1 if target_wins else 0)
+                rule["losses"] = int(rule.get("losses", 0) or 0) + (0 if target_wins else 1)
+                rule["last_result"] = "win" if target_wins else "loss"
+                rule["updated_at"] = int(time.time())
+                _save_local_json(WAGER_ADMIN_RULES_FILE, rules)
+                self.log("[WAGER_ADMIN_RULE]", target_key, "result=", rule["last_result"], "cycle=", rule["cycle"])
+            else:
+                # No configured target, or two managed targets playing each
+                # other: keep the normal random resolution rather than favoring
+                # one side arbitrarily.
+                winner, loser = (first, second) if secrets.randbelow(2) == 0 else (second, first)
         winner_stake = int(winner.get("stake", 0) or 0)
         loser_stake = int(loser.get("stake", 0) or 0)
 
         # Both players enter at the first player's shared stake. Both stakes
         # were reserved atomically when they joined. Do not debit again here:
         # return the winner's stake and add the loser's stake to the winner.
-        _add_points(winner.get("user"), winner_stake + loser_stake)
+        award = _add_points(
+            winner.get("user"), winner_stake + loser_stake,
+            repay_loan=True, loan_repayment_basis=loser_stake, return_details=True,
+        )
+        self._notify_loan_repayment(winner.get("user"), award)
 
         game_key = {
             "رهان":"bet", "مراهنة":"bet", "مضاربة":"duel", "مضاربه":"duel",
@@ -15327,6 +18314,40 @@ class TalkinBot:
         if amount <= 0:
             self.send_room_text(room, _reply_template("game_invalid_amount", DEFAULT_REPLY_MESSAGES["game_invalid_amount"]))
             return True
+        if amount < WAGER_MIN_AMOUNT:
+            message = (
+                "❌ الحد الأدنى للرهان هو 100k نقطة. اكتب 100k أو مبلغًا أكبر."
+                if self._effective_room_language(room) != "en"
+                else "❌ The minimum wager is 100k points. Enter 100k or more."
+            )
+            self.send_room_text(room, message)
+            return True
+
+        def insufficient_notice(balance, required, reserved_points=0, joining=False):
+            balance = max(0, int(balance or 0))
+            required = max(0, int(required or 0))
+            reserved_points = max(0, int(reserved_points or 0))
+            available = max(0, balance - reserved_points)
+            if self._effective_room_language(room) == "en":
+                note = (
+                    f"\nYour command amount does not lower the first player's stake ({_fmt_points(required)})."
+                    if joining else ""
+                )
+                return (
+                    f"❌ Insufficient available balance. Balance: {_fmt_points(balance)}; "
+                    f"available now: {_fmt_points(available)}; required: {_fmt_points(required)}."
+                    + (f" Pending debit: {_fmt_points(reserved_points)}." if reserved_points else "") + note
+                )
+            note = (
+                f"\n📌 مبلغك المكتوب لا يخفض رهان اللاعب الأول ({_fmt_points(required)})."
+                if joining else ""
+            )
+            return (
+                f"❌ رصيدك المتاح لا يكفي. رصيدك الحالي: {_fmt_points(balance)}، "
+                f"المتاح الآن: {_fmt_points(available)}، والمطلوب: {_fmt_points(required)}."
+                + (f"\n⏳ يوجد خصم رهان لم يكتمل بعد بقيمة {_fmt_points(reserved_points)}." if reserved_points else "")
+                + note
+            )
         # أولاً ننظف الألعاب التي تجاوزت دقيقتين، ثم نتحقق هل لدى المستخدم
         # نفس اللعبة معلقة بالفعل. هذا الفحص يسبق فاصل الـ40 ثانية حتى يظهر
         # تنبيه واضح بدلاً من أن يصمت البوت أو يعطي رسالة فاصل عادية.
@@ -15334,6 +18355,13 @@ class TalkinBot:
         with self.game_lock:
             existing = self.wager_waiting.get(game_name.casefold())
             if existing and existing.get("_refund_pending"):
+                pending_refund = dict(existing)
+            else:
+                pending_refund = None
+        if pending_refund is not None:
+            if self._retry_pending_wager_refund(game_name.casefold(), pending_refund):
+                existing = None
+            else:
                 self.send_room_text(
                     room,
                     "⌛ انتهت مهلة هذا الرهان ويجري إعادة مبلغه؛ جرّب بعد لحظات."
@@ -15341,6 +18369,8 @@ class TalkinBot:
                     else "⌛ This wager expired and its refund is processing; try again shortly.",
                 )
                 return True
+        with self.game_lock:
+            existing = self.wager_waiting.get(game_name.casefold())
             if existing and _norm_user(existing.get("user")) == _norm_user(sender):
                 self.send_room_text(room, f"⏳ @{sender} لديك لعبة {game_name} شغالة حالياً.\n🎯 ما زالت تبحث عن منافس.\n⌛ مدة البحث دقيقتان فقط، وبعدها تُلغى تلقائياً إذا لم يدخل منافس.")
                 return True
@@ -15373,38 +18403,68 @@ class TalkinBot:
 
             # A player cannot spend points that are already committed to another
             # open global challenge. The current challenge itself is excluded.
+            # Active challenges already had their stake deducted from the
+            # balance. Counting them again here double-reserved the same points
+            # and caused false "insufficient balance" errors. Only an interrupted
+            # pending_debit still needs to be held against concurrent wagers.
             reserved = sum(
                 int(w.get("stake", 0) or 0) for k, w in self.wager_waiting.items()
                 if k != key and _norm_user(w.get("user")) == _norm_user(sender)
+                and str(w.get("status") or "active").casefold() == "pending_debit"
             )
             # The first player sets the stake for the whole round. A later
             # player's amount in the command does not change that stake: they
             # must have enough balance for the original challenge amount.
             round_stake = int(waiting.get("stake", 0) or 0) if waiting else amount
             balance = _get_points(sender)
+            if error is None and waiting and round_stake < WAGER_MIN_AMOUNT:
+                error = (
+                    "❌ هذا الرهان المعلّق أقل من الحد الأدنى الجديد (100k)؛ لن أقبل الانضمام إليه، "
+                    "وسينتهي تلقائيًا ثم يُعاد مبلغ صاحبه."
+                    if self._effective_room_language(room) != "en"
+                    else "❌ This open wager is below the 100k minimum and cannot be joined. It will expire and be refunded."
+                )
             if error is None and balance < round_stake + reserved:
-                    error = _reply_template(
-                        "game_insufficient", DEFAULT_REPLY_MESSAGES["game_insufficient"],
-                        balance=_fmt_points(balance)
-                    )
+                    error = insufficient_notice(balance, round_stake, reserved, joining=bool(waiting))
 
             if error is None and waiting:
                 # A second player may enter ANY amount, from the same room or another room.
                 # Their room and stake are both preserved for the final result.
-                self.wager_waiting.pop(key, None)
+                # Keep the first challenge persisted until the second player's
+                # debit is idempotently committed below; a restart between
+                # these operations must never lose either the challenge or the
+                # second player's points.
+                pass
             elif error is None:
-                # Reserve the stake immediately. This prevents spending the same
-                # balance in another game while the challenge is open.
-                _add_points(sender, -amount)
+                # Persist the reservation before debiting. If the platform
+                # stops between these two operations, startup resumes the
+                # pending debit with the same idempotent transaction id.
+                challenge_id = uuid.uuid4().hex
                 self.wager_waiting[key] = {
-                    "id": uuid.uuid4().hex,
+                    "id": challenge_id,
                     "user": sender,
                     "room": room,
                     "stake": amount,
                     "reserved": True,
+                    "status": "pending_debit",
+                    "debit_transaction_id": f"wager-debit:{challenge_id}",
                     "game": game_name,
                     "created": time.time(),
                 }
+                self._save_wager_state()
+                debit = _apply_points_delta_once(
+                    sender, -amount, f"wager-debit:{challenge_id}",
+                    f"reserve {game_name} stake",
+                )
+                if not debit.get("ok"):
+                    self.wager_waiting.pop(key, None)
+                    self._save_wager_state()
+                    error = insufficient_notice(
+                        _get_points(sender), amount, reserved,
+                    ) if debit.get("error") == "insufficient" else "❌ تعذر حفظ حجز الرهان بأمان."
+                else:
+                    self.wager_waiting[key]["status"] = "active"
+                    self._save_wager_state()
 
         if error:
             self.send_room_text(room, error)
@@ -15414,7 +18474,27 @@ class TalkinBot:
             # Mirror the first player's wager exactly; do not let a smaller
             # amount supplied by the challenger understate the loser debit.
             round_stake = int(waiting.get("stake", 0) or 0)
-            _add_points(sender, -round_stake)
+            challenge_id = str(waiting.get("id") or key)
+            join_txid = f"wager-join-debit:{challenge_id}:{_norm_user(sender)}"
+            debit = _apply_points_delta_once(
+                sender, -round_stake, join_txid,
+                f"join {game_name} wager",
+            )
+            if not debit.get("ok"):
+                self.send_room_text(
+                    room,
+                    insufficient_notice(
+                        _get_points(sender), round_stake,
+                        joining=True,
+                    ) if debit.get("error") == "insufficient" else
+                    "❌ تعذر تثبيت مبلغ الرهان بأمان؛ لم تُقبل المشاركة."
+                )
+                return True
+            with self.game_lock:
+                current = self.wager_waiting.get(key)
+                if current and str(current.get("id") or "") == challenge_id:
+                    self.wager_waiting.pop(key, None)
+                    self._save_wager_state()
             second = {
                 "user": sender,
                 "room": room,
@@ -15463,7 +18543,11 @@ class TalkinBot:
 
         # Both stakes were reserved when players joined. Return the winner's
         # stake plus the loser's stake; never debit again at settlement.
-        _add_points(winner.get("user"), prize * 2)
+        award = _add_points(
+            winner.get("user"), prize * 2,
+            repay_loan=True, loan_repayment_basis=prize, return_details=True,
+        )
+        self._notify_loan_repayment(winner.get("user"), award)
 
         game_key=game_name
         _record_game(loser.get("user"), game_key, -prize, prize)
@@ -16047,7 +19131,10 @@ class TalkinBot:
             target = str(game.get("target") or username).strip().lstrip("@")
             reward = int(game.get("defuse_reward") or secrets.choice((500_000, 1_000_000)))
             transaction_id = f"bomb-defuse-reward:{game.get('id') or _norm_room(destination) + ':' + _norm_user(target) + ':' + str(int(game.get('expires_at', 0)))}"
-            award = _apply_points_delta_once(target, reward, transaction_id, "bomb defusal reward")
+            award = _apply_points_delta_once(
+                target, reward, transaction_id, "bomb defusal reward", repay_loan=True
+            )
+            self._notify_loan_repayment(target, award)
             if award.get("ok"):
                 try:
                     _record_game(target, "bomb_defuse", reward, 0)
@@ -16071,7 +19158,9 @@ class TalkinBot:
         return True
 
     def _route_room_game_input(self, room, username, text, username_aliases=()):
-        """Route active bomb wires before board-game and Cricket commands."""
+        """Route rank queries and active game commands."""
+        if self._handle_user_room_rank_command(room, username, text):
+            return True
         if self._handle_bot_room_role_command(room, username, text):
             return True
         candidates, seen = [], set()
@@ -16280,8 +19369,8 @@ class TalkinBot:
             item = sale["item"]
             short_id = str(sale["auction_id"])[:8]
             self._auction_broadcast(
-                f"{prefix_ar}🏆 انتهى المزاد! فاز @{sale['winner']} بـ{item.get('icon', '💎')} {item.get('name_ar', 'الجائزة')} بسعر {_fmt_points(sale['bid'])} نقطة.\n✅ أضيفت للمخزون؛ الاسترداد بالحظ 50/50: قطعة أصلية (+0.75% ربح) أو مغشوشة (-1.25% خسارة).\nللمخزون: sv — للاسترداد: red auction {short_id}",
-                f"{prefix_en}🏆 Auction complete! @{sale['winner']} won {item.get('icon', '💎')} {item.get('name_en', 'the prize')} for {_fmt_points(sale['bid'])} points.\n✅ Added to inventory; redemption is a 50/50 chance: authentic (+0.75% profit) or counterfeit (-1.25% loss).\nInventory: sv — redeem: red auction {short_id}",
+                f"{prefix_ar}🏆 انتهى المزاد! فاز @{sale['winner']} بـ{item.get('icon', '💎')} {item.get('name_ar', 'الجائزة')} بسعر {_fmt_points(sale['bid'])} نقطة.\n✅ أضيفت إلى المخزون؛ الاسترداد بالحظ: 1% ربح، 1% خسارة، و98% دون تغيير.\nللمخزون: sv — للاسترداد: red auction {short_id}",
+                f"{prefix_en}🏆 Auction complete! @{sale['winner']} won {item.get('icon', '💎')} {item.get('name_en', 'the prize')} for {_fmt_points(sale['bid'])} points.\n✅ Added to inventory; redemption odds: 1% profit, 1% loss, and 98% no change.\nInventory: sv — redeem: red auction {short_id}",
                 fallback_room,
                 rooms=rooms,
             )
@@ -16307,12 +19396,13 @@ class TalkinBot:
         image_url = self._game_public_image(image_path, route="assets/treasures")
         if not image_url:
             return False
-        sent = False
         item_name_ar = str((item or {}).get("name_ar") or (item or {}).get("name_en") or "قطعة المزاد")
         item_name_en = str((item or {}).get("name_en") or (item or {}).get("name_ar") or "Auction item")
+        sent = False
         for target_room in self._auction_connected_rooms(fallback_room):
             try:
-                if self._effective_room_language(target_room) == "en":
+                language_en = self._effective_room_language(target_room) == "en"
+                if language_en:
                     warning = (
                         f"🔨 Auction item: {item_name_en}\n"
                         "⚠️ Not every auction item may be authentic. Be careful not to risk your entire fortune."
@@ -16360,11 +19450,24 @@ class TalkinBot:
     def _handle_auction_room_command(self, room, username, text):
         if self._handle_auction_toggle(username, text, is_private=False, room=room):
             return True
+        auction_game = getattr(self, "_auction_game", None)
+        active_auction = auction_game.active() if auction_game else None
+        # A bare number is an auction bid only while an actual bidding round
+        # is live. Outside that phase it must fall through to normal room
+        # handling; otherwise every ordinary message such as 12345 receives
+        # the misleading "auction closed" reply.
+        normalized_number = str(text or "").strip().translate(
+            str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+        )
+        bare_number = bool(re.fullmatch(r"[0-9]+(?:[mMbB]|[مب])?", normalized_number))
+        if bare_number and not (
+            isinstance(active_auction, dict)
+            and active_auction.get("phase") == "bidding"
+        ):
+            return False
         action = _parse_auction_room_command(text)
         if not action:
             return False
-        auction_game = getattr(self, "_auction_game", None)
-        active_auction = auction_game.active() if auction_game else None
         if not active_auction and action in {"join", "bid", "pass"}:
             self._auction_room_reply(room, "📭 المزاد مغلق؛ انتظر بدء جولة أخرى.", "📭 The auction is closed; wait for another round to start.")
             return True
@@ -16376,14 +19479,6 @@ class TalkinBot:
                 self._expire_auction_round(active_auction.get("id"))
                 if action in {"join", "bid", "pass"} and not source_is_participant:
                     self._auction_room_reply(room, "📭 المزاد مغلق؛ انتظر بدء جولة أخرى.", "📭 The auction is closed; wait for another round to start.")
-                return True
-            turn_started_at = float(active_auction.get("started_at") or 0)
-            try:
-                turn_deadline_at = float(active_auction.get("turn_deadline_at") or (turn_started_at + TURN_TIMEOUT_SECONDS))
-            except (TypeError, ValueError):
-                turn_deadline_at = self._auction_deadline_at(active_auction)
-            if float(game_clock()) >= turn_deadline_at:
-                self._expire_auction_round(active_auction.get("id"))
                 return True
             current_user_id = "name:" + _norm_user(username)
             participants = active_auction.get("participants") or []
@@ -16421,8 +19516,8 @@ class TalkinBot:
             item_en = f"{item['icon']} {item['name_en']}"
             starting_price = _fmt_points(item.get("starting_price", 100_000_000))
             self._auction_broadcast(
-                f"🔨 بدأ التسجيل في المزاد العالمي!\n🎁 السلعة المختارة: {item_ar}\n💰 السعر الابتدائي: {starting_price} نقطة.\n👥 الحد الأقصى 5 مشاركين؛ اكتب «مزايده» للتسجيل. عند اكتمال 3 يستطيع فاتح الجولة كتابة «ابدا المزاد»، أو يبدأ تلقائياً عند 5. بعد البدء تكون المزايدة بالدور لمدة 60 ثانية؛ لكل لاعب 7 ثوانٍ لإرسال المبلغ قبل انتقال الدور تلقائيًا. في دورك اكتب «زايد <المبلغ>» مثل 110m أو 10b أو «تمرير».",
-                f"🔨 Registration is open for the world auction!\n🎁 Selected item: {item_en}\n💰 Starting price: {starting_price} points.\n👥 Up to 5 players; type “join auction” to register. The host may start with 3, or it starts automatically at 5. After start, bidding runs in turns for up to 60 seconds; each player has 7 seconds to bid before the turn passes automatically. On your turn type “bid <amount>” such as 110m or 10b, or “pass”.",
+                f"🔨 بدأ التسجيل في المزاد العالمي!\n🎁 السلعة المختارة: {item_ar}\n💰 السعر الابتدائي: {starting_price} نقطة.\n👥 الحد الأقصى 5 مشاركين؛ اكتب «مزايده» للتسجيل. عند اكتمال 3 يستطيع فاتح الجولة كتابة «ابدا المزاد»، أو يبدأ تلقائياً عند 5. بعد البدء تكون المزايدة بالدور لمدة 60 ثانية؛ لكل لاعب 7 ثوانٍ لإرسال المبلغ قبل انتقال الدور تلقائيًا. اكتب الرقم فقط مثل 110m أو 10b أو 120000000؛ أو «تمرير».",
+                f"🔨 Registration is open for the world auction!\n🎁 Selected item: {item_en}\n💰 Starting price: {starting_price} points.\n👥 Up to 5 players; type “join auction” to register. The host may start with 3, or it starts automatically at 5. After registration, bidding runs in turns for 60 seconds, with 7 seconds per turn before it advances automatically. Send only the number, such as 110m or 10b, or type “pass”.",
                 room,
             )
             if not self._auction_send_item_image(item, room):
@@ -16451,7 +19546,7 @@ class TalkinBot:
                 item = result["auction"].get("item") or {}
                 starting_price = _fmt_points(item.get("starting_price", 100_000_000))
                 first_turn = result["auction"].get("turn_username") or ""
-                self._auction_broadcast(f"🔔 اكتمل العدد وبدأت المزايدة بالدور لمدة أقصاها 60 ثانية. السعر الابتدائي {starting_price} نقطة؛ أول دور على @{first_turn}. لكل لاعب 7 ثوانٍ للمزايدة قبل انتقال الدور تلقائيًا. اكتب «زايد <المبلغ>» أو «تمرير».", f"🔔 Player limit reached; turn-based bidding has started for up to 60 seconds. Starting price: {starting_price} points. First turn: @{first_turn}. Each player has 7 seconds to bid before their turn passes automatically. Type “bid <amount>” or “pass”.", rooms=self._auction_participant_rooms(result.get("auction")))
+                self._auction_broadcast(f"🔔 اكتمل العدد وبدأت المزايدة لمدة 60 ثانية. السعر الابتدائي {starting_price} نقطة؛ أول دور على @{first_turn}. لكل لاعب 7 ثوانٍ للمزايدة أو التمرير، ثم ينتقل الدور تلقائيًا.", f"🔔 Player limit reached; 60-second bidding has started. Starting price: {starting_price} points. First turn: @{first_turn}. Each player has 7 seconds to bid or pass before the turn advances automatically.", rooms=self._auction_participant_rooms(result.get("auction")))
             return True
 
         if action == "start":
@@ -16461,6 +19556,7 @@ class TalkinBot:
                     "no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."),
                     "not_opener": ("🔒 بدء المزايدة المبكر متاح لفاتح الجولة أو الماستر فقط.", "🔒 Only the host or master can start bidding early."),
                     "not_enough_players": (f"👥 يلزم تسجيل {result.get('participant_count', 0)}/3 مشاركين على الأقل.", f"👥 At least 3 players must register ({result.get('participant_count', 0)}/3)."),
+                    "start_cooldown": (f"⏳ لا يمكنك تشغيل المزاد مرة أخرى الآن؛ تبقى {result.get('remaining_seconds', 0)} ثانية (ساعة بين تشغيلتين).", f"⏳ You must wait {result.get('remaining_seconds', 0)} more seconds before starting another auction (one hour between starts)."),
                 }
                 ar, en = errors.get(result.get("error"), ("🔒 التسجيل مغلق أو بدأت المزايدة بالفعل.", "🔒 Registration is closed or bidding has already started."))
                 self._auction_room_reply(room, ar, en)
@@ -16469,17 +19565,17 @@ class TalkinBot:
             item = result["auction"].get("item") or {}
             starting_price = _fmt_points(item.get("starting_price", 100_000_000))
             first_turn = result["auction"].get("turn_username") or ""
-            self._auction_broadcast(f"🔔 أغلق فاتح الجولة التسجيل؛ بدأت المزايدة بالدور لمدة أقصاها 60 ثانية. السعر الابتدائي {starting_price} نقطة؛ أول دور على @{first_turn}. لكل لاعب 7 ثوانٍ للمزايدة قبل انتقال الدور تلقائيًا. اكتب «زايد <المبلغ>» أو «تمرير».", f"🔔 The host closed registration; turn-based bidding starts now for up to 60 seconds. Starting price: {starting_price} points. First turn: @{first_turn}. Each player has 7 seconds to bid before their turn passes automatically. Type “bid <amount>” or “pass”.", rooms=self._auction_participant_rooms(result.get("auction")))
+            self._auction_broadcast(f"🔔 أغلق فاتح الجولة التسجيل؛ بدأت المزايدة لمدة 60 ثانية. السعر الابتدائي {starting_price} نقطة؛ أول دور على @{first_turn}. لكل لاعب 7 ثوانٍ للمزايدة أو التمرير، ثم ينتقل الدور تلقائيًا.", f"🔔 The host closed registration; 60-second bidding starts now. Starting price: {starting_price} points. First turn: @{first_turn}. Each player has 7 seconds to bid or pass before the turn advances automatically.", rooms=self._auction_participant_rooms(result.get("auction")))
             return True
 
         if action == "bid":
             bid_amount = _parse_auction_bid_amount(text)
             if bid_amount is None:
-                self._auction_room_reply(room, "اكتب مبلغ مزايدتك بعد الأمر، مثل: زايد 110m أو زايد 10b.", "Enter your full bid after the command, for example: bid 110m or bid 10b.")
+                self._auction_room_reply(room, "أرسل رقم المزايدة فقط، مثل: 120m أو 10b أو 120000000.", "Send only the bid number, for example: 120m, 10b, or 120000000.")
                 return True
             result = self._auction_game.bid(user_id, username, bid_amount, _get_points(username))
             if not result.get("ok"):
-                if result.get("error") == "expired":
+                if result.get("error") in {"expired", "turn_expired"}:
                     self._expire_auction_round(active_auction.get("id"))
                     return True
                 if result.get("error") in {"not_your_turn", "not_participant"}:
@@ -16488,7 +19584,7 @@ class TalkinBot:
                     "no_auction": ("📭 لا يوجد مزاد مفتوح.", "📭 No auction is open."),
                     "not_bidding": ("⌛ المزايدة لم تبدأ أو انتهت.", "⌛ Bidding has not started or has ended."),
                     "not_participant": ("🔒 سجّل أولاً أثناء التسجيل بكتابة «مزايده»؛ المشاركة بالمزايدة للمسجلين فقط.", "🔒 Register first by typing “join auction”; only registered players may bid."),
-                    "invalid_amount": ("❌ مبلغ المزايدة غير صحيح. استخدم رقمًا مثل 110m أو 10b.", "❌ Invalid bid amount. Use a number such as 110m or 10b."),
+                    "invalid_amount": ("❌ مبلغ المزايدة غير صحيح. استخدم رقمًا مثل 120m أو 10b أو 120000000.", "❌ Invalid bid amount. Use a number such as 110m or 10b."),
                     "bid_too_low": (f"❌ أقل مزايدة مقبولة الآن هي {_fmt_points(result.get('required', 0))} نقطة.", f"❌ The minimum accepted bid right now is {_fmt_points(result.get('required', 0))} points."),
                     "insufficient": (f"❌ تحتاج {_fmt_points(result.get('required', 0))} نقطة للمزايدة؛ رصيدك {_fmt_points(result.get('balance', 0))}.", f"❌ You need {_fmt_points(result.get('required', 0))} points to bid; your balance is {_fmt_points(result.get('balance', 0))}."),
                 }
@@ -16497,6 +19593,7 @@ class TalkinBot:
                 return True
             amount = _fmt_points(result["amount"])
             next_turn = result.get("next_turn_username") or ""
+            self._schedule_auction_timeout(result.get("auction"))
             self._auction_broadcast(f"🔨 زايد @{username} بمبلغ {amount} نقطة؛ هذا أعلى سعر حالي. الدور التالي على @{next_turn}.", f"🔨 @{username} bid {amount} points; this is the current high bid. Next turn: @{next_turn}.", rooms=self._auction_participant_rooms(result.get("auction")))
             return True
 
@@ -16508,6 +19605,7 @@ class TalkinBot:
                 return True
             if result.get("status") == "passed":
                 next_turn = result.get("next_turn_username") or ""
+                self._schedule_auction_timeout(result.get("auction"))
                 self._auction_broadcast(f"⏭️ مرّر @{username} دوره؛ الدور التالي على @{next_turn}.", f"⏭️ @{username} passed; next turn: @{next_turn}.", rooms=participant_rooms)
                 return True
             if result.get("auto_closed") or result.get("pending") or result.get("status") in {"sold", "no_bids", "no_sale"}:
@@ -16602,7 +19700,10 @@ class TalkinBot:
                 job = str(pending.get("job") or "وظيفة")
                 shown_job = PAYROLL_JOBS_EN.get(job, job) if english else job
                 txid = "payroll:" + str(pending.get("id") or "")
-                result = _apply_points_delta_once(username, amount, txid, "work salary")
+                result = _apply_points_delta_once(
+                    username, amount, txid, "work salary", repay_loan=True
+                )
+                self._notify_loan_repayment(username, result)
                 if not result.get("ok"):
                     self.send_room_text(room, tr("⚠️ تعذر حفظ الراتب الآن؛ بقي راتبك محفوظًا. أعد كتابة راتبي بعد قليل.", "⚠️ Salary could not be saved. Your claim remains pending; type salary again shortly."))
                     return True
@@ -16776,7 +19877,7 @@ class TalkinBot:
             if shot_key in pending:
                 busy = True
                 dragon = False
-            elif FISHING_SHOT_COOLDOWN_SECONDS > 0 and last_shot and now - last_shot < FISHING_SHOT_COOLDOWN_SECONDS:
+            elif (not _is_env_master_for_game_cooldown(username)) and FISHING_SHOT_COOLDOWN_SECONDS > 0 and last_shot and now - last_shot < FISHING_SHOT_COOLDOWN_SECONDS:
                 busy = False
                 cooldown_remaining = FISHING_SHOT_COOLDOWN_SECONDS - (now - last_shot)
                 dragon = False
@@ -16862,7 +19963,7 @@ class TalkinBot:
             except Exception as exc:
                 self.log("[FISHING] dragon hunter badge registration failed:", repr(exc))
             self._queue_dragon_hunter_broadcast(username, room, reward)
-            self._send_game_winner_card("hunt_dragon", username, [room])
+            self._send_game_winner_card("hunt_dragon", username, [room], respect_room_filter=False)
             return True
 
         if language == "en":
@@ -16879,11 +19980,19 @@ class TalkinBot:
         return True
 
     def _lottery_game(self, room, sender, amount=0):
-        if not self._game_cooldown_notice(room, sender, WAGER_GAME_COOLDOWN_SECONDS, "حظ"):
-            return True
         amount = int(amount or 0)
         if amount < 0:
             self.send_room_text(room, "❌ المبلغ غير صحيح.")
+            return True
+        if 0 < amount < WAGER_MIN_AMOUNT:
+            message = (
+                "❌ الحد الأدنى لرهان الحظ المدفوع هو 100k نقطة. اكتب حظ 100k أو أكثر."
+                if self._effective_room_language(room) != "en"
+                else "❌ The minimum paid-luck wager is 100k points. Enter luck 100k or more."
+            )
+            self.send_room_text(room, message)
+            return True
+        if not self._game_cooldown_notice(room, sender, WAGER_GAME_COOLDOWN_SECONDS, "حظ"):
             return True
         # جوائز الحظ تقع دائماً بين 5,000 و100,000 نقطة. في اللعب المدفوع
         # لا تُصرف الجائزة إلا عند الفوز، ويبقى مبلغ الرهان مستقلاً عن الجائزة.
@@ -16920,8 +20029,47 @@ class TalkinBot:
         )
         self.send_room_text(room, text)
         if reward > 0:
-            self._send_game_winner_card("luck", sender, [room])
+            self._send_game_winner_card("luck", sender, [room], respect_room_filter=False)
         return True
+
+    def _recover_stock_market_investments_from_points_history(self):
+        """Rebuild missing pending stock rows from their durable point-debit journal."""
+        try:
+            _points_data()  # Loads the shared transfer journal on a cold start.
+            transactions = [row for row in (_POINTS_TRANSFER_CACHE or []) if isinstance(row, dict)]
+        except Exception as exc:
+            self.log("[STOCK] point-journal recovery read failed:", repr(exc))
+            return 0
+        with self._stock_market_lock:
+            known_ids = {
+                str(row.get("id") or "")
+                for row in getattr(self, "stock_investments", []) + getattr(self, "stock_market_history", [])
+                if isinstance(row, dict)
+            }
+            paid_ids = {
+                str(row.get("id") or "").partition("stock-market-payout:")[2]
+                for row in transactions
+                if str(row.get("id") or "").startswith("stock-market-payout:")
+            }
+            recovered = []
+            for transaction in transactions:
+                investment = transaction.get("stock_market_investment")
+                if not isinstance(investment, dict):
+                    continue
+                investment_id = str(investment.get("id") or "").strip()
+                if (not investment_id or investment_id in known_ids or investment_id in paid_ids
+                        or not investment.get("username")):
+                    continue
+                row = copy.deepcopy(investment)
+                row.setdefault("status", "pending_debit")
+                recovered.append(row)
+                known_ids.add(investment_id)
+            if not recovered:
+                return 0
+            self.stock_investments.extend(recovered)
+            self._save_stock_investments()
+        self.log("[STOCK] recovered pending investments from points journal:", len(recovered))
+        return len(recovered)
 
     def _save_stock_investments(self):
         with self._stock_market_lock:
@@ -17101,6 +20249,157 @@ class TalkinBot:
         self._queue_stock_market_round_broadcast(ordered_rooms)
         return event
 
+    def _notify_loan_repayment(self, username, result):
+        if not isinstance(result, dict) or int(result.get("loan_repayment", 0) or 0) <= 0:
+            return False
+        try:
+            self.send_private_text(
+                username,
+                f"💸 تم اقتطاع {_fmt_points(result.get('loan_repayment', 0))} نقطة من مكسبك لسداد سلفة 100 مليار. "
+                f"المتبقي من السلفة: {_fmt_points(result.get('loan_debt', 0))} نقطة.",
+            )
+            return True
+        except Exception as exc:
+            self.log("[LOAN] repayment notice failed:", repr(exc))
+            return False
+
+    def _wallet_menu_key(self, room, username):
+        return (_norm_room(room), _norm_user(username))
+
+    def _wallet_show_catalog(self, room, username, page=1):
+        page = max(1, min(2, int(page or 1)))
+        state = getattr(self, "wallet_pending_pages", {})
+        if not isinstance(state, dict):
+            state = {}
+        state[self._wallet_menu_key(room, username)] = {"mode": "catalog", "page": page, "created": time.time()}
+        self.wallet_pending_pages = state
+        start = (page - 1) * WALLET_PAGE_SIZE
+        assets = list(WALLET_ASSETS.items())[start:start + WALLET_PAGE_SIZE]
+        lines = [f"🧳 محفظة الاستثمارات — القائمة {page}/2", "اختر سلعة ثم أرسل: شراء اسم السلعة المبلغ"]
+        lines.extend(f"{asset_id}. {asset['icon']} {asset['ar']} ({asset['en']})" for asset_id, asset in assets)
+        lines.append("مثال: شراء ذهب 30b — كل قطعة تُباع تلقائيًا بعد ساعة بربح 5% أو خسارة 5%.")
+        lines.append("اكتب ns لعرض القائمة التالية. يمكنك شراء عدة سلع.")
+        self.send_room_text(room, "\n".join(lines))
+        return True
+
+    def _wallet_show_holdings(self, room, username, page=1):
+        accounts = _points_data()
+        resolved = _resolve_points_account(accounts, username)
+        positions = []
+        if resolved:
+            item = resolved[1]
+            positions = [dict(row) for row in item.get("wallet_positions", [])
+                         if isinstance(row, dict)] if isinstance(item.get("wallet_positions"), list) else []
+        pages = max(1, (len(positions) + WALLET_PAGE_SIZE - 1) // WALLET_PAGE_SIZE)
+        page = max(1, min(pages, int(page or 1)))
+        state = getattr(self, "wallet_pending_pages", {})
+        if not isinstance(state, dict):
+            state = {}
+        state[self._wallet_menu_key(room, username)] = {"mode": "holdings", "page": page, "pages": pages, "created": time.time()}
+        self.wallet_pending_pages = state
+        start = (page - 1) * WALLET_PAGE_SIZE
+        selected = positions[start:start + WALLET_PAGE_SIZE]
+        if not positions:
+            self.send_room_text(room, "🧳 محفظتك فارغة حاليًا. أرسل محفظة لعرض السلع أو شراء سلعة.")
+            return True
+        lines = [f"🧳 القطع النشطة في محفظتك — الصفحة {page}/{pages}"]
+        for row in selected:
+            asset = WALLET_ASSETS.get(int(row.get("asset_id", 0) or 0), {})
+            remaining = max(0, int(float(row.get("due_at", 0) or 0) - time.time()))
+            lines.append(
+                f"{asset.get('icon','📦')} {asset.get('ar','سلعة')} | قيمة الشراء: {_fmt_points(row.get('amount', 0))} نقطة | "
+                f"البيع خلال {remaining // 60} دقيقة"
+            )
+        if pages > page:
+            lines.append("اكتب ns لعرض المزيد.")
+        self.send_room_text(room, "\n".join(lines))
+        return True
+
+    def _wallet_handle_next_page(self, room, username, text):
+        if str(text or "").strip().casefold() not in {"ns", "التالي", "القائمة التالية", "next"}:
+            return False
+        state = getattr(self, "wallet_pending_pages", {})
+        key = self._wallet_menu_key(room, username)
+        entry = state.get(key) if isinstance(state, dict) else None
+        if not isinstance(entry, dict):
+            return False
+        if time.time() - float(entry.get("created", 0) or 0) > 600:
+            state.pop(key, None)
+            return False
+        page = int(entry.get("page", 1) or 1)
+        if entry.get("mode") == "catalog":
+            if page >= 2:
+                self.send_room_text(room, "📋 هذه آخر قائمة. أرسل محفظة للعودة للقائمة الأولى.")
+                return True
+            return self._wallet_show_catalog(room, username, page + 1)
+        if entry.get("mode") == "holdings":
+            if page >= int(entry.get("pages", 1) or 1):
+                self.send_room_text(room, "📋 لا توجد صفحات أخرى في المحفظة.")
+                return True
+            return self._wallet_show_holdings(room, username, page + 1)
+        return False
+
+    def _wallet_purchase_command(self, room, username, parsed_order):
+        asset_id, amount = parsed_order
+        result = _create_wallet_position(username, asset_id, amount, room=room)
+        if result.get("ok"):
+            asset = WALLET_ASSETS[asset_id]
+            position = result.get("position", {})
+            self.send_room_text(
+                room,
+                f"✅ أُضيفت {asset['icon']} {asset['ar']} إلى محفظتك بقيمة {_fmt_points(amount)} نقطة. "
+                f"سيتم بيعها تلقائيًا بعد ساعة بربح 5% أو خسارة 5%. "
+                f"رصيدك المتبقي: {_fmt_points(result.get('balance', 0))}.",
+            )
+            self.log("[WALLET] position created", username, position.get("id"), asset_id, amount)
+            return True
+        messages = {
+            "target_not_found": "❌ لا يوجد سجل نقاط لهذا الحساب؛ العب أو اكسب نقاطًا أولًا.",
+            "insufficient": f"❌ رصيدك لا يكفي. رصيدك الحالي: {_fmt_points(result.get('balance', 0))} نقطة.",
+            "amount_out_of_range": f"❌ قيمة القطعة يجب أن تكون بين {_fmt_points(WALLET_MIN_INVESTMENT)} و{_fmt_points(WALLET_MAX_INVESTMENT)} نقطة.",
+            "too_many_positions": f"❌ وصلت للحد الأقصى ({WALLET_MAX_ACTIVE_POSITIONS}) من القطع النشطة. انتظر بيع بعضها أولًا.",
+        }
+        self.send_room_text(room, messages.get(result.get("error"), "❌ تعذر شراء القطعة الآن؛ لم يُخصم شيء."))
+        return True
+
+    def _process_wallet_investments(self, now=None):
+        now = time.time() if now is None else float(now)
+        for username, position_id in _wallet_due_positions(now):
+            result = _settle_wallet_position(username, position_id, now=now)
+            if not result.get("ok") or not result.get("settled"):
+                continue
+            asset = WALLET_ASSETS.get(int(result.get("asset_id", 0) or 0), {})
+            outcome = result.get("outcome")
+            direction = "ربح 5%" if outcome == "profit" else "خسارة 5%"
+            sign = "+" if int(result.get("net_change", 0) or 0) >= 0 else "-"
+            message = (
+                f"📦 تم بيع {asset.get('icon','')} {asset.get('ar','القطعة')} من محفظتك تلقائيًا بعد ساعة.\n"
+                f"النتيجة: {direction}.\n"
+                f"قيمة الشراء: {_fmt_points(result.get('principal', 0))} نقطة\n"
+                f"العائد قبل سداد السلفة: {_fmt_points(result.get('payout', 0))} نقطة "
+                f"({sign}{_fmt_points(abs(int(result.get('net_change', 0) or 0)))}).\n"
+            )
+            if int(result.get("loan_repayment", 0) or 0) > 0:
+                message += (
+                    f"💸 سداد السلفة من الربح: {_fmt_points(result['loan_repayment'])} نقطة.\n"
+                    f"المتبقي من السلفة: {_fmt_points(result.get('loan_debt', 0))} نقطة.\n"
+                )
+            message += f"💳 رصيدك الحالي: {_fmt_points(result.get('balance', 0))} نقطة."
+            try:
+                self.send_private_text(username, message)
+            except Exception as exc:
+                self.log("[WALLET] private sale notice failed:", username, repr(exc))
+            self.log("[WALLET] position settled", username, position_id, outcome, result.get("payout"))
+
+    def _wallet_settlement_worker(self):
+        """Settle matured wallet assets independently of stock-market settings."""
+        while not self.stop_event.is_set():
+            try:
+                self._process_wallet_investments()
+            except Exception as exc:
+                self.log("[WALLET] settlement worker iteration failed; will retry:", repr(exc))
+            self.stop_event.wait(2.0)
+
     def _stock_market_worker(self):
         while not self.stop_event.is_set():
             try:
@@ -17142,7 +20441,7 @@ class TalkinBot:
             if not isinstance(cooldowns, dict):
                 cooldowns = {}
             last_investment = float(cooldowns.get(user_key, 0) or 0)
-            if STOCK_MARKET_PLAYER_COOLDOWN_SECONDS > 0 and last_investment and now - last_investment < STOCK_MARKET_PLAYER_COOLDOWN_SECONDS:
+            if (not _is_env_master_for_game_cooldown(sender)) and STOCK_MARKET_PLAYER_COOLDOWN_SECONDS > 0 and last_investment and now - last_investment < STOCK_MARKET_PLAYER_COOLDOWN_SECONDS:
                 cooldown_remaining = STOCK_MARKET_PLAYER_COOLDOWN_SECONDS - (now - last_investment)
                 closed = False
                 round_id = None
@@ -17375,11 +20674,13 @@ class TalkinBot:
             else:
                 credit = _apply_points_delta_once(
                     username, payout, f"stock-market-payout:{investment_id}",
-                    f"stock market {outcome} settlement",
+                    f"stock market {outcome} settlement", repay_loan=True,
+                    loan_repayment_basis=max(0, payout - amount),
                 )
             if not credit.get("ok"):
                 self.log("[STOCK] settlement failed; investment kept for retry:", investment_id, credit.get("error"))
                 continue
+            self._notify_loan_repayment(username, credit)
             net_change = payout - amount
             history_row = dict(row)
             history_row.update({
@@ -17482,24 +20783,16 @@ class TalkinBot:
         if not self._game_cooldown_notice(room, sender, WAGER_GAME_COOLDOWN_SECONDS, "استثمار"):
             return True
         """Free investment game against the bot. No @amount and no image."""
-        # Free investment against the bot: a reward is granted only when the
-        # player gets a winning outcome; losses and draws receive no points.
-        roll=secrets.randbelow(100) + 1
-        if roll <= 20:
-            reward=200
-            result="🏆 فوز كبير!"
-        elif roll <= 40:
-            reward=50
-            result="🏆 فزت!"
-        elif roll <= 55:
-            reward=30
-            result="🏆 فزت!"
-        elif roll <= 70:
-            reward=20
-            result="🏆 فزت!"
+        # Independent fair draw for each round: exactly 50% win / 50% loss.
+        # A streak can happen naturally; no hidden loss/win streak adjustment.
+        roll = secrets.randbelow(100) + 1
+        if roll <= 50:
+            reward = secrets.choice((20, 30, 50, 200))
+            result = "🏆 فزت!"
         else:
-            reward=0
-            result="❌ لم تفز هذه المرة."
+            reward = 0
+            result = "❌ لم تفز هذه المرة."
+        odds_text = "🎲 نسبة الفوز في كل جولة: 50% — كل جولة مستقلة."
         balance=self._game_award(sender, reward)
         _record_game(sender, "investment", reward, 0)
         self.send_room_text(
@@ -17507,11 +20800,12 @@ class TalkinBot:
             f"📊✨ استثمار مع البوت\n━━━━━━━━━━━━\n"
             f"👤 اللاعب: @{sender}\n"
             f"{result}\n"
+            f"{odds_text}\n"
             f"🎁 المكافأة: +{_fmt_points(reward)} نقطة\n"
             f"💰 الرصيد: {_fmt_points(balance)}"
         )
         if reward > 0:
-            self._send_game_winner_card("investment", sender, [room])
+            self._send_game_winner_card("investment", sender, [room], respect_room_filter=False)
         return True
 
     def _classify_picture_name(self, name):
@@ -17580,184 +20874,388 @@ class TalkinBot:
         return self._classify_picture_name(name)
 
     def _picture_search_queries_for_name(self, name, gender=None):
-        """Return mostly monkey results, with safe gender-aware playful categories."""
+        """Pick 20% playful monkey results and otherwise an adult SFW gender-matched portrait."""
         gender = gender or self._picture_gender_hint(name)
-        if secrets.randbelow(100) < 60:
+        if secrets.randbelow(100) < 20:
             return ("قرود لطيفة", "قرود مضحكة", "monkeys safe for work", "قرود في الطبيعة")
         if gender == "male":
-            return ("شباب وسيمين safe for work", "شباب بشعين بشكل كوميدي", "شباب عرب محترمين")
+            return (
+                "handsome adult men portrait safe for work",
+                "شباب بالغون وسيمون بملابس محتشمة",
+                "handsome Arab adult man portrait, fully clothed",
+            )
         if gender == "female":
-            return ("بنات حلوات safe for work", "بنات بشعات بشكل كوميدي", "بنات عرب محترمات")
-        return ("أشخاص مضحكون safe for work", "شخصيات كرتونية", "قرود لطيفة")
+            return (
+                "beautiful adult women portrait safe for work",
+                "نساء بالغات بملابس محتشمة portrait",
+                "beautiful Arab adult woman portrait, fully clothed",
+            )
+        return (
+            "adult person portrait safe for work",
+            "شخص بالغ portrait بملابس محتشمة",
+            "fully clothed adult portrait, safe for work",
+        )
 
-    def _handle_random_picture_command(self, room, body, sender):
-        """Handle صورتي/صورتك and .صوره username with name-aware playful searches."""
+    def _random_internet_picture_query(self, requested, gender=None):
+        """Return 20% monkey images and otherwise adult male/female portraits.
+
+        A one-token username (or explicit @username) uses its known room/name
+        gender when available. Unknown usernames and the no-argument command
+        alternate randomly between adult men and women. Multi-word subjects
+        remain normal SafeSearch web searches.
+        """
+        text = str(requested or "").strip()
+        normalized = _norm_user(text)
+        category = ""
+        if not text:
+            if secrets.randbelow(100) < 20:
+                category = "monkey"
+            else:
+                category = secrets.choice(("men", "women"))
+        elif any(word in normalized for word in ("قرد", "قرود", "شمبانزي", "monkey", "chimp")):
+            category = "monkey"
+        elif any(word in normalized for word in ("شاب", "شباب", "رجل", "رجال", "وسيم", "وسيمين")):
+            category = "men"
+        elif any(word in normalized for word in ("بنت", "بنات", "فتاه", "فتاة", "نساء", "امراه", "مراه", "حلوه", "حلوة")):
+            category = "women"
+        else:
+            # A single token is treated as a Talkin username (including a
+            # name-only handle such as Ahmed); multi-word values remain topics.
+            is_username = text.startswith("@") or not re.search(r"\s", text) or gender in ("male", "female")
+            if is_username:
+                if secrets.randbelow(100) < 20:
+                    category = "monkey"
+                else:
+                    category = gender if gender in ("male", "female") else secrets.choice(("men", "women"))
+            else:
+                return f"{text} portrait safe for work", text, False
+
+        if category == "monkey":
+            return "monkeys wildlife", "قرود", True
+        if category == "men" or category == "male":
+            return "handsome adult men portraits fully clothed", "شباب وسيمين بالغين", False
+        return "beautiful adult women portraits fully clothed", "نساء بالغات", False
+
+    def _handle_internet_picture_command(self, room, body, sender):
+        """Search the web for a random image; this is separate from account avatars."""
+        text = str(body or "").strip()
+        if text.casefold() == ".صوره":
+            requested = ""
+        else:
+            match = re.fullmatch(r"\.صوره(?:@|\s+)(.+)", text, re.I)
+            if not match:
+                return False
+            requested = match.group(1).strip()
+        if _is_explicit_picture_query(requested):
+            return True
+        if not room:
+            return True
+
+        busy = getattr(self, "_internet_picture_busy", set())
+        key = (_norm_user(sender), _norm_room(room))
+        if key in busy:
+            return True
+        busy.add(key)
+        self._internet_picture_busy = busy
+
+        def worker():
+            try:
+                target_gender = self._picture_gender_hint(requested) if requested else "unknown"
+                search_query, label, is_monkey = self._random_internet_picture_query(
+                    requested, target_gender
+                )
+                recent = getattr(self, "_internet_picture_recent", {})
+                query_key = _norm_user(search_query)
+                excluded = set(recent.get(query_key, []))
+                image_url = (
+                    _search_monkey_image(exclude_urls=excluded)
+                    if is_monkey
+                    else _search_lookalike_image(search_query, exclude_urls=excluded)
+                )
+                if not image_url and excluded:
+                    image_url = _search_monkey_image() if is_monkey else _search_lookalike_image(search_query)
+                if not image_url:
+                    self.log("[RANDOM-PICTURE] no matching image for query:", search_query[:120])
+                    self.send_room_text(room, "❌ لم أجد صورة مناسبة من نتائج البحث الآن؛ جرّب بعد قليل.")
+                    return
+
+                local = _download_lookalike_image(image_url, f"internet_{uuid.uuid4().hex}")
+                if not local:
+                    self.log("[RANDOM-PICTURE] image download/processing returned no file")
+                    self.send_room_text(room, "❌ ظهرت صورة في البحث لكن تعذّر تنزيلها أو معالجتها؛ تأكد من تثبيت Pillow.")
+                    return
+                base = _public_base_url()
+                if not base:
+                    self.log("[RANDOM-PICTURE] public media URL is not configured")
+                    self.send_room_text(room, "❌ اضبط PUBLIC_BASE_URL أو PUBLIC_MEDIA_URL في متغيرات الاستضافة لعرض الصور داخل Talkin.")
+                    return
+                public_url = f"{base.rstrip('/')}/lookalikes/{local.name}"
+                try:
+                    self._verify_public_media_url(public_url, "image")
+                except Exception as exc:
+                    self.log("[RANDOM-PICTURE] public image check failed:", type(exc).__name__)
+                    self.send_room_text(room, "❌ رابط الصور العام لا يمكن الوصول إليه من الإنترنت؛ راجع PUBLIC_BASE_URL وPORT.")
+                    return
+
+                sent = self.send_room_media(room, public_url, "image") is not False
+                if not sent:
+                    self.send_room_text(room, "❌ تعذر إرسال الصورة إلى Talkin؛ راجع سجل WebSocket.")
+                    return
+                history = list(recent.get(query_key, []))
+                history.append(image_url)
+                recent[query_key] = history[-8:]
+                self._internet_picture_recent = recent
+                self.send_room_text(room, "صورتك هي الصورة")
+            except Exception as exc:
+                self.log("[RANDOM-PICTURE] search failed:", type(exc).__name__, str(exc)[:200])
+                try:
+                    self.send_room_text(room, "❌ تعذر البحث عن الصورة أو إرسالها الآن؛ راجع سجل الاستضافة لمعرفة السبب.")
+                except Exception:
+                    pass
+            finally:
+                busy.discard(key)
+
+        try:
+            threading.Thread(target=worker, name="internet-picture-search", daemon=True).start()
+        except Exception as exc:
+            busy.discard(key)
+            self.log("[RANDOM-PICTURE] worker start failed:", type(exc).__name__)
+        return True
+
+    def _handle_random_picture_command(self, room, body, sender, sender_candidates=None):
+        """Send the actual room-command sender's Talkin profile image to the room."""
         if not room:
             return True
         text = str(body or "").strip()
-        low = text.casefold()
-        m = re.fullmatch(r"\.صوره(?:@|\s+)(.+)", text, re.I)
-        if m:
-            target = m.group(1).strip().lstrip("@").strip()
-            if not target:
-                self.send_room_text(room, "❌ الصيغة: .صوره اسم_المستخدم")
-                return True
-            busy = getattr(self, "_user_picture_busy", set())
-            key = (_norm_user(sender), str(room), _norm_user(target))
-            if key in busy:
-                self.send_room_text(room, f"⏳ جاري البحث عن صوره {target}...")
-                return True
-            busy.add(key); self._user_picture_busy = busy
-            self.send_room_text(room, f"🔎 جاري البحث عن صوره {target}...")
-            response_language = self._capture_room_response_language(room, text)
-            def worker():
-                try:
-                    recent = getattr(self, "_user_picture_recent", {})
-                    room_key = str(room); excluded = set(recent.get(room_key, []))
-                    variants = self._picture_search_queries_for_name(target)
-                    query = secrets.choice(variants)
-                    image_url = None
-                    # For monkey results, use Wikimedia Commons first, then Bing as a fallback.
-                    if any(token in query.casefold() for token in ("قرود", "قرد", "monkey")):
-                        image_url = _search_monkey_image(exclude_urls=excluded)
-                    if not image_url:
-                        image_url = _search_lookalike_image(query, exclude_urls=excluded)
-                    if image_url and image_url in excluded:
-                        excluded.clear()
-                        if any(token in query.casefold() for token in ("قرود", "قرد", "monkey")):
-                            image_url = _search_monkey_image()
-                        if not image_url:
-                            image_url = _search_lookalike_image(query)
-                    if not image_url:
-                        self.send_room_text(room, "❌ لم أجد صورة مناسبة حالياً."); return
-                    local = _download_lookalike_image(image_url, target)
-                    # If the first source refuses the download, immediately try the other source.
-                    if not local:
-                        fallback = _search_lookalike_image(query, exclude_urls=excluded | {image_url})
-                        if fallback:
-                            local = _download_lookalike_image(fallback, target)
-                            if local:
-                                image_url = fallback
-                    if not local:
-                        self.send_room_text(room, "❌ تعذر تحميل الصورة من المصادر المتاحة حالياً."); return
-                    history = list(recent.get(room_key, [])); history.append(image_url)
-                    recent[room_key] = history[-10:]; self._user_picture_recent = recent
-                    base = _public_base_url()
-                    if not base:
-                        self.send_room_text(room, "❌ رابط الصور العام غير مضبوط في إعدادات البوت."); return
-                    public_url = f"{base}/lookalikes/{local.name}"
-                    self.send_room_text(room, f"🖼️ صورتك يا {target} هي")
-                    self.send_room_media(room, public_url, "image")
-                except Exception as exc:
-                    self.log("[USER-PICTURE] failed:", repr(exc))
-                    try: self.send_room_text(room, "❌ تعذر البحث عن الصورة حالياً.")
-                    except Exception: pass
-                finally:
-                    try: busy.discard(key)
-                    except Exception: pass
-            threading.Thread(target=self._localized_room_worker(room, response_language, worker),
-                             name="user-picture-search", daemon=True).start()
-            return True
-        if low not in {"صورتي", "صورتك"}:
+        if text.casefold() not in {"صورتي", "صورتك"}:
             return False
-        busy = getattr(self, "_random_picture_busy", set()); key = (_norm_user(sender), str(room))
+
+        candidates = []
+        seen_candidates = set()
+        for candidate in [sender, *(sender_candidates or [])]:
+            name = str(candidate or "").strip().lstrip("@")
+            key_name = _norm_user(name)
+            if name and key_name and key_name not in seen_candidates:
+                seen_candidates.add(key_name)
+                candidates.append(name)
+        if not candidates:
+            self.send_room_text(room, "❌ لم أتمكن من تحديد اسم حسابك لجلب الصورة.")
+            return True
+
+        primary = candidates[0]
+        busy = getattr(self, "_profile_picture_busy", set())
+        key = (_norm_room(room), _norm_user(primary))
         if key in busy:
-            self.send_room_text(room, f"⏳ @{sender} جاري البحث عن صورتك..."); return True
-        busy.add(key); self._random_picture_busy = busy
-        self.send_room_text(room, f"🔎 جاري البحث عن صورتك يا @{sender}...")
-        response_language = self._capture_room_response_language(room, text)
-        def worker():
+            return True
+        busy.add(key)
+        self._profile_picture_busy = busy
+
+        def cached_photo(candidate):
+            photos = getattr(self, "user_photos", {})
+            if not isinstance(photos, dict):
+                return ""
+            for cache_key in (str(candidate).casefold(), _norm_user(candidate)):
+                value = str(photos.get(cache_key) or "").strip()
+                if value.startswith(("http://", "https://", "//")):
+                    return "https:" + value if value.startswith("//") else value
+            return ""
+
+        def find_cached():
+            for candidate in candidates:
+                value = cached_photo(candidate)
+                if value:
+                    return candidate, value
+            return "", ""
+
+        def wait_for_photo(seconds):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                stop_event = getattr(self, "stop_event", None)
+                if stop_event is not None and stop_event.is_set():
+                    break
+                found_name, found_url = find_cached()
+                if found_url:
+                    return found_name, found_url
+                time.sleep(0.25)
+            return find_cached()
+
+        def profile_photo_worker():
             try:
-                recent = getattr(self, "_random_picture_recent", {}); room_key = str(room)
-                excluded = set(recent.get(room_key, []))
-                variants = self._picture_search_queries_for_name(sender, self._picture_gender_hint(sender))
-                query = secrets.choice(variants)
-                image_url = (_search_monkey_image(exclude_urls=excluded)
-                             if any(token in query.casefold() for token in ("قرود", "قرد", "monkey"))
-                             else _search_lookalike_image(query, exclude_urls=excluded))
-                if image_url and image_url in excluded:
-                    excluded.clear(); image_url = (_search_monkey_image()
-                                                  if any(token in query.casefold() for token in ("قرود", "قرد", "monkey"))
-                                                  else _search_lookalike_image(query))
-                if not image_url:
-                    self.send_room_text(room, "❌ لم أجد صورة مناسبة حالياً."); return
-                local = _download_lookalike_image(image_url, sender)
-                if not local:
-                    self.send_room_text(room, "❌ وجدت صورة لكن تعذر تحميلها حالياً."); return
-                history = list(recent.get(room_key, [])); history.append(image_url)
-                recent[room_key] = history[-10:]; self._random_picture_recent = recent
-                base = _public_base_url()
-                if not base:
-                    self.send_room_text(room, "❌ رابط الصور العام غير مضبوط في إعدادات البوت."); return
-                public_url = f"{base}/lookalikes/{local.name}"
-                self.send_room_text(room, f"🖼️ صورتك يا @{sender} هي")
-                self.send_room_media(room, public_url, "image")
+                # First refresh the room membership table so every username is
+                # mapped to the exact Supabase profile id. Then request Talkin's
+                # native UserItems, which carry the CDN avatar URL itself.
+                try:
+                    self.request_room_occupants(room)
+                    self.log("[PROFILE-PICTURE] room profile ids refreshed:", room)
+                except Exception as roster_exc:
+                    self.log("[PROFILE-PICTURE] DB roster refresh failed:", type(roster_exc).__name__, str(roster_exc)[:120])
+
+                # Current APK request first; older Talkin gateways need BOT_ID.
+                self._queue_profile_roster_refresh(room, primary)
+                found_name, photo_url = wait_for_photo(5.0)
+                if not photo_url:
+                    self._request_native_profile_roster(room, legacy=True)
+                    found_name, photo_url = wait_for_photo(4.0)
+
+                # Try all possible username fields from RoomEvent; server builds
+                # differ on whether the canonical account is in field 2/17/22.
+                if not photo_url:
+                    for candidate in candidates:
+                        try:
+                            photo_url = self._lookup_profile_photo(candidate)
+                        except Exception as lookup_exc:
+                            self.log("[PROFILE-PICTURE] DB lookup failed:", _norm_user(candidate), type(lookup_exc).__name__)
+                        if photo_url:
+                            found_name = candidate
+                            break
+
+                if not photo_url:
+                    cached_count = len(getattr(self, "user_photos", {}) or {})
+                    self.log(
+                        "[PROFILE-PICTURE] avatar not found:",
+                        "candidates=", [_norm_user(x) for x in candidates],
+                        "cached_photos=", cached_count,
+                    )
+                    self.send_room_text(room, "❌ لم أتمكن من جلب صورة حسابك من Talkin. تأكد أن لحسابك صورة ظاهرة ثم أعد أمر «صورتي».")
+                    return
+
+                # «صورتي» يجب أن يحمل صورة الحساب الأصلية مباشرة إلى الغرفة.
+                # لا ننشئ نسخة JPEG ولا نطلب PUBLIC_BASE_URL هنا؛ رابط CDN الذي
+                # أعاده Talkin هو المرفق الذي يرسله العميل مباشرة.
+                media_url = photo_url
+                sent = False
+                send_errors = []
+                try:
+                    result = self.send_room_media(room, media_url, "image")
+                    if result is not False:
+                        sent = True
+                    else:
+                        send_errors.append("send_query returned False")
+                except Exception as media_exc:
+                    send_errors.append(f"{type(media_exc).__name__}: {str(media_exc)[:100]}")
+                if not sent:
+                    self.log("[PROFILE-PICTURE] avatar send failed:", " | ".join(send_errors))
+                    self.send_room_text(room, "❌ وجدت صورة حسابك لكن Talkin لم يقبل إرسالها إلى الغرفة.")
+                    return
+
+                self.log("[PROFILE-PICTURE] avatar sent directly:", _norm_user(found_name or primary), "via=profile-url")
+                self.send_room_text(room, "صورتك هي الصورة")
             except Exception as exc:
-                self.log("[RANDOM-PICTURE] failed:", repr(exc))
-                try: self.send_room_text(room, "❌ تعذر البحث عن الصورة حالياً.")
-                except Exception: pass
+                self.log("[PROFILE-PICTURE] worker failed:", type(exc).__name__, str(exc)[:240])
+                try:
+                    self.send_room_text(room, "❌ تعذر جلب صورة الحساب الآن؛ راجع سجل الاستضافة [PROFILE-PICTURE].")
+                except Exception:
+                    pass
             finally:
-                try: busy.discard(key)
-                except Exception: pass
-        threading.Thread(target=self._localized_room_worker(room, response_language, worker),
-                         name="random-picture-search", daemon=True).start()
-        return True
+                busy.discard(key)
 
-    def _handle_explore_command(self, room, command, sender):
-        match = re.fullmatch(r"ax@(.+)", str(command or "").strip(), re.I | re.S)
-        if not match:
-            return False
-        text = match.group(1).strip()[:150]
-        if not text:
-            self.send_room_text(room, "استخدم ax@النص لنشر محتوى اكسبلور.")
-            return True
-        if self._find_publish_filter_hit(text):
-            self.send_room_text(room, "تعذر نشر النص لأنه يخالف فلتر النشر.")
-            return True
         try:
-            key = _norm_user(sender)
-            avatar_url = getattr(self, "user_photos", {}).get(key, "") or self._lookup_profile_photo(sender)
-            card = render_explore_card(text, sender, avatar_url)
-            base = _public_base_url()
-            if not base:
-                raise RuntimeError("رابط الوسائط العام غير مضبوط")
-            media_url = f"{base}/publish/{card.name}"
-            self._verify_public_media_url(media_url, "image")
-            code = uuid.uuid4().hex[:4]
-            # The text already appears inside the Explore image; keep this
-            # accompanying room message focused on the author and reactions.
-            caption = (f"✨ اكسبلور\n👤 @{str(sender or '').lstrip('@')}\n━━━━━━━━━━━━\n"
-                       f"👍 lk@{code}   ❤️ lv@{code}   👎 dl@{code}\n💬 cm@{code} msg   🚨 report@{code} msg\n🔁 x@{code} — إعادة نشر")
-            self.reaction_targets[code] = {"publisher": str(sender), "kind": "explore", "description": text,
-                                            "media_url": media_url, "caption": caption, "created_at": time.time()}
-            rooms = self._active_rooms() or ([str(room)] if room else [])
-            delivered = 0
-            for target in rooms:
-                if self.send_room_media(target, media_url, "image") is not False:
-                    self.send_room_text(target, caption)
-                    delivered += 1
-            self.send_private_text(sender, f"✅ تم نشر اكسبلور في {delivered} غرفة.")
+            threading.Thread(target=profile_photo_worker, name="profile-photo-lookup", daemon=True).start()
         except Exception as exc:
-            self.log("[EXPLORE] publish failed:", repr(exc))
-            self.send_private_text(sender, "تعذر تجهيز منشور اكسبلور؛ تحقق من إعداد رابط الوسائط العام.")
+            busy.discard(key)
+            self.log("[PROFILE-PICTURE] worker start failed:", type(exc).__name__)
         return True
 
-    def _handle_explore_repost_command(self, room, command, sender):
-        match = re.fullmatch(r"x@([A-Za-z0-9]{4})", str(command or "").strip(), re.I)
-        if not match:
+    def _handle_kemin_command(self, room, body, sender):
+        """Two-player trap challenge. The player who avoids the trap wins 1B."""
+        if str(body or "").strip().casefold() not in {"كمين", "الكمين"}:
             return False
-        code = match.group(1).lower()
-        info = getattr(self, "reaction_targets", {}).get(code)
-        if not isinstance(info, dict) or info.get("kind") != "explore":
-            return False
-        if time.time() - float(info.get("created_at", 0) or 0) > 86400:
-            return False
-        media_url = str(info.get("media_url") or "")
-        if not media_url or self.send_room_media(room, media_url, "image") is False:
-            self.send_room_text(room, "تعذر إعادة نشر هذا المنشور الآن.")
+        if not room or not str(sender or "").strip():
             return True
-        caption = re.sub(r"\n🔁 أعاد النشر:.*$", "", str(info.get("caption") or ""), flags=re.S)
-        self.send_room_text(room, caption + f"\n🔁 أعاد النشر: @{str(sender or '').lstrip('@')}")
+        amount = 1_000_000_000
+        lock = _KEMIN_STATE_LOCK
+        pending = getattr(self, "_kemin_pending", {})
+        now = time.time()
+        with lock:
+            # Expire an abandoned challenge after two minutes.
+            old = pending.get(str(room))
+            if old and now - float(old.get("created", 0)) > 120:
+                pending.pop(str(room), None)
+                old = None
+            if old is None:
+                balance = _points_balance(_resolve_points_account(_points_data(), sender)[1]) if _resolve_points_account(_points_data(), sender) else 0
+                if balance < amount:
+                    self.send_room_text(room, f"❌ @{sender} تحتاج إلى مليار نقطة على الأقل لدخول لعبة الكمين.")
+                    return True
+                pending[str(room)] = {"owner": str(sender), "created": now, "id": uuid.uuid4().hex}
+                self._kemin_pending = pending
+                self.send_room_text(
+                    room,
+                    f"🪤 @{sender} نصب كميناً!\\n"
+                    f"🎯 من يجرؤ على الدخول؟ أرسل «كمين» لتواجه الفخ.\\n"
+                    f"💰 الرهان: 1,000,000,000 نقطة | تنتهي الدعوة خلال دقيقتين."
+                )
+                return True
+            owner = str(old.get("owner") or "")
+            if _norm_user(owner) == _norm_user(sender):
+                self.send_room_text(room, "⏳ أنت صاحب الكمين. انتظر لاعباً آخر ليدخل الفخ.")
+                return True
+            pending.pop(str(room), None)
+            self._kemin_pending = pending
+
+        # Both accounts must be able to cover the full transfer before the draw.
+        accounts = _points_data()
+        owner_account = _resolve_points_account(accounts, owner)
+        challenger_account = _resolve_points_account(accounts, sender)
+        owner_balance = _points_balance(owner_account[1]) if owner_account else 0
+        challenger_balance = _points_balance(challenger_account[1]) if challenger_account else 0
+        if owner_balance < amount or challenger_balance < amount:
+            self.send_room_text(room, "❌ أُلغي الكمين: يجب أن يمتلك اللاعبان مليار نقطة على الأقل.")
+            return True
+
+        # Avoiding the trap wins; falling into it loses.
+        challenger_escaped = bool(secrets.randbelow(2))
+        winner, loser = (sender, owner) if challenger_escaped else (owner, sender)
+        transfer = _transfer_points(loser, winner, amount, reason="kemin_game")
+        if not transfer.get("ok"):
+            self.send_room_text(room, "❌ تعذر تنفيذ تحويل نقاط الكمين؛ لم تُعلن نتيجة الجولة.")
+            return True
+        _record_game(owner, "kemin", -amount if loser == owner else amount, amount)
+        _record_game(sender, "kemin", -amount if loser == sender else amount, amount)
+        loser_name = loser
+        winner_name = winner
+        title = "🪤 وقع في الكمين!" if loser == sender else "🛡️ تفادى الكمين!"
+        result_text = (
+            f"{title}\\n"
+            f"🏆 الفائز: @{winner_name}\\n"
+            f"💥 الخاسر: @{loser_name}\\n"
+            f"💰 تم تحويل 1,000,000,000 نقطة إلى الفائز."
+        )
+        try:
+            card = render_kemin_card(owner, sender, loser, self._lookup_profile_photo(owner),
+                                     self._lookup_profile_photo(sender))
+            card_url = self._game_public_image(card)
+            if card_url:
+                self.send_room_media(room, card_url, "image")
+        except Exception as exc:
+            self.log("[KEMIN] card render failed:", repr(exc))
+        self.send_room_text(room, result_text)
+        return True
+
+    def _handle_top_wagerers(self, room, body):
+        command = str(body or "").strip().casefold()
+        if command not in {"توب المراهنين", "توب رهان"}:
+            return False
+        data = _game_stats_data()
+        totals = []
+        for item in data.values():
+            if not isinstance(item, dict):
+                continue
+            games = item.get("games", {})
+            if not isinstance(games, dict):
+                continue
+            total = sum(max(0, int(g.get("staked", 0) or 0))
+                        for g in games.values() if isinstance(g, dict))
+            if total:
+                totals.append((total, str(item.get("username") or "لاعب")))
+        totals.sort(key=lambda row: row[0], reverse=True)
+        if not totals:
+            self.send_room_text(room, "📊 لا توجد سجلات مراهنات حتى الآن.")
+            return True
+        lines = ["🏆 توب 10 المراهنين في البوت"]
+        for index, (amount, name) in enumerate(totals[:10], 1):
+            lines.append(f"{index}. @{name} — {_fmt_points(amount)} نقطة")
+        self.send_room_text(room, "\n".join(lines))
         return True
 
     def _handle_lookalike_command(self, room, body, sender):
@@ -17799,6 +21297,9 @@ class TalkinBot:
                 # Randomize the theme so repeated commands can return different
                 # images. Keep the queries non-explicit and suitable for chat.
                 variants = self._picture_search_queries_for_name(target, self._picture_gender_hint(target))
+                # All lookalike themes are non-explicit and the search layer
+                # applies strict SafeSearch before any URL is downloaded.
+                variants = tuple(q for q in variants if not _is_explicit_picture_query(q)) or ("adult portrait safe for work",)
                 query = secrets.choice(variants)
                 image_url = (_search_monkey_image(exclude_urls=excluded)
                              if any(token in query.casefold() for token in ("قرود", "قرد", "monkey"))
@@ -17849,7 +21350,7 @@ class TalkinBot:
 
     def _send_steal_image(self, room, game_key, winner_name=""):
         if winner_name:
-            self._send_game_winner_card(game_key, winner_name, [room])
+            self._send_game_winner_card(game_key, winner_name, [room], respect_room_filter=False)
         else:
             base = _public_base_url()
             filename = GAME_IMAGE_FILES.get(game_key)
@@ -17926,7 +21427,7 @@ class TalkinBot:
         if not members:
             self.send_room_text(room, "❌ فشلت السرقة: لا يوجد عضو آخر متاح للسرقة حالياً.")
             _record_game(sender, "steal", 0, 500)
-            self._send_game_winner_card("اسرق_فشل", sender, [room])
+            self._send_game_winner_card("اسرق_فشل", sender, [room], respect_room_filter=False)
             return True
 
         # `اسرق` = choose a victim randomly; `اسرق@username` / `اسرق username` = target that member.
@@ -17946,7 +21447,7 @@ class TalkinBot:
         victim_balance = _get_points(victim)
         if self._steal_protected(victim):
             self.send_room_text(room, f"@{victim} لديه حصانه من السرقه")
-            self._send_game_winner_card("اسرق_فشل", sender, [room])
+            self._send_game_winner_card("اسرق_فشل", sender, [room], respect_room_filter=False)
             return True
         if victim_balance < 500:
             self.send_room_text(
@@ -17956,7 +21457,7 @@ class TalkinBot:
                 f"💰 رصيده: {_fmt_points(victim_balance)}\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
             )
             _record_game(sender, "steal", 0, 500)
-            self._send_game_winner_card("اسرق_فشل", sender, [room])
+            self._send_game_winner_card("اسرق_فشل", sender, [room], respect_room_filter=False)
             return True
 
         # The result is random each attempt: usually success, sometimes the police catch the thief.
@@ -17968,7 +21469,7 @@ class TalkinBot:
                 f"❌ لم تتم السرقة.\n💰 مبلغ الفوز: 0 نقطة\n💸 مبلغ الخسارة: 0 نقطة"
             )
             _record_game(sender, "steal", 0, 500)
-            self._send_game_winner_card("اسرق_فشل", sender, [room])
+            self._send_game_winner_card("اسرق_فشل", sender, [room], respect_room_filter=False)
             return True
 
         transfer = _transfer_points(
@@ -17977,7 +21478,7 @@ class TalkinBot:
         )
         if not transfer.get("ok"):
             self.send_room_text(room, "⚠️ تعذر اعتماد نتيجة السرقة وحفظ النقاط بأمان؛ لم يتم خصم أو إضافة أي نقاط.")
-            self._send_game_winner_card("اسرق_فشل", sender, [room])
+            self._send_game_winner_card("اسرق_فشل", sender, [room], respect_room_filter=False)
             return True
         thief_balance = transfer["recipient_balance"]
         self.send_room_text(
@@ -17991,7 +21492,7 @@ class TalkinBot:
         )
         _record_game(sender, "steal", 500, 500)
         _record_game(victim, "steal", -500, 500)
-        self._send_game_winner_card("اسرق_نجاح", sender, [room])
+        self._send_game_winner_card("اسرق_نجاح", sender, [room], respect_room_filter=False)
         return True
 
 
@@ -18200,6 +21701,7 @@ class TalkinBot:
             # محاولة الحصول على المليون تبقى داخل الغرفة التي أُرسلت منها.
             self.send_room_text(room, loss_text)
             return True
+        _record_money_game_win("million", sender_name)
         self._game_award(sender_name, reward)
         winner_photo = self.user_photos.get(_norm_user(sender_name), "") or self._lookup_profile_photo(sender_name)
 
@@ -18305,7 +21807,18 @@ class TalkinBot:
                 or pending_key in getattr(self, "_stock_auto_gold_pending", {})
             )
             is_ludo_choice = raw in {"1", "2", "3", "4", "١", "٢", "٣", "٤"} and bool(ludo_game)
-            if not (has_pending_bomb or has_pending_choice or has_pending_stock or is_ludo_choice):
+            ascii_digits = raw.translate(str.maketrans(
+                "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"
+            ))
+            is_bare_wager_stake = bool(re.fullmatch(
+                r"[0-9][0-9,]*(?:\.[0-9]+)?[kmb]?", ascii_digits, re.I
+            ))
+            wager_states = getattr(self, "wager_waiting", {})
+            has_pending_wager = is_bare_wager_stake and any(
+                isinstance(value, dict) and not value.get("_refund_pending")
+                for value in (wager_states.values() if isinstance(wager_states, dict) else [])
+            )
+            if not (has_pending_bomb or has_pending_choice or has_pending_stock or is_ludo_choice or has_pending_wager):
                 return False
         response_language = self._capture_room_response_language(room, text)
         def worker():
@@ -18341,17 +21854,40 @@ class TalkinBot:
 
     def _route_active_board_game_join(self, room, sender_name, text):
         """Give an active Ludo/Snake join request priority over cricket's Join."""
-        command = _normalize_game_command_text(text).strip().casefold()
-        if command not in {"join", "انضمام"}:
+        command = " ".join(_normalize_game_command_text(text).strip().casefold().replace("ة", "ه").split())
+        board_aliases = {
+            "join", "انضمام", "join ludo", "join snake", "join snake game", "join ludo game",
+            "انضمام ثعبان", "انضمام لعبة ثعبان", "انضمام لعبه ثعبان",
+            "انضمام لودو", "انضمام لعبة لودو", "انضمام لعبه لودو",
+        }
+        if command not in board_aliases:
             return False
+        target_snake = "ثعبان" in command or "snake" in command
+        target_ludo = "لودو" in command or "ludo" in command
         room_key = _norm_room(room)
         ludo = getattr(self, "ludo_games", {}).get(f"ludo:{room_key}")
         snake = getattr(self, "snake_games", {}).get(f"snake:{room_key}")
+        if target_snake and not isinstance(snake, dict):
+            self.send_room_text(room, "⏳ لا توجد لعبة ثعبان نشطة في هذه الغرفة الآن.")
+            return True
+        if target_ludo and not isinstance(ludo, dict):
+            self.send_room_text(room, "⏳ لا توجد لعبة لودو نشطة في هذه الغرفة الآن.")
+            return True
+        if target_snake and isinstance(snake, dict):
+            if not _is_verified_user(sender_name):
+                self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
+                return True
+            return self._run_game_command_async(room, "انضمام لعبة ثعبان", sender_name)
+        if target_ludo and isinstance(ludo, dict):
+            if not _is_verified_user(sender_name):
+                self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
+                return True
+            return self._run_game_command_async(room, "انضمام لعبة لودو", sender_name)
         if not isinstance(ludo, dict) and not isinstance(snake, dict):
             return False
         if not _is_verified_user(sender_name):
             return False
-        return self._run_game_command_async(room, text, sender_name)
+        return self._run_game_command_async(room, "join", sender_name)
 
     def _game_public_image(self, path, route="games"):
         base=_public_base_url()
@@ -18369,8 +21905,6 @@ class TalkinBot:
 
     def _broadcast_game_start(self, title, game):
         for r in self._active_rooms():
-            if _game_results_disabled_for_room(r):
-                continue
             try:
                 self.send_room_text(r, title)
             except Exception:
@@ -18380,13 +21914,12 @@ class TalkinBot:
         url = self._game_public_image(image_path) if image_path else ""
         sent = 0
         for r in self._active_rooms():
-            if _game_results_disabled_for_room(r):
-                continue
             try:
-                if winner_photo_url:
+                if winner_photo_url and not _game_results_disabled_for_room(r):
                     self.send_room_media(r, winner_photo_url, "image")
                 if url:
-                    self.send_room_media(r, url, "image")
+                    if not _game_results_disabled_for_room(r):
+                        self.send_room_media(r, url, "image")
                 self.send_room_text(r, text)
                 sent += 1
             except Exception:
@@ -18402,14 +21935,8 @@ class TalkinBot:
             return None
         try:
             photo = self.user_photos.get(username.casefold(), "") or self._lookup_profile_photo(username)
-            if not photo or not photo.startswith(("http://", "https://")):
-                return None
-            r = requests.get(photo, headers={"User-Agent":"TalkinBot/23"}, timeout=3)
-            if r.status_code != 200 or not r.content:
-                return None
-            from io import BytesIO
-            av = Image.open(BytesIO(r.content)).convert("RGB")
-            return _fit_crop(av, (size, size)).convert("RGB")
+            av = _download_profile_photo(photo)
+            return _fit_crop(av, (size, size)).convert("RGB") if av is not None else None
         except Exception:
             return None
 
@@ -18432,8 +21959,10 @@ class TalkinBot:
                 _paste_avatar_safe(img, avatar, (36, 41))
             d.text((W//2,38), "🏆 الفائز" if state.get("lang")!="en" else "🏆 WINNER",
                    fill=(255,215,80), font=small, anchor="ma")
-            d.text((W//2,80), f"@{str(winner_name).lstrip('@')}",
-                   fill=(255,255,255), font=title_font, anchor="ma")
+            _draw_name_centered(
+                d, (W//2, 80), str(winner_name).lstrip('@'), 34,
+                (255,255,255), W - 180, apply_correction=True,
+            )
         else:
             d.text((W//2,38), "السلم والثعبان" if state.get("lang")!="en" else "SNAKE & LADDERS", fill=(255,215,80), font=title_font, anchor="ma")
             roll=state.get("last_roll")
@@ -18664,10 +22193,12 @@ class TalkinBot:
             avatar = _load_sender_avatar(winner_photo, 72) if winner_photo else None
             if avatar is not None:
                 _paste_avatar_safe(img, avatar, (left+20, panel_y0+14))
-            d.text((W//2, panel_y0+31), "🏆 الفائز" if state.get("lang")!="en" else "🏆 WINNER",
-                   fill=(245,205,80), font=_gift_font("1",22), anchor="ma")
-            d.text((W//2, panel_y0+70), f"@{str(winner_name).lstrip('@')}",
-                   fill=(255,255,255), font=_gift_font("1",26), anchor="ma")
+            d.text((W//2, panel_y0+23), "🏆 الفائز" if state.get("lang")!="en" else "🏆 WINNER",
+                   fill=(245,205,80), font=_gift_font("1",18), anchor="ma")
+            _draw_name_centered(
+                d, (W//2, panel_y0+80), str(winner_name).lstrip('@'), 24,
+                (255,255,255), W - 180, apply_correction=True,
+            )
 
         out=BASE_DIR/"generated_games"/f"snake_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True)
         img.save(out,"JPEG",quality=86,optimize=True); return out
@@ -18749,8 +22280,10 @@ class TalkinBot:
                 self.send_room_text(r,f"🎲 @{sender} وقف الرول على {roll} وانتقل من {old_pos} إلى {final}.")
             if final>=100:
                 photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender); win_img=self._render_snake_board(game,winner_name=sender)
-                new_points = _add_points(sender, self.SNAKE_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
+                award = _add_points(sender, self.SNAKE_WIN_REWARD, repay_loan=True, return_details=True)
+                self._notify_loan_repayment(sender, award)
+                new_points = int(award.get("balance", 0) or 0)
+                self._broadcast_game_result_all_rooms(f"🏆 فاز @{sender} بلعبة السلم والثعبان!\n🎲 الرول الأخير: {roll}\n📍 وصل إلى الخانة 100.\n💰 جائزة الفوز: +{self.SNAKE_WIN_REWARD:,} نقطة\n💸 سداد السلفة: {_fmt_points(award.get('loan_repayment', 0))} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,"");
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.snake_games.pop(key,None)
@@ -18912,10 +22445,12 @@ class TalkinBot:
             avatar = _load_sender_avatar(winner_photo, 72) if winner_photo else None
             if avatar is not None:
                 _paste_avatar_safe(img, avatar, (ox+20, panel_y0+14))
-            d.text((ox+15*cell//2, panel_y0+31), "🏆 Winner" if state.get("lang") == "en" else "🏆 الفائز",
-                   fill=(245,205,80), font=_gift_font("1",22), anchor="ma")
-            d.text((ox+15*cell//2, panel_y0+70), f"@{str(winner_name).lstrip('@')}",
-                   fill=(255,255,255), font=_gift_font("1",26), anchor="ma")
+            d.text((ox+15*cell//2, panel_y0+23), "🏆 Winner" if state.get("lang") == "en" else "🏆 الفائز",
+                   fill=(245,205,80), font=_gift_font("1",18), anchor="ma")
+            _draw_name_centered(
+                d, (ox+15*cell//2, panel_y0+80), str(winner_name).lstrip('@'), 24,
+                (255,255,255), 15*cell - 180, apply_correction=True,
+            )
         out=BASE_DIR/"generated_games"/f"ludo_{uuid.uuid4().hex}.jpg"; out.parent.mkdir(parents=True,exist_ok=True)
         img.save(out,"JPEG",quality=88,optimize=True); return out
 
@@ -18994,8 +22529,10 @@ class TalkinBot:
                 self.send_room_text(r,f"🎲 @{sender} وقف الرول على {roll} وانتقل من المربع {old} إلى {new}.")
             if new>=58:
                 win_img=self._render_ludo_board(game,winner_name=sender); photo=self.user_photos.get(str(sender).casefold(), "") or self._lookup_profile_photo(sender)
-                new_points = _add_points(sender, self.LUDO_WIN_REWARD)
-                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,""); 
+                award = _add_points(sender, self.LUDO_WIN_REWARD, repay_loan=True, return_details=True)
+                self._notify_loan_repayment(sender, award)
+                new_points = int(award.get("balance", 0) or 0)
+                self._broadcast_game_result_all_rooms(f"🏆 مبروك! فاز @{sender} بلعبة لودو.\n🎲 الرول الأخير: {roll}\n📍 وصل إلى نهاية المسار.\n💰 جائزة الفوز: +{self.LUDO_WIN_REWARD:,} نقطة\n💸 سداد السلفة: {_fmt_points(award.get('loan_repayment', 0))} نقطة\n💳 رصيده الآن: {new_points:,} نقطة",win_img,"");
                 try: game.get("timeout_timer").cancel()
                 except Exception: pass
                 self.ludo_games.pop(key,None); return True
@@ -19231,8 +22768,19 @@ class TalkinBot:
         return True
 
     def _celebrity_partner_game(self, room, sender, gender):
-        female = ["نانسي عجرم", "إليسا", "أصالة نصري", "أحلام الشامسي", "نجوى كرم", "شيرين عبد الوهاب", "بيونسيه", "تايلور سويفت"]
-        male = ["ماجد المهندس", "كاظم الساهر", "عمرو دياب", "محمد عبده", "تامر حسني", "عادل إمام", "توم كروز", "ليوناردو دي كابريو"]
+        """Find a real public celebrity portrait and send it to the room."""
+        female = [
+            ("نانسي عجرم", "Nancy Ajram"), ("إليسا", "Elissa Lebanese singer"),
+            ("أصالة نصري", "Assala Nasri"), ("أحلام الشامسي", "Ahlam Al Shamsi"),
+            ("نجوى كرم", "Najwa Karam"), ("شيرين عبد الوهاب", "Sherine Abdel-Wahab"),
+            ("بيونسيه", "Beyonce"), ("تايلور سويفت", "Taylor Swift"),
+        ]
+        male = [
+            ("ماجد المهندس", "Majid Al Mohandis"), ("كاظم الساهر", "Kadim Al Sahir"),
+            ("عمرو دياب", "Amr Diab"), ("محمد عبده", "Mohammed Abdu"),
+            ("تامر حسني", "Tamer Hosny"), ("عادل إمام", "Adel Emam"),
+            ("توم كروز", "Tom Cruise"), ("ليوناردو دي كابريو", "Leonardo DiCaprio"),
+        ]
         names = female if gender == "female" else male
         busy = getattr(self, "_celebrity_partner_busy", set())
         key = (_norm_user(sender), _norm_room(room))
@@ -19246,47 +22794,95 @@ class TalkinBot:
 
         def worker():
             try:
-                image_result = None
-                name = ""
-                for candidate in secrets.SystemRandom().sample(names, min(4, len(names))):
-                    image_urls = _search_lookalike_images(f"{candidate} celebrity portrait", limit=8)
-                    for image_url in image_urls[:5]:
-                        local = _download_lookalike_image(image_url, f"celebrity_{uuid.uuid4().hex}")
-                        if local:
-                            image_result, name = local, candidate
+                selected_name = ""
+                selected_url = ""
+                failures = []
+                candidates = secrets.SystemRandom().sample(names, len(names))
+                for display_name, english_name in candidates:
+                    # Search the Arabic name and the well-known Latin spelling;
+                    # Wikipedia/Wikimedia often index one but not the other.
+                    for subject in (english_name, display_name):
+                        try:
+                            image_urls = _search_lookalike_images(subject, limit=12)
+                        except Exception as exc:
+                            failures.append(f"search:{type(exc).__name__}")
+                            continue
+                        if not image_urls:
+                            failures.append(f"empty-search:{subject}")
+                            continue
+                        for image_url in image_urls:
+                            check = None
+                            try:
+                                # Some legitimate image hosts ignore Range or use
+                                # application/octet-stream; inspect bytes as well.
+                                check = requests.get(
+                                    image_url,
+                                    headers={"User-Agent": "Mozilla/5.0 TalkinBot/1.0", "Range": "bytes=0-63"},
+                                    timeout=(4, 8), stream=True,
+                                )
+                                status = int(getattr(check, "status_code", 0) or 0)
+                                content_type = str(check.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+                                sample = b""
+                                try:
+                                    sample = check.raw.read(64, decode_content=True)
+                                except Exception:
+                                    try:
+                                        sample = next(check.iter_content(64), b"")
+                                    except Exception:
+                                        pass
+                                valid_magic = (
+                                    sample.startswith(b"\xff\xd8\xff")
+                                    or sample.startswith(b"\x89PNG\r\n\x1a\n")
+                                    or sample[:6] in (b"GIF87a", b"GIF89a")
+                                    or (sample[:4] == b"RIFF" and sample[8:12] == b"WEBP")
+                                )
+                                if status not in (200, 206) or not (content_type.startswith("image/") or valid_magic):
+                                    failures.append(f"not-image:{content_type or status}")
+                                    continue
+                            except Exception as exc:
+                                failures.append(f"verify:{type(exc).__name__}")
+                                continue
+                            finally:
+                                if check is not None:
+                                    try:
+                                        check.close()
+                                    except Exception:
+                                        pass
+                            try:
+                                result = self.send_room_media(room, image_url, "image")
+                                if result is False:
+                                    failures.append("talkin-rejected-image")
+                                    continue
+                                selected_name, selected_url = display_name, image_url
+                                break
+                            except Exception as exc:
+                                failures.append(f"send:{type(exc).__name__}")
+                                self.log("[CELEBRITY_PARTNER] candidate failed:", display_name, repr(exc))
+                        if selected_url:
                             break
-                    if image_result:
+                    if selected_url:
                         break
-                if not image_result:
-                    self.send_room_text(room, "❌ تعذر العثور على صورة مناسبة الآن؛ جرّب مرة أخرى لاحقاً.")
-                    return
-                base = _public_base_url()
-                if not base:
-                    self.send_room_text(room, "❌ تعذر عرض الصورة لأن رابط الوسائط العام غير مضبوط.")
-                    return
-                image_url = f"{base}/lookalikes/{image_result.name}"
-                sent = self.send_room_media(room, image_url, "image")
-                if sent is False:
-                    self.send_room_text(room, "❌ تعذر إرسال الصورة إلى الغرفة.")
-                    return
-                label = ("your wife" if gender == "female" else "your husband") if self._effective_room_language(room) == "en" else ("زوجتك" if gender == "female" else "زوجك")
+                if not selected_url:
+                    raise RuntimeError("no usable celebrity image found; " + ",".join(failures[-12:]))
                 if self._effective_room_language(room) == "en":
-                    self.send_room_text(room, f"💞 @{sender}, {label} is the celebrity {name} ❤️")
-                    return
-                self.send_room_text(room, f"💞 @{sender}، {label} هي الشخصية المشهورة: {name} ❤️")
+                    label = "your wife" if gender == "female" else "your husband"
+                    self.send_room_text(room, f"💞 @{sender}, {label} is the celebrity {selected_name} ❤️")
+                else:
+                    label = "زوجتك" if gender == "female" else "زوجك"
+                    self.send_room_text(room, f"💞 @{sender}، {label} هي الشخصية المشهورة: {selected_name} ❤️")
+                self.log("[CELEBRITY_PARTNER] direct image delivered:", sender, selected_name, selected_url)
             except Exception as exc:
                 self.log("[CELEBRITY_PARTNER] failed:", repr(exc))
                 try:
-                    self.send_room_text(room, "❌ تعذر البحث عن صورة مناسبة حالياً.")
+                    # Keep the familiar user-facing failure message; detailed
+                    # diagnostics remain in the server log for the owner.
+                    self.send_room_text(room, "❌ تعذر العثور على صورة مناسبة الآن؛ جرّب مرة أخرى لاحقاً.")
                 except Exception:
                     pass
             finally:
                 busy.discard(key)
 
-        threading.Thread(
-            target=self._localized_room_worker(room, response_language, worker),
-            name="celebrity-partner-search", daemon=True,
-        ).start()
+        threading.Thread(target=self._localized_room_worker(room, response_language, worker), name="celebrity-partner-search", daemon=True).start()
         return True
 
     def _fun_game(self, room, sender, command):
@@ -19324,14 +22920,17 @@ class TalkinBot:
         return True
 
     def _rare_diamond_event_worker(self):
-        """Run one round at a time; always pause three minutes after it closes."""
+        """Run one round at a time; pause ten minutes after it closes."""
         sequence = list(TIMED_TREASURE_GAMES)
         next_index = int(getattr(self, "_treasure_cycle_index", 0) or 0) % len(sequence)
         next_start = float(getattr(self, "_rare_diamond_next_due", time.time()))
         while not self.stop_event.wait(1.0):
             now = time.time()
             if next_start == float("inf"):
-                next_start = float(getattr(self, "_rare_diamond_next_due", now + 180.0))
+                next_start = float(getattr(
+                    self, "_rare_diamond_next_due",
+                    now + TIMED_TREASURE_ANNOUNCEMENT_INTERVAL_SECONDS,
+                ))
             with self._rare_diamond_lock:
                 event = self._rare_diamond_event
                 expired = isinstance(event, dict) and now >= float(event.get("ends_at", 0) or 0)
@@ -19339,7 +22938,7 @@ class TalkinBot:
                 with self._rare_diamond_lock:
                     if self._rare_diamond_event is event:
                         self._rare_diamond_event = None
-                        self._rare_diamond_next_due = time.time() + 180.0
+                        self._rare_diamond_next_due = time.time() + TIMED_TREASURE_ANNOUNCEMENT_INTERVAL_SECONDS
                 required = int(event.get("required_players", 5))
                 for target_room in event.get("rooms", [event.get("room", "")]):
                     try:
@@ -19348,13 +22947,16 @@ class TalkinBot:
                         if _game_results_disabled_for_room(target_room):
                             continue
                         if self._effective_room_language(target_room) == "en":
-                            notice = f"⌛ {config['title_en']} round closed: the player limit ({required}) was not reached. Next game announcement in 3 minutes."
+                            notice = f"⌛ {config['title_en']} round closed: the player limit ({required}) was not reached. Next game announcement in 10 minutes."
                         else:
-                            notice = f"⌛ أُغلقت جولة {config['title_ar']} لعدم اكتمال العدد ({required}). الإعلان التالي بعد 3 دقائق."
+                            notice = f"⌛ أُغلقت جولة {config['title_ar']} لعدم اكتمال العدد ({required}). الإعلان التالي بعد 10 دقائق."
                         self.send_room_text(target_room, notice)
                     except Exception as exc:
                         self.log("[TREASURE-CYCLE] timeout notice failed:", target_room, repr(exc))
-                next_start = float(getattr(self, "_rare_diamond_next_due", time.time() + 180.0))
+                next_start = float(getattr(
+                    self, "_rare_diamond_next_due",
+                    time.time() + TIMED_TREASURE_ANNOUNCEMENT_INTERVAL_SECONDS,
+                ))
             with self._rare_diamond_lock:
                 active = isinstance(self._rare_diamond_event, dict) and now < float(self._rare_diamond_event.get("ends_at", 0) or 0)
             if active or now < next_start:
@@ -19364,7 +22966,7 @@ class TalkinBot:
                 if self._start_rare_diamond_event(game_key):
                     next_index = (next_index + 1) % len(sequence)
                     self._treasure_cycle_index = next_index
-                    next_start = float("inf")  # resolver/timeout schedules the three-minute pause
+                    next_start = float("inf")  # resolver/timeout schedules the ten-minute pause
                 else:
                     next_start = time.time() + 10.0
             except Exception as exc:
@@ -19573,7 +23175,7 @@ class TalkinBot:
             return False
 
     def _resolve_rare_diamond_event(self, round_id):
-        """Resolve a completed round, then start the three-minute inter-game pause."""
+        """Resolve a completed round, then start the ten-minute inter-game pause."""
         try:
             return self._resolve_rare_diamond_event_impl(round_id)
         finally:
@@ -19582,7 +23184,7 @@ class TalkinBot:
                 with lock:
                     if (getattr(self, "_rare_diamond_event", None) is None
                             and float(getattr(self, "_rare_diamond_next_due", 0) or 0) == float("inf")):
-                        self._rare_diamond_next_due = time.time() + 180.0
+                        self._rare_diamond_next_due = time.time() + TIMED_TREASURE_ANNOUNCEMENT_INTERVAL_SECONDS
 
     def _resolve_rare_diamond_event_impl(self, round_id):
         """Resolve one round. Results go only to rooms where its players joined."""
@@ -19620,8 +23222,10 @@ class TalkinBot:
         prize_label_en = f"{prize_amount:,} points"
         try:
             winner_credit = _apply_points_delta_once(
-                winner, prize_amount, f"{round_id}:winner:{winner_key}", f"{game_key} prize"
+                winner, prize_amount, f"{round_id}:winner:{winner_key}", f"{game_key} prize",
+                repay_loan=True,
             )
+            self._notify_loan_repayment(winner, winner_credit)
         except Exception as exc:
             self.log("[TREASURE-CYCLE] winner credit failed:", winner, repr(exc))
             winner_credit = {"ok": False}
@@ -19725,7 +23329,7 @@ class TalkinBot:
         transaction_id = f"mining-redemption:{pending.get('id') or ''}"
         credited = _apply_points_delta_once(
             sender_name, int(pending.get("points", 0) or 0),
-            transaction_id, "treasure mining redemption",
+            transaction_id, "treasure mining redemption", repay_loan=True,
         )
         if not credited.get("ok"):
             self.send_room_text(
@@ -19776,7 +23380,7 @@ class TalkinBot:
                 self.log("[RARE-DIAMOND] join failed:", repr(exc))
             # The timed rare expedition is separate from ordinary mining.
             # If no event is open, never fall through to the iron/normal dig game.
-            self.send_room_text(room, "💎 لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم بعد 3 دقائق.")
+            self.send_room_text(room, "💎 لا توجد جولة ألماس نادر مفتوحة الآن. انتظر الإعلان القادم بعد 10 دقائق.")
             return True
         if not (is_store or is_inventory or is_top or redeem_match or red_code_match or is_dig or is_diamond_test or is_rare_mining_test):
             return False
@@ -19875,13 +23479,12 @@ class TalkinBot:
                         item_name = auction_item.get("item_name_en") or auction_item.get("item_name_ar") or "Auction prize"
                     else:
                         item_name = auction_item.get("item_name_ar") or auction_item.get("item_name_en") or "جائزة المزاد"
-                    redeem_value = int(auction_item.get("redemption_value", 0) or 0)
                     short_id = str(auction_item.get("id") or "")[:8]
                     if auction_item.get("status") == "redeeming":
-                        status_text = "redemption pending" if language_en else "الاستبدال قيد الاعتماد"
+                        status_text = "redemption pending" if language_en else "الاسترداد قيد الاعتماد"
                         lines.append(f"{number}. {auction_item.get('icon', '💎')} {item_name} — {status_text}")
                     else:
-                        price_text = f"redeem for {redeem_value:,} points" if language_en else f"الاستبدال: {redeem_value:,} نقطة"
+                        price_text = "1% profit, 1% loss, 98% no change" if language_en else "الاسترداد بالحظ: 1% ربح، 1% خسارة، و98% دون تغيير"
                         command_text = f"   Redeem: red auction {short_id}" if language_en else f"   red auction {short_id}"
                         lines.append(f"{number}. {auction_item.get('icon', '💎')} {item_name} — {price_text}")
                         lines.append(command_text)
@@ -19940,22 +23543,30 @@ class TalkinBot:
                 if redeemed.get("ok"):
                     prize = redeemed.get("item") or {}
                     language_en = self._effective_room_language(room) == "en"
-                    authentic = bool(redeemed.get("authentic"))
+                    outcome = str(redeemed.get("outcome") or redeemed.get("result") or "").casefold()
+                    if outcome in {"neutral", "none", "no_change", "unchanged", "لا_شيء", "دون_تغيير"}:
+                        result_kind = "neutral"
+                    elif outcome in {"loss", "counterfeit", "خسارة", "مغشوشة"}:
+                        result_kind = "loss"
+                    elif outcome in {"win", "profit", "authentic", "ربح", "أصلية"}:
+                        result_kind = "win"
+                    else:
+                        result_kind = "win" if redeemed.get("authentic") else "loss"
                     if language_en:
                         prize_name = prize.get("item_name_en") or prize.get("item_name_ar") or "Auction prize"
-                        outcome = "authentic (+0.75% profit)" if authentic else "counterfeit (-1.25% loss)"
+                        result_label = {"win": "profit (1%)", "loss": "loss (1%)", "neutral": "no profit or loss (98%)"}[result_kind]
+                        points_line = f"💰 Balance change: {int(redeemed.get('points', 0) or 0):,} points." if result_kind != "neutral" else "💰 Your balance did not change."
                         response = (
                             f"✅ Redeemed {prize.get('icon', '💎')} {prize_name} from the auction.\n"
-                            f"🎲 Result: {outcome}.\n"
-                            f"💰 Added {int(redeemed.get('points', 0) or 0):,} points to your balance."
+                            f"🎲 Luck result: {result_label}.\n{points_line}"
                         )
                     else:
                         prize_name = prize.get("item_name_ar") or prize.get("item_name_en") or "جائزة المزاد"
-                        outcome = "أصلية (+0.75% ربح)" if authentic else "مغشوشة (-1.25% خسارة)"
+                        result_label = {"win": "ربح (1%)", "loss": "خسارة (1%)", "neutral": "لا ربح ولا خسارة (98%)"}[result_kind]
+                        points_line = f"💰 تغير رصيدك بمقدار {int(redeemed.get('points', 0) or 0):,} نقطة." if result_kind != "neutral" else "💰 لم يتغير رصيدك."
                         response = (
                             f"✅ استبدلت {prize.get('icon', '💎')} {prize_name} من المزاد.\n"
-                            f"🎲 النتيجة: القطعة {outcome}.\n"
-                            f"💰 تمت تسوية {int(redeemed.get('points', 0) or 0):,} نقطة في رصيدك."
+                            f"🎲 نتيجة الحظ: {result_label}.\n{points_line}"
                         )
                     self.send_room_text(room, response)
                 elif redeemed.get("pending"):
@@ -20007,6 +23618,7 @@ class TalkinBot:
             credited = _apply_points_delta_once(
                 sender_name, pending["points"],
                 f"mining-redemption:{pending['id']}", "treasure mining redemption",
+                repay_loan=True,
             )
             if not credited.get("ok"):
                 self.send_room_text(room, "⚠️ حُجزت الكنوز للاستبدال بأمان، لكن تعذر اعتماد النقاط الآن. أعد Rdem لاحقًا؛ لن تُخصم الكنوز مرتين.")
@@ -20034,7 +23646,7 @@ class TalkinBot:
                 last_dig_data = self._mining_last_dig = {}
             with cooldown_lock:
                 last_dig = float(last_dig_data.get(mining_key, 0) or 0)
-                remaining_gate = 60.0 - (now - last_dig)
+                remaining_gate = 0.0 if _is_env_master_for_game_cooldown(sender_name) else 60.0 - (now - last_dig)
                 if remaining_gate > 0:
                     self.send_room_text(room, f"⌛ {sender_name} يمكنك التنقيب مرة كل دقيقة. تبقّى {format_cooldown(int(remaining_gate) + 1)}.")
                     return True
@@ -20075,11 +23687,19 @@ class TalkinBot:
 
     def handle_game_command(self, room, text, sender_name):
         original_raw = str(text or "").strip()
-        auto_gold = original_raw.casefold() in {"بورصة", "بورصه", "stock", "market", "بورصة ذهب", "بورصة الذهب", "gold auto"}
-        confirm_gold = original_raw.casefold() in {"تأكيد", "موافق", "أوافق", "قبول", "تأكيد ذهب", "تأكيد الذهب", "confirm", "join", "confirm gold"}
+        auto_gold = original_raw.casefold() == "gold auto"
+        pending_gold = getattr(self, "_stock_auto_gold_pending", {})
+        pending_gold_key = (_norm_room(room), _norm_user(sender_name))
+        confirm_gold = (
+            original_raw.casefold() in {"تأكيد", "موافق", "أوافق", "قبول", "تأكيد ذهب", "تأكيد الذهب", "confirm", "confirm gold"}
+            and isinstance(pending_gold, dict) and pending_gold_key in pending_gold
+        )
         stock_order = _parse_stock_market_order(text)
+        wallet_order = _parse_wallet_purchase(text)
         raw=_normalize_game_command_text(text)
-        raw_digits = raw.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        raw_digits = raw.translate(str.maketrans(
+            "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"
+        ))
         if stock_order:
             raw = "بورصة"
         if not raw or not sender_name: return False
@@ -20167,52 +23787,96 @@ class TalkinBot:
                 )
             if pending_stock.get("kind") == "market_choice" and re.fullmatch(r"[1-4]",raw_digits):
                 return self._stock_exchange_game(room,sender_name,int(raw_digits))
+        if self._wallet_handle_next_page(room, sender_name, raw):
+            return True
         if self._handle_pending_bot_choice(room, raw, sender_name):
             return True
+        join_alias = " ".join(raw.strip().casefold().replace("ة", "ه").split())
+        if join_alias in {"انضمام لعبه ثعبان", "انضمام ثعبان", "انضمام لعبه لودو", "انضمام لودو"}:
+            if not _is_verified_user(sender_name):
+                self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
+                return True
+            if not _games_enabled_for_room(room):
+                self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
+                return True
+            if "ثعبان" in join_alias:
+                if self._snake_command(room, sender_name, "join"):
+                    return True
+                self.send_room_text(room, "⏳ لا توجد لعبة ثعبان نشطة في هذه الغرفة الآن.")
+            else:
+                if self._ludo_command(room, sender_name, "join"):
+                    return True
+                self.send_room_text(room, "⏳ لا توجد لعبة لودو نشطة في هذه الغرفة الآن.")
+            return True
+        # A bare stake (for example `1` or `100b`) may join the only open
+        # wager. Never guess when multiple wager types are waiting.
+        bare_stake_match = re.fullmatch(r"[0-9][0-9,]*(?:\.[0-9]+)?[kmb]?", raw_digits.strip(), re.I)
+        if bare_stake_match:
+            open_wagers = getattr(self, "wager_waiting", {})
+            open_wagers = [
+                (str(key), value) for key, value in (open_wagers.items() if isinstance(open_wagers, dict) else [])
+                if isinstance(value, dict) and not value.get("_refund_pending")
+            ]
+            if len(open_wagers) == 1:
+                if not _is_verified_user(sender_name):
+                    self.send_room_text(room, f"🔒 @{sender_name} حسابك غير موثق لاستخدام الألعاب.\n{_verification_notice()}")
+                    return True
+                if not _games_enabled_for_room(room):
+                    self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
+                    return True
+                game_key, waiting_wager = open_wagers[0]
+                game_name = str(waiting_wager.get("game") or game_key)
+                amount = _parse_compact_amount(raw_digits.strip())
+                if amount is not None:
+                    return self._queue_wager(room, sender_name, game_name, amount)
+            if len(open_wagers) > 1:
+                self.send_room_text(
+                    room,
+                    "⚠️ توجد رهانات متعددة معلّقة. اكتب اسم اللعبة مع مبلغ لا يقل عن 100k، مثل: رهان 100k أو مضاربة 100k.",
+                )
+                return True
         # Do not run the verification gate for ordinary conversation.
         if not _looks_like_bot_command(raw):
             return False
-        normalized_raw = raw.replace("ة", "ه")
+        normalized_raw = raw_digits.replace("ة", "ه")
         # Game-name normalization: Arabic ه/ة variants are treated as the same
         # command (e.g. سناره/سنارة, حصانه/حصانة), while preserving raw text
         # for commands that contain user arguments.
         game_low = low.replace("ة", "ه")
 
-        # Master-only diagnostic: send the current billion-game image privately
-        # to the master, without publishing it in the room.
-        if low in ("فحص صورة المليار", "فحص صوره المليار", "فحص_صورة_المليار"):
-            if not _is_master_name(sender_name):
-                self.send_room_text(room, "🔒 هذا الأمر مخصص للماستر فقط.")
+        # Primary-master diagnostics render the real winner template with the
+        # configured master name and post it in the room where the command ran.
+        image_check = {
+            "فحص صورة المليون": "million", "فحص صوره المليون": "million",
+            "فحص_صورة_المليون": "million",
+            "فحص صورة المليار": "billion", "فحص صوره المليار": "billion",
+            "فحص_صورة_المليار": "billion",
+        }.get(low)
+        if image_check:
+            if not _is_primary_master(sender_name):
+                self.send_room_text(room, "🔒 فحص صور الجوائز مخصص للماستر الموجود في متغير BOT_MASTER.")
                 return True
-            recipient = sender_name if sender_name else BOT_MASTER
-            if not recipient:
-                self.log("[GAME] billion image check skipped: master recipient is not configured")
-                return True
-            image = ASSETS_DIR / GAME_IMAGE_FILES.get("billion", "game_billion.jpg")
-            if not image.is_file():
-                self.send_private_text(recipient, "❌ صورة المليار غير موجودة في مجلد assets.")
+            if not room:
+                self.send_private_text(sender_name, "⚠️ أرسل أمر الفحص داخل الغرفة التي تريد عرض الصورة فيها.")
                 return True
             base = _public_base_url()
             if not base:
-                self.send_private_text(recipient, "❌ لا يوجد رابط عام لصورة المليار. تأكد من PUBLIC_BASE_URL أو Railway Domain.")
+                self.send_private_text(sender_name, "❌ لا يوجد رابط عام للوسائط؛ تحقق من PUBLIC_MEDIA_URL أو PUBLIC_BASE_URL أو Railway Domain.")
                 return True
             try:
-                # Create a fresh JPEG copy for every inspection. This avoids
-                # client/CDN caching of the original assets URL and sends the
-                # actual billion template through the same media route used by
-                # the bot's private gift images.
                 if not PIL_AVAILABLE:
                     raise RuntimeError("Pillow غير مثبت")
-                check_dir = BASE_DIR / "generated_billion"
-                check_dir.mkdir(parents=True, exist_ok=True)
-                check_path = check_dir / f"billion_check_{uuid.uuid4().hex}.jpg"
-                Image.open(image).convert("RGB").save(check_path, "JPEG", quality=94, optimize=True)
-                url = f"{base}/billion/{check_path.name}"
+                winner_name = str(BOT_MASTER or sender_name).strip().lstrip("@")
+                card = render_money_game_winner_card(image_check, winner_name)
+                url = f"{base}/games/{card.name}"
                 self._verify_public_media_url(url, "image")
-                self.send_private_media(recipient, url, "image")
-                self.send_private_text(recipient, "✅ تم إرسال صورة المليار بالقالب في الخاص.")
+                label = "المليون" if image_check == "million" else "المليار"
+                self.send_room_text(room, f"🧪 اختبار صورة {label} — اسم الماستر: @{winner_name}")
+                if self.send_room_media(room, url, "image") is False:
+                    raise RuntimeError("تعذر إرسال الصورة إلى الغرفة")
+                self.send_private_text(sender_name, f"✅ أُرسلت صورة فحص {label} إلى الغرفة {room} باسم @{winner_name}.")
             except Exception as exc:
-                self.send_private_text(recipient, f"❌ تعذر إرسال صورة المليار: {exc}")
+                self.send_private_text(sender_name, f"❌ تعذر إنشاء/إرسال صورة الفحص: {exc}")
             return True
 
         # All games are available to verified accounts (including VIP).
@@ -20227,6 +23891,28 @@ class TalkinBot:
         if not _games_enabled_for_room(room):
             self.send_room_text(room, "🛑 الألعاب متوقفة في هذه الغرفة حالياً.")
             return True
+        if game_low in ("سلفني", "loan"):
+            result = _request_points_loan(sender_name)
+            if result.get("ok"):
+                self.send_room_text(
+                    room,
+                    f"✅ تمت الموافقة على سلفتك: {_fmt_points(LOAN_AMOUNT)} نقطة. "
+                    f"رصيدك الآن: {_fmt_points(result.get('balance', 0))}. "
+                    f"سيُخصم 20% من مكاسبك حتى سداد {_fmt_points(LOAN_AMOUNT)} نقطة.",
+                )
+            elif result.get("error") == "balance_too_high":
+                self.send_room_text(room, f"❌ لا يمكنك الاستلاف؛ رصيدك {_fmt_points(result.get('balance', 0))} نقطة ويجب أن يكون أقل من 100 مليار.")
+            elif result.get("error") == "outstanding_loan":
+                self.send_room_text(room, f"⏳ لديك سلفة قائمة متبقية: {_fmt_points(result.get('loan_debt', 0))} نقطة. تُتاح سلفة جديدة بعد سدادها.")
+            else:
+                self.send_room_text(room, "❌ تعذر تسجيل السلفة الآن؛ لم يتغير رصيدك.")
+            return True
+        if game_low in ("محفظه", "wallet", "portfolio"):
+            return self._wallet_show_catalog(room, sender_name, 1)
+        if game_low in ("محفظتي", "my wallet"):
+            return self._wallet_show_holdings(room, sender_name, 1)
+        if wallet_order:
+            return self._wallet_purchase_command(room, sender_name, wallet_order)
         # Keep the user's original mining text: the game normalizer maps "تنقيب"
         # and "احفر" to "الماس", but only the original "تنقيب" joins the timed
         # rare-diamond expedition instead of starting an ordinary dig.
@@ -20299,7 +23985,7 @@ class TalkinBot:
         if _norm_user(game_low) in fixed_lookup:
             game_name=fixed_lookup[_norm_user(game_low)]
             return self._queue_fixed_game(room,sender_name,game_name,500)
-        if game_low in ("بورصه", "بورصة"):
+        if game_low in ("بورصه", "بورصة", "stock", "market"):
             return self._stock_exchange_game(room, sender_name)
         # PvP games: outcome is decided by strong random selection, never by
         # who entered first or second.
@@ -20365,6 +24051,7 @@ class TalkinBot:
             _record_game(sender_name, "billion", reward, 0)
 
             if won:
+                _record_money_game_win("billion", sender_name)
                 self._game_award(sender_name, reward)
                 # Prefer the latest live profile URL; DB lookup is only a fallback.
                 winner_key = _norm_user(sender_name)
@@ -20386,7 +24073,7 @@ class TalkinBot:
                 try:
                     base = _public_base_url()
                     if not base:
-                        raise RuntimeError("PUBLIC_BASE_URL أو RAILWAY_PUBLIC_DOMAIN غير مضبوط")
+                        raise RuntimeError("PUBLIC_MEDIA_URL أو PUBLIC_BASE_URL أو RAILWAY_PUBLIC_DOMAIN غير مضبوط")
                     card = render_billion_card(sender_name, winner_photo)
                     url = f"{base}/billion/{card.name}"
                     self._verify_public_media_url(url, "image")
@@ -20505,11 +24192,14 @@ class TalkinBot:
                     "📋 Admin — verification and VIP\n━━━━━━━━━━━━\nvi@name — verify a user\nuns@name — remove verification\nvip@name / unvip@name — manage VIP status\nverify all — verify room members",
                     "🛡️ Admin — protection\n━━━━━━━━━━━━\nprotection@room — open room protection settings\nprotection status — show protection status\nenable protection / disable protection — toggle room protection\nType protection to see numbered options.",
                     "📋 Admin — filter and publishing\n━━━━━━━━━━━━\nmf@on / mf@off — enable/disable the word filter\n+mf@word / -mf@word — add/remove a filtered word\nl@mf — list filtered words\nmbp@name — remove a publishing ban",
-                    "📋 Admin — advanced commands\n━━━━━━━━━━━━\nstatus — bot status\nram / cpu — resource status\nmyrooms — connected rooms\njoin all — rejoin saved rooms\ninv / invite — invite members from this room",
+                    "📋 Admin — system and diagnostics\n━━━━━━━━━━━━\nstatus — bot status\nram / cpu — resource status\nslow reply diagnostics (authorized master only)\nclean temporary files / create backup\nrestart bot service\nmaster service status/on/off\ntoggle invitations and games",
+                    "📋 Admin — points and logs\n━━━━━━━━━━━━\nmsb@name@amount — add points (master private chat)\n-sb@name@amount — deduct points (primary master private chat)\nts@name@amount — replace the saved balance\ntransfer all@amount — bulk points to room members\ntransfer history — show points transfer log",
+                    "📋 Admin — rooms and lists\n━━━━━━━━━━━━\nmyrooms — connected rooms\njoin all — rejoin saved rooms\nadd rooms to file — save current rooms\ninv / invite — invite members\ns@name / is@name — search and presence\nl@a / l@m / l@o / l@b — room role lists\nl@all — show room lists in sequence",
+                    "📋 Admin — extra settings and lists\n━━━━━━━━━━━━\namf@name / -amf@name — manage filter exceptions\nl@amf — list filter exceptions\nl@mfb / l@mbp — filter and publishing-ban lists\nmr@number — set repeat limit\nsf@on / sf@off — room safety filter\nl@mas / l@mvip — master lists",
                 ],
                 2: [
                     "🎵 Music\n━━━━━━━━━━━━\n.sa song name / play song name — play music\nstop music / stop — stop the current song\nsher@name — share the current song",
-                    "❤️ Reactions, photos and lookalikes\n━━━━━━━━━━━━\nlk@code — like | lv@code — love | dl@code — dislike\ncm@code text — comment | report@code text — report\nmy photo / lookalike@name — safe image search",
+                    "❤️ Reactions, photos and lookalikes\n━━━━━━━━━━━━\nlk@code — like | lv@code — love | dl@code — dislike\ncm@code text — comment | report@code text — report\nصورتي — your account avatar only\n.صوره <username/topic> — strict-SafeSearch internet image\n.صوره — random image: 30% monkeys; otherwise adult portrait matching known gender\nشبيه@name / شبيهك@name — safe lookalike-style image\nExplicit/obscene image searches are blocked.",
                 ],
                 3: [
                     "🎮 Games — solo games\n━━━━━━━━━━━━\nrock / paper / scissors — play against the bot\ninvestment, luck, coin@heads/tails, wheel\nbox@1-3, cup@1-3, monster, volcano, bird, star\ntable, uno\nType ns for the next games list.",
@@ -20540,22 +24230,14 @@ class TalkinBot:
                     text += "\n\nType ns for the next section."
                 elif int(page) == 3:
                     text += "\n\nType ns to return to the first game list."
-        # a3 is intentionally one single message: the 13 bot-vs-bot games
-        # must never be split into two chat bubbles. Other help sections keep
-        # the normal safe line batching.
-        if int(page) == 3:
-            if private_to:
-                self._send_text_packets("chat_message", text, to=private_to)
-            elif room:
-                self._send_text_packets("room_message", text, room=room)
-        else:
-            if private_to:
-                self._send_help_chunks("chat_message", text, to=private_to)
-            elif room:
-                self._send_help_chunks("room_message", text, room=room)
+        if private_to:
+            self._send_help_chunks("chat_message", text, to=private_to)
+        elif room:
+            self._send_help_chunks("room_message", text, room=room)
 
     def _send_game_help_section(self, room=None, private_to=None, part=1):
-        # A3 is always one complete message per list; no batching or delay.
+        # Each A3 section is kept as one logical page; the transport helper
+        # splits only if needed to satisfy Talkin's hard packet limit.
         sections = _help_sections_from_messages().get(3, [])
         if not sections:
             return False
@@ -20570,9 +24252,9 @@ class TalkinBot:
         elif idx >= len(sections) - 1:
             text += "\n\n📌 هذه آخر قائمة في A3."
         if private_to:
-            return self._send_text_packets("chat_message", text, to=private_to)
+            return self._send_help_chunks("chat_message", text, to=private_to)
         if room:
-            return self._send_text_packets("room_message", text, room=room)
+            return self._send_help_chunks("room_message", text, room=room)
         return False
 
     def _send_help(self, room=None, private_to=None, page=1, game_part=1):
@@ -20609,10 +24291,6 @@ class TalkinBot:
                 self.send_room_text(room, reply)
             return True
 
-        if (re.fullmatch(r"(?:ايدي|أيدي|id)(?:@.+)?", _body_text, re.I)
-                or re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", _body_text, re.I)):
-            return self._room_list_commands(room, _body_text, sender, is_private)
-
         if _body_low in ("اوامر", "الاوامر", "help", "مساعدة"):
             menu = _command_menu_for(_is_primary_master(sender), is_private=is_private)
             if room and not is_private and self._effective_room_language(room) == "en":
@@ -20635,6 +24313,9 @@ class TalkinBot:
             self._send_help(room=room, private_to=sender if is_private else None, page=_page)
             return True
         if _body_low in ("ns", "n", "التالي", "القائمة التالية", "next"):
+            # Give the wallet its own next-page cursor before generic list/help paging.
+            if not is_private and room and self._wallet_handle_next_page(room, sender, _body_low):
+                return True
             key = (("__private__" if is_private else str(room)), _norm_user(sender))
             # Filter-word navigation has priority over A1..A6 navigation.
             filter_state = getattr(self, "_filter_list_state", {}).get(self._filter_list_key(room, sender))
@@ -20685,6 +24366,26 @@ class TalkinBot:
                         next_page, language, recipient=target
                     )
                 self.send_private_text(sender, message)
+                return True
+
+            # Once the master has opened A1, its explicitly numbered admin
+            # sections take precedence over stale generic result pages. This
+            # keeps ns in the requested moderation -> roles -> ... sequence.
+            if self.help_pages.get(key) == 1:
+                sections = _help_sections_from_messages().get(1, [])
+                current_part = max(1, int(self.help_page_part.get(key, 1) or 1))
+                if current_part < len(sections):
+                    current_part += 1
+                    self.help_page_part[key] = current_part
+                    self.help_game_part[key] = current_part
+                    self._send_help(room=room, private_to=sender if is_private else None,
+                                    page=1, game_part=current_part)
+                else:
+                    message = "✅ انتهت قوائم الإدارة.\n📌 للعودة اكتب a1."
+                    if is_private:
+                        self.send_private_text(sender, message)
+                    elif room:
+                        self.send_room_text(room, message)
                 return True
 
             # Generic long-result navigation. Any command that produced more
@@ -20771,6 +24472,7 @@ class TalkinBot:
             return True
 
         is_publish = _is_publish_command(body)
+        is_publish_unban = bool(re.fullmatch(r"mbp@.+", str(body or "").strip(), re.I))
         repeat_last_command = str(body or "").strip().casefold() == ".u"
         security_command = bool(
             re.match(r"^(?:تشغيل|إيقاف) الحماية$", str(body or "").strip(), re.I)
@@ -20816,8 +24518,17 @@ class TalkinBot:
             or re.fullmatch(r"(?:ترحيب|welcome)@.+", shop_command_text, re.I | re.S)
             or pending_welcome_text
         )
-        points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
-        master_points_transfer_command = bool(re.fullmatch(r"msb@([^@]+)@(\d+)", str(body or "").strip(), re.I))
+        welcome_content_delete_command = shop_command_text.casefold() in {
+            "حذف ترحيب", "حذف الترحيب", "إلغاء الترحيب", "الغاء الترحيب",
+            "حذف ترحيب نص", "حذف الترحيب نص", "حذف ترحيب النص", "حذف الترحيب النص",
+            "حذف ترحيب نصي", "حذف الترحيب نصي", "حذف الترحيب النصي",
+            "حذف ترحيب صورة", "حذف الترحيب صورة", "حذف ترحيب الصورة", "حذف الترحيب الصورة",
+            "حذف ترحيب صوره", "حذف الترحيب صوره", "حذف ترحيب الصوره", "حذف الترحيب الصوره",
+            "delete welcome", "remove welcome", "delete welcome text", "remove welcome text",
+            "delete welcome image", "remove welcome image",
+        }
+        points_transfer_command = bool(re.fullmatch(r"sb@([^@]+)@([^@]+)", str(body or "").strip(), re.I))
+        master_points_transfer_command = bool(re.fullmatch(r"msb@([^@]+)@([^@]+)", str(body or "").strip(), re.I))
         master_points_deduction_command = str(body or "").strip().casefold().startswith("-sb@")
         if master_points_deduction_command and (not is_private or not _is_primary_master(sender)):
             if not _is_primary_master(sender):
@@ -20835,6 +24546,18 @@ class TalkinBot:
                 self.send_private_text(sender, message)
             elif room:
                 self.send_room_text(room, message)
+            return True
+        m_master_transfer = re.fullmatch(r"msb@([^@]+)@([^@]+)", str(body or "").strip(), re.I)
+        if m_master_transfer and is_private and _is_primary_master(sender):
+            target = m_master_transfer.group(1).strip().lstrip("@")
+            amount = _parse_compact_amount(m_master_transfer.group(2))
+            if not target or amount is None or amount <= 0:
+                self.send_private_text(sender, "❌ الصيغة: msb@اسم المستخدم@عدد النقاط مثل 10m10b")
+                return True
+            new = _add_points(target, amount)
+            self.send_private_text(sender, f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{target} من رصيد الماستر.\n💳 رصيد المستلم: {_fmt_points(new)}")
+            if _norm_user(target) != _norm_user(sender):
+                self.send_private_text(target, f"💰 إشعار تحويل: استلمت {_fmt_points(amount)} نقطة من الماستر. رصيدك الحالي: {_fmt_points(new)}")
             return True
         public_top_command = str(body or "").strip().casefold() in {
             "توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top", "ملياري", "مليارات", "مليوني", "ملايين"
@@ -20898,6 +24621,8 @@ class TalkinBot:
                 and not (is_publish and _is_verified_user(sender))
                 and not (points_transfer_command and _is_verified_user(sender))
                 and not (member_shop_command and _is_verified_user(sender))
+                and not welcome_content_delete_command
+                and not is_publish_unban
                 and not join_command
                 and not join_all_command
                 and not repeat_last_command
@@ -21159,6 +24884,24 @@ class TalkinBot:
             cleaned.append(room_name)
         if not cleaned:
             return False
+        # Every explicit دخول@ request becomes a saved-room candidate. This
+        # is intentionally done before the language prompt and before the
+        # asynchronous join, so a reconnect cannot lose a newly requested
+        # room while the server is still acknowledging room_join.
+        existing = _persistent_rooms()
+        existing_keys = {_norm_room(value).casefold() for value in existing}
+        added = False
+        for room_name in cleaned:
+            key = _norm_room(room_name).casefold()
+            if key and key not in existing_keys:
+                existing.append(room_name)
+                existing_keys.add(key)
+                added = True
+        if added:
+            _save_persistent_rooms(existing)
+        if not isinstance(getattr(self, "known_rooms", None), set):
+            self.known_rooms = set()
+        self.known_rooms.update(cleaned)
         if not hasattr(self,"_pending_room_language"):
             self._pending_room_language={}
         self._pending_room_language[self._room_language_pending_key(sender)]={
@@ -21349,9 +25092,6 @@ class TalkinBot:
         pending = self._pending_room_lists.get(_norm_room(room))
         if not isinstance(pending, dict) or pending.get("code") == "is":
             return False
-        if pending.get("bot_role_check"):
-            self.log("[ROOM-ROLE] ignored text preview; waiting for complete server list")
-            return False
 
         # Only consume a response that belongs to the request we sent.
         request_type = str(pending.get("request_type") or "").casefold()
@@ -21377,6 +25117,27 @@ class TalkinBot:
         full_list_types = {
             "members_list", "admins_list", "owners_list", "banned_list"
         }
+        if pending.get("user_room_rank_check"):
+            room_key = _norm_room(source_room)
+            state = getattr(self, "_pending_user_room_rank_checks", {}).get(room_key)
+            if not isinstance(state, dict) or state.get("request_id") != pending.get("request_id"):
+                return False
+            users = self._extract_room_list_users(result)
+            requester_key = _norm_user(state.get("requester", ""))
+            found = next(
+                (u for u in users if _norm_user(u.get("username")) == requester_key),
+                None,
+            )
+            if found:
+                reported_role = str(found.get("role") or "member").casefold().strip().replace(" ", "_")
+                return self._finish_user_room_rank_check(room_key, reported_role)
+            if pending.get("request_mode") == "app":
+                return self._fallback_user_room_rank(room_key, pending.get("request_id"))
+            return self._finish_user_room_rank_check(room_key, missing=True)
+
+        if pending.get("bot_role_check"):
+            self.log("[ROOM-ROLE] ignored text preview; waiting for complete server list")
+            return False
         if (pending.get("complete_users") or request_type in full_list_types) and os.getenv(
                 "ALLOW_TEXT_ROOM_LIST_FALLBACK", "0").strip() != "1":
             self.log(
@@ -21433,181 +25194,6 @@ class TalkinBot:
             self.log("[ROOM-LIST] text response diagnostic failed:", repr(exc))
         return True
 
-    def _send_room_id_sync_request(self, room, room_key, request_id):
-        try:
-            packet = encode_query(
-                "room_admin", type_="members_list", room=room, to=BOT_ID,
-                value="none", id_=request_id,
-            )
-            return self.send_query(packet)
-        except Exception as exc:
-            self.log("[ROOM-ID] members-list request failed:", type(exc).__name__)
-            return False
-
-    def _room_list_response_timeout(self, room_key, request_id):
-        pending_lists = getattr(self, "_pending_room_lists", {})
-        pending = pending_lists.get(room_key)
-        if not isinstance(pending, dict) or str(pending.get("request_id") or "") != str(request_id or ""):
-            return False
-        pending_lists.pop(room_key, None)
-        message = "⌛ لم يصل رد المتواجدين من السيرفر؛ لم يتم حفظ الهوية. أعد المحاولة لاحقًا."
-        senders = pending.get("identity_senders") or ([pending.get("sender")] if pending.get("sender") else [])
-        if pending.get("code") == "identity_update" and senders:
-            for sender in senders:
-                self.send_private_text(sender, message)
-        elif pending.get("private_response"):
-            self.send_private_text(pending.get("sender"), message)
-        else:
-            self.send_room_text(pending.get("response_room") or pending.get("room"), message)
-        return True
-
-    def _schedule_room_id_sync(self, room):
-        """Request one room roster at a time; the server response arrives asynchronously."""
-        room = str(room or "").strip()
-        room_key = _norm_room(room)
-        if not room or not room_key or getattr(self, "ws", None) is None:
-            return False
-        lock = getattr(self, "_room_id_sync_lock", None)
-        if lock is None:
-            lock = self._room_id_sync_lock = threading.RLock()
-        pending_lists = getattr(self, "_pending_room_lists", None)
-        if not isinstance(pending_lists, dict):
-            pending_lists = self._pending_room_lists = {}
-        with lock:
-            now = time.time()
-            last = getattr(self, "_room_id_sync_last", {})
-            if now - float(last.get(room_key, 0) or 0) < 60 or room_key in pending_lists:
-                return False
-            request_id = secrets.token_urlsafe(15)[:20]
-            pending = {
-                "room": room, "code": "id_sync", "request_type": "members_list",
-                "request_id": request_id, "requested_at": now,
-            }
-            timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
-            timer.daemon = True
-            pending["timer"] = timer
-            pending_lists[room_key] = pending
-            last[room_key] = now
-            self._room_id_sync_last = last
-            timer.start()
-        if self._send_room_id_sync_request(room, room_key, request_id) is False:
-            pending_lists.pop(room_key, None)
-            timer.cancel()
-            return False
-        return True
-
-    def _request_identity_update(self, room, sender):
-        """Start an explicit, non-blocking identity refresh for one user."""
-        room = str(room or "").strip()
-        sender = str(sender or "").strip().lstrip("@")
-        room_key = _norm_room(room)
-        if not room_key or getattr(self, "ws", None) is None:
-            self.send_private_text(sender, "⚠️ نفّذ «حدث ايدي» داخل غرفة متصلة حتى أطلب هويتك من السيرفر.")
-            return True
-        pending_lists = getattr(self, "_pending_room_lists", None)
-        if not isinstance(pending_lists, dict):
-            pending_lists = self._pending_room_lists = {}
-        lock = getattr(self, "_room_id_sync_lock", None)
-        if lock is None:
-            lock = self._room_id_sync_lock = threading.RLock()
-        with lock:
-            pending = pending_lists.get(room_key)
-            if isinstance(pending, dict):
-                if pending.get("code") in {"id_sync", "identity_update"}:
-                    senders = pending.setdefault("identity_senders", [])
-                    if not any(_norm_user(item) == _norm_user(sender) for item in senders):
-                        senders.append(sender)
-                    pending["code"] = "identity_update"
-                    return True
-                self.send_private_text(sender, "⌛ هناك طلب أعضاء آخر جارٍ لهذه الغرفة؛ أعد «حدث ايدي» بعد اكتماله.")
-                return True
-            request_id = secrets.token_urlsafe(15)[:20]
-            pending = {
-                "room": room, "code": "identity_update", "request_type": "members_list",
-                "request_id": request_id, "requested_at": time.time(),
-                "identity_senders": [sender],
-            }
-            timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
-            timer.daemon = True
-            pending["timer"] = timer
-            pending_lists[room_key] = pending
-            timer.start()
-        if self._send_room_id_sync_request(room, room_key, request_id) is False:
-            pending_lists.pop(room_key, None)
-            timer.cancel()
-            self.send_private_text(sender, "⚠️ تعذر طلب قائمة الأعضاء من السيرفر؛ حاول مجددًا.")
-        return True
-
-    def _finish_identity_update(self, room, senders, users):
-        """Persist a completed identity update away from the WebSocket event worker."""
-        notifications = []
-        try:
-            with _IDENTITY_METADATA_LOCK:
-                _remember_roster(room, users)
-                for sender in senders:
-                    sender = str(sender or "").strip().lstrip("@")
-                    user_id = _room_roster_id_for_name(users, sender)
-                    if not user_id:
-                        notifications.append((sender, "⚠️ لم يصل ID واضح لحسابك؛ لم تُحدّث الهوية."))
-                        continue
-                    _persist_identity_to_points(sender, user_id, room)
-                    _persist_identity_to_levels(sender, user_id, room)
-                    identities = getattr(self, "welcome_identities", None)
-                    if isinstance(identities, dict):
-                        identities[user_id] = {"username": sender, "user_id": user_id}
-                        try:
-                            self._save_social_features()
-                        except Exception as exc:
-                            self.log("[IDENTITY] welcome metadata save failed:", type(exc).__name__)
-                    notifications.append((sender, "✅ تم تحديث هويتك بنجاح وحفظها داخليًا."))
-        except Exception as exc:
-            self.log("[IDENTITY] background persistence failed:", type(exc).__name__)
-            notifications = [
-                (str(sender or "").strip().lstrip("@"), "⚠️ تعذر حفظ الهوية الآن؛ حاول «حدث ايدي» مرة أخرى.")
-                for sender in senders
-            ]
-        for sender, message in notifications:
-            try:
-                self.send_private_text(sender, message)
-            except Exception as exc:
-                self.log("[IDENTITY] private completion notice failed:", type(exc).__name__)
-
-    def _request_mining_identity_lookup(self, room, sender, text):
-        """Wait for the native roster response before running ID-based mining."""
-        room = str(room or "").strip()
-        room_key = _norm_room(room)
-        if not room_key or getattr(self, "ws", None) is None:
-            self.send_room_text(room, "⚠️ لا أستطيع تحديد معرفك الآن؛ تأكد من اتصال الغرفة.")
-            return True
-        pending_lists = getattr(self, "_pending_room_lists", None)
-        if not isinstance(pending_lists, dict):
-            pending_lists = self._pending_room_lists = {}
-        followup = {"sender": str(sender or "").strip().lstrip("@"), "text": str(text or "")}
-        pending = pending_lists.get(room_key)
-        if isinstance(pending, dict):
-            if pending.get("code") in {"id_sync", "mine_uid"}:
-                pending.setdefault("mine_followups", []).append(followup)
-                return True
-            self.send_room_text(room, "⌛ هناك طلب أعضاء جارٍ لهذه الغرفة؛ أعد أمر التنقيب بعد اكتماله.")
-            return True
-        lock = getattr(self, "_room_id_sync_lock", None)
-        if lock is None:
-            lock = self._room_id_sync_lock = threading.RLock()
-        request_id = secrets.token_urlsafe(15)[:20]
-        pending = {
-            "room": room, "code": "mine_uid", "request_type": "members_list",
-            "request_id": request_id, "requested_at": time.time(), "mine_followups": [followup],
-        }
-        timer = threading.Timer(20.0, self._room_list_response_timeout, args=(room_key, request_id))
-        timer.daemon = True
-        pending["timer"] = timer
-        with lock:
-            pending_lists[room_key] = pending
-        timer.start()
-        self.send_room_text(room, f"🔄 جارٍ تحديد حساب @{followup['sender']} عبر ID في الخلفية.")
-        self._send_room_id_sync_request(room, room_key, request_id)
-        return True
-
     def _complete_pending_room_list(self, result):
         source_room = str(result.get("_occupants_room") or "").strip()
         if not source_room:
@@ -21615,12 +25201,6 @@ class TalkinBot:
         pending = self._pending_room_lists.pop(_norm_room(source_room), None)
         if not isinstance(pending, dict):
             return False
-        response_timer = pending.get("timer")
-        if response_timer:
-            try:
-                response_timer.cancel()
-            except Exception:
-                pass
 
         if pending.get("bot_role_check"):
             room_key = _norm_room(source_room)
@@ -21628,58 +25208,15 @@ class TalkinBot:
             if not isinstance(state, dict) or state.get("request_id") != pending.get("request_id"):
                 return False
             users = self._extract_room_list_users(result)
-            bot_user = next(
-                (user for user in users if _norm_user(user.get("username")) == _norm_user(BOT_ID)),
-                None,
-            )
+            bot_key = _norm_user(BOT_ID)
+            bot_user = next((u for u in users if _norm_user(u.get("username")) == bot_key), None)
             if bot_user:
-                reported_role = _normalize_room_role(bot_user.get("role"))
-                if reported_role not in {"", "none", "unknown"}:
+                reported_role = str(bot_user.get("role") or "").casefold().strip().replace(" ", "_")
+                if reported_role not in {"none", "unknown"}:
                     return self._finish_bot_room_role_check(room_key, reported_role)
             if pending.get("request_mode") == "app":
                 return self._fallback_bot_room_role_check(room_key, pending.get("request_id"))
             return self._finish_bot_room_role_check(room_key, missing=True)
-
-        code = str(pending.get("code") or "").lower()
-        if code in {"id_sync", "identity_update", "mine_uid"}:
-            users = self._extract_room_list_users(result)
-            if code == "identity_update":
-                senders = pending.get("identity_senders") or ([pending.get("sender")] if pending.get("sender") else [])
-                valid_senders = []
-                for sender_name in senders:
-                    sender_name = str(sender_name or "").strip().lstrip("@")
-                    if _room_roster_id_for_name(users, sender_name):
-                        valid_senders.append(sender_name)
-                    else:
-                        self.send_private_text(sender_name, "⚠️ لم يصل ID واضح لحسابك؛ لم تُحدّث الهوية.")
-                if valid_senders:
-                    worker = threading.Thread(
-                        target=self._finish_identity_update,
-                        args=(source_room, valid_senders, users),
-                        name="identity-update-worker",
-                        daemon=True,
-                    )
-                    worker.start()
-                return True
-
-            _remember_roster(source_room, users)
-            room_users = getattr(self, "room_users", None)
-            if isinstance(room_users, dict):
-                for user in users:
-                    name = str(user.get("username") or "").strip().lstrip("@")
-                    if name:
-                        room_users.setdefault(source_room, {})[name] = str(user.get("role") or "none")
-            if code == "mine_uid":
-                for followup in pending.get("mine_followups", []):
-                    sender_name = str(followup.get("sender") or "").strip().lstrip("@")
-                    user_id = _room_roster_id_for_name(users, sender_name)
-                    if user_id:
-                        self._execute_mining_command_with_id(
-                            source_room, followup.get("text", ""), sender_name, user_id
-                        )
-                    else:
-                        self.send_room_text(source_room, f"⚠️ لم يصل معرّف حساب @{sender_name} من السيرفر.")
-            return True
 
         # INV roster collection: each category is fetched separately. The
         # response category is authoritative; then the next category is
@@ -21997,374 +25534,7 @@ class TalkinBot:
         self.send_query(encode_query("room_admin",type_=types[code],room=state["room"],to=BOT_ID,value="none",id_=rid))
         return True
 
-    def _profile_lookup_runtime(self):
-        lock = getattr(self, "_profile_lookup_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._profile_lookup_lock = lock
-        if not isinstance(getattr(self, "_profile_lookup_queue", None), list):
-            self._profile_lookup_queue = []
-        if not isinstance(getattr(self, "_profile_lookup_by_name", None), dict):
-            self._profile_lookup_by_name = {}
-        if not isinstance(getattr(self, "_id_refresh_jobs", None), dict):
-            self._id_refresh_jobs = {}
-        if not isinstance(getattr(self, "_pending_identity_transfers", None), dict):
-            self._pending_identity_transfers = {}
-        return lock
-
-    def _queue_profile_lookup(self, username, consumer):
-        target = str(username or "").strip().lstrip("@")
-        target_key = _norm_user(target)
-        if not target or not target_key or len(target) > 128:
-            return False
-        lock = self._profile_lookup_runtime()
-        with lock:
-            pending = self._profile_lookup_by_name.get(target_key)
-            if isinstance(pending, dict):
-                pending.setdefault("consumers", []).append(dict(consumer or {}))
-                return True
-            task = {
-                "username": target,
-                "username_key": target_key,
-                "request_id": "".join(secrets.choice(PROFILE_LOOKUP_UID_ALPHABET) for _ in range(20)),
-                "consumers": [dict(consumer or {})],
-                "timer": None,
-            }
-            self._profile_lookup_by_name[target_key] = task
-            self._profile_lookup_queue.append(task)
-            should_dispatch = getattr(self, "_profile_lookup_active", None) is None
-        if should_dispatch:
-            self._dispatch_profile_lookup_queue()
-        return True
-
-    def _dispatch_profile_lookup_queue(self):
-        while True:
-            lock = self._profile_lookup_runtime()
-            with lock:
-                if getattr(self, "_profile_lookup_active", None) is not None:
-                    return True
-                pending_queue = self._profile_lookup_queue
-                if not pending_queue:
-                    return True
-                task = pending_queue.pop(0)
-                self._profile_lookup_active = task
-                timer = threading.Timer(
-                    PROFILE_LOOKUP_TIMEOUT_SECONDS,
-                    self._profile_lookup_timeout,
-                    args=(task["request_id"],),
-                )
-                timer.daemon = True
-                task["timer"] = timer
-            timer.start()
-            try:
-                packet = encode_query(
-                    "profile_other", type_=task["username"], uid=task["request_id"]
-                )
-                if self.send_query(packet) is False:
-                    raise RuntimeError("profile_other request was not sent")
-                self.log("[PROFILE] requested user ID for", task["username"])
-                return True
-            except Exception as exc:
-                self.log("[PROFILE] profile_other request failed:", repr(exc))
-                self._finish_profile_lookup(
-                    task["request_id"], error="send_failed", dispatch_next=False
-                )
-
-    def _profile_lookup_timeout(self, request_id):
-        self._finish_profile_lookup(request_id, error="timeout")
-
-    def _finish_profile_lookup(self, request_id, *, user_id="", profile_name="", error="", dispatch_next=True):
-        lock = self._profile_lookup_runtime()
-        with lock:
-            task = getattr(self, "_profile_lookup_active", None)
-            if not isinstance(task, dict) or task.get("request_id") != request_id:
-                return False
-            self._profile_lookup_active = None
-            self._profile_lookup_by_name.pop(task.get("username_key"), None)
-            timer = task.get("timer")
-            if timer is not None:
-                try:
-                    timer.cancel()
-                except Exception:
-                    pass
-            consumers = list(task.get("consumers") or [])
-            next_pending = bool(self._profile_lookup_queue)
-        for consumer in consumers:
-            try:
-                self._handle_profile_lookup_consumer(
-                    consumer, task.get("username", ""), profile_name or task.get("username", ""),
-                    str(user_id or ""), str(error or ""),
-                )
-            except Exception as exc:
-                self.log("[PROFILE] lookup consumer failed:", repr(exc))
-        if dispatch_next and next_pending:
-            self._dispatch_profile_lookup_queue()
-        return True
-
-    def _handle_profile_other_payload(self, payload):
-        try:
-            data = json.loads(payload) if isinstance(payload, str) else payload
-        except Exception:
-            return False
-        if not isinstance(data, dict) or str(data.get("handler") or "").strip().casefold() != "profile_other":
-            return False
-        lock = self._profile_lookup_runtime()
-        with lock:
-            task = getattr(self, "_profile_lookup_active", None)
-            if not isinstance(task, dict):
-                self.log("[PROFILE] ignored unsolicited profile_other response")
-                return True
-            expected_name = str(task.get("username") or "")
-            request_id = str(task.get("request_id") or "")
-        reported_name = str(data.get("type") or data.get("username") or data.get("user_name") or "").strip().lstrip("@")
-        if not reported_name or _norm_user(reported_name) != _norm_user(expected_name):
-            self.log("[PROFILE] ignored profile_other response with mismatched username", reported_name)
-            return True
-        user_id = str(data.get("user_id") or "").strip()
-        if not user_id.isdigit():
-            self._finish_profile_lookup(
-                request_id, profile_name=reported_name, error="missing_user_id"
-            )
-            return True
-        self._finish_profile_lookup(
-            request_id, user_id=user_id, profile_name=reported_name
-        )
-        return True
-
-    def _start_profile_id_command(self, room, target, requester, is_private=False):
-        target = str(target or "").strip().lstrip("@")
-        if not target or len(target) > 128:
-            message = "❌ الصيغة: id@اسم المستخدم"
-            self.send_private_text(requester, message) if is_private else self.send_room_text(room, message)
-            return True
-        consumer = {
-            "kind": "show_id", "requester": str(requester or ""),
-            "room": str(room or ""), "is_private": bool(is_private),
-        }
-        if not self._queue_profile_lookup(target, consumer):
-            message = "⚠️ تعذر بدء طلب ID. تحقق من اتصال البوت وحاول مجددًا."
-            self.send_private_text(requester, message) if is_private else self.send_room_text(room, message)
-            return True
-        message = f"🔎 أبحث عن ID المستخدم @{target} من الخادم..."
-        self.send_private_text(requester, message) if is_private else self.send_room_text(room, message)
-        return True
-
-    def _profile_refresh_targets(self, kind):
-        rows = []
-        if kind == "vip":
-            for _path, username, _record in _vip_identity_entries(_vip_data()):
-                if _norm_user(username):
-                    rows.append(username)
-        else:
-            for key, item in _points_data().items():
-                if not isinstance(item, dict):
-                    continue
-                username = str(item.get("username") or key or "").strip().lstrip("@")
-                if _norm_user(username):
-                    rows.append(username)
-        groups = defaultdict(list)
-        for name in rows:
-            groups[_norm_user(name)].append(name)
-        unique, ambiguous = [], 0
-        for names in groups.values():
-            if len(names) == 1:
-                unique.append(names[0])
-            else:
-                ambiguous += len(names)
-        return unique, ambiguous, len(rows)
-
-    def _start_user_id_refresh(self, kind, requester, is_private):
-        if not _is_primary_master(requester):
-            self.send_private_text(requester, "🚫 تحديث ملفات IDs مخصص للماستر الأساسي فقط.")
-            return True
-        if not is_private:
-            self.send_private_text(requester, "🚫 أرسل أمر تحديث IDs في خاص البوت فقط.")
-            return True
-        self._profile_lookup_runtime()
-        jobs = self._id_refresh_jobs
-        existing = jobs.get(kind)
-        if isinstance(existing, dict):
-            self.send_private_text(requester, "⏳ يوجد تحديث IDs لهذا الملف قيد التنفيذ بالفعل.")
-            return True
-        targets, ambiguous, total_accounts = self._profile_refresh_targets(kind)
-        job = {
-            "kind": kind, "requester": str(requester or ""),
-            "total_accounts": total_accounts, "request_total": len(targets),
-            "completed": 0, "fetched": 0, "updated": 0,
-            "unchanged": 0, "failed": ambiguous,
-        }
-        jobs[kind] = job
-        label = "VIP" if kind == "vip" else "النقاط"
-        self.send_private_text(
-            requester,
-            f"⏳ بدأت مزامنة IDs لملف {label}. عدد السجلات: {total_accounts}. سأرسل النتيجة عند الاكتمال.",
-        )
-        for username in targets:
-            self._queue_profile_lookup(username, {
-                "kind": "refresh_id", "job_kind": kind,
-            })
-        self._maybe_finish_user_id_refresh(kind)
-        return True
-
-    def _maybe_finish_user_id_refresh(self, kind):
-        job = getattr(self, "_id_refresh_jobs", {}).get(kind)
-        if not isinstance(job, dict) or int(job.get("completed", 0)) < int(job.get("request_total", 0)):
-            return False
-        label = "VIP" if kind == "vip" else "النقاط"
-        message = (
-            f"✅ اكتمل تحديث ملف {label}.\n"
-            f"👤 عدد المستخدمين: {job['total_accounts']}\n"
-            f"🔎 جلبت ID لـ: {job['fetched']} مستخدم\n"
-            f"💾 حدثت ID لـ: {job['updated']} مستخدم\n"
-            f"↔️ كانت IDs محدثة: {job['unchanged']}\n"
-            f"⚠️ تعذر التحقق/التحديث: {job['failed']}"
-        )
-        requester = str(job.get("requester") or BOT_MASTER)
-        getattr(self, "_id_refresh_jobs", {}).pop(kind, None)
-        self.send_private_text(requester, message)
-        return True
-
-    def _handle_profile_lookup_consumer(self, consumer, requested_name, profile_name, user_id, error):
-        kind = str(consumer.get("kind") or "")
-        if kind == "show_id":
-            requester = consumer.get("requester", "")
-            message = (
-                f"🆔 ID المستخدم @{profile_name}: {user_id}"
-                if user_id and not error else
-                f"❌ لم أتمكن من جلب ID لـ@{requested_name} من الخادم ({error or 'رد غير صالح'})."
-            )
-            if consumer.get("is_private"):
-                self.send_private_text(requester, message)
-            else:
-                self.send_room_text(consumer.get("room", ""), message)
-            return
-        if kind == "refresh_id":
-            job_kind = consumer.get("job_kind")
-            job = getattr(self, "_id_refresh_jobs", {}).get(job_kind)
-            if not isinstance(job, dict):
-                return
-            job["completed"] = int(job.get("completed", 0)) + 1
-            if error or not user_id:
-                job["failed"] = int(job.get("failed", 0)) + 1
-            else:
-                job["fetched"] = int(job.get("fetched", 0)) + 1
-                result = (
-                    _update_vip_user_id(profile_name, user_id)
-                    if job_kind == "vip" else _set_points_user_id(profile_name, user_id)
-                )
-                if not result.get("ok"):
-                    job["failed"] = int(job.get("failed", 0)) + 1
-                elif result.get("changed"):
-                    job["updated"] = int(job.get("updated", 0)) + 1
-                else:
-                    job["unchanged"] = int(job.get("unchanged", 0)) + 1
-            self._maybe_finish_user_id_refresh(job_kind)
-            return
-        if kind == "points_transfer_identity":
-            transfer_id = str(consumer.get("transfer_id") or "")
-            state = getattr(self, "_pending_identity_transfers", {}).get(transfer_id)
-            if not isinstance(state, dict) or state.get("completed"):
-                return
-            role = str(consumer.get("role") or "")
-            if error or not user_id:
-                self._finish_identity_checked_transfer(
-                    transfer_id, error=f"تعذر جلب ID لـ@{requested_name} من الخادم."
-                )
-                return
-            state[f"{role}_id"] = user_id
-            if state.get("sender_id") and state.get("target_id"):
-                self._finish_identity_checked_transfer(transfer_id)
-
-    def _start_identity_checked_transfer(self, sender, target, amount):
-        self._profile_lookup_runtime()
-        sender_name = str(sender or "").strip().lstrip("@")
-        target_name = str(target or "").strip().lstrip("@")
-        pending_key = (_norm_user(sender_name), _norm_user(target_name), int(amount))
-        for state in self._pending_identity_transfers.values():
-            if state.get("pending_key") == pending_key:
-                self.send_private_text(sender_name, "⏳ هذا التحويل قيد التحقق بالفعل.")
-                return True
-        transfer_id = secrets.token_hex(12)
-        state = {
-            "sender": sender_name, "target": target_name, "amount": int(amount),
-            "pending_key": pending_key, "completed": False,
-        }
-        self._pending_identity_transfers[transfer_id] = state
-        self.send_private_text(sender_name, "🔎 أتحقق من ID المرسل والمستلم مقابل ملف النقاط قبل التحويل...")
-        for role, username in (("sender", sender_name), ("target", target_name)):
-            self._queue_profile_lookup(username, {
-                "kind": "points_transfer_identity", "transfer_id": transfer_id,
-                "role": role,
-            })
-        return True
-
-    def _finish_identity_checked_transfer(self, transfer_id, error=""):
-        state = getattr(self, "_pending_identity_transfers", {}).get(str(transfer_id))
-        if not isinstance(state, dict) or state.get("completed"):
-            return False
-        state["completed"] = True
-        self._pending_identity_transfers.pop(str(transfer_id), None)
-        sender, target = state["sender"], state["target"]
-        if error:
-            self.send_private_text(sender, f"❌ لم يتم التحويل. {error} لم يتغير أي رصيد.")
-            return True
-        sender_check = _points_identity_status(sender, state.get("sender_id"))
-        target_check = _points_identity_status(target, state.get("target_id"))
-        if not sender_check.get("ok") or not target_check.get("ok"):
-            check = sender_check if not sender_check.get("ok") else target_check
-            label = "حسابك" if check is sender_check else f"حساب @{target}"
-            reason = check.get("error")
-            if reason == "id_missing":
-                detail = f"لا يوجد ID محفوظ في ملف النقاط لـ{label}. اطلب من الماستر تحديث IDs الملف أولًا."
-            elif reason == "id_mismatch":
-                detail = f"ID الخادم لا يطابق ID المحفوظ لـ{label}. لم يتم التحويل."
-            elif reason == "ambiguous_target":
-                detail = f"يوجد أكثر من سجل مطابق لـ{label} في ملف النقاط."
-            elif reason == "ambiguous_user_id":
-                detail = f"ID الخادم مسجل في أكثر من حساب داخل ملف النقاط لـ{label}. اطلب من الماستر إزالة الالتباس أولًا."
-            else:
-                detail = f"الاسم لا يطابق سجل النقاط المحفوظ لـ{label}."
-            self.send_private_text(sender, f"❌ لم يتم التحويل. {detail} لم يتغير أي رصيد.")
-            return True
-        if str(state.get("sender_id")) == str(state.get("target_id")):
-            self.send_private_text(sender, "❌ المرسل والمستلم هما الحساب نفسه حسب ID الخادم. لم يتغير أي رصيد.")
-            return True
-        result = _transfer_points(
-            sender, target, state["amount"], allow_alias_source=False, require_exact_target=True,
-            expected_sender_id=state.get("sender_id"), expected_target_id=state.get("target_id"),
-        )
-        if not result.get("ok"):
-            errors = {
-                "target_not_found": "المستلم غير موجود في ملف النقاط.",
-                "sender_not_found": "حسابك غير موجود في ملف النقاط.",
-                "insufficient": f"رصيدك غير كافٍ؛ رصيدك الحالي {_fmt_points(result.get('sender_balance'))} نقطة.",
-                "same_account": "لا يمكن التحويل إلى الحساب نفسه.",
-                "sender_id_mismatch": "تغير ID حساب المرسل في ملف النقاط أثناء التحقق.",
-                "target_id_mismatch": "تغير ID حساب المستلم في ملف النقاط أثناء التحقق.",
-                "identity_name_mismatch": "تغير الاسم المحفوظ في ملف النقاط أثناء التحقق.",
-                "ambiguous_user_id": "ID أحد الطرفين مكرر في أكثر من حساب.",
-            }
-            self.send_private_text(sender, f"❌ فشل التحويل: {errors.get(result.get('error'), 'تعذر حفظ العملية بأمان.') } لم يتغير أي رصيد.")
-            return True
-        amount = int(state["amount"])
-        recipient = result["recipient"]
-        self.send_private_text(sender, f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{recipient}. رصيدك: {_fmt_points(result['sender_balance'])}")
-        if _norm_user(recipient) != _norm_user(sender):
-            self.send_private_text(recipient, f"💰 استلمت {_fmt_points(amount)} نقطة من @{result['sender']}. رصيدك الحالي: {_fmt_points(result['recipient_balance'])}")
-        return True
-
     def _room_list_commands(self, room, text, sender, is_private):
-        id_text = str(text or "").strip()
-        if id_text.casefold() in {"id", "ايدي", "أيدي"}:
-            return self._start_profile_id_command(room, sender, sender, is_private)
-        id_match = re.fullmatch(r"(?:id|ايدي|أيدي)@(.+)", id_text, re.I)
-        if id_match:
-            return self._start_profile_id_command(room, id_match.group(1), sender, is_private)
-
-        update_id = re.fullmatch(r"(?:حدث|تحديث)\s+(?:ايدي|أيدي|id)", id_text, re.I)
-        if update_id:
-            return self._request_identity_update(room, sender)
-
         match = re.fullmatch(r"l@([amob])", str(text or "").strip(), re.I)
         if match:
             if not room:
@@ -22469,50 +25639,404 @@ class TalkinBot:
         text=str(body or "").strip()
         low=text.casefold()
 
-        if low in VIP_ID_REFRESH_COMMANDS:
-            return self._start_user_id_refresh("vip", sender, is_private)
-        if low in POINTS_ID_REFRESH_COMMANDS:
-            return self._start_user_id_refresh("points", sender, is_private)
-        if low.startswith("ts@"):
-            if not _is_primary_master(sender):
-                self.send_private_text(sender, "🚫 أمر ts مخصص للماستر الأساسي المحدد في BOT_MASTER فقط.")
-                return True
-            if not is_private:
-                if room:
-                    self.send_room_text(room, "🚫 أرسل أمر ts في خاص البوت فقط.")
-                return True
-            match = re.fullmatch(r"ts@([^@]+)@([^@]+)", text, re.I)
-            if not match:
-                self.send_private_text(sender, "❌ الصيغة: ts@اسم المستخدم@عدد النقاط")
+        # Full-control secondary masters. The owner in BOT_MASTER alone may
+        # grant or revoke this role; it is separate from verification masters.
+        match = re.fullmatch(r"vipmas@(.+)", text, re.I)
+        if match:
+            if not is_private or not _is_bot_owner(sender):
+                self.send_private_text(sender, "🔒 إضافة ماستر كامل متاحة للمالك الأساسي في الخاص فقط.")
                 return True
             target = match.group(1).strip().lstrip("@")
-            raw_amount = match.group(2).strip()
-            zero_token = raw_amount.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")).replace(",", "")
-            amount = 0 if zero_token in {"0", "0.0", "0.00"} else _parse_compact_amount(raw_amount)
-            if not target or amount is None or amount < 0:
-                self.send_private_text(sender, "❌ المبلغ غير صالح. استخدم عددًا صحيحًا غير سالب، مثل 0 أو 1000000 أو 10m.")
+            if not target:
+                self.send_private_text(sender, "❌ الصيغة: vipmas@اسم المستخدم")
                 return True
-            result = _set_points_balance(target, amount, actor=sender)
-            if not result.get("ok"):
-                if result.get("error") == "target_not_found":
-                    message = f"❌ لم أجد @{target} في ملف النقاط؛ لم يتغير أي رصيد."
-                elif result.get("error") == "ambiguous_target":
-                    message = f"⚠️ وجدت أكثر من سجل مطابق لـ@{target} في ملف النقاط؛ لم يتغير أي رصيد. استخدم الاسم الكامل لتمييز الحساب."
-                elif result.get("error") == "invalid_amount":
-                    message = "❌ يجب أن يكون عدد النقاط صفرًا أو أكبر."
-                else:
-                    message = "⚠️ تعذر حفظ التسوية بأمان؛ لم يتغير الرصيد. حاول لاحقًا."
-                self.send_private_text(sender, message)
+            if _norm_user(target) in {_norm_user(BOT_MASTER), _norm_user(BOT_ID)}:
+                self.send_private_text(sender, "⚠️ هذا الحساب لا يحتاج إلى إضافة ماستر كامل.")
                 return True
-            if result.get("changed"):
-                message = (
-                    f"✅ تمت تسوية نقاط @{result['username']}.\n"
-                    f"قبل: {int(result['old_balance']):,} نقطة\n"
-                    f"بعد: {int(result['balance']):,} نقطة"
+            rows = _vip_full_master_list()
+            if any(_norm_user(x) == _norm_user(target) for x in rows):
+                self.send_private_text(sender, f"⚠️ @{target} لديه صلاحية الماستر الكامل بالفعل.")
+                return True
+            rows.append(target)
+            _save_local_json(VIP_FULL_MASTERS_FILE, rows)
+            self.send_private_text(sender, f"✅ تم إضافة @{target} كـماستر كامل؛ يستطيع استخدام صلاحيات الماستر الأساسي.")
+            return True
+
+        match = re.fullmatch(r"-vipmas@(.+)", text, re.I)
+        if match:
+            if not is_private or not _is_bot_owner(sender):
+                self.send_private_text(sender, "🔒 سحب الماستر الكامل متاح للمالك الأساسي في الخاص فقط.")
+                return True
+            target = match.group(1).strip().lstrip("@")
+            if not target:
+                self.send_private_text(sender, "❌ الصيغة: -vipmas@اسم المستخدم")
+                return True
+            rows = _vip_full_master_list()
+            remaining = [x for x in rows if _norm_user(x) != _norm_user(target)]
+            if len(remaining) == len(rows):
+                self.send_private_text(sender, f"ℹ️ @{target} لا يملك صلاحية ماستر كامل.")
+                return True
+            _save_local_json(VIP_FULL_MASTERS_FILE, remaining)
+            self.send_private_text(sender, f"✅ تم سحب صلاحية الماستر الكامل من @{target}.")
+            return True
+
+        match = re.fullmatch(r"unvipmas@(.+)", text, re.I)
+        if match:
+            if not is_private or not _is_bot_owner(sender):
+                self.send_private_text(sender, "🔒 سحب الماستر الكامل متاح للمالك الأساسي في الخاص فقط.")
+                return True
+            target = match.group(1).strip().lstrip("@")
+            rows = [x for x in _vip_full_master_list() if _norm_user(x) != _norm_user(target)]
+            _save_local_json(VIP_FULL_MASTERS_FILE, rows)
+            self.send_private_text(sender, f"✅ تم سحب صلاحية الماستر الكامل من @{target}.")
+            return True
+
+        if low == "l@vipmas":
+            if not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 القائمة مخصصة للماستر الكامل.")
+                return True
+            rows = _vip_full_master_list()
+            message = "👑 الماسترات الكاملة\n━━━━━━━━━━━━\n" + ("\n".join(f"• @{x}" for x in rows) if rows else "📭 لا يوجد ماسترات إضافيون.")
+            self.send_private_text(sender, message)
+            return True
+
+        # Managed wager sequence: 3 consecutive wins, then one loss, per
+        # target account. The rule affects only player-vs-player wager results.
+        match = re.fullmatch(r"ربح@(.+)", text, re.I)
+        if match:
+            if not is_private or not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 أمر ربح@ مخصص للماستر الكامل في الخاص فقط.")
+                return True
+            target = match.group(1).strip().lstrip("@")
+            if not target:
+                self.send_private_text(sender, "❌ الصيغة: ربح@اسم المستخدم")
+                return True
+            with _WAGER_ADMIN_RULES_LOCK:
+                rules = _load_local_json(WAGER_ADMIN_RULES_FILE, {})
+                if not isinstance(rules, dict): rules = {}
+                rules[_norm_user(target)] = {"username": target, "enabled": True, "cycle": 0, "wins": 0, "losses": 0, "updated_at": int(time.time())}
+                _save_local_json(WAGER_ADMIN_RULES_FILE, rules)
+            self.send_private_text(sender, f"✅ تم تفعيل نمط الرهانات لـ@{target}: 3 انتصارات ثم خسارة واحدة بالتتابع.")
+            return True
+
+        match = re.fullmatch(r"-ربح@(.+)", text, re.I)
+        if match:
+            if not is_private or not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 أمر -ربح@ مخصص للماستر الكامل في الخاص فقط.")
+                return True
+            target = match.group(1).strip().lstrip("@")
+            if not target:
+                self.send_private_text(sender, "❌ الصيغة: -ربح@اسم المستخدم")
+                return True
+            with _WAGER_ADMIN_RULES_LOCK:
+                rules = _load_local_json(WAGER_ADMIN_RULES_FILE, {})
+                if not isinstance(rules, dict): rules = {}
+                entry = rules.get(_norm_user(target))
+                if isinstance(entry, dict):
+                    entry["enabled"] = False
+                    entry["updated_at"] = int(time.time())
+                _save_local_json(WAGER_ADMIN_RULES_FILE, rules)
+            self.send_private_text(sender, f"✅ تم إلغاء نمط الربح عن @{target}.")
+            return True
+
+        match = re.fullmatch(r"سحب ربح@(.+)", text, re.I)
+        if match:
+            if not is_private or not _is_primary_master(sender):
+                self.send_private_text(sender, "🔒 أمر سحب ربح@ مخصص للماستر الكامل في الخاص فقط.")
+                return True
+            target = match.group(1).strip().lstrip("@")
+            with _WAGER_ADMIN_RULES_LOCK:
+                rules = _load_local_json(WAGER_ADMIN_RULES_FILE, {})
+                if not isinstance(rules, dict): rules = {}
+                entry = rules.get(_norm_user(target))
+                if isinstance(entry, dict): entry["enabled"] = False; entry["updated_at"] = int(time.time())
+                _save_local_json(WAGER_ADMIN_RULES_FILE, rules)
+            self.send_private_text(sender, f"✅ تم إيقاف نمط الرهانات عن @{target}.")
+            return True
+
+        delete_text_commands = {
+            "حذف ترحيب نص", "حذف الترحيب نص", "حذف ترحيب النص", "حذف الترحيب النص",
+            "حذف ترحيب نصي", "حذف الترحيب نصي", "حذف الترحيب النصي",
+            "delete welcome text", "remove welcome text",
+        }
+        delete_image_commands = {
+            "حذف ترحيب صورة", "حذف الترحيب صورة", "حذف ترحيب الصورة", "حذف الترحيب الصورة",
+            "حذف ترحيب صوره", "حذف الترحيب صوره", "حذف ترحيب الصوره", "حذف الترحيب الصوره",
+            "delete welcome image", "remove welcome image",
+        }
+        delete_all_commands = {
+            "حذف ترحيب", "حذف الترحيب", "إلغاء الترحيب", "الغاء الترحيب",
+            "delete welcome", "remove welcome",
+        }
+        cancel_welcome_purchase_commands = {
+            "إلغاء شراء الترحيب", "الغاء شراء الترحيب",
+            "إلغاء شراء الترحيب المخصص", "الغاء شراء الترحيب المخصص",
+            "cancel welcome purchase",
+        }
+        delete_scope = (
+            "text" if low in delete_text_commands else
+            "image" if low in delete_image_commands else
+            "all" if low in delete_all_commands else
+            "purchase" if low in cancel_welcome_purchase_commands else None
+        )
+        if delete_scope:
+            key = _norm_user(sender)
+            welcomes = getattr(self, "custom_welcomes", None)
+            if not isinstance(welcomes, dict):
+                welcomes = self.custom_welcomes = {}
+            pending_text = getattr(self, "custom_welcome_text_pending", None)
+            pending_image = getattr(self, "custom_welcome_image_pending", None)
+            if not isinstance(pending_text, dict):
+                pending_text = self.custom_welcome_text_pending = {}
+            if not isinstance(pending_image, dict):
+                pending_image = self.custom_welcome_image_pending = {}
+
+            if delete_scope == "purchase":
+                removed_unlocks = member_shop.remove_welcome_unlocks(
+                    sender,
+                    user_id=_stored_user_id(sender, room),
+                    aliases=_stored_user_aliases(sender, room),
+                )
+                removed_pending = pending_text.pop(key, None) is not None
+                removed_pending = pending_image.pop(key, None) is not None or removed_pending
+                entry = welcomes.pop(key, None)
+                removed_content = bool(
+                    isinstance(entry, dict) and (entry.get("message") or entry.get("image_url"))
+                )
+                self._save_social_features()
+                removed = bool(removed_unlocks or removed_pending or removed_content)
+                reply = (
+                    "✅ أُلغي شراء ميزات الترحيب وحُذفت إعداداتها المحفوظة."
+                    if removed else
+                    "ℹ️ لا توجد ميزة ترحيب مشتراة أو إعدادات محفوظة لهذا الحساب."
                 )
             else:
-                message = f"ℹ️ رصيد @{result['username']} هو بالفعل {_fmt_points(result['balance'])} نقطة؛ لم يتغير."
-            self.send_private_text(sender, message)
+                removed = False
+                if delete_scope in {"all", "text"}:
+                    removed = pending_text.pop(key, None) is not None or removed
+                if delete_scope in {"all", "image"}:
+                    removed = pending_image.pop(key, None) is not None or removed
+                entry = welcomes.get(key)
+                if isinstance(entry, dict):
+                    if delete_scope in {"all", "text"}:
+                        removed = bool(entry.pop("message", None)) or removed
+                    if delete_scope in {"all", "image"}:
+                        removed = bool(entry.pop("image_url", None)) or removed
+                    if not entry.get("message") and not entry.get("image_url"):
+                        welcomes.pop(key, None)
+                elif entry is not None and delete_scope in {"all", "text"}:
+                    welcomes.pop(key, None)
+                    removed = True
+                self._save_social_features()
+                if delete_scope == "text":
+                    reply = "✅ حُذف ترحيبك النصي." if removed else "ℹ️ لا يوجد ترحيب نصي محفوظ أو قيد الإعداد."
+                elif delete_scope == "image":
+                    reply = "✅ حُذفت صورة ترحيبك." if removed else "ℹ️ لا توجد صورة ترحيب محفوظة أو قيد الإعداد."
+                else:
+                    reply = (
+                        "✅ حُذف الترحيب النصي والصوري المحفوظ. ما زالت ميزات المتجر مفعّلة."
+                        if removed else "ℹ️ لا يوجد ترحيب محفوظ أو إعداد قيد الانتظار."
+                    )
+            self.send_private_text(sender, reply)
+            return True
+
+        enable_name_aliases = {
+            "تشغيل الاسما", "تشغيل الاسماء", "تشغيل الأسماء", "تشغيل الاسم",
+            "تشغيل الأسماء المعدلة", "تشغيل الاسماء المعدله",
+        }
+        disable_name_aliases = {
+            "ايقاف الاسما", "إيقاف الاسما", "ايقاف الاسماء", "إيقاف الأسماء",
+            "ايقاف الاسم", "إيقاف الاسماء المعدلة", "إيقاف الأسماء المعدلة",
+        }
+        if low in enable_name_aliases | disable_name_aliases:
+            if not _is_primary_master(sender):
+                reply = "🔒 تشغيل وإيقاف الأسماء المعدلة مخصص للماستر الأساسي فقط."
+            else:
+                enabled = low in enable_name_aliases
+                _set_image_name_corrections_enabled(enabled)
+                reply = (
+                    "✅ تم تشغيل استخدام الأسماء المعدلة المحفوظة في ملف التصحيحات."
+                    if enabled else
+                    "⏸️ تم إيقاف استخدام الأسماء المعدلة. ستظهر الأسماء كما تصل من الشات، ولم تُحذف التصحيحات المحفوظة."
+                )
+            if sender:
+                if room and not is_private:
+                    self.send_room_text(room, reply)
+                else:
+                    self.send_private_text(sender, reply)
+            return True
+
+        name_image_commands = {
+            "فحص اسم": "preview",
+            "اصلاح اسم": "repair", "إصلاح اسم": "repair",
+            "تعديل اسم": "edit", "تعديل الاسم": "edit",
+            "حذف تصحيح اسم": "delete", "حذف تصحيح الاسم": "delete",
+            "حذف اسم": "delete", "حذفاسم": "delete",
+            "حذف تصحييح اسم": "delete", "حذف تصحييح الاسم": "delete",
+        }
+        name_image_mode = name_image_commands.get(low)
+        if name_image_mode:
+            if not _is_primary_master(sender):
+                message = "🔒 هذا الأمر مخصص للماستر المحدد في BOT_MASTER، ويمكن استخدامه من الخاص أو داخل الغرفة."
+                if sender:
+                    self.send_room_text(room, message) if room and not is_private else self.send_private_text(sender, message)
+                return True
+            requests_by_master = getattr(self, "_master_name_image_requests", None)
+            if not isinstance(requests_by_master, dict):
+                requests_by_master = self._master_name_image_requests = {}
+            requests_by_master[_norm_user(sender)] = {
+                "mode": name_image_mode, "created_at": time.time(),
+                "is_private": bool(is_private), "room": str(room or ""),
+            }
+            prompt = (
+                "أرسل اسم المستخدم الحقيقي المراد تعديلُه كما يظهر في المحادثة (من دون @). "
+                "بعد ذلك سأطلب منك نص التعديل اليدوي، وعند «اعتماد الاسم» سأضيف التصحيح أو أحدّث تصحيح هذا المستخدم فقط."
+                if name_image_mode == "edit" else
+                "أرسل اسم المستخدم الذي تريد حذف تصحيحه (من دون @). سيعود للظهور كما يصل من المحادثة."
+                if name_image_mode == "delete" else
+                "أرسل اسم المستخدم الأساسي كما يظهر في المحادثة (من دون @). "
+                "بعد ذلك سأطلب منك تعديل الاسم، ثم أرسل المعاينة ولا يُحفظ التعديل إلا بعد إرسال «اعتماد الاسم»."
+                if name_image_mode == "repair" else
+                "أرسل الاسم الذي تريد فحص كتابته في صورة (من دون @)."
+            )
+            self.send_room_text(room, prompt) if room and not is_private else self.send_private_text(sender, prompt)
+            return True
+
+        name_requests = getattr(self, "_master_name_image_requests", {})
+        pending_name = name_requests.get(_norm_user(sender)) if isinstance(name_requests, dict) else None
+        if isinstance(pending_name, dict) and _is_primary_master(sender):
+            request_private = bool(pending_name.get("is_private", True))
+            request_room = str(pending_name.get("room") or room or "")
+            def _name_text(message):
+                if request_private:
+                    self.send_private_text(sender, message)
+                elif request_room:
+                    self.send_room_text(request_room, message)
+            def _name_media(url):
+                if request_private:
+                    return self.send_private_media(sender, url, "image")
+                return self.send_room_media(request_room, url, "image") if request_room else False
+            if time.time() - float(pending_name.get("created_at") or 0) > 180:
+                name_requests.pop(_norm_user(sender), None)
+                _name_text("⌛ انتهت مهلة طلب الاسم. أرسل «اصلاح اسم» أو «فحص اسم» للبدء مجددًا.")
+                return True
+            if low in {"إلغاء", "الغاء", "cancel"}:
+                name_requests.pop(_norm_user(sender), None)
+                _name_text("تم إلغاء طلب فحص الاسم.")
+                return True
+            if pending_name.get("mode") == "awaiting_method":
+                manual_match = re.fullmatch(r"(?:تعديل الاسم|النص الصحيح)\s*[:：]\s*(.+)", text, re.S)
+                if manual_match:
+                    candidate_name = manual_match.group(1).strip()
+                else:
+                    # Accept the corrected spelling as a plain next message
+                    # too.  The old flow required a prefix and consequently
+                    # rejected a perfectly valid new name that differed from
+                    # the original source name.
+                    candidate_name = _clean_name_for_image(text).strip()
+                if not candidate_name or len(candidate_name) > 256:
+                    _name_text(
+                        "أرسل الاسم الجديد مباشرة، أو بصيغة:\n"
+                        "«تعديل الاسم: النص الصحيح»\n"
+                        "بعد المعاينة أرسل «اعتماد الاسم» للحفظ."
+                    )
+                    return True
+                pending_name["mode"] = "repair_ready"
+                pending_name["created_at"] = time.time()
+                text = candidate_name
+            if pending_name.get("mode") == "delete":
+                username = _clean_name_for_image(text).strip()
+                if not username or len(username) > 256:
+                    _name_text("❌ أرسل اسم المستخدم من 1 إلى 256 حرفًا، أو اكتب إلغاء.")
+                    return True
+                deleted = _delete_image_name_correction(username)
+                name_requests.pop(_norm_user(sender), None)
+                _name_text(
+                    "✅ تم حذف تصحيح الاسم، وسيظهر المستخدم كما في المحادثة."
+                    if deleted else "ℹ️ لا يوجد تصحيح محفوظ لهذا المستخدم، وسيظهر كما في المحادثة."
+                )
+                return True
+            if pending_name.get("mode") == "awaiting_approval":
+                if low in {
+                    "اعتماد الاسم", "اعتمد الاسم", "اعتماد التعديل", "اعتمد التعديل",
+                    "اعتماد التصحيح", "اعتمد التصحيح", "اعتماد", "نعم", "yes",
+                }:
+                    try:
+                        _save_image_name_correction(
+                            pending_name.get("source_name", ""),
+                            pending_name.get("candidate_name", ""),
+                        )
+                        name_requests.pop(_norm_user(sender), None)
+                        _name_text("✅ تم اعتماد تصحيح الاسم وحفظه. سيظهر بالصيغة المعتمدة في بطاقات الصور والترحيب القادمة.")
+                    except Exception as exc:
+                        _name_text(f"❌ تعذر حفظ تصحيح الاسم: {exc}")
+                    return True
+                edit_match = re.fullmatch(r"(?:تعديل الاسم|النص الصحيح)\s*[:：]\s*(.+)", text, re.S)
+                if edit_match:
+                    candidate_name = _clean_name_for_image(edit_match.group(1)).strip()
+                    if not candidate_name or len(candidate_name) > 256:
+                        _name_text("❌ أرسل الاسم المصحح من 1 إلى 256 حرفًا.")
+                        return True
+                    try:
+                        card = render_name_preview_card(candidate_name, corrected=True)
+                        base = _public_base_url()
+                        if not base:
+                            raise RuntimeError("رابط الوسائط العامة غير مضبوط")
+                        url = f"{base}/welcomes/{card.name}"
+                        self._verify_public_media_url(url, "image")
+                        if _name_media(url) is False:
+                            raise RuntimeError("تعذر إرسال صورة المعاينة")
+                        pending_name["candidate_name"] = candidate_name
+                        pending_name["created_at"] = time.time()
+                        _name_text("أرسلت معاينة النص البديل. إذا كانت صحيحة أرسل «اعتماد الاسم»، أو أرسل تعديلًا آخر، أو «إلغاء».")
+                    except Exception as exc:
+                        _name_text(f"❌ تعذر إنشاء معاينة الاسم: {exc}")
+                    return True
+                _name_text("بعد المعاينة أرسل «اعتماد الاسم»، أو «تعديل الاسم: النص الصحيح»، أو «إلغاء».")
+                return True
+            display_name = _clean_name_for_image(text).strip()
+            if not display_name or len(display_name) > 256:
+                _name_text("❌ أرسل اسمًا من 1 إلى 256 حرفًا، أو اكتب إلغاء.")
+                return True
+            mode = str(pending_name.get("mode") or "preview")
+            if mode in {"repair", "edit"}:
+                pending_name.update(
+                    mode="awaiting_method", source_name=display_name,
+                    candidate_name=display_name, created_at=time.time(),
+                )
+                _name_text(
+                    "✅ تم استلام اسم المستخدم الأساسي. أرسل الاسم الجديد مباشرة، أو بصيغة:\n"
+                    "«تعديل الاسم: النص الصحيح»\n"
+                    "بعد المعاينة أرسل «اعتماد الاسم» للحفظ."
+                )
+                return True
+            name_requests.pop(_norm_user(sender), None)
+            try:
+                card = render_name_preview_card(display_name, corrected=(mode in {"repair", "repair_ready"}))
+                base = _public_base_url()
+                if not base:
+                    raise RuntimeError("رابط الوسائط العامة غير مضبوط")
+                url = f"{base}/welcomes/{card.name}"
+                self._verify_public_media_url(url, "image")
+                if _name_media(url) is False:
+                    raise RuntimeError("تعذر إرسال صورة المعاينة")
+                if mode in {"repair", "repair_ready"}:
+                    name_requests[_norm_user(sender)] = {
+                        "mode": "awaiting_approval",
+                        # Keep the original chat username as the lookup key;
+                        # the candidate may intentionally be completely
+                        # different from it.
+                        "source_name": pending_name.get("source_name") or display_name,
+                        "candidate_name": display_name,
+                        "created_at": time.time(),
+                        "is_private": request_private, "room": request_room,
+                    }
+                _name_text(
+                    "✅ أرسلت المعاينة. أرسل «اعتماد الاسم» لحفظها واستخدامها في الصور القادمة، أو «تعديل الاسم: النص الصحيح» لإنشاء بديل، أو «إلغاء»."
+                    if mode == "repair" else "✅ أرسلت صورة فحص الاسم.",
+                )
+            except Exception as exc:
+                _name_text(f"❌ تعذر إنشاء صورة الاسم: {exc}")
             return True
 
         if low in {"فحص زرع", "فحص الزرع", "farm check", "check farm"}:
@@ -22550,12 +26074,12 @@ class TalkinBot:
                 self.custom_welcome_enabled = True
                 self._save_social_features()
                 pending_text.pop(pending_key, None)
-                self.send_private_text(sender, "✅ تم حفظ نص الترحيب المخصص.")
+                self.send_private_text(sender, "✅ تم حفظ نص الترحيب المخصص. للحذف: حذف ترحيب النص، أو حذف ترحيب لحذف النص والصورة.")
                 return True
 
         result_toggle = re.fullmatch(r"sf@(on|off)", text, re.I)
         if result_toggle:
-            disable_results = result_toggle.group(1).casefold() == "on"
+            enable_results = result_toggle.group(1).casefold() == "on"
             role, role_known = _room_role(self, room, sender)
             role_key = re.sub(r"[\s_-]+", "", role.casefold())
             owner_role = role_known and role_key in {"owner", "creator", "roomowner", "roomcreator", "host", "مالك", "صانع", "صانعي", "صانعالغرفة", "صانعالغرفه"}
@@ -22570,19 +26094,19 @@ class TalkinBot:
                 return True
             data = _game_control_data()
             disabled = [str(value).strip() for value in data.get("results_disabled_rooms", []) if str(value).strip()]
-            if disable_results:
-                if all(_norm_room(value) != _norm_room(room) for value in disabled):
-                    disabled.append(str(room).strip())
-            else:
+            if enable_results:
                 disabled = [value for value in disabled if _norm_room(value) != _norm_room(room)]
+            elif all(_norm_room(value) != _norm_room(room) for value in disabled):
+                disabled.append(str(room).strip())
             data["results_disabled_rooms"] = disabled
             # Clear the legacy global switch; result controls are room-scoped.
             data["all_room_results_enabled"] = True
             _save_game_control(data)
-            if disable_results:
-                response = "⛔ أُوقفت إعلانات وصور نتائج الألعاب في هذه الغرفة فقط."
-            else:
-                response = "✅ أُعيدت إعلانات وصور نتائج الألعاب في هذه الغرفة فقط."
+            response = (
+                "✅ تم تشغيل صور نتائج الألعاب في هذه الغرفة فقط."
+                if enable_results else
+                "⛔ تم إيقاف صور نتائج الألعاب في هذه الغرفة فقط."
+            )
             self.send_room_text(room, response)
             return True
 
@@ -22772,7 +26296,7 @@ class TalkinBot:
             return True
 
         # Master-only room broadcast: رسالهغرف@النص / رسالةغرف@النص.
-        m_room_broadcast = re.fullmatch(r"(?:رسالهغرف|رسالةغرف|رساله\s+غرفه|رسالة\s+غرفه)@(.+)", text, re.I | re.S)
+        m_room_broadcast = re.fullmatch(r"(?:رسالهغرف|رسالةغرف|رساله\s+غرفه|رسالة\s+غرفه|room\s+message)@(.+)", text, re.I | re.S)
         if m_room_broadcast:
             if not _is_primary_master(sender):
                 self.send_private_text(sender, "🔒 هذا الأمر مخصص للماستر الأساسي فقط.")
@@ -22781,8 +26305,15 @@ class TalkinBot:
             if not message_text:
                 self.send_private_text(sender, "❌ الصيغة: رساله غرفه@نص الرسالة")
                 return True
-            count=self.broadcast_all_rooms(message_text)
-            self.send_private_text(sender, f"📣 تم إرسال الرسالة إلى {count} غرفة.")
+            english = text.casefold().startswith("room message@")
+            if self._queue_room_broadcast(message_text, sender):
+                ack = ("⏳ Your request is being handled in the background; a delivery report will follow."
+                       if english else "⏳ جاري تلبية طلبك... سيتم إبلاغك بعد انتهاء الإرسال إلى كل الغرف.")
+                self.send_private_text(sender, ack)
+            else:
+                busy = ("⏳ The room broadcast queue is full; please retry shortly."
+                        if english else "⏳ طابور بث الغرف ممتلئ حاليًا؛ أعد الأمر بعد قليل.")
+                self.send_private_text(sender, busy)
             return True
 
         # Ordinary-user private message: رساله@اسم_المستخدم نص الرسالة
@@ -22817,36 +26348,13 @@ class TalkinBot:
             if not recipients:
                 self.send_private_text(sender, "⚠️ لم أجد مستخدمين معروفين لإرسال الرسالة لهم.")
                 return True
-            self.send_private_text(sender, f"📣 بدأ إرسال الرسالة الخاصة إلى {len(recipients)} مستخدم.\n⏳ الإرسال جارٍ في الخلفية...")
-
-            def _broadcast_worker(targets, payload, requester):
-                delay = max(0.05, float(os.getenv("PRIVATE_BROADCAST_DELAY", "0.15")))
-                sent = 0
-                failed = 0
-                total = len(targets)
-                for username in targets:
-                    try:
-                        if self.send_private_text(username, payload):
-                            sent += 1
-                        else:
-                            failed += 1
-                    except Exception as exc:
-                        failed += 1
-                        self.log("[BROADCAST] failed", username, repr(exc))
-                    if delay:
-                        time.sleep(delay)
+            if self._queue_private_broadcast(recipients, message_text, sender):
                 self.send_private_text(
-                    requester,
-                    f"📣 اكتمل البث الخاص.\n👥 المستهدفون: {total}\n✅ تم الإرسال: {sent}\n❌ تعذر الإرسال: {failed}"
+                    sender,
+                    "⏳ جاري تلبية طلبك... سيتم إبلاغك بعد انتهاء إرسال الرسالة الخاصة."
                 )
-                self.log(f"[BROADCAST] completed total={total} sent={sent} failed={failed}")
-
-            threading.Thread(
-                target=_broadcast_worker,
-                args=(recipients, message_text, sender),
-                daemon=True,
-                name="private-broadcast",
-            ).start()
+            else:
+                self.send_private_text(sender, "⏳ يوجد بث خاص قيد التنفيذ؛ أعد المحاولة بعد قليل.")
             return True
 
         # The protection menu and all of its numbered settings are private and
@@ -23260,16 +26768,36 @@ class TalkinBot:
             (self.send_private_text if is_private else self.send_room_text)(sender if is_private else room, message)
             return True
         balance_top_aliases = {
-            "ملياري": (1_000_000_000, "المليار"),
-            "مليارات": (1_000_000_000, "المليار"),
-            "مليوني": (1_000_000, "المليون"),
-            "ملايين": (1_000_000, "المليون"),
+            "ملياري": "billion", "مليارات": "billion", "مليارت": "billion",
+            "مليوني": "million", "ملايين": "million",
         }
         if low in balance_top_aliases:
-            threshold, label = balance_top_aliases[low]
             english = _detect_text_language(text) == "en"
-            message = _points_threshold_top_message(threshold, label, english=english)
+            message = _money_game_top_text(balance_top_aliases[low], english=english)
             if is_private:
+                reserve = "\n📄 القائمة 999/999\n\n📌 اكتب ns للقائمة التالية."
+                def _fits(value):
+                    return len(encode_query("chat_message", type_="text", to=str(sender), body=value + reserve)) <= min(_ws_payload_limit(), SAFE_COMMAND_REPLY_BYTES)
+                raw_pages, current = [], []
+                for line in message.splitlines():
+                    candidate = "\n".join(current + [line])
+                    if current and not _fits(candidate):
+                        raw_pages.append("\n".join(current)); current = [line]
+                    else:
+                        current.append(line)
+                if current:
+                    raw_pages.append("\n".join(current))
+                pages = [f"{page}\n📄 القائمة {i}/{len(raw_pages)}" for i, page in enumerate(raw_pages, 1)]
+                result_key = ("chat_message", "", str(sender))
+                result_pages = getattr(self, "_result_pages", {})
+                if len(pages) > 1:
+                    result_pages[result_key] = {"pages": pages, "part": 1, "kwargs": {"to": str(sender)}, "language": "ar"}
+                    self._result_pages = result_pages
+                    message = pages[0] + "\n\n📌 اكتب ns للقائمة التالية."
+                else:
+                    result_pages.pop(result_key, None)
+                    self._result_pages = result_pages
+                    message = pages[0] + "\n\n✅ انتهت القوائم."
                 self.send_private_text(sender, message)
             else:
                 self.send_room_text(room, message)
@@ -23615,6 +27143,21 @@ class TalkinBot:
                 if is_private: self.send_private_text(sender, msg)
                 elif room: self.send_room_text(room, msg)
                 return True
+            # Persist explicit manual join targets immediately. The actual
+            # room_join packets still run on the serial background worker, so
+            # saving here prevents a newly requested room from being lost
+            # across a reconnect while its server acknowledgement is pending.
+            saved_rooms = _persistent_rooms()
+            saved_keys = {_norm_room(value).casefold() for value in saved_rooms}
+            for target in rooms:
+                key = _norm_room(target).casefold()
+                if key and key not in saved_keys:
+                    saved_rooms.append(target)
+                    saved_keys.add(key)
+            _save_persistent_rooms(saved_rooms)
+            if not isinstance(getattr(self, "known_rooms", None), set):
+                self.known_rooms = set()
+            self.known_rooms.update(rooms)
             for target in rooms:
                 blocked = _norm_room(target) in getattr(self, "blocked_rooms", set())
                 if blocked:
@@ -23644,16 +27187,49 @@ class TalkinBot:
                 self.send_private_text(sender, confirm_msg)
                 
             return True
-        m_master_transfer = re.fullmatch(r"msb@([^@]+)@(\d+)", text, re.I)
-        if m_master_transfer and is_private and _is_primary_master(sender):
-            target, amount = m_master_transfer.group(1).strip().lstrip("@"), int(m_master_transfer.group(2))
-            if not target or amount <= 0:
-                self.send_private_text(sender, "❌ الصيغة: msb@اسم المستخدم@عدد النقاط")
+        if text.casefold().startswith("ts@"):
+            if not _is_primary_master(sender):
+                self.send_private_text(
+                    sender,
+                    "🚫 أمر ts مخصص للماستر الأساسي المحدد في BOT_MASTER فقط.",
+                )
                 return True
-            new = _add_points(target, amount)
-            self.send_private_text(sender, f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{target} من رصيد الماستر.\n💳 رصيد المستلم: {_fmt_points(new)}")
-            if _norm_user(target) != _norm_user(sender):
-                self.send_private_text(target, f"💰 إشعار تحويل: استلمت {_fmt_points(amount)} نقطة من الماستر. رصيدك الحالي: {_fmt_points(new)}")
+            if not is_private:
+                if room:
+                    self.send_room_text(room, "🚫 أرسل أمر ts في خاص البوت فقط.")
+                return True
+            match = re.fullmatch(r"ts@([^@]+)@([^@]+)", text, re.I)
+            if not match:
+                self.send_private_text(sender, "❌ الصيغة: ts@اسم المستخدم@عدد النقاط")
+                return True
+            target = match.group(1).strip().lstrip("@")
+            raw_amount = match.group(2).strip()
+            zero_token = raw_amount.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")).replace(",", "")
+            amount = 0 if zero_token in {"0", "0.0", "0.00"} else _parse_compact_amount(raw_amount)
+            if not target or amount is None or amount < 0:
+                self.send_private_text(sender, "❌ المبلغ غير صالح. استخدم عددًا صحيحًا غير سالب، مثل 0 أو 1000000 أو 10m.")
+                return True
+            result = _set_points_balance(target, amount, actor=sender)
+            if not result.get("ok"):
+                if result.get("error") == "target_not_found":
+                    message = f"❌ لم أجد @{target} في ملف النقاط؛ لم يتغير أي رصيد."
+                elif result.get("error") == "ambiguous_target":
+                    message = f"⚠️ وجدت أكثر من سجل مطابق لـ@{target} في ملف النقاط؛ لم يتغير أي رصيد. استخدم الاسم الكامل لتمييز الحساب."
+                elif result.get("error") == "invalid_amount":
+                    message = "❌ يجب أن يكون عدد النقاط صفرًا أو أكبر."
+                else:
+                    message = "⚠️ تعذر حفظ التسوية بأمان؛ لم يتغير الرصيد. حاول لاحقًا."
+                self.send_private_text(sender, message)
+                return True
+            if result.get("changed"):
+                message = (
+                    f"✅ تمت تسوية نقاط @{result['username']}.\n"
+                    f"قبل: {int(result['old_balance']):,} نقطة\n"
+                    f"بعد: {int(result['balance']):,} نقطة"
+                )
+            else:
+                message = f"ℹ️ رصيد @{result['username']} هو بالفعل {_fmt_points(result['balance'])} نقطة؛ لم يتغير."
+            self.send_private_text(sender, message)
             return True
 
         if text.casefold().startswith("-sb@"):
@@ -23668,11 +27244,15 @@ class TalkinBot:
                 if room:
                     self.send_room_text(room, "🚫 أرسل أمر -sb في خاص البوت فقط.")
                 return True
-            match = re.fullmatch(r"-sb@([^@]+)@(\d+)", text, re.I)
+            match = re.fullmatch(r"-sb@([^@]+)@([^@]+)", text, re.I)
             if not match:
                 self.send_private_text(sender, "❌ الصيغة: -sb@اسم المستخدم@عدد النقاط")
                 return True
-            target, amount = match.group(1).strip().lstrip("@"), int(match.group(2))
+            target = match.group(1).strip().lstrip("@")
+            amount = _parse_compact_amount(match.group(2))
+            if amount is None or amount <= 0:
+                self.send_private_text(sender, "❌ مبلغ غير صالح. استخدم رقمًا مثل 1000000 أو 10m10b.")
+                return True
             result = _deduct_points(target, amount, actor=sender)
             english = _detect_text_language(text) == "en"
             if not result.get("ok"):
@@ -23698,13 +27278,44 @@ class TalkinBot:
             self.send_private_text(sender, message)
             return True
 
-        m_transfer = re.fullmatch(r"sb@([^@]+)@(\d+)", text, re.I)
+        m_transfer = re.fullmatch(r"sb@([^@]+)@([^@]+)", text, re.I)
         if m_transfer and _is_verified_user(sender):
-            target, amount = m_transfer.group(1).strip().lstrip("@"), int(m_transfer.group(2))
-            if not target or amount <= 0:
-                self.send_private_text(sender, "❌ الصيغة: sb@اسم المستخدم@عدد النقاط")
+            target = m_transfer.group(1).strip().lstrip("@")
+            amount = _parse_compact_amount(m_transfer.group(2))
+            if not target or amount is None or amount <= 0:
+                self.send_private_text(sender, "❌ الصيغة: sb@اسم المستخدم@عدد النقاط مثل 10m10b")
                 return True
-            return self._start_identity_checked_transfer(sender, target, amount)
+            result = _transfer_points(sender, target, amount)
+            if not result.get("ok"):
+                error = result.get("error")
+                if error in {"target_not_found", "sender_not_found"}:
+                    message = "❌ فشل التحويل: اكتب اسم المستخدم الصحيح كما هو محفوظ في ملف النقاط. لم يتم خصم أي نقاط."
+                elif error == "insufficient":
+                    message = f"❌ رصيدك غير كافٍ. رصيدك الحالي: {_fmt_points(result.get('sender_balance'))} نقطة. لم يتم خصم شيء."
+                elif error == "same_account":
+                    message = "❌ لا يمكن تحويل النقاط إلى الحساب نفسه. لم يتم خصم أي نقاط."
+                else:
+                    message = "⚠️ تعذر حفظ التحويل بأمان؛ لم يتم تأكيده. أعد المحاولة لاحقاً."
+                if _detect_text_language(text) == "en":
+                    message = {
+                        "target_not_found": "❌ Transfer failed: enter the exact username saved in the points file. No points were deducted.",
+                        "sender_not_found": "❌ Transfer failed: your points account was not found. No points were deducted.",
+                        "insufficient": f"❌ Insufficient balance: {_fmt_points(result.get('sender_balance'))} points. Nothing was deducted.",
+                        "same_account": "❌ You cannot transfer points to the same account. No points were deducted.",
+                        "persistence_failed": "⚠️ The transfer could not be safely saved; it was not confirmed. Please retry later.",
+                    }.get(error, message)
+                self.send_private_text(sender, message)
+                return True
+            recipient = result["recipient"]
+            sender_reply = f"✅ تم تحويل {_fmt_points(amount)} نقطة إلى @{recipient}. رصيدك: {_fmt_points(result['sender_balance'])}"
+            recipient_reply = f"💰 استلمت {_fmt_points(amount)} نقطة من @{result['sender']}. رصيدك الحالي: {_fmt_points(result['recipient_balance'])}"
+            if _detect_text_language(text) == "en":
+                sender_reply = f"✅ Transferred {_fmt_points(amount)} points to @{recipient}. Your balance: {_fmt_points(result['sender_balance'])}"
+                recipient_reply = f"💰 You received {_fmt_points(amount)} points from @{result['sender']}. Balance: {_fmt_points(result['recipient_balance'])}"
+            self.send_private_text(sender, sender_reply)
+            if _norm_user(recipient) != _norm_user(sender):
+                self.send_private_text(recipient, recipient_reply)
+            return True
 
         # VIP users may publish images; the actual image is handled by _handle_publish_media.
         if _is_publish_command(text) and _is_vip_user(sender):
@@ -23734,6 +27345,7 @@ class TalkinBot:
         public_welcome_command = bool(
             re.fullmatch(r"(?:ترحيب|welcome)@.+", shop_command_text, re.I | re.S)
             or shop_command_text.casefold() in {"ترحيب_صورة", "welcome_image"}
+            or shop_command_text.casefold() in {"حذف الترحيب", "حذف ترحيب", "إلغاء الترحيب", "الغاء الترحيب", "إلغاء شراء الترحيب", "الغاء شراء الترحيب", "delete welcome", "remove welcome"}
         )
         pending_welcome_text = _norm_user(sender) in getattr(self, "custom_welcome_text_pending", {})
         verified_shop_action = _is_verified_user(sender) and (public_shop_command or public_welcome_command or pending_welcome_text)
@@ -23980,6 +27592,8 @@ class TalkinBot:
             # requested the verification.
             self.send_private_text(target, f"✅ تم توثيق حسابك @{target} بنجاح.\n🎉 يمكنك الآن استخدام أوامر البوت.")
             self.send_private_text(sender, f"✅ تم توثيق @{target}.")
+            if room:
+                self.send_room_text(room, f"✅ تم توثيق @{target} بنجاح.")
             return True
         if low.startswith("ازالة توثيق@") or low.startswith("إزالة توثيق@") or low.startswith("سحب التوثيق@") or low.startswith("uns@"): 
             if not _is_verification_manager(sender):
@@ -24197,6 +27811,17 @@ class TalkinBot:
                 self.connected_rooms = {r for r in self.connected_rooms if _norm_room(r) != blocked_key}
                 self._save_blocked_rooms()
                 _save_persistent_rooms(self.known_rooms)
+            # A manual دخول@ request is also an explicit save request. Store
+            # the room before asking for language so it survives reconnects
+            # even when the server ACK arrives asynchronously.
+            saved_rooms = _persistent_rooms()
+            saved_keys = {_norm_room(value).casefold() for value in saved_rooms}
+            if _norm_room(target).casefold() not in saved_keys:
+                saved_rooms.append(target)
+                _save_persistent_rooms(saved_rooms)
+            if not isinstance(getattr(self, "known_rooms", None), set):
+                self.known_rooms = set()
+            self.known_rooms.add(target)
             # Ask for the language before sending room_join. The previous
             # room-command path joined first and showed the prompt afterward.
             self._begin_join_rooms_language(
@@ -24367,8 +27992,8 @@ class TalkinBot:
             if not _is_master_name(sender):
                 self.send_private_text(sender, "🔒 إضافة ردود المغادرة مخصصة للماستر.")
                 return True
-            trigger, reply = _auto_reply_key(m_ds.group(1)), m_ds.group(2).strip()
-            if len(trigger) != 1 or not reply:
+            trigger, reply = _departure_trigger_key(m_ds.group(1)), m_ds.group(2).strip()
+            if not trigger or not reply:
                 self.send_private_text(sender, "❌ الصيغة: +ds@أي_حرف@الرد (مثال: +ds@س@الرد)")
                 return True
             replies = getattr(self, "departure_replies", {})
@@ -24460,7 +28085,7 @@ class TalkinBot:
                 if not isinstance(getattr(self, "custom_welcome_image_pending", None), dict):
                     self.custom_welcome_image_pending = {}
                 self.custom_welcome_image_pending[_norm_user(sender)] = {"username": sender, "created_at": time.time()}
-                extra = "\n🖼️ أرسل صورة الترحيب الآن (خلال دقيقتين)."
+                extra = "\n🖼️ أرسل صورة الترحيب الآن (خلال دقيقتين)؛ سيُكتب اسمك عليها عند الترحيب بك."
             else:
                 extra = "\n⏱️ تنتهي الحماية بعد ساعة."
             self.send_private_text(sender, f"✅ تم شراء {item['icon']} {item['name']} مقابل {item['cost']:,} نقطة.{extra}")
@@ -24485,7 +28110,7 @@ class TalkinBot:
                 getattr(self, "custom_welcome_text_pending", {}).pop(welcome_key, None)
                 self.custom_welcome_enabled = True
                 self._save_social_features()
-                self.send_private_text(sender, "✅ تم حفظ ترحيبك المخصص.")
+                self.send_private_text(sender, "✅ تم حفظ ترحيبك المخصص. للحذف: حذف ترحيب النص، أو حذف ترحيب لحذف النص والصورة.")
             return True
         if low in {"ترحيب_صورة", "welcome_image"}:
             if not member_shop.active(
@@ -24497,7 +28122,7 @@ class TalkinBot:
             if not isinstance(getattr(self, "custom_welcome_image_pending", None), dict):
                 self.custom_welcome_image_pending = {}
             self.custom_welcome_image_pending[_norm_user(sender)] = {"username": sender, "created_at": time.time()}
-            self.send_private_text(sender, "🖼️ أرسل صورة الترحيب الآن في الخاص أو أي غرفة خلال دقيقتين.")
+            self.send_private_text(sender, "🖼️ أرسل صورة الترحيب الآن في الخاص أو أي غرفة خلال دقيقتين؛ سيُكتب اسمك عليها عند الترحيب بك.")
             return True
 
         # Custom welcome: swc+@اسم@الترحيب and on/off.
@@ -24535,14 +28160,20 @@ class TalkinBot:
         m_unpublish_ban=re.fullmatch(r"mbp@(.+)",text.strip(),re.I)
         if m_unpublish_ban:
             if not _is_master_name(sender):
+                if is_private:
+                    self.send_private_text(sender, "🔒 فك منع النشر متاح للماستر فقط. أرسل الأمر من حساب الماستر المسجل.")
                 return True
             target=m_unpublish_ban.group(1).strip().lstrip("@")
             if not target:
                 self.send_private_text(sender,"❌ الصيغة: mbp@اسم المستخدم")
                 return True
-            was=_is_publish_banned(target)
-            _remove_publish_ban(target)
-            self.send_private_text(sender, f"✅ تم فك منع النشر عن {target}." if was else "ℹ️ المستخدم غير موجود في قائمة منع النشر.")
+            removed = _remove_publish_ban(target)
+            if _is_publish_banned(target):
+                self.send_private_text(sender, f"❌ تعذر فك منع النشر عن {target}; بقي الحظر فعالًا. تحقق من صلاحية الكتابة على ملف بيانات البوت.")
+            elif removed:
+                self.send_private_text(sender, f"✅ تم فك منع النشر عن {target} وإزالة {removed} سجل(ات).")
+            else:
+                self.send_private_text(sender, f"ℹ️ {target} غير موجود في قائمة منع النشر.")
             return True
 
         # Publishing: master or verified user says نشر / انشر (optionally @description), then sends an image.
@@ -24649,7 +28280,7 @@ class TalkinBot:
         caption=_message_template(
             "publish", "broadcast",
             "🖼️ منشور صورة\n👤 {publisher}\n📝 {description}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
-            publisher=sender, description=desc or "بدون وصف",
+            publisher=_name_for_chat_text(sender), description=desc or "بدون وصف",
             source_label=source_room, code=base_code,
             like=reaction_codes["like"], love=reaction_codes["love"], dislike=reaction_codes["dislike"],
             comment=reaction_codes["comment"], report=reaction_codes["report"], room=source_room
@@ -24796,7 +28427,7 @@ class TalkinBot:
         caption=_message_template(
             "publish", "broadcast",
             "🖼️ منشور صورة\n👤 {publisher}\n📝 {description}\n━━━━━━━━━━━━━\n👍 lk@{like}\n❤️ lv@{love}\n👎 dl@{dislike}\n💬 cm@{comment} msg\n🚨 report@{report} msg",
-            publisher=sender, description=desc or "بدون وصف",
+            publisher=_name_for_chat_text(sender), description=desc or "بدون وصف",
             source_label=source_room, code=base_code,
             like=reaction_codes["like"], love=reaction_codes["love"], dislike=reaction_codes["dislike"],
             comment=reaction_codes["comment"], report=reaction_codes["report"], room=source_room
@@ -24917,7 +28548,7 @@ class TalkinBot:
             pending_map.pop(sender_key, None)
             self.custom_welcome_enabled = True
             self._save_social_features()
-            self.send_private_text(username, "✅ تم حفظ صورة الترحيب. ستظهر عند دخولك الجديد للغرفة.")
+            self.send_private_text(username, "✅ تم حفظ صورة الترحيب. ستظهر عند دخولك الجديد للغرفة. للحذف: حذف ترحيب الصورة، أو حذف ترحيب لحذف النص والصورة.")
             return True
         return False
 
@@ -24930,11 +28561,71 @@ class TalkinBot:
         image_url = str(custom_welcome.get("image_url") or "").strip()
         if not image_url.startswith(("http://", "https://")):
             return False
+        threading.Thread(
+            target=self._render_and_send_personal_welcome_image,
+            args=(str(room or ""), str(username or ""), image_url),
+            daemon=True,
+            name="personal-welcome-image",
+        ).start()
+        return True
+
+    def _render_and_send_personal_welcome_image(self, room, username, image_url):
+        """Download the user's chosen art, stamp their exact username, and send it."""
         try:
-            return self.send_room_media(room, image_url, "image") is not False
+            if not PIL_AVAILABLE:
+                raise RuntimeError("Pillow غير مثبت")
+            response = requests.get(image_url, timeout=(5, 15), stream=True)
+            response.raise_for_status()
+            chunks, size = [], 0
+            for chunk in response.iter_content(64 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > 8 * 1024 * 1024:
+                    raise ValueError("صورة الترحيب أكبر من 8 MB")
+                chunks.append(chunk)
+            if not chunks:
+                raise ValueError("ملف صورة الترحيب فارغ")
+            raw = b"".join(chunks)
+            with Image.open(io.BytesIO(raw)) as probe:
+                width, height = probe.size
+                if width < 1 or height < 1 or width * height > 24_000_000:
+                    raise ValueError("أبعاد صورة الترحيب غير مناسبة")
+                image = probe.convert("RGBA")
+            target_w = min(1200, image.width)
+            if image.width > target_w:
+                target_h = max(1, round(image.height * target_w / image.width))
+                image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            w, h = image.size
+            banner_h = max(112, int(h * 0.20))
+            banner_y = h - banner_h
+            overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+            draw.rectangle((0, banner_y, w, h), fill=(4, 20, 30, 225))
+            draw.line((int(w * .06), banner_y + 2, int(w * .94), banner_y + 2),
+                      fill=(244, 196, 92, 255), width=max(2, int(w * .004)))
+            _draw_centered(
+                draw, (w / 2, banner_y + banner_h * .34), "أهلاً وسهلاً",
+                max(20, int(banner_h * .23)), (255, 224, 145, 255), int(w * .88),
+            )
+            _draw_name_centered(
+                draw, (w / 2, banner_y + banner_h * .70), str(username or "").lstrip("@"),
+                max(20, int(banner_h * .25)), (255, 255, 255, 255), int(w * .88),
+                apply_correction=True, force_ltr=True,
+            )
+            image = Image.alpha_composite(image, overlay).convert("RGB")
+            out_dir = BASE_DIR / "generated_welcomes"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out = out_dir / f"welcome_{uuid.uuid4().hex}.jpg"
+            image.save(out, "JPEG", quality=88, optimize=True)
+            base = _public_base_url()
+            if not base:
+                raise RuntimeError("رابط الوسائط العامة غير مضبوط")
+            url = f"{base}/welcomes/{out.name}"
+            self._verify_public_media_url(url, "image")
+            self.send_room_media(room, url, "image")
         except Exception as exc:
-            self.log("[WELCOME] custom image send failed:", username, repr(exc))
-            return False
+            self.log("[WELCOME] personalized image send failed:", username, repr(exc))
 
     def _try_custom_gift_media(self, room, media_url, candidates=()):
         media_url = str(media_url or "").strip()
@@ -24995,9 +28686,9 @@ class TalkinBot:
             _draw_centered(draw, (width / 2, photo_h + 145), f"Sender / المرسل: {sender}", 32, (126, 226, 255), width - 80)
             _draw_centered(draw, (width / 2, photo_h + 225), f"Recipient / المستلم: {receiver}", 32, (255, 166, 218), width - 80)
             _draw_centered(draw, (width / 2, photo_h + 310), f"Room / الغرفة: {room}", 29, (230, 230, 238), width - 80)
-            generated = BASE_DIR / "generated_gifts" / f"usergift_{uuid.uuid4().hex}.jpg"
+            generated = GENERATED_GIFTS_DIR / f"usergift_{uuid.uuid4().hex}.jpg"
             generated.parent.mkdir(parents=True, exist_ok=True)
-            card.save(generated, "JPEG", quality=90, optimize=True, progressive=True)
+            card.save(generated, "JPEG", quality=90, optimize=True, progressive=False)
             media = f"{base.rstrip('/')}/gifts/{generated.name}"
             self._verify_public_media_url(media, "image")
             rooms = list(self._active_rooms())
@@ -25165,6 +28856,264 @@ class TalkinBot:
         self.log("[JOINLEAVE] ignored automatic member restore after ban:", room, username)
         return False
 
+    def _handle_reaction_command(self, room, command, sender):
+        """Route reactions privately and acknowledge them in the originating room."""
+        value = str(command or "").strip()
+        repost = re.fullmatch(r"x@([A-Za-z0-9]{4})", value, re.I)
+        if repost:
+            code = repost.group(1).lower()
+            info = getattr(self, "reaction_targets", {}).get(code)
+            if not isinstance(info, dict) or info.get("kind") != "explore":
+                return False
+            if time.time() - float(info.get("created_at", 0) or 0) > 86400:
+                return False
+            media_url = str(info.get("media_url") or "")
+            if not media_url or self.send_room_media(room, media_url, "image") is False:
+                self.send_room_text(room, "تعذر إعادة نشر هذا المنشور الآن.")
+                return True
+            original = str(info.get("caption") or "")
+            original = re.sub(r"\n🔁 أعاد النشر:.*$", "", original, flags=re.S)
+            self.send_room_text(room, original + f"\n🔁 أعاد النشر: @{str(sender or '').lstrip('@')}")
+            return True
+        reaction = re.fullmatch(r"(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?", value, re.I)
+        if not reaction:
+            return False
+        action, code = reaction.group(1).lower(), reaction.group(2).lower()
+        extra = (reaction.group(3) or "").strip()
+        info = getattr(self, "reaction_targets", {}).get(code)
+        if not isinstance(info, dict) or time.time() - float(info.get("created_at", 0) or 0) > 86400:
+            return False
+        publisher = str(info.get("publisher") or "").strip()
+        source_kind = str(info.get("kind") or "").lower()
+        source_desc = str(info.get("description") or info.get("title") or "").strip()
+        labels = {"lk": "👍 إعجاب", "lv": "❤️ حب", "dl": "👎 عدم إعجاب", "cm": "💬 تعليق", "report": "🚨 بلاغ"}
+        owner_label = "صاحب الأغنية" if source_kind == "music" else "ناشر الصورة"
+        notice = f"{labels[action]} على المحتوى المنشور\n🆔 الرمز: {code}\n👤 المتفاعل: {sender}\n📌 {owner_label}: {publisher}"
+        if source_desc: notice += f"\n📝 المحتوى: {source_desc}"
+        if extra: notice += f"\n💬 رسالة التفاعل: {extra}"
+        notice += f"\n🏠 الغرفة: {room}"
+        english_room = self._configured_room_language(room) == "en"
+        room_ack = ({"lk": "You liked the post", "dl": "You disliked the post", "lv": "You loved the post", "report": "Report sent", "cm": "Your comment was sent"}[action]
+                    if english_room else
+                    {"lk": "لقد أعجبت بمنشور", "dl": "لم تعجب", "lv": "أحببت", "report": "تم إرسال البلاغ", "cm": "تم إرسال تعليقك"}[action])
+        self.send_room_text(room, f"@{str(sender or '').lstrip('@')} {room_ack}")
+        if action == "report":
+            master = str(BOT_MASTER or "").strip()
+            if master: self.send_private_text(master, notice)
+            return True
+        if publisher:
+            self.send_private_text(publisher, notice)
+        return True
+    def _translate_text_external(self, text, target_language):
+        value = str(text or "").strip()
+        if not value: return ""
+        target = "en" if str(target_language).casefold() == "en" else "ar"
+        response = requests.get("https://translate.googleapis.com/translate_a/single",
+            params={"client":"gtx","sl":"auto","tl":target,"dt":"t","q":value[:1800]},
+            headers={"User-Agent":"Mozilla/5.0"}, timeout=(5, 15))
+        response.raise_for_status()
+        data = response.json(); parts = data[0] if isinstance(data, list) and data else []
+        return "".join(str(x[0]) for x in parts if isinstance(x, list) and x and x[0]).strip()
+
+    def _handle_translation_subscription(self, room, body, sender):
+        command = str(body or "").strip()
+        stop_match = re.fullmatch(
+            r"(?:إيقاف|ايقاف|وقف)\s*الترجم(?:ة|ه)(?:\s*@?([^\s@]+))?|(?:stoptranslation|stoptranslate|stop\s+translation)(?:@|\s+)?([^\s@]+)?",
+            command, re.I,
+        )
+        if stop_match:
+            target = (stop_match.group(1) or stop_match.group(2) or "").strip().lstrip("@")
+            subscriptions = getattr(self, "translation_subscriptions", {})
+            removed = 0
+            if isinstance(subscriptions, dict):
+                if target:
+                    target_key = _norm_user(target)
+                    entries = subscriptions.get(target_key, {})
+                    if isinstance(entries, dict) and _norm_user(sender) in entries:
+                        entries.pop(_norm_user(sender), None); removed += 1
+                    if isinstance(entries, dict) and not entries:
+                        subscriptions.pop(target_key, None)
+                else:
+                    requester_key = _norm_user(sender)
+                    for target_key in list(subscriptions):
+                        entries = subscriptions.get(target_key, {})
+                        if isinstance(entries, dict) and requester_key in entries:
+                            entries.pop(requester_key, None); removed += 1
+                        if isinstance(entries, dict) and not entries:
+                            subscriptions.pop(target_key, None)
+            message = "✅ تم إيقاف الترجمة." if removed else "ℹ️ لا يوجد اشتراك ترجمة لإيقافه."
+            self.send_room_text(room, message) if room else self.send_private_text(sender, message)
+            return True
+        match = re.fullmatch(r"(انجليزي|عربي)@([^\s@]+)", command, re.I)
+        if not match: return False
+        requested, target = match.group(1), match.group(2).strip().lstrip("@")
+        language = "en" if requested.casefold() == "انجليزي" else "ar"
+        subscriptions = getattr(self, "translation_subscriptions", None)
+        if not isinstance(subscriptions, dict): subscriptions = self.translation_subscriptions = {}
+        subscription_room = str(room or getattr(self, "room", "") or getattr(self, "last_joined_room", "") or "").strip()
+        subscriptions.setdefault(_norm_user(target), {})[_norm_user(sender)] = {"requester": str(sender or ""), "language": language, "room": subscription_room, "created_at": time.time()}
+        msg = (f"✅ ستصل ترجمة رسائل @{target} إلى الغرفة باللغة الإنجليزية." if language == "en" else f"✅ ستصل ترجمة رسائل @{target} إلى الغرفة باللغة العربية.")
+        self.send_private_text(sender, msg) if not room else self.send_room_text(room, msg)
+        return True
+
+    def _translate_subscribed_message(self, sender, body, room=""):
+        entries = (getattr(self, "translation_subscriptions", {}) or {}).get(_norm_user(sender), {})
+        if not isinstance(entries, dict): return
+        def worker():
+            for requester_key, item in list(entries.items()):
+                try:
+                    translated = self._translate_text_external(body, item.get("language", "en"))
+                    if translated:
+                        label = "English" if item.get("language") == "en" else "العربية"
+                        target_room = str(item.get("room") or "").strip()
+                        if target_room:
+                            self.send_room_text(target_room, f"🌐 ترجمة ({label}) من @{sender}:\n{translated}")
+                except Exception as exc:
+                    self.log("[TRANSLATE] failed:", type(exc).__name__, str(exc)[:160])
+        threading.Thread(target=worker, name="message-translation", daemon=True).start()
+
+    def _handle_personal_design_command(self, room, command, sender, is_private=False):
+        """Handle صمم صورتي / اسم <name> / تغيير صورتك."""
+        raw = str(command or "").strip()
+        low = raw.casefold()
+        if low in {"صمم صورتي", "صمم صورتى", "صمم صورتي 3d", "صمم صورتي ثلاثي الابعاد"}:
+            photo_url = (getattr(self, "user_photos", {}).get(_norm_user(sender), "")
+                         or getattr(self, "user_photos", {}).get(str(sender or "").casefold(), "")
+                         or self._lookup_profile_photo(sender))
+            if not photo_url:
+                try:
+                    self._queue_profile_roster_refresh(room, sender)
+                except Exception:
+                    pass
+                notice = "⏳ لم تصل صورة حسابك بعد. حدّث صورة الحساب أو أعد الأمر بعد لحظات."
+                self.send_private_text(sender, notice) if is_private else self.send_room_text(room, notice)
+                return True
+            try:
+                image_path = render_user_3d_portrait_gif(photo_url, sender)
+                base = _public_base_url()
+                if not base:
+                    raise RuntimeError("PUBLIC_BASE_URL غير مضبوط")
+                media_url = f"{base}/publish/{image_path.name}"
+                self._verify_public_media_url(media_url, "image")
+                sent = (self.send_private_media(sender, media_url, "image", filename=image_path.name)
+                        if is_private else self.send_room_media(room, media_url, "image"))
+                if sent is False:
+                    raise RuntimeError("رفض الاتصال إرسال الصورة")
+                notice = f"✨ تم تصميم صورة @{sender} بتأثير ثلاثي الأبعاد متحرك."
+                self.send_private_text(sender, notice) if is_private else self.send_room_text(room, notice)
+            except Exception as exc:
+                self.log("[DESIGN] portrait failed:", repr(exc))
+                notice = "❌ تعذر تصميم الصورة. تحقق من رابط الوسائط العام وتوفر Pillow."
+                self.send_private_text(sender, notice) if is_private else self.send_room_text(room, notice)
+            return True
+
+        name_match = re.fullmatch(r"اسم\s+(.+)", raw, re.I | re.S)
+        if name_match:
+            name = name_match.group(1).strip()
+            if not name or len(name) > 48:
+                self.send_room_text(room, "❌ الاسم يجب أن يكون من 1 إلى 48 حرفاً. مثال: اسم احمد")
+                return True
+            try:
+                image_path = render_3d_name_card(name)
+                base = _public_base_url()
+                if not base:
+                    raise RuntimeError("PUBLIC_BASE_URL غير مضبوط")
+                media_url = f"{base}/publish/{image_path.name}"
+                self._verify_public_media_url(media_url, "image")
+                sent = (self.send_private_media(sender, media_url, "image", filename=image_path.name)
+                        if is_private else self.send_room_media(room, media_url, "image"))
+                if sent is False:
+                    raise RuntimeError("رفض الاتصال إرسال الصورة")
+            except Exception as exc:
+                self.log("[DESIGN] name card failed:", repr(exc))
+                notice = "❌ تعذر إنشاء صورة الاسم. تحقق من Pillow ورابط الوسائط العام."
+                self.send_private_text(sender, notice) if is_private else self.send_room_text(room, notice)
+            return True
+
+        if low in {"تغيير صورتك", "غير صورتك", "تغيير صورة البوت", "غير صورة البوت"}:
+            if not _is_master_name(sender):
+                self.send_room_text(room, "🔒 تغيير صورة البوت مخصص للماستر.")
+                return True
+            try:
+                assets = sorted(ASSETS_DIR.glob("bot_avatar_*.jpg")) + sorted(ASSETS_DIR.glob("bot_avatar_*.png"))
+                if not assets:
+                    raise RuntimeError("لا توجد صور bot_avatar داخل assets")
+                last = str(getattr(self, "_last_bot_avatar_asset", "") or "")
+                choices = [p for p in assets if str(p) != last] or assets
+                chosen = random.choice(choices)
+                base = _public_base_url()
+                if not base:
+                    raise RuntimeError("PUBLIC_BASE_URL غير مضبوط")
+                photo_url = f"{base}/assets/{quote(chosen.name)}"
+                self._verify_public_media_url(photo_url, "image")
+                action = os.getenv("BOT_PROFILE_PHOTO_ACTION", "profile_update").strip() or "profile_update"
+                photo_type = os.getenv("BOT_PROFILE_PHOTO_TYPE", "photo").strip() or "photo"
+                packet = encode_query(action, type_=photo_type, value=photo_url)
+                if len(packet) > _ws_payload_limit():
+                    raise RuntimeError("حزمة تحديث الصورة تجاوزت حد WebSocket")
+                sent = self.send_query(packet)
+                if sent is False:
+                    raise RuntimeError("لم يقبل اتصال WebSocket طلب تغيير الصورة")
+                self._last_bot_avatar_asset = str(chosen)
+                self.log("[PROFILE] bot photo update request sent:", chosen.name, "action=", action, "type=", photo_type)
+                self.send_private_text(sender, "📨 أُرسل طلب تغيير صورة البوت إلى الخادم. إذا لم تتغير الصورة، فنسخة Talkin لديك قد تتطلب بروتوكول رفع صورة مختلفاً عن تحديث الحالة.")
+            except Exception as exc:
+                self.log("[PROFILE] bot photo update failed:", repr(exc))
+                self.send_private_text(sender, f"❌ تعذر إرسال طلب تغيير صورة البوت: {str(exc)[:180]}")
+            return True
+        return False
+
+    def _handle_explore_command(self, room, command, sender):
+        match = re.fullmatch(r"ax@(.+)", str(command or "").strip(), re.I | re.S)
+        if not match:
+            return False
+        text = match.group(1).strip()[:150]
+        if not text:
+            self.send_room_text(room, "استخدم ax@النص لنشر محتوى اكسبلور.")
+            return True
+        if self._find_publish_filter_hit(text):
+            self.send_room_text(room, "تعذر نشر النص لأنه يخالف فلتر النشر.")
+            return True
+        try:
+            key = _norm_user(sender)
+            avatar_url = getattr(self, "user_photos", {}).get(key, "") or self._lookup_profile_photo(sender)
+            english = self._configured_room_language(room) == "en"
+            language = "en" if english else "ar"
+            # The card preserves the exact language and wording supplied in
+            # ax@text; no translation is performed inside Explore artwork.
+            secondary_text = ""
+            mode = os.getenv("EXPLORE_TEMPLATE_MODE", "cycle").strip().casefold()
+            if mode not in {"static", "animated", "cycle"}: mode = "cycle"
+            if mode == "cycle": mode = "animated" if int(time.time()) % 2 else "static"
+            card = (render_explore_animated_card(text, sender, avatar_url, language=language, secondary_text=secondary_text)
+                    if mode == "animated" else render_explore_card(text, sender, avatar_url, language=language, secondary_text=secondary_text))
+            base = _public_base_url()
+            if not base:
+                raise RuntimeError("رابط الوسائط العام غير مضبوط")
+            media_url = f"{base}/publish/{card.name}"
+            self._verify_public_media_url(media_url, "image")
+            code = uuid.uuid4().hex[:4]
+            # The text already appears inside the Explore image; keep this
+            # accompanying room message focused on the author and reactions.
+            if english:
+                caption = (f"✨ Explore\n👤 @{str(sender or '').lstrip('@')}\n━━━━━━━━━━━━\n"
+                           f"👍 lk@{code}   ❤️ lv@{code}   👎 dl@{code}\n💬 cm@{code} msg   🚨 report@{code} msg\n🔁 x@{code} — Repost")
+            else:
+                caption = (f"✨ اكسبلور\n👤 @{str(sender or '').lstrip('@')}\n━━━━━━━━━━━━\n"
+                           f"👍 lk@{code}   ❤️ lv@{code}   👎 dl@{code}\n💬 cm@{code} msg   🚨 report@{code} msg\n🔁 x@{code} — إعادة نشر")
+            self.reaction_targets[code] = {"publisher": str(sender), "kind": "explore", "description": text,
+                                            "media_url": media_url, "caption": caption, "created_at": time.time()}
+            rooms = self._active_rooms() or ([str(room)] if room else [])
+            delivered = 0
+            for target in rooms:
+                if self.send_room_media(target, media_url, "image") is not False:
+                    self.send_room_text(target, caption)
+                    delivered += 1
+            self.send_private_text(sender, f"✅ تم نشر اكسبلور في {delivered} غرفة.")
+        except Exception as exc:
+            self.log("[EXPLORE] publish failed:", repr(exc))
+            self.send_private_text(sender, "تعذر تجهيز منشور اكسبلور؛ تحقق من إعداد رابط الوسائط العام.")
+        return True
     def handle_room_event(self, result):
         event = (result.get("room_event") or {}) if isinstance(result, dict) else {}
         event_type = str(event.get(1, ""))
@@ -25216,7 +29165,11 @@ class TalkinBot:
             if not hasattr(self, "connected_rooms") or not isinstance(self.connected_rooms, set):
                 self.connected_rooms = set()
             self.connected_rooms.add(room)
-        if body:
+        secret_pending = getattr(self, "_secret_export_auth_pending", {})
+        is_secret_password_reply = (
+            isinstance(secret_pending, dict) and _norm_user(frm) in secret_pending
+        )
+        if body and not is_secret_password_reply:
             self._remember_inflight_command(room, body, frm, is_private=False)
         if room and room != BOT_MASTER and _norm_room(room) not in getattr(self, "blocked_rooms", set()):
             # This handler runs for every room message.  Rewriting the JSON
@@ -25253,6 +29206,9 @@ class TalkinBot:
         # Consume that native response before ordinary room-command handling.
         if self._complete_pending_room_list_text(room, body):
             return
+        if event_type == "text" and body:
+            if self._handle_translation_subscription(room, body, frm): return
+            self._translate_subscribed_message(frm, body, room)
         if event_type == "text" and self._handle_telegram_log_command(body, frm):
             return
         # NS is a navigation command. Every newly received NS must be accepted
@@ -25336,22 +29292,57 @@ class TalkinBot:
                         self.log("[JOINLEAVE] ban failed", repr(exc))
         
         if event_type == "user_joined" and username:
+            # Numeric RoomEvent field 3 is `to`, not a profile photo. Only
+            # trust explicitly named avatar fields; UserItem field 3 is handled
+            # separately by the roster decoder.
+            joined_photo = _extract_room_event_profile_photo(event)
+            if joined_photo.startswith("//"):
+                joined_photo = "https:" + joined_photo
+            if joined_photo.startswith(("http://", "https://")):
+                if not isinstance(getattr(self, "user_photos", None), dict):
+                    self.user_photos = {}
+                self.user_photos[username.casefold()] = joined_photo
+                self.user_photos[_norm_user(username)] = joined_photo
+            else:
+                # Join notifications often omit the profile URL; refresh the
+                # full roster asynchronously so game cards can use it later.
+                self._queue_profile_roster_refresh(room, username)
+
             # Optional room protection: reject accounts with no profile photo.
-            # Field 3 is the native UserItem photo field; the cache is used as
-            # a fallback when the join event omits it.
+            # The cache above is used as a fallback when a join event omits it.
             if (_room_protection_cfg(room).get("no_photo")
                     and _norm_user(username) != _norm_user(BOT_ID)
                     and _auto_ban_candidate(self, room, username, role if role_field_present else None)):
-                joined_photo = str(event.get(3, "") or event.get("photo", "") or "").strip()
+                joined_photo = _extract_room_event_profile_photo(event)
                 joined_photo = joined_photo or str(getattr(self, "user_photos", {}).get(_norm_user(username), "") or "").strip()
                 if not joined_photo:
-                    try:
-                        self.send_admin(room, username, "ban")
-                        _record_filter_ban(username, room, "حساب بلا صورة", "حماية الصورة")
-                        self.send_room_text(room, f"🚫 تم حظر @{username} لعدم وجود صورة حساب.")
-                    except Exception as exc:
-                        self.log("[NO-PHOTO] ban failed", repr(exc))
-                    return
+                    # A join event commonly omits the avatar even when the
+                    # account has one. Let the native roster request above
+                    # populate the cache before enforcing this room rule.
+                    def verify_joined_photo():
+                        deadline = time.monotonic() + 8.0
+                        while time.monotonic() < deadline:
+                            photos = getattr(self, "user_photos", {})
+                            photo = (photos.get(_norm_user(username), "") or
+                                     photos.get(username.casefold(), "")) if isinstance(photos, dict) else ""
+                            if str(photo or "").startswith(("http://", "https://")):
+                                return
+                            stop_event = getattr(self, "stop_event", None)
+                            if stop_event is not None and stop_event.is_set():
+                                return
+                            time.sleep(0.25)
+                        try:
+                            self.send_admin(room, username, "ban")
+                            _record_filter_ban(username, room, "حساب بلا صورة", "حماية الصورة")
+                            self.send_room_text(room, f"🚫 تم حظر @{username} لعدم وجود صورة حساب.")
+                        except Exception as exc:
+                            self.log("[NO-PHOTO] deferred ban failed", repr(exc))
+
+                    threading.Thread(
+                        target=verify_joined_photo,
+                        name="no-profile-photo-check",
+                        daemon=True,
+                    ).start()
             room_members = self.room_users.setdefault(room, {})
             already_present = any(_norm_user(member) == norm_u for member in room_members)
             room_members[username] = role or "none"
@@ -25375,7 +29366,7 @@ class TalkinBot:
                 welcome = f"👑 لقد أتاكم الزعيم\n👤 {username}\n🏠 الغرفة: {room}"
             elif username and _norm_user(username) != _norm_user(BOT_ID):
                 welcomes_enabled = bool(getattr(self, "custom_welcome_enabled", True))
-                cw = self._custom_welcome_for_identity(username, room) if welcomes_enabled else None
+                cw = getattr(self, "custom_welcomes", {}).get(_norm_user(username)) if welcomes_enabled else None
                 welcome = _join_welcome_message(username, room, welcomes_enabled, cw)
             if username and _norm_user(username) != _norm_user(BOT_ID) and self._is_dragon_hunter(username):
                 if self._configured_room_language(room) == "en":
@@ -25399,34 +29390,14 @@ class TalkinBot:
                 getattr(self, "_room_entry_users", {}).pop(entry_room, None)
 
         elif event_type == "user_left" and username:
-            self.room_users.get(room, {}).pop(username, None)
-            departed = getattr(self, "_last_departed_user_by_room", None)
-            if departed is None:
-                departed = self._last_departed_user_by_room = {}
-            departed[_norm_room(room)] = username
             if _norm_user(username) == _norm_user(BOT_ID):
-                self.connected_rooms = {
-                    connected for connected in self.connected_rooms
-                    if _norm_room(connected) != _norm_room(room)
-                }
-                pending_leaves = getattr(self, "_pending_room_leaves", {})
-                for pending_room, leave_ack in tuple(pending_leaves.items()):
-                    if _norm_room(pending_room).casefold() == _norm_room(room).casefold():
-                        pending_leaves.pop(pending_room, None)
-                        leave_ack.set()
-                        break
-                if getattr(self, "_intentional_leaves", None) and _norm_room(room) in self._intentional_leaves:
-                    self.log(f"[USER_LEFT_DETECTED] Bot left {room} intentionally; skipping auto-rejoin.")
-                else:
-                    # A user_left event can be echoed during a reconnect or after
-                    # a bot-issued leave. Only an explicit kick event below may
-                    # schedule the automatic leave/wait/rejoin cycle.
-                    self.log(f"[USER_LEFT_DETECTED] Bot left {room} without a confirmed kick; no auto-rejoin.")
-                    self._send_master_room_departure_notice(
-                        room, event_type,
-                        str(event.get("reason", "") or event.get("message", "") or ""),
-                        str(event.get(22, "") or event.get("actor", "") or ""),
-                    )
+                self._handle_unconfirmed_bot_user_left(room)
+            else:
+                self.room_users.get(room, {}).pop(username, None)
+                departed = getattr(self, "_last_departed_user_by_room", None)
+                if departed is None:
+                    departed = self._last_departed_user_by_room = {}
+                departed[_norm_room(room)] = username
             if _norm_user(username) == _norm_user(BOT_MASTER):
                 self._master_online_rooms.discard(_norm_room(room))
                 self.master_online = bool(self._master_online_rooms)
@@ -25476,13 +29447,34 @@ class TalkinBot:
                 if changed_role in ("kicked", "outcast"):
                     self.room_users.get(room, {}).pop(changed_user, None)
                     if _norm_user(changed_user) == _norm_user(BOT_ID):
+                        room_key = _norm_room(room)
+                        was_connected = any(
+                            _norm_room(connected).casefold() == room_key.casefold()
+                            for connected in getattr(self, "connected_rooms", set())
+                        )
+                        recent_departures = getattr(self, "_recent_bot_room_departures", {})
+                        departed_recently = (
+                            isinstance(recent_departures, dict)
+                            and 0 <= time.time() - float(recent_departures.get(room_key, 0) or 0) <= 120
+                        )
+                        was_in_room = was_connected or departed_recently
+                        if isinstance(recent_departures, dict):
+                            recent_departures.pop(room_key, None)
                         self.connected_rooms = {
                             connected for connected in self.connected_rooms
-                            if _norm_room(connected) != _norm_room(room)
+                            if _norm_room(connected).casefold() != _norm_room(room).casefold()
                         }
-                        if changed_role == "kicked":
+                        intentional = _norm_room(room) in getattr(self, "_intentional_leaves", set())
+                        if was_in_room and not intentional:
+                            self._send_master_room_departure_notice(
+                                room, "role_changed", reason=changed_role,
+                                actor=str(event.get(22, "") or event.get("actor", "") or ""),
+                            )
+                        if changed_role == "kicked" and was_in_room and not intentional:
                             self.log(f"[KICK_DETECTED] Bot was kicked from {room}; rejoining automatically...")
                             self._schedule_auto_rejoin(room)
+                        elif intentional:
+                            self.log(f"[ROLE_CHANGED] Ignoring rejoin for intentionally left room {room}.")
                 else:
                     self.room_users.setdefault(room, {})[changed_user] = changed_role
                 key = (room.casefold(), changed_user.casefold(), changed_role)
@@ -25553,6 +29545,9 @@ class TalkinBot:
             # the session-only connected-room list.
             if room:
                 self.connected_rooms.add(room)
+                room_key = _norm_room(room)
+                getattr(self, "_recent_bot_room_departures", {}).pop(room_key, None)
+                getattr(self, "_intentional_leaves", set()).discard(room_key)
             self.last_joined_room = room
             rnorm = _norm_room(room)
             waiting_ack = getattr(self, "_auto_rejoin_waiting_ack", None)
@@ -25867,43 +29862,44 @@ class TalkinBot:
             self._request_custom_gift_image(room, frm, gift_request.group(1))
             return
 
-        # صورتي/صورتك: صورة عشوائية من الويب داخل الغرفة.
-        if self._handle_random_picture_command(room, body, frm):
+        # أوامر الكمين وتوب المراهنين والصور الشخصية/العشوائية.
+        if self._handle_kemin_command(room, body, frm):
             return
-
-        if self._handle_explore_command(room, body, frm):
+        if self._handle_top_wagerers(room, body):
             return
-        if self._handle_explore_repost_command(room, body, frm):
+        profile_sender = frm or username or str(event.get(17, "") or "").strip()
+        profile_sender_candidates = [
+            frm, event_user_22, event_user_17, username,
+            str(event.get("username", "") or ""),
+        ]
+        if self._handle_personal_design_command(room, body, profile_sender):
+            return
+        if self._handle_internet_picture_command(room, body, profile_sender):
+            return
+        if self._handle_random_picture_command(
+            room, body, profile_sender, sender_candidates=profile_sender_candidates
+        ):
             return
 
         # شبيه: متاح كأمر غرفة مستقل ولا يحتاج توثيقاً.
         if self._handle_lookalike_command(room, body, frm):
             return
 
-        # Reactions/comments/reports: notify the original publisher privately.
-        reaction=re.match(r"^(lk|lv|dl|cm|report)@([A-Za-z0-9]{4})(?:\s+(.*))?$", body.strip(), re.I)
-        if reaction:
-            action,code,extra=reaction.group(1).lower(),reaction.group(2).lower(),(reaction.group(3) or "").strip()
-            info=self.reaction_targets.get(code)
-            if info and time.time()-float(info.get("created_at",0)) <= 86400:
-                publisher=str(info.get("publisher") or "").strip()
-                labels={"lk":"👍 إعجاب","lv":"❤️ حب","dl":"👎 عدم إعجاب","cm":"💬 تعليق","report":"🚨 بلاغ"}
-                source_desc = str(info.get("description") or info.get("title") or "").strip()
-                owner_label = "صاحب الأغنية" if str(info.get("kind") or "").lower() == "music" else "اسم الناشر"
-                notice=f"لقد تفاعلت مع {labels.get(action,action)}\n👤 المتفاعل: {frm}\n📌 {owner_label}: {publisher}"
-                if source_desc: notice += f"\n📝 المحتوى: {source_desc}"
-                if extra: notice += f"\n💬 رسالة التفاعل: {extra}"
-                # التفاعل يظهر داخل نفس الغرفة، وتصل نسخة مطابقة أيضاً
-                # إلى صاحب الصورة/الأغنية على الخاص.
-                self.send_room_text(room, notice)
-                if publisher and _norm_user(publisher) != _norm_user(frm):
-                    private_notice = notice + f"\n🏠 الغرفة: {room}"
-                    self.send_private_text(publisher, private_notice)
-                return
+        # Explore publication/repost and reactions are handled before ordinary command gates.
+        if self._handle_explore_command(room, body, profile_sender):
+            return
+        if self._handle_reaction_command(room, body, frm):
+            return
 
         # نقاطي متاح للجميع ولا يحتاج توثيقاً.
         if body.strip().casefold() in ("نقاطي", "points"):
             self.send_room_text(room, _points_summary_text(frm))
+            if not getattr(self, "_replaying_bot_action", False):
+                self._remember_bot_action(room, body, frm, is_private=False)
+            return
+        named_points = re.fullmatch(r"(?:نقاط|points)\s+@?(.+?)", body.strip(), re.I)
+        if named_points:
+            self.send_room_text(room, _named_points_text(named_points.group(1)))
             if not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, frm, is_private=False)
             return
@@ -25915,6 +29911,7 @@ class TalkinBot:
         verified_sender = _verified_identity_candidate(username, frm, event.get(17, ""))
         is_verified = bool(verified_sender)
         command_sender = verified_sender or username or frm or str(event.get(17, "") or "").strip()
+        owner_live_music_allowed = _owner_live_music_allowed(self, room, command_sender, body)
         cricket_sender = command_sender
         # Bomb replies use digits that Cricket also accepts, so the shared
         # router claims active bomb wires before routing any board-game input.
@@ -25927,6 +29924,7 @@ class TalkinBot:
         # restricted to masters. Unverified command attempts receive one clear
         # notice instead of being silently ignored.
         if (not is_verified
+                and not owner_live_music_allowed
                 and _looks_like_bot_command(body)
                 and not re.match(r"^دخول\s*@\s*.+$", body.strip(), re.I)
                 and body.strip().casefold() not in {"توب", "top", "توب الألعاب", "توب الالعاب", "top games", "games top", "ملياري", "مليارات", "مليوني", "ملايين"}):
@@ -25987,13 +29985,13 @@ class TalkinBot:
             else:
                 self.request_live_room(room)
             return
-        m_share_ar = re.fullmatch(r"(?:مشاركه|مشاركة)\s+@?([^\s@]+)", body.strip(), re.I)
+        m_share_ar = re.fullmatch(r"(?:مشاركه|مشاركة)(?:\s+|@)(?!اسم(?:\s|$))@?([^\s@]+)", body.strip(), re.I)
         if m_share_ar:
             self.share_last_music(frm, m_share_ar.group(1), room)
             if not getattr(self, "_replaying_bot_action", False):
                 self._remember_bot_action(room, body, frm, is_private=False)
             return
-        m_share = re.fullmatch(r"sher@(.+)", body.strip(), re.I)
+        m_share = re.fullmatch(r"(?:sher|share)@(.+)", body.strip(), re.I)
         if m_share:
             self.share_last_music(frm, m_share.group(1), room)
             if not getattr(self, "_replaying_bot_action", False):
@@ -26001,7 +29999,7 @@ class TalkinBot:
             return
         if (body.strip().startswith((".تشغيل ", "بث "))
                 or re.match(r"^(?:play|music|song)\s+.+$", body.strip(), re.I)):
-            if not is_verified:
+            if not is_verified and not owner_live_music_allowed:
                 self.send_room_text(room, f"🔒 @{frm} غير موثّق لتشغيل الأغاني.\n{_verification_notice()}")
                 return
             is_room_broadcast = body.strip().startswith("بث ")
@@ -26022,11 +30020,20 @@ class TalkinBot:
                 if not getattr(self, "_replaying_bot_action", False):
                     self._remember_bot_action(room, body, frm, is_private=False)
                 return
+        youtube_test = re.fullmatch(r"\.aa\s*(.+)", body.strip(), re.I)
+        if youtube_test:
+            if not is_verified:
+                self.send_room_text(room, f"🔒 @{frm} غير موثّق لاختبار تشغيل الأغاني.\n{_verification_notice()}")
+                return
+            if self.handle_youtube_test_command(room, youtube_test.group(1), frm):
+                if not getattr(self, "_replaying_bot_action", False):
+                    self._remember_bot_action(room, body, frm, is_private=False)
+                return
         if body.strip().lower().startswith(".sa "):
             if not is_verified:
                 self.send_room_text(room, f"🔒 @{frm} غير موثّق لاستخدام الأغاني.\n{_verification_notice()}")
                 return
-            if self.handle_music_command(room, body, frm):
+            if self.handle_music_command(room, body, frm, broadcast_all=True, with_reactions=True):
                 if not getattr(self, "_replaying_bot_action", False):
                     self._remember_bot_action(room, body, frm, is_private=False)
                 return
@@ -26034,6 +30041,12 @@ class TalkinBot:
         # Keep a small per-room message history for diagnostics.
         self.last_messages[room].append((frm, body, event_id))
         self.last_messages[room] = self.last_messages[room][-50:]
+
+        # Wallet catalog/holdings pagination owns `ns` while this user has an
+        # active wallet page. Route it before the generic management pager,
+        # whose fallback otherwise consumes `ns` and leaves wallet page 1 stuck.
+        if self._wallet_handle_next_page(room, command_sender, body):
+            return
 
         if self._handle_management_command(room, body, frm):
             return
@@ -26283,32 +30296,23 @@ class TalkinBot:
 
     def on_message(self, ws, message):
         """Queue inbound frames so expensive decoding/commands never block recv()."""
+        if isinstance(message, str):
+            return
         try:
-            if isinstance(message, str):
-                if not message.lstrip().startswith("{"):
-                    return
+            # One shallow protobuf pass is enough to prioritize chat/room text
+            # above low-value roster/stream traffic. The full decode happens
+            # once, inside the worker.
+            top = decode_message(message)
+            priority = 2
+            if 9 in top or 10 in top:
                 priority = 0
-                queued_message = message
-            else:
-                raw_message = bytes(message)
-                if raw_message.lstrip().startswith(b"{"):
-                    priority = 0
-                    queued_message = raw_message
-                else:
-                    # One shallow protobuf pass prioritizes command-bearing
-                    # frames; JSON profile_other replies use the high priority.
-                    top = decode_message(raw_message)
-                    priority = 2
-                    if 9 in top or 10 in top:
-                        priority = 0
-                    elif 8 in top:
-                        priority = 1
-                    queued_message = raw_message
+            elif 8 in top:
+                priority = 1
             with self._event_queue_lock:
                 self._event_queue_seq += 1
                 seq = self._event_queue_seq
             try:
-                self._event_queue.put_nowait((priority, seq, ws, queued_message))
+                self._event_queue.put_nowait((priority, seq, ws, bytes(message)))
             except queue.Full:
                 # Never let a burst of presence/stream frames freeze command
                 # reception. If the queue is full, make one immediate worker
@@ -26316,7 +30320,7 @@ class TalkinBot:
                 # low-priority pressure rather than blocking the socket.
                 if priority == 0:
                     try:
-                        self._process_message(ws, queued_message)
+                        self._process_message(ws, bytes(message))
                     except Exception as exc:
                         self.log("[EVENT-WORKER] urgent frame failed:", repr(exc))
                 else:
@@ -26329,25 +30333,9 @@ class TalkinBot:
     def _process_message(self, ws, message):
         try:
             if isinstance(message, str):
-                if not self._handle_profile_other_payload(message):
-                    self.log("[WS] ignored unrelated text frame")
-                return
-            if isinstance(message, (bytes, bytearray)) and bytes(message).lstrip().startswith(b"{"):
-                try:
-                    text_frame = bytes(message).decode("utf-8")
-                except UnicodeDecodeError:
-                    self.log("[WS] ignored non-UTF8 JSON text frame")
-                    return
-                if not self._handle_profile_other_payload(text_frame):
-                    self.log("[WS] ignored unrelated JSON text frame")
+                self.log("[WS] unexpected text frame received")
                 return
             result = decode_result_message(message)
-            if self._handle_profile_other_payload(result):
-                return
-            if str(result.get("type") or "").strip().casefold() == "profile_other":
-                value = result.get("value")
-                if isinstance(value, str) and self._handle_profile_other_payload(value):
-                    return
             self._handle_stream_result_ack(result)
             self._cache_user_photos_from_result(result)
             # Room join outcomes are emitted as top-level ResultMessage types
@@ -26480,7 +30468,11 @@ class TalkinBot:
                     private_username = str(
                         cm.get(22, "") or cm.get("username", "") or cm.get("sender", "") or ""
                     ).strip()
-                    if body:
+                    secret_pending = getattr(self, "_secret_export_auth_pending", {})
+                    is_secret_password_reply = (
+                        isinstance(secret_pending, dict) and _norm_user(frm) in secret_pending
+                    )
+                    if body and not is_secret_password_reply:
                         self._remember_inflight_command(self.room, body, frm, is_private=True)
                     media_url = next(
                         (str(cm.get(key, "") or "").strip() for key in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, "url", "media_url", "image_url", "file_url")
@@ -26508,7 +30500,11 @@ class TalkinBot:
                         media_candidates = [frm, cm.get(22, ""), cm.get("sender", ""), cm.get("username", "")]
                         if self._try_publish_pending_media(media_room, media_url, media_candidates):
                             return
-                    if body and self._handle_telegram_log_command(body, frm):
+                    if body and self._handle_explore_command(self.room, body, frm):
+                        return
+                    if body and self._handle_reaction_command(self.room, body, frm):
+                        return
+                    if body and self._handle_telegram_log_command(body, frm, is_private=True):
                         return
                     # Every NS is a fresh navigation request. Do not suppress
                     # rapid NS commands with the normal transport de-dup cache.
@@ -26545,6 +30541,12 @@ class TalkinBot:
                         self.master_online = True
                         self.master_last_seen = time.time()
                     if body and self._handle_master_process_command(frm, body, is_private=True):
+                        return
+                    private_design_sender = (
+                        _verified_identity_candidate(private_username, frm) or private_username or frm
+                    )
+                    if body and self._handle_personal_design_command(
+                            self.room, body, private_design_sender, is_private=True):
                         return
                     # The standalone master account is a four-option support
                     # service, not a second games/music/invitations bot. Route
@@ -26603,6 +30605,12 @@ class TalkinBot:
                     if body and body.casefold() in ("نقاطي", "points"):
                         self.send_private_text(frm, _points_summary_text(frm))
                         return
+                    named_points = re.fullmatch(r"(?:نقاط|points)\s+@?(.+?)", body.strip(), re.I)
+                    if named_points:
+                        self.send_private_text(frm, _named_points_text(named_points.group(1)))
+                        return
+                    if body and self._handle_translation_subscription("", body, frm):
+                        return
                     if body:
                         # A pending multi-room join language choice has priority
                         # over game commands; otherwise "1" starts Ludo and the
@@ -26612,11 +30620,11 @@ class TalkinBot:
                             return
                         if self._handle_management_command(self.room, body, frm, is_private=True):
                             return
-                    m_share_ar = re.fullmatch(r"(?:مشاركه|مشاركة)\s+@?([^\s@]+)", body.strip(), re.I)
+                    m_share_ar = re.fullmatch(r"(?:مشاركه|مشاركة)(?:\s+|@)(?!اسم(?:\s|$))@?([^\s@]+)", body.strip(), re.I)
                     if m_share_ar:
                         self.share_last_music(frm, m_share_ar.group(1))
                         return
-                    m_share = re.fullmatch(r"sher@(.+)", body.strip(), re.I)
+                    m_share = re.fullmatch(r"(?:sher|share)@(.+)", body.strip(), re.I)
                     if m_share:
                         self.share_last_music(frm, m_share.group(1))
                         return
@@ -26634,8 +30642,15 @@ class TalkinBot:
                                 room_output=not is_room_broadcast,
                                 live_stream=is_room_broadcast):
                             return
+                    youtube_test = re.fullmatch(r"\.aa\s*(.+)", body.strip(), re.I)
+                    if youtube_test:
+                        if not private_is_verified:
+                            self.send_private_text(frm, f"🔒 @{frm} غير موثّق لاختبار تشغيل الأغاني.\n{_verification_notice()}")
+                            return
+                        if self.handle_youtube_test_command(self.room, youtube_test.group(1), frm):
+                            return
                     if body.strip().lower().startswith(".sa "):
-                        if self.handle_music_command(self.room, body, frm):
+                        if self.handle_music_command(self.room, body, frm, broadcast_all=True, with_reactions=True):
                             return
                     m_custom_gift = re.fullmatch(r"sav@([^@\s]+)", body.strip(), re.I)
                     if m_custom_gift:
@@ -26877,19 +30892,21 @@ class TalkinBot:
             elif kind == "close":
                 raise ConnectionError(f"WebSocket closed during room-list bootstrap: {message}")
 
-        # Startup/reconnect room policy is controlled independently from manual
-        # join commands: STARTUP_JOIN_ENABLED gates GROUP_TO_JOIN, while
-        # RESTORE_SAVED_ROOMS_ON_STARTUP gates the persisted room catalog.
+        # Startup/reconnect room policy:
+        # OFF = only the configured GROUP_TO_JOIN/FIRST_ROOM.
+        # ON  = all rooms saved in tracked_rooms.json plus GROUP_TO_JOIN.
+        # Manual `.دخول غرفي` is independent and always joins the saved list.
         if MASTER_SERVICE_ENABLED:
             rooms_to_restore = set()
         else:
-            rooms_to_restore = set()
-            if RESTORE_SAVED_ROOMS_ON_STARTUP:
-                rooms_to_restore.update(
-                    str(r).strip() for r in _persistent_rooms()
-                    if str(r).strip() and _norm_room(r) not in getattr(self, "blocked_rooms", set())
-                )
-            if STARTUP_JOIN_ENABLED and self.room:
+            # tracked_rooms.json is the authoritative startup source. The
+            # in-memory known_rooms set may be a truncated/stale view after a
+            # reconnect and was the reason only a subset was restored.
+            rooms_to_restore = {
+                str(r).strip() for r in _persistent_rooms()
+                if str(r).strip() and _norm_room(r) not in getattr(self, "blocked_rooms", set())
+            }
+            if self.room:
                 rooms_to_restore.add(str(self.room).strip())
         if rooms_to_restore:
             self._room_restore_candidates = {
@@ -27032,7 +31049,7 @@ class TalkinBot:
             missing.append("BOT_ID (or BOT_USERNAME)")
         if not BOT_PWD:
             missing.append("BOT_PWD (or BOT_PASSWORD)")
-        if STARTUP_JOIN_ENABLED and not self.room and not MASTER_SERVICE_ENABLED:
+        if not self.room and not MASTER_SERVICE_ENABLED:
             missing.append("GROUP_TO_JOIN (or FIRST_ROOM)")
         if DEBUG and not QUIET_MODE:
             print(f"[ROOM_POLICY] startup={'ALL_SAVED_ROOMS' if AUTO_JOIN_ALL_ROOMS else 'FIRST_ROOM_ONLY'} verification={'ON' if VERIFICATION_ENABLED else 'OFF'}", flush=True)
@@ -27050,6 +31067,30 @@ class TalkinBot:
         self._start_cpu_guard()
         self._cleanup_thread = start_runtime_cleanup(self.stop_event, self)
         self.asset_server = start_asset_server()
+        try:
+            ytdlp_version = getattr(getattr(yt_dlp, "version", None), "__version__", "installed") if yt_dlp else "MISSING"
+            js_runtime_status = []
+            for runtime_name in ("deno", "node"):
+                runtime_path = shutil.which(runtime_name)
+                if runtime_path:
+                    try:
+                        probe = subprocess.run([runtime_path, "--version"], capture_output=True, text=True, timeout=3, check=False)
+                        js_runtime_status.append(f"{runtime_name}={((probe.stdout or probe.stderr).strip() or 'unknown')}")
+                    except Exception:
+                        js_runtime_status.append(f"{runtime_name}=unavailable")
+            self.log(
+                "[MEDIA_DIAGNOSTICS]",
+                f"yt_dlp={ytdlp_version}",
+                f"ffmpeg={'yes' if shutil.which('ffmpeg') else 'NO'}",
+                f"Pillow={'yes' if PIL_AVAILABLE else 'NO'}",
+                f"JS={','.join(js_runtime_status) if js_runtime_status else 'NO Deno/Node'}",
+                f"public_base={'set' if _public_base_url() else 'MISSING'}",
+                f"asset_server={'started' if self.asset_server else 'FAILED/DISABLED'}",
+                f"port={ASSET_HTTP_PORT}",
+                f"pot_provider={'set:'+YOUTUBE_POT_BASE_URL if YOUTUBE_POT_BASE_URL else 'localhost:4416/default-if-plugin-installed'}",
+            )
+        except Exception as diagnostic_exc:
+            self.log("[MEDIA_DIAGNOSTICS] failed:", type(diagnostic_exc).__name__)
         while not self.stop_event.is_set():
             try:
                 self.run_once()
